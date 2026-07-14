@@ -112,6 +112,37 @@ describe('ChatTranscript', () => {
     expect(wrapper.text()).not.toContain('在资料库中定位')
   })
 
+  it('preserves multiline assistant text while keeping HTML-looking content inert', () => {
+    const multilineText = '数联：数据要素联通\n智联：智能与算力连接\n光联：<strong>城市光网支撑</strong>'
+    const message = assistantMessage()
+    message.paragraphs = [
+      {
+        text: multilineText,
+        citations: [],
+      },
+    ]
+
+    const wrapper = mount(ChatTranscript, {
+      props: {
+        messages: [message],
+        loading: false,
+        error: null,
+      },
+      global: {
+        stubs: {
+          MultimodalPanel: true,
+        },
+      },
+    })
+
+    const paragraph = wrapper.find('.answer-paragraph')
+
+    expect(paragraph.classes()).toContain('answer-paragraph--multiline')
+    expect(paragraph.text()).toBe(multilineText)
+    expect(paragraph.find('strong').exists()).toBe(false)
+    expect(paragraph.html()).toContain('&lt;strong&gt;城市光网支撑&lt;/strong&gt;')
+  })
+
   it('renders pending DCAgent answer as a waiting state without conclusion tools', () => {
     const wrapper = mount(ChatTranscript, {
       props: {

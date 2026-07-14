@@ -63,7 +63,13 @@ watch(
             :key="`${message.id}-${paragraphIndex}-${paragraph.text}`"
             class="answer-block"
           >
-            <p class="answer-paragraph" :class="{ 'answer-paragraph--streaming': message.streaming && paragraphIndex === message.paragraphs.length - 1 }">
+            <p
+              class="answer-paragraph"
+              :class="{
+                'answer-paragraph--multiline': paragraph.text.includes('\n'),
+                'answer-paragraph--streaming': message.streaming && paragraphIndex === message.paragraphs.length - 1,
+              }"
+            >
               {{ paragraph.text }}<span v-if="message.streaming && paragraphIndex === message.paragraphs.length - 1" class="streaming-caret" aria-hidden="true" />
             </p>
           </div>
@@ -171,6 +177,10 @@ watch(
   color: #e4eef3;
   font-size: 15px;
   line-height: 1.86;
+}
+
+.answer-paragraph--multiline {
+  white-space: pre-line;
 }
 
 .answer-paragraph--streaming {
