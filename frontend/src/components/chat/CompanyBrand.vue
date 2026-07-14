@@ -1,6 +1,6 @@
 <template>
   <header class="company-brand" data-ignore-quantum-pulse aria-label="公司品牌">
-    <span class="company-brand__mark" aria-hidden="true">DC</span>
+    <img class="company-brand__mark" :src="'/favicon-logo.svg'" alt="" aria-hidden="true">
     <span class="company-brand__name">DC-Agent</span>
   </header>
 </template>
@@ -19,24 +19,11 @@
 }
 
 .company-brand__mark {
-  display: inline-grid;
-  place-items: center;
+  display: block;
   width: 38px;
   height: 38px;
-  border: 1px solid rgba(129, 229, 255, 0.32);
-  border-radius: 12px;
-  color: #dff9ff;
-  background:
-    linear-gradient(145deg, rgba(184, 242, 255, 0.2), rgba(103, 216, 255, 0.06)),
-    rgba(10, 20, 28, 0.48);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.1),
-    0 0 26px rgba(80, 198, 238, 0.16);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0;
-  backdrop-filter: blur(14px);
+  flex: 0 0 auto;
+  object-fit: contain;
 }
 
 .company-brand__name {
@@ -59,7 +46,6 @@
   .company-brand__mark {
     width: 34px;
     height: 34px;
-    border-radius: 11px;
   }
 
   .company-brand__name {
