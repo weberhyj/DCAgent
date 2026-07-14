@@ -17,3 +17,4 @@ qa-screenshots/
 frontend/.tmp/
 frontend/artifacts/
 frontend/test-artifacts/
+.worktrees/
