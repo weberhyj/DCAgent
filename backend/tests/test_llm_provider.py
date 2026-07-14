@@ -95,6 +95,9 @@ def indexed_hit(
 
 
 class FakeLLMResponse:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
     def raise_for_status(self) -> None:
         return None
 
@@ -103,7 +106,7 @@ class FakeLLMResponse:
             "choices": [
                 {
                     "message": {
-                        "content": "根据已检索资料，现金流风险与回款周期相关。[1]"
+                        "content": self.content,
                     }
                 }
             ]
@@ -111,8 +114,12 @@ class FakeLLMResponse:
 
 
 class RecordingHttpClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        response_content: str = "根据已检索资料，现金流风险与回款周期相关。[1]",
+    ) -> None:
         self.requests: list[dict] = []
+        self.response_content = response_content
 
     def __enter__(self) -> "RecordingHttpClient":
         return self
@@ -122,7 +129,7 @@ class RecordingHttpClient:
 
     def post(self, url: str, json: dict, headers: dict) -> FakeLLMResponse:
         self.requests.append({"url": url, "json": json, "headers": headers})
-        return FakeLLMResponse()
+        return FakeLLMResponse(self.response_content)
 
 
 class LLMProviderTest(unittest.TestCase):
@@ -269,6 +276,36 @@ class LLMProviderTest(unittest.TestCase):
         self.assertIn("cashflow.txt", payload["messages"][1]["content"])
         self.assertEqual(reply.paragraphs[0].citations[0].source_id, "kb-llm")
         self.assertNotIn("[1]", reply.paragraphs[0].text)
+
+    def test_openai_provider_normalizes_formatted_answer_before_returning(self) -> None:
+        client = RecordingHttpClient(
+            response_content=(
+                "- **数联**：数据要素联通\n"
+                "- **智联**：智能与算力连接\n"
+                "- **光联**：城市光网支撑。[1]"
+            )
+        )
+        provider = OpenAICompatibleLLMProvider(
+            api_base="https://llm.example.test/v1",
+            api_key="test-key",
+            model="dc-agent-test-model",
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client):
+            reply = provider.generate_reply(
+                LLMRequest(
+                    content="请说明三类连接能力",
+                    mode="source",
+                    knowledge_hits=[indexed_hit()],
+                    previous_messages=[],
+                )
+            )
+
+        self.assertEqual(
+            reply.paragraphs[0].text,
+            "数联：数据要素联通\n智联：智能与算力连接\n光联：城市光网支撑。",
+        )
+        self.assertEqual(reply.paragraphs[0].citations[0].source_id, "kb-llm")
 
     def test_openai_provider_refuses_without_external_call_when_no_knowledge_hits(self) -> None:
         provider = OpenAICompatibleLLMProvider(

@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import httpx
 
-from .answer_text import remove_inline_citation_markers
+from .answer_text import normalize_plain_text_answer
 from .models import (
     ChatMessageModel,
     CitationModel,
@@ -100,7 +100,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 response = client.post(f"{self.api_base}/chat/completions", json=payload, headers=headers)
                 response.raise_for_status()
                 data = response.json()
-            content = remove_inline_citation_markers(
+            content = normalize_plain_text_answer(
                 str(data["choices"][0]["message"]["content"])
             )
         except httpx.TimeoutException as exc:
