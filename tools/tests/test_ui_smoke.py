@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import io
 import unittest
 from unittest.mock import patch
@@ -9,6 +10,12 @@ from tools import ui_smoke
 
 
 class UiSmokeContractTests(unittest.TestCase):
+    def test_quality_import_uses_playwright_mime_type_key(self) -> None:
+        source = inspect.getsource(ui_smoke.verify_quality_app)
+
+        self.assertIn('mimeType="text/csv"', source)
+        self.assertNotIn("mime_type=", source)
+
     def test_build_evaluation_import_csv_contains_answerable_and_no_answer_cases(self) -> None:
         content = ui_smoke.build_evaluation_import_csv().decode("utf-8-sig")
         rows = list(csv.DictReader(io.StringIO(content)))

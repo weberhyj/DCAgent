@@ -322,7 +322,7 @@ def verify_quality_app() -> None:
                 page.locator('[data-testid="evaluation-import-file"]').set_input_files(
                     FilePayload(
                         name="evaluation-cases.csv",
-                        mime_type="text/csv",
+                        mimeType="text/csv",
                         buffer=build_evaluation_import_csv(),
                     ),
                 )
