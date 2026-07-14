@@ -34,6 +34,16 @@ class NormalizePlainTextAnswerTests(unittest.TestCase):
             "a and b",
         )
 
+    def test_normalizes_chinese_inline_bold_spans(self):
+        cases = {
+            "这是**重点**内容": "这是重点内容",
+            "现金流风险与**回款周期**直接相关。": "现金流风险与回款周期直接相关。",
+        }
+
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(normalize_plain_text_answer(value), expected)
+
     def test_preserves_code_like_and_escaped_stars(self):
         values = [
             "`**literal**`",
@@ -61,6 +71,13 @@ class NormalizePlainTextAnswerTests(unittest.TestCase):
 
     def test_preserves_indented_formatted_lists(self):
         values = ["    - **literal**", "\t- **literal**", "  - **literal**"]
+
+        for value in values:
+            with self.subTest(value=value):
+                self.assertEqual(normalize_plain_text_answer(value), value)
+
+    def test_preserves_indented_code_lines(self):
+        values = ["示例：\n    **literal**", "示例：\n\t**literal**"]
 
         for value in values:
             with self.subTest(value=value):

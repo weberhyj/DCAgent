@@ -12,12 +12,13 @@ _INDENTED_LIST_PREFIX = re.compile(r"^([ \t]+)[-+*][ \t]+")
 _STAR_RUN = re.compile(r"\*+")
 _BOLD_CONTENT = r"(?:(?!\*\*)\S)(?:(?:(?!\*\*)[^\r\n])*?(?:(?!\*\*)\S))?"
 _BOLD_SPAN = re.compile(
-    rf"(?<!\w)(?<!\\)\*\*({_BOLD_CONTENT})(?<!\\)\*\*(?!\w)"
+    rf"(?<![A-Za-z0-9_])(?<!\\)\*\*({_BOLD_CONTENT})(?<!\\)\*\*(?![A-Za-z0-9_])"
 )
 _PROTECTED_REGION = re.compile(
     r"```.*?(?:```|\Z)"
     r"|(?P<ticks>`+)[^\r\n]*?(?P=ticks)"
     r"|`[^\r\n]*(?=\r?\n|\Z)"
+    r"|^(?: {4,}|\t)[^\r\n]*"
     r"|^[ \t]+[-+*][ \t]+[^\r\n]*",
     re.MULTILINE | re.DOTALL,
 )
