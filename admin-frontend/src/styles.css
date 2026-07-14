@@ -1,0 +1,72 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700;800&display=swap");
+
+:root {
+  --font-sans: "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "IBM Plex Mono", Consolas, monospace;
+  --color-bg: #eef3f7;
+  --color-panel: #fbfcfd;
+  --color-panel-soft: #f4f7fa;
+  --color-border: #d8e1ea;
+  --color-border-strong: #bcc9d6;
+  --color-text: #17212b;
+  --color-muted: #657585;
+  --color-accent: #1463ff;
+  --color-accent-strong: #0b3fb8;
+  --color-accent-soft: #e7efff;
+  --color-danger: #bb3434;
+  --color-success: #087b55;
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  background: var(--color-bg);
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+body {
+  background:
+    linear-gradient(90deg, rgba(20, 99, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(20, 99, 255, 0.04) 1px, transparent 1px),
+    radial-gradient(circle at 84% 8%, rgba(20, 99, 255, 0.11), transparent 28%),
+    #eef3f7;
+  background-size: 28px 28px, 28px 28px, 100% 100%, auto;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+}
+
+button {
+  transition: border-color 140ms ease, color 140ms ease, background 140ms ease, opacity 140ms ease;
+}
+
+::selection {
+  color: #ffffff;
+  background: #1463ff;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 99px;
+  background: rgba(20, 99, 255, 0.32);
+  background-clip: padding-box;
+}

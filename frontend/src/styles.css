@@ -1,0 +1,76 @@
+@import url("https://cdn.jsdelivr.net/npm/cn-fontsource-ding-talk-jin-bu-ti-regular@1.0.3/font.css");
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700;800&display=swap");
+
+:root {
+  --font-sans: "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  --font-display: "DingTalk JinBuTi", "Alimama ShuHeiTi", "YouSheBiaoTiHei", "HarmonyOS Sans SC", "MiSans", "DengXian", "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
+  --color-bg: #091117;
+  --color-panel: #111a22;
+  --color-border: rgba(161, 217, 238, 0.18);
+  --color-text: #edf7fb;
+  --color-muted: #9aafbd;
+  --color-accent: #67d8ff;
+  --color-accent-strong: #b8f2ff;
+  --color-accent-soft: rgba(103, 216, 255, 0.16);
+  --color-alert: #d8bd7a;
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  background: linear-gradient(180deg, #17222a, var(--color-bg));
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+body {
+  background:
+    radial-gradient(circle at 20% 0%, rgba(103, 216, 255, 0.11), transparent 28%),
+    radial-gradient(circle at 78% 8%, rgba(150, 129, 255, 0.13), transparent 34%),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.032) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    #091117;
+  background-size: 100% 100%, 100% 100%, 44px 44px, 44px 44px, auto;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+}
+
+button {
+  transition: transform 160ms ease, border-color 160ms ease, color 160ms ease, background 160ms ease, opacity 160ms ease;
+}
+
+button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+::selection {
+  color: #05070a;
+  background: #8be8ff;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 99px;
+  background: rgba(103, 216, 255, 0.38);
+  background-clip: padding-box;
+}
