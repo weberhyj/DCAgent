@@ -161,6 +161,24 @@ class LLMProviderTest(unittest.TestCase):
         self.assertIn("cashflow.txt", prompt)
         self.assertIn("上一轮问题", prompt)
 
+    def test_system_and_user_prompts_require_plain_text_without_markup(self) -> None:
+        prompt = build_prompt(
+            LLMRequest(
+                content="请说明三类连接能力",
+                mode="source",
+                knowledge_hits=[indexed_hit()],
+                previous_messages=[],
+            )
+        )
+
+        for prompt_layer in (RAG_SYSTEM_PROMPT, prompt):
+            with self.subTest(prompt_layer=prompt_layer):
+                self.assertIn("纯文本", prompt_layer)
+                self.assertIn("Markdown", prompt_layer)
+                self.assertIn("HTML", prompt_layer)
+                self.assertIn("列表符号", prompt_layer)
+                self.assertIn("加粗", prompt_layer)
+
     def test_template_provider_refuses_to_answer_without_knowledge_hits(self) -> None:
         provider = TemplateLLMProvider()
 
