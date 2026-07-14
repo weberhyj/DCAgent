@@ -13,7 +13,7 @@ const navigation = [
   <div class="admin-shell">
     <aside class="admin-sidebar">
       <RouterLink class="admin-brand" :to="{ name: 'overview' }" aria-label="返回管理概览">
-        <span class="admin-brand__mark">DC</span>
+        <img class="admin-brand__mark" :src="'/favicon-logo.svg'" alt="" aria-hidden="true">
         <span class="admin-brand__copy">
           <strong>DC-Agent</strong>
         </span>
@@ -92,18 +92,11 @@ const navigation = [
 }
 
 .admin-brand__mark {
-  display: grid;
-  place-items: center;
+  display: block;
   width: 38px;
   height: 38px;
   flex: 0 0 auto;
-  border-radius: 8px;
-  color: #ffffff;
-  background: #113e91;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 700;
-  box-shadow: 0 8px 20px rgba(17, 62, 145, 0.2);
+  object-fit: contain;
 }
 
 .admin-brand__copy {
