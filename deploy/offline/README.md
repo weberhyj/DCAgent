@@ -4,7 +4,9 @@ This Compose project is the private, single-server deployment contract for DC-Ag
 
 ## Prepare local configuration
 
-Run `tools/prepare_offline_env.ps1` from the repository root. The script copies `.env.example` only when `.env` is absent and creates the PostgreSQL password/database URL secret pair only when neither file exists. It refuses a partial pair and never prints secret values. Use `-RotateSecrets` only for an intentional coordinated rotation of both files.
+Run `tools/prepare_offline_env.ps1` from the repository root. The script copies `.env.example` only when `.env` is absent and creates the PostgreSQL password/database URL secret pair only when neither file exists. It refuses a partial pair and never prints secret values. Secret files are staged, validated, permission-restricted, and published as a recoverable pair.
+
+`-RotateSecrets` is a **pre-initialization only** operation. The script resolves `DATA_ROOT` from `.env` when possible and refuses rotation when `${DATA_ROOT}/postgres/PG_VERSION` exists, because changing files alone cannot change the password stored in an initialized PostgreSQL role. Rotation after initialization requires a controlled maintenance procedure: stop dependent services, run a reviewed `ALTER ROLE`, update both secret files together, restart services, and verify connectivity. That coordinated workflow is intentionally outside this phase.
 
 Before deployment, replace every placeholder digest and model checksum in `deploy/offline/.env` with the approved values from the offline artifact lock and internal registry. Do not replace digest references with floating public tags.
 
@@ -25,3 +27,5 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 The hashed `backend/requirements-offline.txt` and `backend/requirements-benchmark.txt` files are intentionally absent until the target Linux Python 3.12 environment and internal wheel mirror are fixed. Dockerfiles already enforce the final contract with `--no-index`, the local wheel directory, and `--require-hashes`; do not fabricate lock files locally.
 
 Docker is not installed on the current development machine, so Compose rendering cannot be verified here. Validate `docker compose --env-file deploy/offline/.env -f deploy/offline/compose.yaml config --quiet` on a host with Docker before deployment.
+
+The PostgreSQL target host must also run the real baseline/stamp and drift-rejection tests against the approved PostgreSQL version. Local unit tests validate catalog-row normalization and advisory lock orchestration, but they do not prove the live `pg_catalog` queries, session advisory lock concurrency, or rollback behavior on the target server. A Docker build of all three offline images and the Compose configuration check remain target-host gates.

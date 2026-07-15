@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from alembic import command
 from alembic.config import Config
@@ -198,6 +199,22 @@ def make_config(database_url: str) -> Config:
 
 
 class AlembicBaselineTest(unittest.TestCase):
+    def test_env_uses_supplied_connection_without_building_an_engine(self) -> None:
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        try:
+            with engine.connect() as connection:
+                config = make_config("sqlite+pysqlite:///:memory:")
+                config.attributes["connection"] = connection
+                with patch(
+                    "sqlalchemy.engine_from_config",
+                    side_effect=AssertionError("external connection was ignored"),
+                ):
+                    command.upgrade(config, "head")
+                self.assertIn("alembic_version", inspect(connection).get_table_names())
+                self.assertFalse(connection.closed)
+        finally:
+            engine.dispose()
+
     def test_empty_database_upgrades_to_complete_frozen_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "baseline.db"

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 ARG PYTHON_BASE_IMAGE
 FROM ${PYTHON_BASE_IMAGE}
 

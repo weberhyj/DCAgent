@@ -58,6 +58,8 @@ class ComposeContractTest(unittest.TestCase):
         self.assertIn("NoNewline", text)
         self.assertIn("icacls", text)
         self.assertIn("LASTEXITCODE", text)
+        self.assertIn("SetAccessRuleProtection", text)
+        self.assertIn("Set-Acl", text)
         self.assertIn("artifacts/secrets/", (REPO_ROOT / ".gitignore").read_text(encoding="utf-8"))
 
         powershell = shutil.which("pwsh") or shutil.which("powershell")
@@ -69,7 +71,7 @@ class ComposeContractTest(unittest.TestCase):
             (root / "deploy" / "offline").mkdir(parents=True)
             (root / "tools").mkdir()
             (root / "deploy" / "offline" / ".env.example").write_text(
-                "DATA_ROOT=./artifacts/data\n", encoding="utf-8"
+                "DATA_ROOT=../../artifacts/data\n", encoding="utf-8"
             )
             copied_script = root / "tools" / "prepare_offline_env.ps1"
             copied_script.write_bytes(script.read_bytes())
@@ -133,6 +135,120 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(partial.returncode, 0)
             self.assertTrue(password_path.exists())
             self.assertFalse(database_path.exists())
+
+    def test_initialized_postgres_rotation_refuses_without_changing_secrets(self) -> None:
+        script = REPO_ROOT / "tools" / "prepare_offline_env.ps1"
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "deploy" / "offline").mkdir(parents=True)
+            (root / "tools").mkdir()
+            (root / "deploy" / "offline" / ".env.example").write_text(
+                "DATA_ROOT=../../artifacts/data\n", encoding="utf-8"
+            )
+            copied_script = root / "tools" / "prepare_offline_env.ps1"
+            copied_script.write_bytes(script.read_bytes())
+
+            def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(copied_script),
+                        *arguments,
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            self.assertEqual(run().returncode, 0)
+            postgres_data = root / "artifacts" / "data" / "postgres"
+            postgres_data.mkdir(parents=True)
+            (postgres_data / "PG_VERSION").write_text("16\n", encoding="ascii")
+            password_path = root / "artifacts" / "secrets" / "postgres-password"
+            database_path = root / "artifacts" / "secrets" / "database-url"
+            before_password = password_path.read_bytes()
+            before_database = database_path.read_bytes()
+
+            rotated = run("-RotateSecrets")
+            self.assertNotEqual(rotated.returncode, 0)
+            self.assertEqual(before_password, password_path.read_bytes())
+            self.assertEqual(before_database, database_path.read_bytes())
+            self.assertIn("ALTER ROLE", rotated.stderr + rotated.stdout)
+            self.assertNotIn(before_password.decode("ascii"), rotated.stderr + rotated.stdout)
+            self.assertNotIn(before_database.decode("ascii"), rotated.stderr + rotated.stdout)
+
+    def test_staged_secret_failure_preserves_active_pair(self) -> None:
+        script = REPO_ROOT / "tools" / "prepare_offline_env.ps1"
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "deploy" / "offline").mkdir(parents=True)
+            (root / "tools").mkdir()
+            (root / "deploy" / "offline" / ".env.example").write_text(
+                "DATA_ROOT=../../artifacts/data\n", encoding="utf-8"
+            )
+            copied_script = root / "tools" / "prepare_offline_env.ps1"
+            copied_script.write_bytes(script.read_bytes())
+
+            def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(copied_script),
+                        *arguments,
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            self.assertEqual(run().returncode, 0)
+            password_path = root / "artifacts" / "secrets" / "postgres-password"
+            database_path = root / "artifacts" / "secrets" / "database-url"
+            before_password = password_path.read_bytes()
+            before_database = database_path.read_bytes()
+            (root / "artifacts" / "secrets" / "database-url.new").mkdir()
+
+            failed = run("-RotateSecrets")
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(before_password, password_path.read_bytes())
+            self.assertEqual(before_database, database_path.read_bytes())
+
+    def test_dockerfiles_have_no_floating_syntax_directive(self) -> None:
+        for dockerfile_name in ("backend.Dockerfile", "worker.Dockerfile", "embedding.Dockerfile"):
+            text = (REPO_ROOT / "deploy" / "docker" / dockerfile_name).read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("# syntax=docker/dockerfile:1", text)
+
+    def test_readme_documents_rotation_limit_and_target_host_gates(self) -> None:
+        text = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pre-initialization only", text)
+        self.assertIn("ALTER ROLE", text)
+        self.assertIn("advisory lock", text)
+        self.assertIn("PostgreSQL target host", text)
+        self.assertIn("Docker build", text)
 
 
 if __name__ == "__main__":
