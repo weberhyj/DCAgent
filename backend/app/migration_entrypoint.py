@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -273,20 +274,20 @@ BASELINE_INDEXES: dict[str, dict[str, IndexSignature]] = {
     "knowledge_chunks": {"ix_knowledge_chunks_source_id": _index(("source_id",))},
 }
 
-BASELINE_FOREIGN_KEYS: dict[str, set[ForeignKeySignature]] = {
-    "messages": {
-        _foreign_key(("conversation_id",), "conversations", ("id",), "CASCADE")
-    },
-    "agent_steps": {
-        _foreign_key(("run_id",), "agent_runs", ("id",), "CASCADE")
-    },
-    "evaluation_runs": {
+BASELINE_FOREIGN_KEYS: dict[str, tuple[ForeignKeySignature, ...]] = {
+    "messages": (
+        _foreign_key(("conversation_id",), "conversations", ("id",), "CASCADE"),
+    ),
+    "agent_steps": (
+        _foreign_key(("run_id",), "agent_runs", ("id",), "CASCADE"),
+    ),
+    "evaluation_runs": (
         _foreign_key(("case_id",), "evaluation_cases", ("id",), "CASCADE"),
         _foreign_key(("batch_id",), "evaluation_batches", ("id",), "SET NULL"),
-    },
-    "knowledge_chunks": {
-        _foreign_key(("source_id",), "knowledge_sources", ("id",), "CASCADE")
-    },
+    ),
+    "knowledge_chunks": (
+        _foreign_key(("source_id",), "knowledge_sources", ("id",), "CASCADE"),
+    ),
 }
 
 
@@ -631,6 +632,42 @@ def _get_foreign_keys(
     return inspector.get_foreign_keys(table_name, **schema_arguments)
 
 
+def _normalize_postgres_foreign_key_catalog_row(row: Any) -> tuple[str, ...]:
+    semantic_options: list[str] = []
+    if not str(row.get("constraint_name") or "").strip():
+        semantic_options.append("missing-constraint-name")
+    if "is_validated" not in row:
+        semantic_options.append("missing-validated-state")
+    elif row.get("is_validated") is not True:
+        semantic_options.append("not-validated")
+    if "is_enforced" not in row:
+        semantic_options.append("missing-enforced-state")
+    elif row.get("is_enforced") is not True:
+        semantic_options.append("not-enforced")
+    return tuple(sorted(set(semantic_options)))
+
+
+POSTGRES_FOREIGN_KEY_CATALOG_SQL = text(
+    """
+    SELECT
+        constraint_row.conname AS constraint_name,
+        constraint_row.convalidated AS is_validated,
+        COALESCE(
+            (to_jsonb(constraint_row)->>'conenforced')::boolean,
+            TRUE
+        ) AS is_enforced
+    FROM pg_constraint AS constraint_row
+    JOIN pg_class AS table_class
+      ON table_class.oid = constraint_row.conrelid
+    JOIN pg_namespace AS table_namespace
+      ON table_namespace.oid = table_class.relnamespace
+    WHERE table_namespace.nspname = :schema_name
+      AND table_class.relname = :table_name
+      AND constraint_row.contype = 'f'
+    """
+)
+
+
 POSTGRES_INDEX_CATALOG_SQL = text(
     """
     SELECT
@@ -761,6 +798,31 @@ def _validate_postgres_index_catalog(
             errors.append(f"PostgreSQL index catalog differs for table {table_name}")
 
 
+def _validate_postgres_foreign_key_catalog(
+    connection: Any,
+    errors: list[str],
+    schema_name: str,
+    actual_foreign_keys: dict[str, tuple[ForeignKeySignature, ...]],
+    table_names: set[str],
+) -> None:
+    _require_supported_postgres_version(connection)
+    for table_name in sorted(table_names):
+        rows = connection.execute(
+            POSTGRES_FOREIGN_KEY_CATALOG_SQL,
+            {"schema_name": schema_name, "table_name": table_name},
+        ).mappings().all()
+        if (
+            len(rows) != len(actual_foreign_keys.get(table_name, ()))
+            or any(
+                _normalize_postgres_foreign_key_catalog_row(row)
+                for row in rows
+            )
+        ):
+            errors.append(
+                f"PostgreSQL foreign key catalog differs for table {table_name}"
+            )
+
+
 def _schema_fingerprint(
     connection: Any,
     ignored_tables: frozenset[str] = frozenset(),
@@ -779,7 +841,7 @@ def _schema_fingerprint(
     columns: dict[str, tuple[ColumnSignature, ...]] = {}
     primary_keys: dict[str, PrimaryKeySignature] = {}
     indexes: dict[str, dict[str, IndexSignature]] = {}
-    foreign_keys: dict[str, set[ForeignKeySignature]] = {}
+    foreign_keys: dict[str, tuple[ForeignKeySignature, ...]] = {}
     defaults: dict[str, tuple[tuple[str, Any], ...]] = {}
     unique_constraints: dict[str, tuple[Any, ...]] = {}
     check_constraints: dict[str, tuple[Any, ...]] = {}
@@ -814,7 +876,7 @@ def _schema_fingerprint(
                 str(index["name"]): _normalize_index(index)
                 for index in inspector.get_indexes(table_name, **schema_arguments)
             }
-        foreign_keys[table_name] = {
+        foreign_keys[table_name] = tuple(
             _normalize_foreign_key(
                 foreign_key,
                 default_schema_name=default_schema_name,
@@ -830,7 +892,7 @@ def _schema_fingerprint(
                     else None
                 ),
             )
-        }
+        )
         if connection.dialect.name == "sqlite":
             unique_constraints[table_name] = tuple(
                 (
@@ -926,8 +988,8 @@ def _validate_baseline(
             errors.append(f"primary key differs for table {table_name}")
         if actual["indexes"][table_name] != BASELINE_INDEXES[table_name]:
             errors.append(f"indexes differ for table {table_name}")
-        if actual["foreign_keys"].get(table_name, set()) != BASELINE_FOREIGN_KEYS.get(
-            table_name, set()
+        if Counter(actual["foreign_keys"].get(table_name, ())) != Counter(
+            BASELINE_FOREIGN_KEYS.get(table_name, ())
         ):
             errors.append(f"foreign keys differ for table {table_name}")
         if any(default is not None for _, default in actual["defaults"][table_name]):
@@ -945,6 +1007,21 @@ def _validate_baseline(
         except Exception as error:
             errors.append(
                 "PostgreSQL index catalog could not be validated: "
+                f"{error}"
+            )
+        try:
+            if schema_name is None:
+                raise RuntimeError("current PostgreSQL schema is unavailable")
+            _validate_postgres_foreign_key_catalog(
+                connection,
+                errors,
+                schema_name,
+                actual["foreign_keys"],
+                expected_tables & actual["tables"],
+            )
+        except Exception as error:
+            errors.append(
+                "PostgreSQL foreign key catalog could not be validated: "
                 f"{error}"
             )
 

@@ -504,6 +504,135 @@ class FingerprintNormalizationTest(unittest.TestCase):
                     ),
                 )
 
+    def test_postgres_foreign_key_catalog_row_requires_validated_enforced(
+        self,
+    ) -> None:
+        normalize = getattr(
+            migration_entrypoint,
+            "_normalize_postgres_foreign_key_catalog_row",
+            None,
+        )
+        self.assertIsNotNone(normalize)
+        plain = {
+            "constraint_name": "messages_conversation_id_fkey",
+            "is_validated": True,
+            "is_enforced": True,
+        }
+        self.assertEqual((), normalize(plain))
+
+        variants = (
+            {name: value for name, value in plain.items() if name != "is_validated"},
+            {**plain, "is_validated": False},
+            {name: value for name, value in plain.items() if name != "is_enforced"},
+            {**plain, "is_enforced": False},
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual((), normalize(variant))
+
+    def test_postgres_foreign_key_catalog_sql_is_version_compatible(self) -> None:
+        statement = getattr(
+            migration_entrypoint,
+            "POSTGRES_FOREIGN_KEY_CATALOG_SQL",
+            None,
+        )
+        self.assertIsNotNone(statement)
+        catalog_sql = str(statement)
+
+        self.assertIn("FROM pg_constraint AS constraint_row", catalog_sql)
+        self.assertIn("constraint_row.contype = 'f'", catalog_sql)
+        self.assertIn("constraint_row.convalidated AS is_validated", catalog_sql)
+        self.assertIn("to_jsonb(constraint_row)->>'conenforced'", catalog_sql)
+        self.assertIn("AS is_enforced", catalog_sql)
+        self.assertNotIn("constraint_row.conenforced", catalog_sql)
+        self.assertIn(":schema_name", catalog_sql)
+        self.assertIn(":table_name", catalog_sql)
+
+    def test_postgres_foreign_key_catalog_rejects_not_valid(self) -> None:
+        validate = getattr(
+            migration_entrypoint,
+            "_validate_postgres_foreign_key_catalog",
+            None,
+        )
+        self.assertIsNotNone(validate)
+        connection = MagicMock()
+        connection.execute.return_value.mappings.return_value.all.return_value = [
+            {
+                "constraint_name": "messages_conversation_id_fkey",
+                "is_validated": False,
+                "is_enforced": True,
+            }
+        ]
+        errors: list[str] = []
+
+        validate(
+            connection,
+            errors,
+            "tenant",
+            {"messages": (MagicMock(),)},
+            {"messages"},
+        )
+
+        self.assertEqual(
+            ["PostgreSQL foreign key catalog differs for table messages"],
+            errors,
+        )
+        connection.execute.assert_called_once_with(
+            migration_entrypoint.POSTGRES_FOREIGN_KEY_CATALOG_SQL,
+            {"schema_name": "tenant", "table_name": "messages"},
+        )
+
+    def test_postgres_foreign_key_catalog_query_failure_is_fail_closed(self) -> None:
+        validate = getattr(
+            migration_entrypoint,
+            "_validate_postgres_foreign_key_catalog",
+            None,
+        )
+        self.assertIsNotNone(validate)
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
+        connection.execute.side_effect = RuntimeError("catalog unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "catalog unavailable"):
+            validate(connection, [], "tenant", {"messages": ()}, {"messages"})
+
+    def test_duplicate_foreign_key_semantics_preserve_count(self) -> None:
+        inspector = MagicMock()
+        inspector.default_schema_name = "main"
+        inspector.get_table_names.return_value = ["items"]
+        inspector.get_columns.return_value = [
+            {"name": "id", "type": sa.Integer(), "nullable": False},
+            {"name": "parent_id", "type": sa.Integer(), "nullable": False},
+        ]
+        inspector.get_pk_constraint.return_value = {
+            "name": "items_pkey",
+            "constrained_columns": ["id"],
+        }
+        inspector.get_indexes.return_value = []
+        foreign_key = {
+            "constrained_columns": ["parent_id"],
+            "referred_schema": None,
+            "referred_table": "items",
+            "referred_columns": ["id"],
+            "options": {"ondelete": "CASCADE"},
+        }
+        inspector.get_foreign_keys.return_value = [
+            {**foreign_key, "name": "items_parent_id_fkey"},
+            {**foreign_key, "name": "items_parent_id_duplicate_fkey"},
+        ]
+        inspector.get_unique_constraints.return_value = []
+        inspector.get_check_constraints.return_value = []
+        connection = MagicMock()
+        connection.dialect.name = "mysql"
+
+        with patch("app.migration_entrypoint.inspect", return_value=inspector):
+            fingerprint = migration_entrypoint._schema_fingerprint(connection)
+
+        actual_foreign_keys = fingerprint["foreign_keys"]["items"]
+        self.assertEqual(2, len(actual_foreign_keys))
+        self.assertEqual(actual_foreign_keys[0], actual_foreign_keys[1])
+
     def test_postgres_fk_reflection_ignores_search_path(self) -> None:
         inspector = MagicMock()
         inspector.get_foreign_keys.return_value = []
