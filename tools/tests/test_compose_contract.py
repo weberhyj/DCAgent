@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -86,7 +87,7 @@ class ComposeContractTest(unittest.TestCase):
         wrapper_text = wrapper.read_text(encoding="utf-8")
 
         for token in (
-            "ValueFromRemainingArguments",
+            "$ComposeArguments = @($args)",
             "Get-OfflineEnvMap",
             "SetEnvironmentVariable",
             "config",
@@ -95,6 +96,7 @@ class ComposeContractTest(unittest.TestCase):
             "ConvertFrom-Json",
             "registry.internal/dc-agent/",
             "sha256",
+            "dc-agent-offline",
             "Assert-SafeComposeArguments",
             "Assert-RenderedOfflineCompose",
             "finally",
@@ -149,6 +151,7 @@ class ComposeContractTest(unittest.TestCase):
                 }
 
             rendered = {
+                "name": "dc-agent-offline",
                 "services": {
                     "postgres": {
                         "image": safe_image,
@@ -205,16 +208,22 @@ class ComposeContractTest(unittest.TestCase):
             fake_bin = root / "fake-bin"
             fake_bin.mkdir()
             (fake_bin / "docker.ps1").write_text(
-                "param([Parameter(ValueFromRemainingArguments=$true)][string[]]$DockerArgs)\n"
+                "$DockerArgs = @($args)\n"
+                "if ($DockerArgs.Count -gt 0 -and $DockerArgs[0] -eq 'context') {\n"
+                "  Write-Output $env:FAKE_DOCKER_CONTEXT_HOST\n"
+                "  exit 0\n"
+                "}\n"
                 "$record = [ordered]@{\n"
                 "  args = @($DockerArgs)\n"
                 "  POSTGRES_IMAGE = [Environment]::GetEnvironmentVariable('POSTGRES_IMAGE')\n"
                 "  DATA_ROOT = [Environment]::GetEnvironmentVariable('DATA_ROOT')\n"
                 "  POSTGRES_PASSWORD_FILE = [Environment]::GetEnvironmentVariable('POSTGRES_PASSWORD_FILE')\n"
+                "  COMPOSE_PROJECT_NAME = [Environment]::GetEnvironmentVariable('COMPOSE_PROJECT_NAME')\n"
                 "}\n"
                 "Add-Content -LiteralPath $env:FAKE_DOCKER_LOG -Value ($record | ConvertTo-Json -Compress)\n"
                 "if ($DockerArgs -contains 'config') {\n"
-                "  [Console]::Out.Write([IO.File]::ReadAllText($env:FAKE_DOCKER_RENDER))\n"
+                "  & $env:FAKE_PYTHON -c \"import os,sys; sys.stderr.write('benign config warning\\n'); sys.stdout.write(open(os.environ['FAKE_DOCKER_RENDER'], encoding='utf-8').read())\"\n"
+                "  exit $LASTEXITCODE\n"
                 "}\n"
                 "exit 0\n",
                 encoding="utf-8",
@@ -224,9 +233,14 @@ class ComposeContractTest(unittest.TestCase):
             process_environment["PATH"] = str(fake_bin) + os.pathsep + process_environment.get("PATH", "")
             process_environment["FAKE_DOCKER_RENDER"] = str(render_path)
             process_environment["FAKE_DOCKER_LOG"] = str(log_path)
+            process_environment["FAKE_PYTHON"] = sys.executable
+            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = (
+                "unix:///var/run/docker.sock"
+            )
             process_environment["POSTGRES_IMAGE"] = "docker.io/library/postgres:latest"
             process_environment["DATA_ROOT"] = str(root / "external-data")
             process_environment["POSTGRES_PASSWORD_FILE"] = str(root / "external-secret")
+            process_environment["COMPOSE_PROJECT_NAME"] = "attacker-project"
 
             def run(
                 rendered_config: dict[str, object],
@@ -265,12 +279,52 @@ class ComposeContractTest(unittest.TestCase):
                 self.assertIsNone(record["POSTGRES_IMAGE"])
                 self.assertIsNone(record["DATA_ROOT"])
                 self.assertIsNone(record["POSTGRES_PASSWORD_FILE"])
+                self.assertIsNone(record["COMPOSE_PROJECT_NAME"])
+            config_arguments = records[0]["args"]
+            self.assertIn("--profile", config_arguments)
+            self.assertIn("*", config_arguments)
+            self.assertLess(
+                config_arguments.index("--profile"),
+                config_arguments.index("config"),
+            )
+            self.assertEqual(["up", "-d"], records[1]["args"][-2:])
+
+            for safe_arguments in (
+                ("logs", "-f", "api"),
+                ("rm", "-f", "api"),
+            ):
+                with self.subTest(safe_arguments=safe_arguments):
+                    accepted_safe_arguments = run(rendered, *safe_arguments)
+                    self.assertEqual(
+                        0,
+                        accepted_safe_arguments.returncode,
+                        accepted_safe_arguments.stderr,
+                    )
 
             for unsafe_arguments in (
                 ("-f", str(root / "external-compose.yaml"), "up", "-d"),
                 ("--file=external-compose.yaml", "up", "-d"),
                 ("--env-file", str(root / "external.env"), "up", "-d"),
                 ("--project-directory", str(root / "external-project"), "up", "-d"),
+                ("-p", "other-project", "up", "-d"),
+                ("--project-name=other-project", "up", "-d"),
+                (
+                    "build",
+                    "--build-arg",
+                    "PYTHON_BASE_IMAGE=docker.io/library/python:latest",
+                ),
+                (
+                    "run",
+                    "-v",
+                    f"{root / 'external-data'}:/data",
+                    "api",
+                ),
+                ("start", "api"),
+                ("restart", "api"),
+                ("up", "--no-recreate", "-d"),
+                ("up", "--no-deps", "api"),
+                ("up", "--no-build", "-d"),
+                ("up", "--scale", "schema-migration=0", "api"),
             ):
                 with self.subTest(unsafe_arguments=unsafe_arguments):
                     rejected_arguments = run(rendered, *unsafe_arguments)
@@ -283,12 +337,101 @@ class ComposeContractTest(unittest.TestCase):
                         ).lower(),
                     )
 
+            scale_arguments = ("scale", "schema-migration=0")
+            with self.subTest(unsafe_arguments=scale_arguments):
+                if log_path.exists():
+                    log_path.unlink()
+                rejected_scale = run(rendered, *scale_arguments)
+                self.assertFalse(
+                    log_path.exists()
+                    and log_path.read_text(encoding="utf-8").strip(),
+                    "standalone scale must be rejected before Docker is invoked",
+                )
+                self.assertNotEqual(0, rejected_scale.returncode)
+                self.assertIn(
+                    "override",
+                    (rejected_scale.stdout + rejected_scale.stderr).lower(),
+                )
+
+            missing_profile_service = json.loads(json.dumps(rendered))
+            del missing_profile_service["services"]["llama"]
+            rejected_missing_profile = run(
+                missing_profile_service,
+                "--profile",
+                "generation",
+                "up",
+                "-d",
+                "llama",
+            )
+            self.assertNotEqual(0, rejected_missing_profile.returncode)
+            self.assertIn(
+                "service",
+                (
+                    rejected_missing_profile.stdout
+                    + rejected_missing_profile.stderr
+                ).lower(),
+            )
+
+            unsafe_project_name = json.loads(json.dumps(rendered))
+            unsafe_project_name["name"] = "attacker-project"
+            rejected_project_name = run(unsafe_project_name)
+            self.assertNotEqual(0, rejected_project_name.returncode)
+            self.assertIn(
+                "project",
+                (
+                    rejected_project_name.stdout
+                    + rejected_project_name.stderr
+                ).lower(),
+            )
+
+            process_environment["DOCKER_CONTEXT"] = "remote-prod"
+            rejected_remote_context = run(rendered)
+            self.assertNotEqual(0, rejected_remote_context.returncode)
+            self.assertIn(
+                "context",
+                (
+                    rejected_remote_context.stdout
+                    + rejected_remote_context.stderr
+                ).lower(),
+            )
+            process_environment.pop("DOCKER_CONTEXT")
+
+            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = (
+                "tcp://remote.example:2375"
+            )
+            rejected_remote_default = run(rendered)
+            self.assertNotEqual(0, rejected_remote_default.returncode)
+            self.assertIn(
+                "context",
+                (
+                    rejected_remote_default.stdout
+                    + rejected_remote_default.stderr
+                ).lower(),
+            )
+            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = (
+                "unix:///var/run/docker.sock"
+            )
+
             unsafe_image = json.loads(json.dumps(rendered))
             unsafe_image["services"]["postgres"]["image"] = "docker.io/library/postgres:latest"
             rejected_image = run(unsafe_image)
             self.assertNotEqual(0, rejected_image.returncode)
             self.assertIn("image", (rejected_image.stdout + rejected_image.stderr).lower())
             self.assertEqual(1, len(log_path.read_text(encoding="utf-8").splitlines()))
+
+            uppercase_digest = json.loads(json.dumps(rendered))
+            uppercase_digest["services"]["postgres"]["image"] = (
+                "registry.internal/dc-agent/runtime@sha256:" + "A" * 64
+            )
+            rejected_uppercase_digest = run(uppercase_digest)
+            self.assertNotEqual(0, rejected_uppercase_digest.returncode)
+            self.assertIn(
+                "image",
+                (
+                    rejected_uppercase_digest.stdout
+                    + rejected_uppercase_digest.stderr
+                ).lower(),
+            )
 
             unsafe_bind = json.loads(json.dumps(rendered))
             unsafe_bind["services"]["postgres"]["volumes"][0]["source"] = str(

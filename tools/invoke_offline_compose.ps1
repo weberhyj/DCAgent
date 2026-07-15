@@ -1,9 +1,5 @@
-param(
-    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
-    [string[]]$ComposeArguments
-)
-
 $ErrorActionPreference = "Stop"
+$ComposeArguments = @($args)
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $composeDirectory = Join-Path $repo "deploy/offline"
@@ -41,19 +37,117 @@ function Get-OfflineEnvMap {
 function Assert-SafeComposeArguments {
     param([string[]]$Arguments)
 
-    foreach ($argument in $Arguments) {
+    $command = $null
+    $commandIndex = -1
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $argument = $Arguments[$index]
+        if ($null -ne $command) { break }
         if (
             $argument -in @(
                 "-f",
                 "--file",
                 "--env-file",
-                "--project-directory"
+                "--project-directory",
+                "-p",
+                "--project-name"
             ) -or
             $argument -match '^-f.+' -or
-            $argument -match '^--(?:file|env-file|project-directory)='
+            $argument -match '^-p.+' -or
+            $argument -match '^--(?:file|env-file|project-directory|project-name)='
         ) {
-            throw "Compose file, environment, and project-directory override arguments are not allowed"
+            throw "Compose file, environment, project-directory, and project-name override arguments are not allowed"
         }
+        if ($argument -in @("--ansi", "--parallel", "--profile", "--progress")) {
+            if ($index + 1 -ge $Arguments.Count) {
+                throw "Compose global option $argument requires a value"
+            }
+            $index++
+            continue
+        }
+        if ($argument -match '^--(?:ansi|parallel|profile|progress)=') {
+            continue
+        }
+        if ($argument -in @("--compatibility", "--dry-run")) {
+            continue
+        }
+        if ($argument.StartsWith("-")) {
+            throw "Unsupported Compose global option $argument could bypass preflight validation"
+        }
+        $command = $argument
+        $commandIndex = $index
+    }
+    if ($null -eq $command) {
+        throw "A Docker Compose command is required"
+    }
+    if ($command -in @("create", "restart", "run", "scale", "start")) {
+        throw "docker compose $command is not allowed because lifecycle overrides bypass the validated service model"
+    }
+    if ($command -eq "build") {
+        for ($index = $commandIndex + 1; $index -lt $Arguments.Count; $index++) {
+            $argument = $Arguments[$index]
+            if (
+                $argument -in @(
+                    "--build-arg",
+                    "--build-context",
+                    "--builder",
+                    "--secret",
+                    "--ssh"
+                ) -or
+                $argument -match '^--(?:build-arg|build-context|builder|secret|ssh)='
+            ) {
+                throw "Compose build override argument $argument is not allowed"
+            }
+        }
+    }
+    if ($command -eq "up") {
+        for ($index = $commandIndex + 1; $index -lt $Arguments.Count; $index++) {
+            $argument = $Arguments[$index]
+            if ($argument -in @("--no-build", "--no-deps", "--no-recreate", "--scale") -or $argument -match '^--scale=') {
+                throw "Compose lifecycle override argument $argument is not allowed"
+            }
+        }
+    }
+}
+
+function Assert-LocalDockerContext {
+    $dockerHost = [Environment]::GetEnvironmentVariable("DOCKER_HOST", "Process")
+    if (
+        -not [string]::IsNullOrWhiteSpace($dockerHost) -and
+        $dockerHost -cne "unix:///var/run/docker.sock"
+    ) {
+        throw "Only the local rootful Docker host at unix:///var/run/docker.sock is supported"
+    }
+    $dockerContext = [Environment]::GetEnvironmentVariable(
+        "DOCKER_CONTEXT",
+        "Process"
+    )
+    if (
+        -not [string]::IsNullOrWhiteSpace($dockerContext) -and
+        $dockerContext -cne "default"
+    ) {
+        throw "Only the local default Docker context is supported"
+    }
+}
+
+function Assert-LocalDockerEndpoint {
+    $contextErrorPath = [IO.Path]::GetTempFileName()
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $contextOutput = & docker "context" "inspect" "default" "--format" "{{.Endpoints.docker.Host}}" 2> $contextErrorPath
+        $contextExitCode = $LASTEXITCODE
+        $contextError = [IO.File]::ReadAllText($contextErrorPath)
+    }
+    finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+        Remove-Item -LiteralPath $contextErrorPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($contextExitCode -ne 0) {
+        throw "Docker default context could not be inspected: $contextError"
+    }
+    $endpoint = ($contextOutput -join [Environment]::NewLine).Trim()
+    if ($endpoint -cne "unix:///var/run/docker.sock") {
+        throw "Docker default context must use unix:///var/run/docker.sock"
     }
 }
 
@@ -143,7 +237,7 @@ function Assert-InternalDigestImage {
 
     if (
         [string]::IsNullOrWhiteSpace($Image) -or
-        $Image -notmatch '^registry\.internal/dc-agent/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$'
+        $Image -cnotmatch '^registry\.internal/dc-agent/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$'
     ) {
         throw "$Context image must use registry.internal/dc-agent/ and an exact sha256 digest"
     }
@@ -155,9 +249,29 @@ function Assert-RenderedOfflineCompose {
         [Collections.IDictionary]$EnvironmentMap
     )
 
+    $projectName = [string](Get-JsonPropertyValue -Object $Rendered -Name "name")
+    if ($projectName -cne "dc-agent-offline") {
+        throw "Rendered Compose project name must be dc-agent-offline"
+    }
     $services = Get-JsonPropertyValue -Object $Rendered -Name "services"
     if ($null -eq $services) {
         throw "Rendered Compose configuration has no services"
+    }
+    foreach ($requiredService in @(
+        "postgres",
+        "clickhouse",
+        "qdrant",
+        "redis",
+        "clamav",
+        "schema-migration",
+        "embedding-service",
+        "api",
+        "ingestion-worker",
+        "llama"
+    )) {
+        if ($null -eq (Get-JsonPropertyValue -Object $services -Name $requiredService)) {
+            throw "Rendered Compose configuration is missing required service $requiredService"
+        }
     }
 
     foreach ($serviceProperty in $services.PSObject.Properties) {
@@ -280,35 +394,49 @@ if ($null -eq $ComposeArguments -or $ComposeArguments.Count -eq 0) {
     throw "Pass Docker Compose arguments, for example: up -d"
 }
 Assert-SafeComposeArguments -Arguments $ComposeArguments
+Assert-LocalDockerContext
 if (-not (Test-Path -LiteralPath $composePath -PathType Leaf)) {
     throw "Offline Compose file is missing: $composePath"
 }
 
 $environmentMap = Get-OfflineEnvMap -Path $envPath
 $savedEnvironment = [ordered]@{}
+$cleanEnvironmentNames = @(
+    @($environmentMap.Keys)
+    "COMPOSE_ENV_FILES"
+    "COMPOSE_FILE"
+    "COMPOSE_PROFILES"
+    "COMPOSE_PROJECT_NAME"
+) | Sort-Object -Unique
 $baseArguments = @(
+    "--context", "default",
     "compose",
     "--env-file", $envPath,
     "-f", $composePath
 )
 
 try {
-    foreach ($name in $environmentMap.Keys) {
+    foreach ($name in $cleanEnvironmentNames) {
         $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
         [Environment]::SetEnvironmentVariable($name, $null, "Process")
     }
 
+    Assert-LocalDockerEndpoint
+
     $configErrorPath = [IO.Path]::GetTempFileName()
     $originalConsoleOut = [Console]::Out
     $directConsoleOutput = [IO.StringWriter]::new()
+    $configErrorActionPreference = $ErrorActionPreference
     try {
         [Console]::SetOut($directConsoleOutput)
-        $pipelineOutput = & docker @baseArguments "config" "--format" "json" 2> $configErrorPath
+        $ErrorActionPreference = "Continue"
+        $pipelineOutput = & docker @baseArguments "--profile" "*" "config" "--format" "json" 2> $configErrorPath
         $configExitCode = $LASTEXITCODE
         $configError = [IO.File]::ReadAllText($configErrorPath)
         $directOutputText = $directConsoleOutput.ToString()
     }
     finally {
+        $ErrorActionPreference = $configErrorActionPreference
         [Console]::SetOut($originalConsoleOut)
         $directConsoleOutput.Dispose()
         Remove-Item -LiteralPath $configErrorPath -Force -ErrorAction SilentlyContinue
