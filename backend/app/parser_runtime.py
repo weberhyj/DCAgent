@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+from .offline_artifacts import is_local_filesystem_path
+
 
 OFFLINE_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
     {
@@ -34,12 +36,40 @@ class ParserRuntime:
         path_exists: Callable[[Path], bool] | None = None,
     ) -> "ParserRuntime":
         exists = Path.exists if path_exists is None else path_exists
+        docling_artifacts_path = _read_local_path(
+            environ, "DOCLING_ARTIFACTS_PATH"
+        )
+        paddleocr_home = _read_local_path(environ, "PADDLEOCR_HOME")
+        libreoffice_bin = _read_local_path(environ, "LIBREOFFICE_BIN")
+
+        directory_paths = (
+            ("DOCLING_ARTIFACTS_PATH", docling_artifacts_path),
+            ("PADDLEOCR_HOME", paddleocr_home),
+        )
+        configured_paths = directory_paths + (
+            ("LIBREOFFICE_BIN", libreoffice_bin),
+        )
+        for variable, path in configured_paths:
+            if not exists(path):
+                raise ParserRuntimeError(
+                    f"{variable} must reference an existing local path: {path}"
+                )
+
+        for variable, path in directory_paths:
+            if not path.is_dir():
+                raise ParserRuntimeError(
+                    f"{variable} must reference an existing local directory: {path}"
+                )
+        if not libreoffice_bin.is_file():
+            raise ParserRuntimeError(
+                "LIBREOFFICE_BIN must reference an existing local regular file: "
+                f"{libreoffice_bin}"
+            )
+
         return cls(
-            docling_artifacts_path=_require_local_path(
-                environ, "DOCLING_ARTIFACTS_PATH", exists
-            ),
-            paddleocr_home=_require_local_path(environ, "PADDLEOCR_HOME", exists),
-            libreoffice_bin=_require_local_path(environ, "LIBREOFFICE_BIN", exists),
+            docling_artifacts_path=docling_artifacts_path,
+            paddleocr_home=paddleocr_home,
+            libreoffice_bin=libreoffice_bin,
         )
 
 
@@ -53,24 +83,18 @@ def configure_parser_runtime(
     return runtime
 
 
-def _require_local_path(
+def _read_local_path(
     environ: Mapping[str, str],
     variable: str,
-    path_exists: Callable[[Path], bool],
 ) -> Path:
     raw_value = environ.get(variable)
     if not isinstance(raw_value, str) or not raw_value.strip():
         raise ParserRuntimeError(f"{variable} is required")
 
     value = raw_value.strip()
-    if value.casefold().startswith(("http://", "https://")):
+    if not is_local_filesystem_path(value):
         raise ParserRuntimeError(
-            f"{variable} must reference a local path, not an HTTP/HTTPS URL"
+            f"{variable} must reference a local filesystem path; "
+            "network shares and URI schemes are not allowed"
         )
-
-    path = Path(value).expanduser()
-    if not path_exists(path):
-        raise ParserRuntimeError(
-            f"{variable} must reference an existing local path: {path}"
-        )
-    return path
+    return Path(value).expanduser()

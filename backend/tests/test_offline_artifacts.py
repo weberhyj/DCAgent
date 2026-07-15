@@ -83,20 +83,40 @@ class OfflineArtifactManifestTest(unittest.TestCase):
                 ):
                     validate_artifact_manifest({"artifacts": [artifact]})
 
-    def test_rejects_http_and_https_artifact_paths(self) -> None:
+    def test_rejects_uri_and_network_share_artifact_paths(self) -> None:
         for local_path in (
             "http://models.example/docling",
             "https://models.example/paddleocr",
-            "  HTTPS://models.example/libreoffice  ",
+            "ftp://models.example/libreoffice",
+            "s3://offline-bucket/paddleocr",
+            "file://server/share/docling",
+            "urn:dc-agent:docling",
+            r"\\server\share\docling",
+            "//server/share/docling",
         ):
             with self.subTest(local_path=local_path):
                 artifact = valid_artifact()
                 artifact["localPath"] = local_path
 
                 with self.assertRaisesRegex(
-                    ValueError, "^offline artifact paths must be local$"
+                    ValueError,
+                    "^offline artifact paths must be local filesystem paths; "
+                    "network shares and URI schemes are not allowed$",
                 ):
                     validate_artifact_manifest({"artifacts": [artifact]})
+
+    def test_accepts_posix_relative_and_windows_drive_root_artifact_paths(self) -> None:
+        for local_path in (
+            "/models/docling",
+            "models/docling",
+            r"C:\models\docling",
+            "C:/models/docling",
+        ):
+            with self.subTest(local_path=local_path):
+                artifact = valid_artifact()
+                artifact["localPath"] = local_path
+
+                validate_artifact_manifest({"artifacts": [artifact]})
 
     def test_rejects_properties_outside_the_locked_contract(self) -> None:
         artifact = valid_artifact()
@@ -142,10 +162,26 @@ class OfflineArtifactManifestTest(unittest.TestCase):
         self.assertIsNone(re.fullmatch(checksum_pattern, "A" * 64))
 
         local_path_pattern = properties["localPath"]["pattern"]
-        self.assertIsNotNone(re.fullmatch(local_path_pattern, "/models/docling"))
-        self.assertIsNone(
-            re.fullmatch(local_path_pattern, " https://models.example/docling")
-        )
+        for local_path in (
+            "/models/docling",
+            "models/docling",
+            r"C:\models\docling",
+            "C:/models/docling",
+        ):
+            with self.subTest(schema_local_path=local_path):
+                self.assertIsNotNone(re.fullmatch(local_path_pattern, local_path))
+
+        for remote_path in (
+            "https://models.example/docling",
+            "ftp://models.example/docling",
+            "s3://offline-bucket/docling",
+            "file://server/share/docling",
+            "urn:dc-agent:docling",
+            r"\\server\share\docling",
+            "//server/share/docling",
+        ):
+            with self.subTest(schema_remote_path=remote_path):
+                self.assertIsNone(re.fullmatch(local_path_pattern, remote_path))
 
         description = artifact_schema["description"].lower()
         for artifact_family in (

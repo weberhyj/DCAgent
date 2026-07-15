@@ -13,6 +13,20 @@ ARTIFACT_FIELDS = (
     "localPath",
 )
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+URI_SCHEME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+WINDOWS_DRIVE_ROOT_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
+NETWORK_SHARE_PATTERN = re.compile(r"^[\\/]{2}")
+
+
+def is_local_filesystem_path(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if WINDOWS_DRIVE_ROOT_PATTERN.match(candidate):
+        return True
+    return not (
+        URI_SCHEME_PATTERN.match(candidate) or NETWORK_SHARE_PATTERN.match(candidate)
+    )
 
 
 def validate_artifact_manifest(payload: Mapping[str, object]) -> None:
@@ -50,6 +64,8 @@ def validate_artifact_manifest(payload: Mapping[str, object]) -> None:
                 "artifact sha256 must be exactly 64 lowercase hexadecimal characters"
             )
 
-        local_path = artifact["localPath"].strip()
-        if local_path.casefold().startswith(("http://", "https://")):
-            raise ValueError("offline artifact paths must be local")
+        if not is_local_filesystem_path(artifact["localPath"]):
+            raise ValueError(
+                "offline artifact paths must be local filesystem paths; "
+                "network shares and URI schemes are not allowed"
+            )
