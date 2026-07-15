@@ -955,7 +955,14 @@ def _validate_alembic_version_table(
     inspector = inspect(connection)
     if connection.dialect.name == "postgresql" and schema_name is None:
         schema_name = connection.scalar(text("SELECT current_schema()"))
+    if connection.dialect.name == "postgresql":
+        server_version = tuple(connection.dialect.server_version_info or ())
+        if server_version < (15,):
+            raise RuntimeError(
+                "PostgreSQL 15+ required for exact index validation"
+            )
     schema_arguments = {"schema": schema_name} if schema_name is not None else {}
+    postgres_primary_indexes: tuple[IndexSignature, ...] | None = None
     try:
         columns = inspector.get_columns("alembic_version", **schema_arguments)
         primary_key = inspector.get_pk_constraint(
@@ -974,6 +981,19 @@ def _validate_alembic_version_table(
             connection.dialect.name,
             schema_name=schema_name,
         )
+        if connection.dialect.name == "postgresql":
+            catalog_rows = connection.execute(
+                POSTGRES_INDEX_CATALOG_SQL,
+                {
+                    "schema_name": schema_name,
+                    "table_name": "alembic_version",
+                },
+            ).mappings().all()
+            postgres_primary_indexes = tuple(
+                _normalize_postgres_index_catalog_row(row)
+                for row in catalog_rows
+                if row.get("is_primary") is True
+            )
     except Exception as error:
         raise ManagedRevisionStateError(
             "Alembic revision table structure could not be inspected"
@@ -987,10 +1007,18 @@ def _validate_alembic_version_table(
     expected_columns: tuple[ColumnSignature, ...] = (
         ("version_num", _string(32), False, True),
     )
+    expected_primary_index = IndexSignature(
+        columns=("version_num",),
+        unique=True,
+    )
     has_server_default = any(column.get("default") is not None for column in columns)
     if (
         column_signatures != expected_columns
         or primary_key_signature != PrimaryKeySignature(("version_num",))
+        or (
+            connection.dialect.name == "postgresql"
+            and postgres_primary_indexes != (expected_primary_index,)
+        )
         or has_server_default
         or unique_constraints
         or indexes

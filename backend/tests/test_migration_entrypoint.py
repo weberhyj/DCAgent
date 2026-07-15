@@ -61,6 +61,37 @@ def current_revision(database_url: str) -> str:
 
 
 class FingerprintNormalizationTest(unittest.TestCase):
+    def _postgres_version_table_mocks(
+        self,
+        catalog_row: dict[str, object],
+    ) -> tuple[MagicMock, MagicMock]:
+        inspector = MagicMock()
+        inspector.get_columns.return_value = [
+            {
+                "name": "version_num",
+                "type": postgresql.VARCHAR(32),
+                "nullable": False,
+                "default": None,
+            }
+        ]
+        inspector.get_pk_constraint.return_value = {
+            "name": "alembic_version_pkc",
+            "constrained_columns": ["version_num"],
+            "dialect_options": {},
+        }
+        inspector.get_unique_constraints.return_value = []
+        inspector.get_indexes.return_value = []
+        inspector.get_check_constraints.return_value = []
+        inspector.get_foreign_keys.return_value = []
+
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
+        connection.execute.return_value.mappings.return_value.all.return_value = [
+            catalog_row
+        ]
+        return connection, inspector
+
     def test_type_signature_distinguishes_database_type_families(self) -> None:
         normalize = migration_entrypoint._normalize_type
 
@@ -267,6 +298,74 @@ class FingerprintNormalizationTest(unittest.TestCase):
             "primary_constraint.condeferred AS primary_constraint_deferred",
             catalog_sql,
         )
+
+    def test_postgres_alembic_version_accepts_exact_primary_catalog_row(self) -> None:
+        catalog_row = {
+            "index_name": "alembic_version_pkc",
+            "is_unique": True,
+            "is_valid": True,
+            "is_ready": True,
+            "is_live": True,
+            "is_primary": True,
+            "primary_constraint_oid": 123,
+            "primary_constraint_deferrable": False,
+            "primary_constraint_deferred": False,
+            "nulls_not_distinct": False,
+            "reloptions": None,
+            "tablespace": None,
+            "access_method": "btree",
+            "predicate": None,
+            "expressions": None,
+            "key_attribute_count": 1,
+            "total_attribute_count": 1,
+            "key_definitions": ["version_num"],
+        }
+        connection, inspector = self._postgres_version_table_mocks(catalog_row)
+
+        with patch("app.migration_entrypoint.inspect", return_value=inspector):
+            migration_entrypoint._validate_alembic_version_table(
+                connection,
+                schema_name="tenant",
+            )
+
+        connection.execute.assert_called_once_with(
+            migration_entrypoint.POSTGRES_INDEX_CATALOG_SQL,
+            {"schema_name": "tenant", "table_name": "alembic_version"},
+        )
+
+    def test_postgres_alembic_version_rejects_deferrable_primary_catalog_row(
+        self,
+    ) -> None:
+        catalog_row = {
+            "index_name": "alembic_version_pkc",
+            "is_unique": True,
+            "is_valid": True,
+            "is_ready": True,
+            "is_live": True,
+            "is_primary": True,
+            "primary_constraint_oid": 123,
+            "primary_constraint_deferrable": True,
+            "primary_constraint_deferred": True,
+            "nulls_not_distinct": False,
+            "reloptions": None,
+            "tablespace": None,
+            "access_method": "btree",
+            "predicate": None,
+            "expressions": None,
+            "key_attribute_count": 1,
+            "total_attribute_count": 1,
+            "key_definitions": ["version_num"],
+        }
+        connection, inspector = self._postgres_version_table_mocks(catalog_row)
+
+        with (
+            patch("app.migration_entrypoint.inspect", return_value=inspector),
+            self.assertRaises(migration_entrypoint.ManagedRevisionStateError),
+        ):
+            migration_entrypoint._validate_alembic_version_table(
+                connection,
+                schema_name="tenant",
+            )
 
     def test_primary_key_signature_fails_closed_on_semantic_options(self) -> None:
         def fingerprint(primary_key: dict[str, object]) -> object:
