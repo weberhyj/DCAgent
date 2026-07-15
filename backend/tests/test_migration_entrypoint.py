@@ -431,6 +431,7 @@ class FingerprintNormalizationTest(unittest.TestCase):
 
     def test_postgres_index_catalog_requires_version_15_or_newer(self) -> None:
         connection = MagicMock()
+        connection.dialect.name = "postgresql"
         connection.dialect.server_version_info = (14, 12)
 
         with self.assertRaisesRegex(RuntimeError, r"PostgreSQL 15\+ required"):
@@ -602,6 +603,7 @@ class FingerprintNormalizationTest(unittest.TestCase):
         inspector.get_table_names.return_value = []
         connection = MagicMock()
         connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
         connection.scalar.return_value = "tenant"
 
         with patch("app.migration_entrypoint.inspect", return_value=inspector):
@@ -612,6 +614,23 @@ class FingerprintNormalizationTest(unittest.TestCase):
 
         self.assertEqual("upgrade", action)
         inspector.get_table_names.assert_called_once_with(schema="tenant")
+
+    def test_postgres_14_empty_classification_fails_before_inspection(self) -> None:
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (14, 12)
+
+        with (
+            patch("app.migration_entrypoint.inspect") as inspect_database,
+            self.assertRaisesRegex(RuntimeError, r"PostgreSQL 15\+ required"),
+        ):
+            migration_entrypoint._classify_and_validate(
+                connection,
+                MagicMock(),
+            )
+
+        connection.scalar.assert_not_called()
+        inspect_database.assert_not_called()
 
     def test_column_generation_metadata_changes_fingerprint(self) -> None:
         base_column = {
@@ -881,9 +900,43 @@ class MigrationEntrypointTest(unittest.TestCase):
             ],
         )
 
+    def test_postgres_14_empty_database_refuses_upgrade_without_mutation(
+        self,
+    ) -> None:
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (14, 12)
+        connection.in_transaction.return_value = False
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with (
+            patch("app.migration_entrypoint.create_engine", return_value=engine),
+            patch("app.migration_entrypoint.inspect") as inspect_database,
+            patch("app.migration_entrypoint.command.stamp") as stamp,
+            patch("app.migration_entrypoint.command.upgrade") as upgrade,
+            self.assertRaisesRegex(RuntimeError, r"PostgreSQL 15\+ required"),
+        ):
+            run_migrations(
+                database_url="postgresql+psycopg://db",
+                config_path=BACKEND_ROOT / "alembic.ini",
+            )
+
+        connection.scalar.assert_not_called()
+        inspect_database.assert_not_called()
+        stamp.assert_not_called()
+        upgrade.assert_not_called()
+        executed_sql = tuple(
+            str(call.args[0]) for call in connection.execute.call_args_list
+        )
+        self.assertEqual(2, len(executed_sql))
+        self.assertIn("pg_advisory_lock", executed_sql[0])
+        self.assertIn("pg_advisory_unlock", executed_sql[1])
+
     def test_postgres_advisory_lock_is_released_on_migration_failure(self) -> None:
         connection = MagicMock()
         connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
         connection.in_transaction.return_value = False
         engine = MagicMock()
         engine.connect.return_value.__enter__.return_value = connection
@@ -909,6 +962,7 @@ class MigrationEntrypointTest(unittest.TestCase):
         events: list[tuple[str, str | None]] = []
         connection = MagicMock()
         connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
         connection.in_transaction.return_value = False
 
         def record_execute(statement: object, *args: object, **kwargs: object) -> MagicMock:

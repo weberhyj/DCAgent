@@ -717,16 +717,22 @@ def _normalize_sqlite_index_catalog_row(
     )
 
 
-def _validate_postgres_index_catalog(
-    connection: Any,
-    errors: list[str],
-    schema_name: str,
-) -> None:
+def _require_supported_postgres_version(connection: Any) -> None:
+    if connection.dialect.name != "postgresql":
+        return
     server_version = tuple(connection.dialect.server_version_info or ())
     if server_version < (15,):
         raise RuntimeError(
             "PostgreSQL 15+ required for exact index validation"
         )
+
+
+def _validate_postgres_index_catalog(
+    connection: Any,
+    errors: list[str],
+    schema_name: str,
+) -> None:
+    _require_supported_postgres_version(connection)
     for table_name, expected_indexes in BASELINE_INDEXES.items():
         rows = connection.execute(
             POSTGRES_INDEX_CATALOG_SQL,
@@ -961,15 +967,10 @@ def _validate_alembic_version_table(
     connection: Any,
     schema_name: str | None = None,
 ) -> None:
+    _require_supported_postgres_version(connection)
     inspector = inspect(connection)
     if connection.dialect.name == "postgresql" and schema_name is None:
         schema_name = connection.scalar(text("SELECT current_schema()"))
-    if connection.dialect.name == "postgresql":
-        server_version = tuple(connection.dialect.server_version_info or ())
-        if server_version < (15,):
-            raise RuntimeError(
-                "PostgreSQL 15+ required for exact index validation"
-            )
     schema_arguments = {"schema": schema_name} if schema_name is not None else {}
     postgres_primary_indexes: tuple[IndexSignature, ...] | None = None
     try:
@@ -1074,6 +1075,7 @@ def _classify_and_validate(
     connection: Any,
     config: Config,
 ) -> str:
+    _require_supported_postgres_version(connection)
     schema_name: str | None = None
     if connection.dialect.name == "postgresql":
         schema_name = connection.scalar(text("SELECT current_schema()"))
