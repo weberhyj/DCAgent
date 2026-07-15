@@ -3,6 +3,7 @@ name: dc-agent-offline
 services:
   postgres:
     image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
+    restart: unless-stopped
     environment:
       POSTGRES_DB: dc_agent
       POSTGRES_USER: dc_agent
@@ -25,6 +26,7 @@ services:
 
   clickhouse:
     image: ${CLICKHOUSE_IMAGE:?CLICKHOUSE_IMAGE is required}
+    restart: unless-stopped
     volumes:
       - type: bind
         source: ${DATA_ROOT:?DATA_ROOT is required}/clickhouse
@@ -42,6 +44,7 @@ services:
 
   qdrant:
     image: ${QDRANT_IMAGE:?QDRANT_IMAGE is required}
+    restart: unless-stopped
     volumes:
       - type: bind
         source: ${DATA_ROOT:?DATA_ROOT is required}/qdrant
@@ -59,6 +62,7 @@ services:
 
   redis:
     image: ${REDIS_IMAGE:?REDIS_IMAGE is required}
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - type: bind
@@ -76,6 +80,7 @@ services:
 
   clamav:
     image: ${CLAMAV_IMAGE:?CLAMAV_IMAGE is required}
+    restart: unless-stopped
     environment:
       CLAMAV_NO_FRESHCLAMD: "true"
     networks:
@@ -95,6 +100,7 @@ services:
         DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
         DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
     command: ["python", "-m", "app.migration_entrypoint"]
+    restart: "no"
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
     depends_on:
@@ -113,6 +119,7 @@ services:
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:?PYTHON_BASE_IMAGE is required}
         DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
         DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
+    restart: unless-stopped
     environment:
       OFFLINE_MODE: "true"
       EMBEDDING_MODEL_ROOT: /models/${EMBEDDING_MODEL_DIR:?EMBEDDING_MODEL_DIR is required}
@@ -140,6 +147,7 @@ services:
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:?PYTHON_BASE_IMAGE is required}
         DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
         DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
+    restart: unless-stopped
     environment:
       OFFLINE_MODE: "true"
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -211,6 +219,7 @@ services:
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:?PYTHON_BASE_IMAGE is required}
         DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
         DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
+    restart: unless-stopped
     environment:
       OFFLINE_MODE: "true"
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -269,6 +278,7 @@ services:
 
   llama:
     image: ${LLAMA_IMAGE:?LLAMA_IMAGE is required}
+    restart: unless-stopped
     command:
       ["--model", "/models/${LLAMA_MODEL_FILE:?LLAMA_MODEL_FILE is required}", "--host", "0.0.0.0", "--port", "8080", "--parallel", "${MODEL_SLOTS:?MODEL_SLOTS is required}"]
     volumes:

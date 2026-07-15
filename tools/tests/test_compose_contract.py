@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -50,6 +51,260 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn('"6333:6333"', text)
         self.assertNotIn('"6379:6379"', text)
         self.assertNotIn('"8080:8080"', text)
+
+    def test_compose_restart_policy_is_explicit(self) -> None:
+        compose_text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        def service_block(service_name: str) -> str:
+            match = re.search(
+                rf"(?ms)^  {re.escape(service_name)}:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|^networks:)",
+                compose_text,
+            )
+            self.assertIsNotNone(match)
+            return match.group("body")
+
+        for service_name in (
+            "postgres",
+            "clickhouse",
+            "qdrant",
+            "redis",
+            "clamav",
+            "embedding-service",
+            "api",
+            "ingestion-worker",
+            "llama",
+        ):
+            with self.subTest(service_name=service_name):
+                self.assertIn("restart: unless-stopped", service_block(service_name))
+        self.assertIn('restart: "no"', service_block("schema-migration"))
+
+    def test_compose_wrapper_has_clean_environment_validation_contract(self) -> None:
+        wrapper = REPO_ROOT / "tools" / "invoke_offline_compose.ps1"
+        self.assertTrue(wrapper.is_file())
+        wrapper_text = wrapper.read_text(encoding="utf-8")
+
+        for token in (
+            "ValueFromRemainingArguments",
+            "Get-OfflineEnvMap",
+            "SetEnvironmentVariable",
+            "config",
+            "--format",
+            "json",
+            "ConvertFrom-Json",
+            "registry.internal/dc-agent/",
+            "sha256",
+            "Assert-SafeComposeArguments",
+            "Assert-RenderedOfflineCompose",
+            "finally",
+        ):
+            self.assertIn(token, wrapper_text)
+        self.assertNotIn("Invoke-Expression", wrapper_text)
+        self.assertNotIn("cmd /c", wrapper_text.lower())
+
+    def test_compose_wrapper_cleans_overrides_and_rejects_rendered_bypasses(
+        self,
+    ) -> None:
+        wrapper = REPO_ROOT / "tools" / "invoke_offline_compose.ps1"
+        self.assertTrue(wrapper.is_file())
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tools").mkdir()
+            (root / "deploy" / "offline").mkdir(parents=True)
+            copied_wrapper = root / "tools" / "invoke_offline_compose.ps1"
+            copied_wrapper.write_bytes(wrapper.read_bytes())
+            shutil.copy2(
+                REPO_ROOT / "deploy" / "offline" / "compose.yaml",
+                root / "deploy" / "offline" / "compose.yaml",
+            )
+            data_root = (root / "artifacts" / "data").resolve()
+            model_root = (root / "artifacts" / "models").resolve()
+            password_path = (root / "artifacts" / "secrets" / "postgres-password").resolve()
+            database_path = (root / "artifacts" / "secrets" / "database-url").resolve()
+            safe_image = (
+                "registry.internal/dc-agent/runtime@sha256:" + "a" * 64
+            )
+            (root / "deploy" / "offline" / ".env").write_text(
+                f"DATA_ROOT={data_root}\n"
+                f"MODEL_ROOT={model_root}\n"
+                f"POSTGRES_PASSWORD_FILE={password_path}\n"
+                f"DATABASE_URL_SECRET_FILE={database_path}\n"
+                f"POSTGRES_IMAGE={safe_image}\n"
+                "DCAGENT_UID=1000\n"
+                "DCAGENT_GID=1000\n",
+                encoding="utf-8",
+            )
+
+            def bind(source: Path, target: str) -> dict[str, object]:
+                return {
+                    "type": "bind",
+                    "source": str(source),
+                    "target": target,
+                    "bind": {"create_host_path": False},
+                }
+
+            rendered = {
+                "services": {
+                    "postgres": {
+                        "image": safe_image,
+                        "volumes": [bind(data_root / "postgres", "/var/lib/postgresql/data")],
+                    },
+                    "clickhouse": {
+                        "image": safe_image,
+                        "volumes": [bind(data_root / "clickhouse", "/var/lib/clickhouse")],
+                    },
+                    "qdrant": {
+                        "image": safe_image,
+                        "volumes": [bind(data_root / "qdrant", "/qdrant/storage")],
+                    },
+                    "redis": {
+                        "image": safe_image,
+                        "volumes": [bind(data_root / "redis", "/data")],
+                    },
+                    "clamav": {"image": safe_image},
+                    "schema-migration": {
+                        "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}}
+                    },
+                    "embedding-service": {
+                        "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "volumes": [bind(model_root, "/models")],
+                    },
+                    "api": {
+                        "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "volumes": [
+                            bind(data_root / "raw", "/data/raw"),
+                            bind(data_root / "parquet", "/data/parquet"),
+                            bind(model_root, "/models"),
+                        ],
+                    },
+                    "ingestion-worker": {
+                        "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "volumes": [
+                            bind(data_root / "raw", "/data/raw"),
+                            bind(data_root / "parquet", "/data/parquet"),
+                            bind(model_root, "/models"),
+                        ],
+                    },
+                    "llama": {
+                        "image": safe_image,
+                        "volumes": [bind(model_root, "/models")],
+                    },
+                },
+                "secrets": {
+                    "postgres_password": {"file": str(password_path)},
+                    "database_url": {"file": str(database_path)},
+                },
+            }
+            render_path = root / "render.json"
+            log_path = root / "docker.log"
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            (fake_bin / "docker.ps1").write_text(
+                "param([Parameter(ValueFromRemainingArguments=$true)][string[]]$DockerArgs)\n"
+                "$record = [ordered]@{\n"
+                "  args = @($DockerArgs)\n"
+                "  POSTGRES_IMAGE = [Environment]::GetEnvironmentVariable('POSTGRES_IMAGE')\n"
+                "  DATA_ROOT = [Environment]::GetEnvironmentVariable('DATA_ROOT')\n"
+                "  POSTGRES_PASSWORD_FILE = [Environment]::GetEnvironmentVariable('POSTGRES_PASSWORD_FILE')\n"
+                "}\n"
+                "Add-Content -LiteralPath $env:FAKE_DOCKER_LOG -Value ($record | ConvertTo-Json -Compress)\n"
+                "if ($DockerArgs -contains 'config') {\n"
+                "  [Console]::Out.Write([IO.File]::ReadAllText($env:FAKE_DOCKER_RENDER))\n"
+                "}\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+
+            process_environment = os.environ.copy()
+            process_environment["PATH"] = str(fake_bin) + os.pathsep + process_environment.get("PATH", "")
+            process_environment["FAKE_DOCKER_RENDER"] = str(render_path)
+            process_environment["FAKE_DOCKER_LOG"] = str(log_path)
+            process_environment["POSTGRES_IMAGE"] = "docker.io/library/postgres:latest"
+            process_environment["DATA_ROOT"] = str(root / "external-data")
+            process_environment["POSTGRES_PASSWORD_FILE"] = str(root / "external-secret")
+
+            def run(
+                rendered_config: dict[str, object],
+                *compose_arguments: str,
+            ) -> subprocess.CompletedProcess[str]:
+                render_path.write_text(
+                    json.dumps(rendered_config),
+                    encoding="utf-8",
+                )
+                if log_path.exists():
+                    log_path.unlink()
+                arguments = compose_arguments or ("up", "-d")
+                return subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(copied_wrapper),
+                        *arguments,
+                    ],
+                    cwd=root,
+                    env=process_environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            accepted = run(rendered)
+            self.assertEqual(0, accepted.returncode, accepted.stderr)
+            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(2, len(records))
+            for record in records:
+                self.assertIsNone(record["POSTGRES_IMAGE"])
+                self.assertIsNone(record["DATA_ROOT"])
+                self.assertIsNone(record["POSTGRES_PASSWORD_FILE"])
+
+            for unsafe_arguments in (
+                ("-f", str(root / "external-compose.yaml"), "up", "-d"),
+                ("--file=external-compose.yaml", "up", "-d"),
+                ("--env-file", str(root / "external.env"), "up", "-d"),
+                ("--project-directory", str(root / "external-project"), "up", "-d"),
+            ):
+                with self.subTest(unsafe_arguments=unsafe_arguments):
+                    rejected_arguments = run(rendered, *unsafe_arguments)
+                    self.assertNotEqual(0, rejected_arguments.returncode)
+                    self.assertIn(
+                        "override",
+                        (
+                            rejected_arguments.stdout
+                            + rejected_arguments.stderr
+                        ).lower(),
+                    )
+
+            unsafe_image = json.loads(json.dumps(rendered))
+            unsafe_image["services"]["postgres"]["image"] = "docker.io/library/postgres:latest"
+            rejected_image = run(unsafe_image)
+            self.assertNotEqual(0, rejected_image.returncode)
+            self.assertIn("image", (rejected_image.stdout + rejected_image.stderr).lower())
+            self.assertEqual(1, len(log_path.read_text(encoding="utf-8").splitlines()))
+
+            unsafe_bind = json.loads(json.dumps(rendered))
+            unsafe_bind["services"]["postgres"]["volumes"][0]["source"] = str(
+                root / "external-data" / "postgres"
+            )
+            rejected_bind = run(unsafe_bind)
+            self.assertNotEqual(0, rejected_bind.returncode)
+            self.assertIn("bind", (rejected_bind.stdout + rejected_bind.stderr).lower())
+
+            unsafe_secret = json.loads(json.dumps(rendered))
+            unsafe_secret["secrets"]["postgres_password"]["file"] = str(
+                root / "external-secret"
+            )
+            rejected_secret = run(unsafe_secret)
+            self.assertNotEqual(0, rejected_secret.returncode)
+            self.assertIn("secret", (rejected_secret.stdout + rejected_secret.stderr).lower())
 
     def test_compose_requires_all_interpolated_values(self) -> None:
         compose_path = REPO_ROOT / "deploy" / "offline" / "compose.yaml"
