@@ -1,0 +1,3 @@
+-r requirements-offline.in
+locust>=2.37,<3
+pip-tools>=7.4,<8

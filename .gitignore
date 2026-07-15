@@ -18,3 +18,7 @@ frontend/.tmp/
 frontend/artifacts/
 frontend/test-artifacts/
 .worktrees/
+artifacts/wheels/
+artifacts/models/
+artifacts/benchmarks/
+deploy/offline/artifacts.lock.json
