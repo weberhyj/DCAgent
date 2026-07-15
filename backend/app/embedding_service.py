@@ -80,12 +80,17 @@ async def _bounded_embedding_request(request: Request) -> EmbeddingRequest:
                 detail="embedding request payload exceeds 256 KiB",
             )
 
-    raw_body = await request.body()
-    if len(raw_body) > MAX_EMBEDDING_REQUEST_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail="embedding request payload exceeds 256 KiB",
-        )
+    raw_chunks: list[bytes] = []
+    raw_body_size = 0
+    async for chunk in request.stream():
+        raw_body_size += len(chunk)
+        if raw_body_size > MAX_EMBEDDING_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="embedding request payload exceeds 256 KiB",
+            )
+        raw_chunks.append(chunk)
+    raw_body = b"".join(raw_chunks)
     try:
         return EmbeddingRequest.model_validate_json(raw_body)
     except (ValidationError, ValueError) as error:
@@ -466,7 +471,12 @@ def load_flag_embedding_backend(
             "FlagEmbedding is required by the production embedding service"
         ) from error
 
-    model = FlagModel(str(model_root), use_fp16=False)
+    model = FlagModel(
+        str(model_root),
+        use_fp16=False,
+        normalize_embeddings=metadata.normalized,
+        trust_remote_code=False,
+    )
     return FlagEmbeddingBackend(model, normalized=metadata.normalized)
 
 

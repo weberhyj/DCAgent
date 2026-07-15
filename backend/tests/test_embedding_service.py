@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import builtins
 import json
+import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -20,6 +24,7 @@ from app.embedding_service import (
     compute_model_directory_sha256,
     create_embedding_app,
     create_production_app,
+    load_flag_embedding_backend,
 )
 
 
@@ -49,13 +54,18 @@ class LegacyEmbeddingBackend:
         return [[1.0, 2.0, 3.0, 4.0] for _ in texts]
 
 
-def metadata(*, checksum: str = "a" * 64, dimensions: int = 4) -> EmbeddingModelMetadata:
+def metadata(
+    *,
+    checksum: str = "a" * 64,
+    dimensions: int = 4,
+    normalized: bool = True,
+) -> EmbeddingModelMetadata:
     return EmbeddingModelMetadata(
         "bge-test",
         "1",
         checksum,
         dimensions,
-        True,
+        normalized,
         "e" * 64,
         "1",
     )
@@ -331,6 +341,139 @@ class EmbeddingServiceTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, EMBEDDING_METADATA_FILENAME):
                 with TestClient(app):
                     pass
+
+    def test_flag_loader_sets_offline_environment_before_local_model_import(self) -> None:
+        model_root = Path("C:/offline/models/bge-test")
+        events: list[tuple[object, ...]] = []
+        fake_module = types.ModuleType("FlagEmbedding")
+
+        class FakeFlagModel:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                events.append(
+                    (
+                        "construct",
+                        args,
+                        kwargs,
+                        os.environ["HF_HUB_OFFLINE"],
+                        os.environ["TRANSFORMERS_OFFLINE"],
+                        os.environ["HF_HUB_DISABLE_TELEMETRY"],
+                        os.environ["TOKENIZERS_PARALLELISM"],
+                    )
+                )
+
+        fake_module.FlagModel = FakeFlagModel  # type: ignore[attr-defined]
+        original_import = builtins.__import__
+
+        def import_with_observation(
+            name: str,
+            globals: dict[str, object] | None = None,
+            locals: dict[str, object] | None = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> object:
+            if name == "FlagEmbedding":
+                events.append(
+                    (
+                        "import",
+                        os.environ["HF_HUB_OFFLINE"],
+                        os.environ["TRANSFORMERS_OFFLINE"],
+                        os.environ["HF_HUB_DISABLE_TELEMETRY"],
+                        os.environ["TOKENIZERS_PARALLELISM"],
+                    )
+                )
+                return fake_module
+            return original_import(name, globals, locals, fromlist, level)
+
+        with patch.dict(
+            os.environ,
+            {
+                "HF_HUB_OFFLINE": "wrong",
+                "TRANSFORMERS_OFFLINE": "wrong",
+                "HF_HUB_DISABLE_TELEMETRY": "wrong",
+                "TOKENIZERS_PARALLELISM": "wrong",
+            },
+            clear=False,
+        ), patch("builtins.__import__", side_effect=import_with_observation):
+            load_flag_embedding_backend(model_root, metadata(normalized=False))
+
+        self.assertEqual(
+            events,
+            [
+                ("import", "1", "1", "1", "false"),
+                (
+                    "construct",
+                    (str(model_root),),
+                    {
+                        "use_fp16": False,
+                        "normalize_embeddings": False,
+                        "trust_remote_code": False,
+                    },
+                    "1",
+                    "1",
+                    "1",
+                    "false",
+                ),
+            ],
+        )
+
+
+class EmbeddingRequestStreamingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_stops_reading_chunked_body_immediately_after_raw_limit(self) -> None:
+        for headers in ([], [(b"content-length", b"1")]):
+            with self.subTest(headers=headers):
+                backend = FakeEmbeddingBackend()
+                app = create_embedding_app(backend=backend, metadata=metadata())
+                chunks = [
+                    b"x" * (128 * 1024),
+                    b"y" * (128 * 1024),
+                    b"z",
+                    b"later chunk must remain unread",
+                ]
+                receive_calls = 0
+
+                async def receive() -> dict[str, object]:
+                    nonlocal receive_calls
+                    receive_calls += 1
+                    if receive_calls > len(chunks):
+                        raise AssertionError("request reader consumed a later chunk")
+                    return {
+                        "type": "http.request",
+                        "body": chunks[receive_calls - 1],
+                        "more_body": receive_calls < len(chunks),
+                    }
+
+                sent: list[dict[str, object]] = []
+
+                async def send(message: dict[str, object]) -> None:
+                    sent.append(message)
+
+                await app(
+                    {
+                        "type": "http",
+                        "asgi": {"version": "3.0", "spec_version": "2.3"},
+                        "http_version": "1.1",
+                        "method": "POST",
+                        "scheme": "http",
+                        "path": "/v1/embeddings",
+                        "raw_path": b"/v1/embeddings",
+                        "query_string": b"",
+                        "headers": headers,
+                        "client": ("testclient", 50000),
+                        "server": ("testserver", 80),
+                        "root_path": "",
+                    },
+                    receive,
+                    send,
+                )
+
+                response_start = next(
+                    message
+                    for message in sent
+                    if message["type"] == "http.response.start"
+                )
+                self.assertEqual(response_start["status"], 413)
+                self.assertEqual(receive_calls, 3)
+                self.assertEqual(backend.calls, [])
 
 
 if __name__ == "__main__":
