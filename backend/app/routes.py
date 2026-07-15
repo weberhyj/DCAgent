@@ -4,6 +4,7 @@ import secrets
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BeforeValidator
 
 from .evaluation import (
@@ -70,6 +71,44 @@ def get_evaluation_import_service(request: Request) -> EvaluationImportService:
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/healthz")
+def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/readyz")
+def readyz(request: Request) -> JSONResponse:
+    if not getattr(request.app.state, "health_checks_active", False):
+        report: dict[str, dict[str, bool | str]] = {
+            "startup": {"ok": False, "detail": "not initialized"}
+        }
+    else:
+        registry = getattr(request.app.state, "health_registry", None)
+        if registry is None:
+            report = {
+                "startup": {"ok": False, "detail": "not initialized"}
+            }
+        else:
+            try:
+                report = registry.report()
+            except Exception:
+                report = {
+                    "health_registry": {
+                        "ok": False,
+                        "detail": "check failed",
+                    }
+                }
+
+    ready = all(bool(item["ok"]) for item in report.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": "ready" if ready else "not_ready",
+            "dependencies": report,
+        },
+    )
 
 
 @router.get("/admin/agent/runs", response_model=list[AgentRunAudit])
