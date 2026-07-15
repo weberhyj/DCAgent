@@ -331,11 +331,20 @@ def _normalize_type(column_type: Any) -> TypeSignature:
 
     string_family = family in {"varchar", "nvarchar", "char", "nchar", "text"}
     numeric_family = family in {"numeric", "float", "real"}
+    precision = getattr(column_type, "precision", None) if numeric_family else None
+    if visit_name in {"double_precision", "real"}:
+        precision = None
+    elif visit_name == "float" and isinstance(precision, int):
+        if 1 <= precision <= 24:
+            family = "real"
+            precision = None
+        elif 25 <= precision <= 53:
+            precision = None
     return TypeSignature(
         family=family,
         length=getattr(column_type, "length", None) if string_family else None,
         collation=getattr(column_type, "collation", None) if string_family else None,
-        precision=getattr(column_type, "precision", None) if numeric_family else None,
+        precision=precision,
         scale=getattr(column_type, "scale", None) if family == "numeric" else None,
         asdecimal=getattr(column_type, "asdecimal", None) if numeric_family else None,
     )

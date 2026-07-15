@@ -99,10 +99,21 @@ class FingerprintNormalizationTest(unittest.TestCase):
         self.assertNotEqual(normalize(sa.SmallInteger()), normalize(sa.Integer()))
         self.assertNotEqual(normalize(postgresql.JSONB()), normalize(sa.JSON()))
         self.assertNotEqual(normalize(sa.REAL()), normalize(sa.Float()))
-        self.assertEqual(
-            normalize(postgresql.DOUBLE_PRECISION()),
-            normalize(sa.Float()),
+        double_precision_types = (
+            sa.Float(),
+            sa.Float(precision=25),
+            sa.Float(precision=53),
+            postgresql.DOUBLE_PRECISION(),
+            postgresql.DOUBLE_PRECISION(precision=53),
         )
+        for double_precision_type in double_precision_types:
+            with self.subTest(double_precision_type=double_precision_type):
+                self.assertEqual(
+                    normalize(double_precision_type),
+                    normalize(sa.Float()),
+                )
+        self.assertEqual(normalize(sa.Float(24)), normalize(postgresql.REAL()))
+        self.assertNotEqual(normalize(sa.Float(24)), normalize(sa.Float()))
         equivalent_aliases = (
             (sa.String(32), postgresql.VARCHAR(32)),
             (sa.Text(), postgresql.TEXT()),
@@ -114,6 +125,21 @@ class FingerprintNormalizationTest(unittest.TestCase):
         for generic, postgres_type in equivalent_aliases:
             with self.subTest(generic=generic, postgres_type=postgres_type):
                 self.assertEqual(normalize(generic), normalize(postgres_type))
+
+    def test_postgres_reflected_double_precision_matches_float_baseline(
+        self,
+    ) -> None:
+        reflected_column = {
+            "name": "retrieval_min_score",
+            "type": postgresql.DOUBLE_PRECISION(precision=53),
+            "nullable": False,
+            "default": None,
+        }
+
+        self.assertEqual(
+            migration_entrypoint.BASELINE_COLUMNS["evaluation_batches"][4],
+            migration_entrypoint._normalize_column(reflected_column, set()),
+        )
 
     def test_type_signature_keeps_collation_precision_and_scale(self) -> None:
         normalize = migration_entrypoint._normalize_type
