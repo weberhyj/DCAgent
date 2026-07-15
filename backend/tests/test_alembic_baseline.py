@@ -225,6 +225,21 @@ class AlembicBaselineTest(unittest.TestCase):
             inspector = inspect(engine)
             application_tables = set(inspector.get_table_names()) - {"alembic_version"}
             self.assertEqual(set(EXPECTED_COLUMNS), application_tables)
+            version_columns = inspector.get_columns("alembic_version")
+            self.assertEqual(1, len(version_columns))
+            self.assertEqual("version_num", version_columns[0]["name"])
+            self.assertEqual("VARCHAR(32)", str(version_columns[0]["type"]).upper())
+            self.assertFalse(version_columns[0]["nullable"])
+            self.assertIsNone(version_columns[0]["default"])
+            self.assertEqual(
+                ("version_num",),
+                tuple(
+                    inspector.get_pk_constraint("alembic_version").get(
+                        "constrained_columns"
+                    )
+                    or ()
+                ),
+            )
 
             for table_name, expected_columns in EXPECTED_COLUMNS.items():
                 with self.subTest(table=table_name):

@@ -137,6 +137,9 @@ class FingerprintNormalizationTest(unittest.TestCase):
             "is_valid": True,
             "is_ready": True,
             "is_live": True,
+            "nulls_not_distinct": False,
+            "reloptions": None,
+            "tablespace": None,
             "access_method": "btree",
             "predicate": None,
             "expressions": None,
@@ -154,6 +157,16 @@ class FingerprintNormalizationTest(unittest.TestCase):
             {**plain, "is_ready": False},
             {**plain, "is_live": False},
             {name: value for name, value in plain.items() if name != "is_live"},
+            {**plain, "nulls_not_distinct": True},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "nulls_not_distinct"
+            },
+            {**plain, "reloptions": ["fillfactor=90"]},
+            {name: value for name, value in plain.items() if name != "reloptions"},
+            {**plain, "tablespace": "fastspace"},
+            {name: value for name, value in plain.items() if name != "tablespace"},
             {**plain, "access_method": "hash"},
             {**plain, "predicate": "sequence > 0"},
             {**plain, "expressions": "lower(sequence)"},
@@ -169,6 +182,160 @@ class FingerprintNormalizationTest(unittest.TestCase):
                         variant
                     ).semantic_options,
                 )
+
+        catalog_sql = str(migration_entrypoint.POSTGRES_INDEX_CATALOG_SQL)
+        self.assertIn("indnullsnotdistinct", catalog_sql)
+        self.assertIn("reloptions", catalog_sql)
+        self.assertIn("pg_tablespace", catalog_sql)
+        self.assertIn("indisprimary", catalog_sql)
+        self.assertIn(":schema_name", catalog_sql)
+        self.assertNotIn("current_schema()", catalog_sql)
+        self.assertNotIn("NOT index_state.indisprimary", catalog_sql)
+
+    def test_postgres_primary_catalog_row_requires_plain_constraint(self) -> None:
+        plain = {
+            "index_name": "evaluation_runs_pkey",
+            "is_unique": True,
+            "is_valid": True,
+            "is_ready": True,
+            "is_live": True,
+            "is_primary": True,
+            "nulls_not_distinct": False,
+            "reloptions": None,
+            "tablespace": None,
+            "access_method": "btree",
+            "predicate": None,
+            "expressions": None,
+            "key_attribute_count": 1,
+            "total_attribute_count": 1,
+            "key_definitions": ["id"],
+            "primary_constraint_oid": 123,
+            "primary_constraint_deferrable": False,
+            "primary_constraint_deferred": False,
+        }
+        self.assertEqual(
+            (),
+            migration_entrypoint._normalize_postgres_index_catalog_row(
+                plain
+            ).semantic_options,
+        )
+
+        variants = (
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "primary_constraint_oid"
+            },
+            {**plain, "primary_constraint_oid": None},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "primary_constraint_deferrable"
+            },
+            {**plain, "primary_constraint_deferrable": True},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "primary_constraint_deferred"
+            },
+            {**plain, "primary_constraint_deferred": True},
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual(
+                    (),
+                    migration_entrypoint._normalize_postgres_index_catalog_row(
+                        variant
+                    ).semantic_options,
+                )
+
+    def test_postgres_catalog_sql_joins_primary_constraint(self) -> None:
+        catalog_sql = str(migration_entrypoint.POSTGRES_INDEX_CATALOG_SQL)
+
+        self.assertIn("LEFT JOIN pg_constraint AS primary_constraint", catalog_sql)
+        self.assertIn("primary_constraint.contype = 'p'", catalog_sql)
+        self.assertIn(
+            "primary_constraint.conindid = index_state.indexrelid",
+            catalog_sql,
+        )
+        self.assertIn("primary_constraint.oid AS primary_constraint_oid", catalog_sql)
+        self.assertIn(
+            "primary_constraint.condeferrable AS primary_constraint_deferrable",
+            catalog_sql,
+        )
+        self.assertIn(
+            "primary_constraint.condeferred AS primary_constraint_deferred",
+            catalog_sql,
+        )
+
+    def test_primary_key_signature_fails_closed_on_semantic_options(self) -> None:
+        def fingerprint(primary_key: dict[str, object]) -> object:
+            inspector = MagicMock()
+            inspector.default_schema_name = "public"
+            inspector.get_table_names.return_value = ["items"]
+            inspector.get_columns.return_value = [
+                {"name": "id", "type": sa.Integer(), "nullable": False},
+            ]
+            inspector.get_pk_constraint.return_value = primary_key
+            inspector.get_indexes.return_value = []
+            inspector.get_foreign_keys.return_value = []
+            inspector.get_unique_constraints.return_value = []
+            inspector.get_check_constraints.return_value = []
+            connection = MagicMock()
+            connection.dialect.name = "postgresql"
+            connection.scalar.return_value = "tenant"
+            with patch("app.migration_entrypoint.inspect", return_value=inspector):
+                return migration_entrypoint._schema_fingerprint(connection)[
+                    "primary_keys"
+                ]
+
+        plain = {
+            "name": "items_pkey",
+            "constrained_columns": ["id"],
+            "dialect_options": {},
+        }
+        normalized = fingerprint(plain)
+        variants = (
+            {**plain, "dialect_options": {"postgresql_include": ["label"]}},
+            {**plain, "deferrable": True},
+            {**plain, "initially": "DEFERRED"},
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual(normalized, fingerprint(variant))
+
+    def test_postgres_index_catalog_requires_version_15_or_newer(self) -> None:
+        connection = MagicMock()
+        connection.dialect.server_version_info = (14, 12)
+
+        with self.assertRaisesRegex(RuntimeError, r"PostgreSQL 15\+ required"):
+            migration_entrypoint._validate_postgres_index_catalog(
+                connection,
+                [],
+                "public",
+            )
+        connection.execute.assert_not_called()
+
+    def test_postgres_version_requirement_survives_baseline_wrapping(self) -> None:
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (14, 12)
+
+        with (
+            patch(
+                "app.migration_entrypoint._schema_fingerprint",
+                return_value={"tables": set()},
+            ),
+            patch("app.migration_entrypoint._validate_counter_row"),
+            self.assertRaisesRegex(
+                BaselineSchemaMismatch,
+                r"PostgreSQL 15\+ required",
+            ),
+        ):
+            migration_entrypoint._validate_baseline(
+                connection,
+                schema_name="public",
+            )
 
     def test_foreign_key_signature_includes_all_semantic_options(self) -> None:
         plain = {
@@ -218,11 +385,148 @@ class FingerprintNormalizationTest(unittest.TestCase):
             inspector,
             "messages",
             dialect_name="postgresql",
+            schema_name="tenant",
         )
         inspector.get_foreign_keys.assert_called_once_with(
             "messages",
+            schema="tenant",
             postgresql_ignore_search_path=True,
         )
+
+    def test_foreign_key_only_normalizes_the_inspected_schema(self) -> None:
+        foreign_key = {
+            "name": "messages_conversation_id_fkey",
+            "constrained_columns": ["conversation_id"],
+            "referred_schema": "public",
+            "referred_table": "conversations",
+            "referred_columns": ["id"],
+            "options": {"ondelete": "CASCADE"},
+        }
+
+        normalized = migration_entrypoint._normalize_foreign_key(
+            foreign_key,
+            default_schema_name="public",
+            current_schema_name="tenant",
+        )
+        self.assertEqual("public", normalized.referred_schema)
+        self.assertIsNone(
+            migration_entrypoint._normalize_foreign_key(
+                {**foreign_key, "referred_schema": "tenant"},
+                default_schema_name="public",
+                current_schema_name="tenant",
+            ).referred_schema
+        )
+
+    def test_postgres_fingerprint_uses_pk_constraint_and_locked_schema(self) -> None:
+        inspector = MagicMock()
+        inspector.default_schema_name = "public"
+        inspector.get_table_names.return_value = ["items"]
+        inspector.get_columns.return_value = [
+            {"name": "tenant_id", "type": sa.Integer(), "nullable": False},
+            {"name": "item_id", "type": sa.Integer(), "nullable": False},
+            {"name": "label", "type": sa.String(20), "nullable": False},
+        ]
+        inspector.get_pk_constraint.return_value = {
+            "name": "items_pkey",
+            "constrained_columns": ["item_id", "tenant_id"],
+        }
+        inspector.get_indexes.return_value = []
+        inspector.get_foreign_keys.return_value = []
+        inspector.get_unique_constraints.return_value = []
+        inspector.get_check_constraints.return_value = []
+
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.scalar.return_value = "tenant"
+
+        with patch("app.migration_entrypoint.inspect", return_value=inspector):
+            fingerprint = migration_entrypoint._schema_fingerprint(connection)
+
+        self.assertEqual(
+            fingerprint["primary_keys"],
+            {
+                "items": migration_entrypoint.PrimaryKeySignature(
+                    ("item_id", "tenant_id")
+                )
+            },
+        )
+        self.assertEqual(
+            tuple(column[3] for column in fingerprint["columns"]["items"]),
+            (True, True, False),
+        )
+        inspector.get_table_names.assert_called_once_with(schema="tenant")
+        inspector.get_columns.assert_called_once_with("items", schema="tenant")
+        inspector.get_pk_constraint.assert_called_once_with(
+            "items", schema="tenant"
+        )
+        inspector.get_indexes.assert_called_once_with("items", schema="tenant")
+        inspector.get_foreign_keys.assert_called_once_with(
+            "items",
+            schema="tenant",
+            postgresql_ignore_search_path=True,
+        )
+        inspector.get_unique_constraints.assert_called_once_with(
+            "items", schema="tenant"
+        )
+        inspector.get_check_constraints.assert_called_once_with(
+            "items", schema="tenant"
+        )
+
+    def test_postgres_classification_locks_table_lookup_to_current_schema(self) -> None:
+        inspector = MagicMock()
+        inspector.get_table_names.return_value = []
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.scalar.return_value = "tenant"
+
+        with patch("app.migration_entrypoint.inspect", return_value=inspector):
+            action = migration_entrypoint._classify_and_validate(
+                connection,
+                MagicMock(),
+            )
+
+        self.assertEqual("upgrade", action)
+        inspector.get_table_names.assert_called_once_with(schema="tenant")
+
+    def test_column_generation_metadata_changes_fingerprint(self) -> None:
+        base_column = {
+            "name": "value",
+            "type": sa.Integer(),
+            "nullable": False,
+            "default": None,
+        }
+
+        def fingerprint(column: dict[str, object]) -> dict[str, object]:
+            inspector = MagicMock()
+            inspector.default_schema_name = "public"
+            inspector.get_table_names.return_value = ["items"]
+            inspector.get_columns.return_value = [column]
+            inspector.get_pk_constraint.return_value = {
+                "name": "items_pkey",
+                "constrained_columns": [],
+            }
+            inspector.get_indexes.return_value = []
+            inspector.get_foreign_keys.return_value = []
+            inspector.get_unique_constraints.return_value = []
+            inspector.get_check_constraints.return_value = []
+            connection = MagicMock()
+            connection.dialect.name = "postgresql"
+            connection.scalar.return_value = "tenant"
+            with patch("app.migration_entrypoint.inspect", return_value=inspector):
+                return migration_entrypoint._schema_fingerprint(connection)
+
+        plain = fingerprint(base_column)
+        variants = (
+            {**base_column, "computed": {"sqltext": "1", "persisted": True}},
+            {**base_column, "identity": {"start": 1, "increment": 1}},
+            {**base_column, "autoincrement": True},
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual(
+                    plain["columns"],
+                    fingerprint(variant)["columns"],
+                )
 
 
 class MigrationEntrypointTest(unittest.TestCase):
@@ -232,22 +536,38 @@ class MigrationEntrypointTest(unittest.TestCase):
         revisions: list[str],
         *,
         primary_key: bool = True,
+        column_type: str = "VARCHAR(32)",
+        extra_column: bool = False,
+        foreign_key: bool = False,
     ) -> None:
         engine = create_engine(database_url)
-        with engine.begin() as connection:
-            primary_key_sql = " PRIMARY KEY" if primary_key else ""
-            connection.execute(
-                text(
-                    "CREATE TABLE alembic_version ("
-                    f"version_num VARCHAR(32) NOT NULL{primary_key_sql})"
+        try:
+            with engine.begin() as connection:
+                primary_key_sql = " PRIMARY KEY" if primary_key else ""
+                extra_column_sql = ", unexpected INTEGER" if extra_column else ""
+                foreign_key_sql = (
+                    ", FOREIGN KEY (version_num) "
+                    "REFERENCES alembic_version(version_num)"
+                    if foreign_key
+                    else ""
                 )
-            )
-            for revision in revisions:
                 connection.execute(
-                    text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
-                    {"revision": revision},
+                    text(
+                        "CREATE TABLE alembic_version ("
+                        f"version_num {column_type} NOT NULL{primary_key_sql}"
+                        f"{extra_column_sql}{foreign_key_sql})"
+                    )
                 )
-        engine.dispose()
+                for revision in revisions:
+                    connection.execute(
+                        text(
+                            "INSERT INTO alembic_version (version_num) "
+                            "VALUES (:revision)"
+                        ),
+                        {"revision": revision},
+                    )
+        finally:
+            engine.dispose()
 
     def test_existing_current_database_is_stamped_and_rerun_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -273,6 +593,31 @@ class MigrationEntrypointTest(unittest.TestCase):
 
             with self.assertRaises(migration_entrypoint.ManagedRevisionStateError):
                 run_migrations(database_url=database_url, config_path=BACKEND_ROOT / "alembic.ini")
+
+    def test_malformed_alembic_version_schema_refuses_to_start(self) -> None:
+        variants = (
+            {"primary_key": False},
+            {"column_type": "TEXT"},
+            {"extra_column": True},
+            {"foreign_key": True},
+        )
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temp_dir:
+                database_url = sqlite_url(Path(temp_dir) / "malformed-version.db")
+                prepare_current_schema(database_url)
+                self._create_version_table(
+                    database_url,
+                    ["20260715_00"],
+                    **variant,
+                )
+
+                with self.assertRaises(
+                    migration_entrypoint.ManagedRevisionStateError
+                ):
+                    run_migrations(
+                        database_url=database_url,
+                        config_path=BACKEND_ROOT / "alembic.ini",
+                    )
 
     def test_managed_baseline_missing_schema_refuses_to_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -380,7 +725,11 @@ class MigrationEntrypointTest(unittest.TestCase):
         )
         events: list[tuple[str, object]] = []
 
-        def validate(active_connection: object) -> None:
+        def validate(
+            active_connection: object,
+            schema_name: str | None = None,
+        ) -> None:
+            self.assertIsNone(schema_name)
             events.append(("validate", active_connection))
 
         def stamp(config: object, revision: str) -> None:
@@ -681,6 +1030,36 @@ class MigrationEntrypointTest(unittest.TestCase):
 
             with self.assertRaises(BaselineSchemaMismatch):
                 run_migrations(database_url=database_url, config_path=BACKEND_ROOT / "alembic.ini")
+            self.assertNotIn("alembic_version", table_names(database_url))
+
+    def test_generated_column_drift_refuses_to_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = sqlite_url(Path(temp_dir) / "generated-column.db")
+            prepare_current_schema(database_url)
+            engine = create_engine(database_url)
+            with engine.begin() as connection:
+                connection.execute(text("DROP TABLE evaluation_counters"))
+                connection.execute(
+                    text(
+                        "CREATE TABLE evaluation_counters ("
+                        "name VARCHAR(80) NOT NULL PRIMARY KEY, "
+                        "next_value BIGINT GENERATED ALWAYS AS (1000000) "
+                        "STORED NOT NULL)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO evaluation_counters (name) "
+                        "VALUES ('evaluation_runs')"
+                    )
+                )
+            engine.dispose()
+
+            with self.assertRaises(BaselineSchemaMismatch):
+                run_migrations(
+                    database_url=database_url,
+                    config_path=BACKEND_ROOT / "alembic.ini",
+                )
             self.assertNotIn("alembic_version", table_names(database_url))
 
     def test_missing_foreign_key_refuses_to_stamp(self) -> None:

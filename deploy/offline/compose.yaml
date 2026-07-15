@@ -10,7 +10,11 @@ services:
     secrets:
       - postgres_password
     volumes:
-      - ${DATA_ROOT}/postgres:/var/lib/postgresql/data
+      - type: bind
+        source: ${DATA_ROOT}/postgres
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
     networks:
       - offline
     healthcheck:
@@ -22,7 +26,11 @@ services:
   clickhouse:
     image: ${CLICKHOUSE_IMAGE}
     volumes:
-      - ${DATA_ROOT}/clickhouse:/var/lib/clickhouse
+      - type: bind
+        source: ${DATA_ROOT}/clickhouse
+        target: /var/lib/clickhouse
+        bind:
+          create_host_path: false
     networks:
       - offline
     mem_limit: ${CLICKHOUSE_MEMORY_LIMIT}
@@ -35,7 +43,11 @@ services:
   qdrant:
     image: ${QDRANT_IMAGE}
     volumes:
-      - ${DATA_ROOT}/qdrant:/qdrant/storage
+      - type: bind
+        source: ${DATA_ROOT}/qdrant
+        target: /qdrant/storage
+        bind:
+          create_host_path: false
     networks:
       - offline
     mem_limit: ${QDRANT_MEMORY_LIMIT}
@@ -49,7 +61,11 @@ services:
     image: ${REDIS_IMAGE}
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - ${DATA_ROOT}/redis:/data
+      - type: bind
+        source: ${DATA_ROOT}/redis
+        target: /data
+        bind:
+          create_host_path: false
     networks:
       - offline
     healthcheck:
@@ -76,6 +92,8 @@ services:
       dockerfile: deploy/docker/backend.Dockerfile
       args:
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
+        DCAGENT_UID: ${DCAGENT_UID}
+        DCAGENT_GID: ${DCAGENT_GID}
     command: ["python", "-m", "app.migration_entrypoint"]
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -93,12 +111,19 @@ services:
       dockerfile: deploy/docker/embedding.Dockerfile
       args:
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
+        DCAGENT_UID: ${DCAGENT_UID}
+        DCAGENT_GID: ${DCAGENT_GID}
     environment:
       OFFLINE_MODE: "true"
       EMBEDDING_MODEL_ROOT: /models/${EMBEDDING_MODEL_DIR}
       EMBEDDING_MODEL_SHA256: ${EMBEDDING_MODEL_SHA256}
     volumes:
-      - ${MODEL_ROOT}:/models:ro
+      - type: bind
+        source: ${MODEL_ROOT}
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - offline
     healthcheck:
@@ -113,6 +138,8 @@ services:
       dockerfile: deploy/docker/backend.Dockerfile
       args:
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
+        DCAGENT_UID: ${DCAGENT_UID}
+        DCAGENT_GID: ${DCAGENT_GID}
     environment:
       OFFLINE_MODE: "true"
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -140,9 +167,22 @@ services:
     secrets:
       - database_url
     volumes:
-      - ${DATA_ROOT}/raw:/data/raw
-      - ${DATA_ROOT}/parquet:/data/parquet
-      - ${MODEL_ROOT}:/models:ro
+      - type: bind
+        source: ${DATA_ROOT}/raw
+        target: /data/raw
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DATA_ROOT}/parquet
+        target: /data/parquet
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MODEL_ROOT}
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -169,6 +209,8 @@ services:
       dockerfile: deploy/docker/worker.Dockerfile
       args:
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
+        DCAGENT_UID: ${DCAGENT_UID}
+        DCAGENT_GID: ${DCAGENT_GID}
     environment:
       OFFLINE_MODE: "true"
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -190,9 +232,22 @@ services:
     secrets:
       - database_url
     volumes:
-      - ${DATA_ROOT}/raw:/data/raw
-      - ${DATA_ROOT}/parquet:/data/parquet
-      - ${MODEL_ROOT}:/models:ro
+      - type: bind
+        source: ${DATA_ROOT}/raw
+        target: /data/raw
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DATA_ROOT}/parquet
+        target: /data/parquet
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MODEL_ROOT}
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       schema-migration:
         condition: service_completed_successfully
@@ -217,7 +272,12 @@ services:
     command:
       ["--model", "/models/${LLAMA_MODEL_FILE}", "--host", "0.0.0.0", "--port", "8080", "--parallel", "${MODEL_SLOTS}"]
     volumes:
-      - ${MODEL_ROOT}:/models:ro
+      - type: bind
+        source: ${MODEL_ROOT}
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - offline
     profiles: ["generation"]
