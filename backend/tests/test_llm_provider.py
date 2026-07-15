@@ -419,6 +419,7 @@ class LLMProviderTest(unittest.TestCase):
         template = create_llm_provider({"LLM_PROVIDER": "template"})
         openai_compatible = create_llm_provider(
             {
+                "OFFLINE_MODE": "false",
                 "LLM_PROVIDER": "openai_compatible",
                 "LLM_API_BASE": "https://llm.example.test/v1",
                 "LLM_API_KEY": "test-key",
@@ -429,6 +430,40 @@ class LLMProviderTest(unittest.TestCase):
         self.assertIsInstance(template, TemplateLLMProvider)
         self.assertIsInstance(openai_compatible, OpenAICompatibleLLMProvider)
         self.assertEqual(openai_compatible.model, "dc-agent-test-model")
+
+    def test_llm_provider_factory_normalizes_hyphenated_provider_name(self) -> None:
+        provider = create_llm_provider(
+            {
+                "LLM_PROVIDER": "openai-compatible",
+                "LLM_API_BASE": "http://127.0.0.1:8080/v1",
+                "LLM_API_KEY": "test-key",
+                "LLM_MODEL": "dc-agent-test-model",
+            }
+        )
+
+        self.assertIsInstance(provider, OpenAICompatibleLLMProvider)
+
+    def test_llm_provider_factory_defaults_to_offline_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "private or loopback"):
+            create_llm_provider(
+                {
+                    "LLM_PROVIDER": "openai_compatible",
+                    "LLM_API_BASE": "https://api.example.com/v1",
+                    "LLM_API_KEY": "test-key",
+                    "LLM_MODEL": "dc-agent-test-model",
+                }
+            )
+
+    def test_llm_provider_factory_rejects_empty_api_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "LLM_API_KEY is required"):
+            create_llm_provider(
+                {
+                    "LLM_PROVIDER": "openai_compatible",
+                    "LLM_API_BASE": "http://127.0.0.1:8080/v1",
+                    "LLM_API_KEY": "  ",
+                    "LLM_MODEL": "dc-agent-test-model",
+                }
+            )
 
 
 if __name__ == "__main__":

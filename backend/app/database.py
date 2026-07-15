@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from threading import RLock
 from typing import Iterator
 
@@ -16,7 +17,32 @@ DEFAULT_DATABASE_URL = "postgresql+psycopg://postgres:123456@127.0.0.1:5432/dc_a
 
 def resolve_database_url(environ: Mapping[str, str] | None = None) -> str:
     source = os.environ if environ is None else environ
-    return source.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+    direct_value = source.get("DATABASE_URL")
+    secret_file_value = source.get("DATABASE_URL_FILE")
+    direct_url = direct_value.strip() if direct_value is not None else ""
+    secret_file = secret_file_value.strip() if secret_file_value is not None else ""
+
+    if direct_url and secret_file:
+        raise ValueError("Set exactly one of DATABASE_URL or DATABASE_URL_FILE")
+    if direct_value is not None and not direct_url:
+        raise ValueError("DATABASE_URL must not be empty")
+    if secret_file_value is not None and not secret_file:
+        raise ValueError("DATABASE_URL_FILE must not be empty")
+    if direct_url:
+        return direct_url
+    if not secret_file:
+        return DEFAULT_DATABASE_URL
+
+    secret_path = Path(secret_file)
+    try:
+        secret_url = secret_path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ValueError(
+            f"database URL secret file could not be read: {secret_path}"
+        ) from error
+    if not secret_url:
+        raise ValueError("database URL secret file must not be empty")
+    return secret_url
 
 
 class Base(DeclarativeBase):

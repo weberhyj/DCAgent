@@ -16,6 +16,7 @@ from .models import (
     KnowledgeSearchHitModel,
     ResponseParagraphModel,
 )
+from .offline_settings import parse_bool, require_private_url
 from .time_utils import display_datetime_label
 
 
@@ -125,15 +126,21 @@ class OpenAICompatibleLLMProvider(LLMProvider):
 
 def create_llm_provider(environ: Mapping[str, str] | None = None) -> LLMProvider:
     source = os.environ if environ is None else environ
-    provider = source.get("LLM_PROVIDER", "template").strip().lower()
+    provider = source.get("LLM_PROVIDER", "template").strip().lower().replace("-", "_")
     if provider in {"", "template", "mock"}:
         return TemplateLLMProvider()
     if provider == "openai_compatible":
         api_base = source.get("LLM_API_BASE", "").strip()
         api_key = source.get("LLM_API_KEY", "").strip()
         model = source.get("LLM_MODEL", "").strip()
-        if not api_base or not api_key or not model:
-            raise ValueError("LLM_API_BASE, LLM_API_KEY, and LLM_MODEL are required for openai_compatible provider")
+        if not api_key:
+            raise ValueError("LLM_API_KEY is required")
+        if not api_base:
+            raise ValueError("LLM_API_BASE is required")
+        if not model:
+            raise ValueError("LLM_MODEL is required")
+        if parse_bool(source.get("OFFLINE_MODE"), default=True):
+            api_base = require_private_url(api_base, "LLM_API_BASE")
         return OpenAICompatibleLLMProvider(api_base=api_base, api_key=api_key, model=model)
     raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
 
