@@ -647,6 +647,67 @@ def _normalize_postgres_foreign_key_catalog_row(row: Any) -> tuple[str, ...]:
     return tuple(sorted(set(semantic_options)))
 
 
+def _normalize_postgres_table_catalog_row(row: Any) -> tuple[str, ...]:
+    semantic_options: list[str] = []
+    if not str(row.get("table_name") or "").strip():
+        semantic_options.append("missing-table-name")
+    if "relkind" not in row:
+        semantic_options.append("missing-relkind")
+    elif row.get("relkind") != "r":
+        semantic_options.append(f"relkind={_semantic_value(row.get('relkind'))}")
+    if "relpersistence" not in row:
+        semantic_options.append("missing-relpersistence")
+    elif row.get("relpersistence") != "p":
+        semantic_options.append(
+            f"relpersistence={_semantic_value(row.get('relpersistence'))}"
+        )
+    if "relispartition" not in row:
+        semantic_options.append("missing-relispartition")
+    elif row.get("relispartition") is not False:
+        semantic_options.append("partitioned")
+    if "reloptions" not in row:
+        semantic_options.append("missing-reloptions")
+    elif row.get("reloptions") is not None:
+        semantic_options.append(
+            f"reloptions={_semantic_value(row.get('reloptions'))}"
+        )
+    if "reltablespace" not in row:
+        semantic_options.append("missing-reltablespace")
+    elif row.get("reltablespace") != 0:
+        semantic_options.append(
+            f"reltablespace={_semantic_value(row.get('reltablespace'))}"
+        )
+    if "relrowsecurity" not in row:
+        semantic_options.append("missing-relrowsecurity")
+    elif row.get("relrowsecurity") is not False:
+        semantic_options.append("row-security")
+    if "relforcerowsecurity" not in row:
+        semantic_options.append("missing-relforcerowsecurity")
+    elif row.get("relforcerowsecurity") is not False:
+        semantic_options.append("forced-row-security")
+    return tuple(sorted(set(semantic_options)))
+
+
+POSTGRES_TABLE_CATALOG_SQL = text(
+    """
+    SELECT
+        table_class.relname AS table_name,
+        table_class.relkind AS relkind,
+        table_class.relpersistence AS relpersistence,
+        table_class.relispartition AS relispartition,
+        table_class.reloptions AS reloptions,
+        table_class.reltablespace AS reltablespace,
+        table_class.relrowsecurity AS relrowsecurity,
+        table_class.relforcerowsecurity AS relforcerowsecurity
+    FROM pg_class AS table_class
+    JOIN pg_namespace AS table_namespace
+      ON table_namespace.oid = table_class.relnamespace
+    WHERE table_namespace.nspname = :schema_name
+      AND table_class.relname = :table_name
+    """
+)
+
+
 POSTGRES_FOREIGN_KEY_CATALOG_SQL = text(
     """
     SELECT
@@ -796,6 +857,27 @@ def _validate_postgres_index_catalog(
         }
         if actual_indexes != expected_indexes:
             errors.append(f"PostgreSQL index catalog differs for table {table_name}")
+
+
+def _validate_postgres_table_catalog(
+    connection: Any,
+    errors: list[str],
+    schema_name: str,
+    table_names: set[str],
+) -> None:
+    _require_supported_postgres_version(connection)
+    for table_name in sorted(table_names):
+        rows = connection.execute(
+            POSTGRES_TABLE_CATALOG_SQL,
+            {"schema_name": schema_name, "table_name": table_name},
+        ).mappings().all()
+        if (
+            len(rows) != 1
+            or _normalize_postgres_table_catalog_row(rows[0])
+        ):
+            errors.append(
+                f"PostgreSQL table catalog differs for table {table_name}"
+            )
 
 
 def _validate_postgres_foreign_key_catalog(
@@ -1003,6 +1085,20 @@ def _validate_baseline(
         try:
             if schema_name is None:
                 raise RuntimeError("current PostgreSQL schema is unavailable")
+            _validate_postgres_table_catalog(
+                connection,
+                errors,
+                schema_name,
+                expected_tables,
+            )
+        except Exception as error:
+            errors.append(
+                "PostgreSQL table catalog could not be validated: "
+                f"{error}"
+            )
+        try:
+            if schema_name is None:
+                raise RuntimeError("current PostgreSQL schema is unavailable")
             _validate_postgres_index_catalog(connection, errors, schema_name)
         except Exception as error:
             errors.append(
@@ -1050,6 +1146,7 @@ def _validate_alembic_version_table(
         schema_name = connection.scalar(text("SELECT current_schema()"))
     schema_arguments = {"schema": schema_name} if schema_name is not None else {}
     postgres_primary_indexes: tuple[IndexSignature, ...] | None = None
+    postgres_table_catalog_valid: bool | None = None
     try:
         columns = inspector.get_columns("alembic_version", **schema_arguments)
         primary_key = inspector.get_pk_constraint(
@@ -1069,6 +1166,16 @@ def _validate_alembic_version_table(
             schema_name=schema_name,
         )
         if connection.dialect.name == "postgresql":
+            if schema_name is None:
+                raise RuntimeError("current PostgreSQL schema is unavailable")
+            table_catalog_errors: list[str] = []
+            _validate_postgres_table_catalog(
+                connection,
+                table_catalog_errors,
+                schema_name,
+                {"alembic_version"},
+            )
+            postgres_table_catalog_valid = not table_catalog_errors
             catalog_rows = connection.execute(
                 POSTGRES_INDEX_CATALOG_SQL,
                 {
@@ -1105,6 +1212,10 @@ def _validate_alembic_version_table(
         or (
             connection.dialect.name == "postgresql"
             and postgres_primary_indexes != (expected_primary_index,)
+        )
+        or (
+            connection.dialect.name == "postgresql"
+            and postgres_table_catalog_valid is not True
         )
         or has_server_default
         or unique_constraints

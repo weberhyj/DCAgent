@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text
@@ -64,6 +64,7 @@ class FingerprintNormalizationTest(unittest.TestCase):
     def _postgres_version_table_mocks(
         self,
         catalog_row: dict[str, object],
+        table_catalog_row: dict[str, object] | None = None,
     ) -> tuple[MagicMock, MagicMock]:
         inspector = MagicMock()
         inspector.get_columns.return_value = [
@@ -87,9 +88,32 @@ class FingerprintNormalizationTest(unittest.TestCase):
         connection = MagicMock()
         connection.dialect.name = "postgresql"
         connection.dialect.server_version_info = (15, 8)
-        connection.execute.return_value.mappings.return_value.all.return_value = [
-            catalog_row
+        index_result = MagicMock()
+        index_result.mappings.return_value.all.return_value = [catalog_row]
+        table_result = MagicMock()
+        table_result.mappings.return_value.all.return_value = [
+            table_catalog_row
+            or {
+                "table_name": "alembic_version",
+                "relkind": "r",
+                "relpersistence": "p",
+                "relispartition": False,
+                "reloptions": None,
+                "reltablespace": 0,
+                "relrowsecurity": False,
+                "relforcerowsecurity": False,
+            }
         ]
+        table_statement = getattr(
+            migration_entrypoint,
+            "POSTGRES_TABLE_CATALOG_SQL",
+            None,
+        )
+        connection.execute.side_effect = (
+            lambda statement, parameters: (
+                table_result if statement is table_statement else index_result
+            )
+        )
         return connection, inspector
 
     def test_type_signature_distinguishes_database_type_families(self) -> None:
@@ -354,10 +378,19 @@ class FingerprintNormalizationTest(unittest.TestCase):
                 schema_name="tenant",
             )
 
-        connection.execute.assert_called_once_with(
-            migration_entrypoint.POSTGRES_INDEX_CATALOG_SQL,
-            {"schema_name": "tenant", "table_name": "alembic_version"},
+        connection.execute.assert_has_calls(
+            [
+                call(
+                    migration_entrypoint.POSTGRES_TABLE_CATALOG_SQL,
+                    {"schema_name": "tenant", "table_name": "alembic_version"},
+                ),
+                call(
+                    migration_entrypoint.POSTGRES_INDEX_CATALOG_SQL,
+                    {"schema_name": "tenant", "table_name": "alembic_version"},
+                ),
+            ]
         )
+        self.assertEqual(2, connection.execute.call_count)
 
     def test_postgres_alembic_version_rejects_deferrable_primary_catalog_row(
         self,
@@ -383,6 +416,50 @@ class FingerprintNormalizationTest(unittest.TestCase):
             "key_definitions": ["version_num"],
         }
         connection, inspector = self._postgres_version_table_mocks(catalog_row)
+
+        with (
+            patch("app.migration_entrypoint.inspect", return_value=inspector),
+            self.assertRaises(migration_entrypoint.ManagedRevisionStateError),
+        ):
+            migration_entrypoint._validate_alembic_version_table(
+                connection,
+                schema_name="tenant",
+            )
+
+    def test_postgres_alembic_version_rejects_unlogged_table(self) -> None:
+        catalog_row = {
+            "index_name": "alembic_version_pkc",
+            "is_unique": True,
+            "is_valid": True,
+            "is_ready": True,
+            "is_live": True,
+            "is_primary": True,
+            "primary_constraint_oid": 123,
+            "primary_constraint_deferrable": False,
+            "primary_constraint_deferred": False,
+            "nulls_not_distinct": False,
+            "reloptions": None,
+            "tablespace": None,
+            "access_method": "btree",
+            "predicate": None,
+            "expressions": None,
+            "key_attribute_count": 1,
+            "total_attribute_count": 1,
+            "key_definitions": ["version_num"],
+        }
+        connection, inspector = self._postgres_version_table_mocks(
+            catalog_row,
+            table_catalog_row={
+                "table_name": "alembic_version",
+                "relkind": "r",
+                "relpersistence": "u",
+                "relispartition": False,
+                "reloptions": None,
+                "reltablespace": 0,
+                "relrowsecurity": False,
+                "relforcerowsecurity": False,
+            },
+        )
 
         with (
             patch("app.migration_entrypoint.inspect", return_value=inspector),
@@ -596,6 +673,122 @@ class FingerprintNormalizationTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "catalog unavailable"):
             validate(connection, [], "tenant", {"messages": ()}, {"messages"})
+
+    def test_postgres_table_catalog_row_requires_plain_permanent_table(self) -> None:
+        normalize = getattr(
+            migration_entrypoint,
+            "_normalize_postgres_table_catalog_row",
+            None,
+        )
+        self.assertIsNotNone(normalize)
+        plain = {
+            "table_name": "messages",
+            "relkind": "r",
+            "relpersistence": "p",
+            "relispartition": False,
+            "reloptions": None,
+            "reltablespace": 0,
+            "relrowsecurity": False,
+            "relforcerowsecurity": False,
+        }
+        self.assertEqual((), normalize(plain))
+
+        variants = (
+            {name: value for name, value in plain.items() if name != "relkind"},
+            {**plain, "relkind": "p"},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "relpersistence"
+            },
+            {**plain, "relpersistence": "u"},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "relispartition"
+            },
+            {**plain, "relispartition": True},
+            {name: value for name, value in plain.items() if name != "reloptions"},
+            {**plain, "reloptions": ["fillfactor=90"]},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "reltablespace"
+            },
+            {**plain, "reltablespace": 12345},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "relrowsecurity"
+            },
+            {**plain, "relrowsecurity": True},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "relforcerowsecurity"
+            },
+            {**plain, "relforcerowsecurity": True},
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual((), normalize(variant))
+
+    def test_postgres_table_catalog_sql_checks_physical_properties(self) -> None:
+        statement = getattr(
+            migration_entrypoint,
+            "POSTGRES_TABLE_CATALOG_SQL",
+            None,
+        )
+        self.assertIsNotNone(statement)
+        catalog_sql = str(statement)
+        self.assertIn("FROM pg_class AS table_class", catalog_sql)
+        for field in (
+            "relkind",
+            "relpersistence",
+            "relispartition",
+            "reloptions",
+            "reltablespace",
+            "relrowsecurity",
+            "relforcerowsecurity",
+        ):
+            self.assertIn(field, catalog_sql)
+        self.assertIn(":schema_name", catalog_sql)
+        self.assertIn(":table_name", catalog_sql)
+
+    def test_postgres_table_catalog_rejects_unlogged_table(self) -> None:
+        validate = getattr(
+            migration_entrypoint,
+            "_validate_postgres_table_catalog",
+            None,
+        )
+        self.assertIsNotNone(validate)
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
+        connection.execute.return_value.mappings.return_value.all.return_value = [
+            {
+                "table_name": "messages",
+                "relkind": "r",
+                "relpersistence": "u",
+                "relispartition": False,
+                "reloptions": None,
+                "reltablespace": 0,
+                "relrowsecurity": False,
+                "relforcerowsecurity": False,
+            }
+        ]
+        errors: list[str] = []
+
+        validate(connection, errors, "tenant", {"messages"})
+
+        self.assertEqual(
+            ["PostgreSQL table catalog differs for table messages"],
+            errors,
+        )
+        connection.execute.assert_called_once_with(
+            migration_entrypoint.POSTGRES_TABLE_CATALOG_SQL,
+            {"schema_name": "tenant", "table_name": "messages"},
+        )
 
     def test_duplicate_foreign_key_semantics_preserve_count(self) -> None:
         inspector = MagicMock()
