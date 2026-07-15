@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from sqlalchemy.engine import make_url
 
 from app.infra.health import (
     DependencyCheck,
@@ -16,6 +17,7 @@ from app.infra.health import (
     postgres_schema_revision_check,
 )
 from app.database import Database
+from app.main import _database_url_with_connect_timeout
 from app.offline_settings import OfflineSettings
 
 
@@ -179,6 +181,114 @@ class LazyStartupTest(unittest.TestCase):
             {name: 1 for name in resources},
         )
 
+    def test_production_lifespan_reuses_and_closes_health_clients(self) -> None:
+        module = importlib.import_module("app.main")
+        database = Database("sqlite+pysqlite:///:memory:")
+        with database.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO alembic_version (version_num) VALUES ('20260715_00')"
+            )
+
+        class FakeResponse:
+            status_code = 200
+            text = "Ok.\n"
+
+            @staticmethod
+            def json() -> dict[str, str]:
+                return {"status": "ready"}
+
+        class FakeHttpClient:
+            def __init__(self) -> None:
+                self.get_calls: list[str] = []
+                self.close_calls = 0
+
+            def get(self, url: str) -> FakeResponse:
+                self.get_calls.append(url)
+                return FakeResponse()
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class FakeRedisClient:
+            def __init__(self) -> None:
+                self.ping_calls = 0
+                self.close_calls = 0
+
+            def ping(self) -> bool:
+                self.ping_calls += 1
+                return True
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        class FakeClamAVSocket:
+            def __enter__(self) -> "FakeClamAVSocket":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def settimeout(self, timeout: float) -> None:
+                return None
+
+            def sendall(self, payload: bytes) -> None:
+                return None
+
+            def recv(self, size: int) -> bytes:
+                return b"PONG\0"
+
+        http_client = FakeHttpClient()
+        redis_client = FakeRedisClient()
+        http_factory_calls = 0
+        redis_factory_calls = 0
+
+        def build_http_client(**_kwargs: object) -> FakeHttpClient:
+            nonlocal http_factory_calls
+            http_factory_calls += 1
+            return http_client
+
+        def build_redis_client(
+            _url: str,
+            **_kwargs: object,
+        ) -> FakeRedisClient:
+            nonlocal redis_factory_calls
+            redis_factory_calls += 1
+            return redis_client
+
+        try:
+            app = module.create_production_app(
+                environ=private_environment(),
+                database_factory=lambda _url: database,
+                repository_factory=lambda: ClosableFake("repository"),
+                ingestion_queue_factory=lambda _repository: ClosableFake("queue"),
+                storage_factory=lambda _root: ClosableFake("storage"),
+                evaluation_import_service_factory=lambda: ClosableFake(
+                    "evaluation"
+                ),
+                health_http_client_factory=build_http_client,
+                health_redis_client_factory=build_redis_client,
+            )
+
+            with patch(
+                "app.infra.health.socket.create_connection",
+                return_value=FakeClamAVSocket(),
+            ):
+                with TestClient(app) as client:
+                    self.assertEqual(http_factory_calls, 1)
+                    self.assertEqual(redis_factory_calls, 1)
+                    self.assertEqual(client.get("/api/readyz").status_code, 200)
+                    self.assertEqual(client.get("/api/readyz").status_code, 200)
+                    self.assertEqual(len(http_client.get_calls), 6)
+                    self.assertEqual(redis_client.ping_calls, 2)
+
+            self.assertEqual(http_client.close_calls, 1)
+            self.assertEqual(redis_client.close_calls, 1)
+        finally:
+            database.engine.dispose()
+
     def test_template_provider_skips_llama_dependency(self) -> None:
         checks = build_dependency_checks(
             build_settings(),
@@ -271,6 +381,90 @@ class LazyStartupTest(unittest.TestCase):
                 )
         finally:
             database.engine.dispose()
+
+    def test_postgres_revision_check_sets_scoped_statement_timeout(self) -> None:
+        events: list[str] = []
+
+        class FakeConnection:
+            class Dialect:
+                name = "postgresql"
+
+            dialect = Dialect()
+
+            def __enter__(self) -> "FakeConnection":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def exec_driver_sql(self, statement: str) -> None:
+                events.append(statement)
+
+        class FakeEngine:
+            def connect(self) -> FakeConnection:
+                return FakeConnection()
+
+        class FakeDatabase:
+            engine = FakeEngine()
+
+        class FakeScriptDirectory:
+            @staticmethod
+            def get_heads() -> tuple[str]:
+                return ("future_head",)
+
+        class FakeMigrationContext:
+            @staticmethod
+            def get_current_heads() -> tuple[str]:
+                return ("future_head",)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "alembic.ini"
+            config_path.write_text("[alembic]\n", encoding="utf-8")
+            with (
+                patch(
+                    "alembic.script.ScriptDirectory.from_config",
+                    return_value=FakeScriptDirectory(),
+                ),
+                patch(
+                    "alembic.runtime.migration.MigrationContext.configure",
+                    side_effect=lambda _connection: (
+                        events.append("migration-context")
+                        or FakeMigrationContext()
+                    ),
+                ),
+            ):
+                check = postgres_schema_revision_check(
+                    FakeDatabase(),
+                    config_path=config_path,
+                    timeout_seconds=1.25,
+                )
+
+                self.assertEqual(check(), (True, "schema current"))
+
+        self.assertEqual(events[0], "SET LOCAL statement_timeout = 1250")
+        self.assertEqual(events[1], "migration-context")
+
+    def test_database_connect_timeout_is_forcibly_bounded(self) -> None:
+        for configured_timeout in ("999999", "nan", "inf", "0"):
+            with self.subTest(configured_timeout=configured_timeout):
+                url = _database_url_with_connect_timeout(
+                    "postgresql+psycopg://dc_agent:secret@127.0.0.1/dc_agent"
+                    f"?connect_timeout={configured_timeout}",
+                    2.0,
+                )
+                parsed = make_url(url)
+                self.assertEqual(parsed.query["connect_timeout"], "2")
+
+    def test_database_connect_timeout_handles_invalid_runtime_timeout(self) -> None:
+        for runtime_timeout in (float("nan"), float("inf"), 0.0, -1.0):
+            with self.subTest(runtime_timeout=runtime_timeout):
+                url = _database_url_with_connect_timeout(
+                    "postgresql+psycopg://dc_agent:secret@127.0.0.1/dc_agent"
+                    "?connect_timeout=999999",
+                    runtime_timeout,
+                )
+                parsed = make_url(url)
+                self.assertEqual(parsed.query["connect_timeout"], "2")
 
     def test_embedding_readiness_uses_service_root_readyz(self) -> None:
         class FakeResponse:
@@ -396,6 +590,62 @@ class LazyStartupTest(unittest.TestCase):
                 clamav_check.check(),
                 (False, "invalid configuration"),
             )
+
+    def test_arbitrary_clamav_service_name_is_rejected_without_dns(self) -> None:
+        environ = private_environment(CLAMAV_HOST="attacker")
+        checks = build_dependency_checks(
+            build_settings(environ),
+            database=object(),
+            environ=environ,
+        )
+        clamav_check = next(check for check in checks if check.name == "clamav")
+
+        with patch(
+            "app.infra.health.socket.create_connection",
+            side_effect=AssertionError("unapproved ClamAV host was contacted"),
+        ):
+            self.assertEqual(
+                clamav_check.check(),
+                (False, "invalid configuration"),
+            )
+
+    def test_clamav_ping_reads_partial_pong_until_terminator(self) -> None:
+        class FakeClamAVSocket:
+            def __init__(self) -> None:
+                self.chunks = [b"PO", b"NG", b"\0"]
+                self.recv_calls = 0
+
+            def __enter__(self) -> "FakeClamAVSocket":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def settimeout(self, timeout: float) -> None:
+                return None
+
+            def sendall(self, payload: bytes) -> None:
+                return None
+
+            def recv(self, size: int) -> bytes:
+                self.recv_calls += 1
+                return self.chunks.pop(0)
+
+        fake_socket = FakeClamAVSocket()
+        environ = private_environment(CLAMAV_HOST="clamav")
+        checks = build_dependency_checks(
+            build_settings(environ),
+            database=object(),
+            environ=environ,
+        )
+        clamav_check = next(check for check in checks if check.name == "clamav")
+
+        with patch(
+            "app.infra.health.socket.create_connection",
+            return_value=fake_socket,
+        ):
+            self.assertEqual(clamav_check.check(), (True, "ready"))
+        self.assertEqual(fake_socket.recv_calls, 3)
 
 
 if __name__ == "__main__":

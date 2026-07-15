@@ -17,6 +17,8 @@ from .evaluation_import import EvaluationImportService
 from .infra.health import (
     DependencyHealthRegistry,
     build_dependency_checks,
+    create_http_health_client,
+    create_redis_health_client,
 )
 from .ingestion import KnowledgeIngestionQueue
 from .llm import LLMProvider, create_llm_provider
@@ -97,9 +99,15 @@ def _database_url_with_connect_timeout(
     if url.get_backend_name() != "postgresql":
         return database_url
 
-    bounded_timeout = max(1, min(10, math.ceil(timeout_seconds)))
+    try:
+        normalized_timeout = float(timeout_seconds)
+    except (TypeError, ValueError):
+        normalized_timeout = 2.0
+    if not math.isfinite(normalized_timeout) or normalized_timeout <= 0:
+        normalized_timeout = 2.0
+    bounded_timeout = max(1, min(10, math.ceil(normalized_timeout)))
     query = dict(url.query)
-    query.setdefault("connect_timeout", str(bounded_timeout))
+    query["connect_timeout"] = str(bounded_timeout)
     return url.set(query=query).render_as_string(hide_password=False)
 
 
@@ -139,6 +147,8 @@ def create_production_app(
     ingestion_queue_factory: Callable[[ChatRepository], object] | None = None,
     storage_factory: Callable[[Path], object] | None = None,
     evaluation_import_service_factory: Callable[[], object] | None = None,
+    health_http_client_factory: Callable[..., object] | None = None,
+    health_redis_client_factory: Callable[..., object] | None = None,
     upload_dir: Path | None = None,
 ) -> FastAPI:
     environment_override = dict(environ) if environ is not None else None
@@ -200,11 +210,26 @@ def create_production_app(
             evaluation_service = own(evaluation_builder())
 
             if health_registry_factory is None:
+                health_http_client = own(
+                    create_http_health_client(
+                        settings.dependency_timeout_seconds,
+                        client_factory=health_http_client_factory,
+                    )
+                )
+                health_redis_client = own(
+                    create_redis_health_client(
+                        settings.redis_url,
+                        settings.dependency_timeout_seconds,
+                        client_factory=health_redis_client_factory,
+                    )
+                )
                 health_registry = DependencyHealthRegistry(
                     build_dependency_checks(
                         settings,
                         database=database,
                         environ=source,
+                        http_client=health_http_client,
+                        redis_client=health_redis_client,
                     )
                 )
             else:

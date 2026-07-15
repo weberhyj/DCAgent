@@ -6,7 +6,7 @@ import socket
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -20,13 +20,17 @@ HttpClientFactory = Callable[..., Any]
 
 _MAX_DETAIL_LENGTH = 160
 _MAX_DEPENDENCY_TIMEOUT_SECONDS = 10.0
+_MAX_CLAMAV_RESPONSE_BYTES = 64
+_ALLOWED_PRIVATE_SERVICE_HOSTS = frozenset({"clamav", "localhost"})
+_PRIVATE_NETWORKS = (
+    ip_network("10.0.0.0/8"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.168.0.0/16"),
+    ip_network("fc00::/7"),
+)
 _SENSITIVE_DETAIL_PATTERN = re.compile(
     r"(?:[a-z][a-z0-9+.-]*://|"
     r"\b(?:api[_-]?key|authorization|password|secret|token)\s*[:=])",
-    re.IGNORECASE,
-)
-_PRIVATE_SERVICE_HOST_PATTERN = re.compile(
-    r"^(?=.{1,253}$)(?!-)[a-z0-9-]+(?<!-)$",
     re.IGNORECASE,
 )
 
@@ -97,6 +101,18 @@ def _http_client(
     timeout_seconds: float,
     client_factory: HttpClientFactory | None,
 ) -> Any:
+    return create_http_health_client(
+        timeout_seconds,
+        client_factory=client_factory,
+    )
+
+
+def create_http_health_client(
+    timeout_seconds: float,
+    *,
+    client_factory: HttpClientFactory | None = None,
+) -> Any:
+    timeout_seconds = _bounded_timeout(timeout_seconds)
     if client_factory is not None:
         return client_factory(
             timeout=timeout_seconds,
@@ -118,6 +134,7 @@ def _http_status_check(
     path: str,
     timeout_seconds: float,
     *,
+    client: Any | None = None,
     client_factory: HttpClientFactory | None = None,
     require_ready_json: bool = False,
     expected_text: frozenset[str] | None = None,
@@ -125,7 +142,10 @@ def _http_status_check(
     endpoint = _root_endpoint(service_url, path)
 
     def check() -> tuple[bool, str]:
-        with _http_client(timeout_seconds, client_factory) as client:
+        if client is None:
+            with _http_client(timeout_seconds, client_factory) as one_shot_client:
+                response = one_shot_client.get(endpoint)
+        else:
             response = client.get(endpoint)
         if response.status_code != 200:
             return False, "unavailable"
@@ -152,6 +172,7 @@ def postgres_schema_revision_check(
     database: object,
     *,
     config_path: str | Path | None = None,
+    timeout_seconds: float = 2.0,
 ) -> DependencyCheckCallable:
     resolved_config_path = Path(
         config_path
@@ -173,6 +194,17 @@ def postgres_schema_revision_check(
         )
         engine = getattr(database, "engine")
         with engine.connect() as connection:
+            if (
+                getattr(getattr(connection, "dialect", None), "name", None)
+                == "postgresql"
+            ):
+                timeout_milliseconds = max(
+                    1,
+                    math.ceil(_bounded_timeout(timeout_seconds) * 1000),
+                )
+                connection.exec_driver_sql(
+                    f"SET LOCAL statement_timeout = {timeout_milliseconds}"
+                )
             current_heads = frozenset(
                 MigrationContext.configure(connection).get_current_heads()
             )
@@ -190,25 +222,29 @@ def postgres_schema_revision_check(
 def _redis_ping_check(
     redis_url: str,
     timeout_seconds: float,
+    *,
+    client: Any | None = None,
+    client_factory: HttpClientFactory | None = None,
 ) -> DependencyCheckCallable:
     def check() -> tuple[bool, str]:
-        from redis import Redis
+        if client is not None:
+            ok = bool(client.ping())
+            return ok, "ready" if ok else "unavailable"
 
-        client = Redis.from_url(
+        one_shot_client = create_redis_health_client(
             redis_url,
-            socket_connect_timeout=timeout_seconds,
-            socket_timeout=timeout_seconds,
-            health_check_interval=0,
+            timeout_seconds,
+            client_factory=client_factory,
         )
         try:
-            ok = bool(client.ping())
+            ok = bool(one_shot_client.ping())
         finally:
-            close = getattr(client, "close", None)
+            close = getattr(one_shot_client, "close", None)
             if callable(close):
                 with suppress(Exception):
                     close()
             else:
-                pool = getattr(client, "connection_pool", None)
+                pool = getattr(one_shot_client, "connection_pool", None)
                 disconnect = getattr(pool, "disconnect", None)
                 if callable(disconnect):
                     with suppress(Exception):
@@ -216,6 +252,26 @@ def _redis_ping_check(
         return ok, "ready" if ok else "unavailable"
 
     return check
+
+
+def create_redis_health_client(
+    redis_url: str,
+    timeout_seconds: float,
+    *,
+    client_factory: HttpClientFactory | None = None,
+) -> Any:
+    timeout_seconds = _bounded_timeout(timeout_seconds)
+    keyword_arguments = {
+        "socket_connect_timeout": timeout_seconds,
+        "socket_timeout": timeout_seconds,
+        "health_check_interval": 0,
+    }
+    if client_factory is not None:
+        return client_factory(redis_url, **keyword_arguments)
+
+    from redis import Redis
+
+    return Redis.from_url(redis_url, **keyword_arguments)
 
 
 def _clamav_ping_check(
@@ -239,8 +295,25 @@ def _clamav_ping_check(
         ) as connection:
             connection.settimeout(timeout_seconds)
             connection.sendall(b"zPING\0")
-            response = connection.recv(16)
-        ok = response.rstrip(b"\0\r\n") == b"PONG"
+            response = bytearray()
+            while len(response) < _MAX_CLAMAV_RESPONSE_BYTES:
+                chunk = connection.recv(
+                    min(16, _MAX_CLAMAV_RESPONSE_BYTES - len(response))
+                )
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if b"\0" in chunk or b"\n" in chunk:
+                    break
+        response_bytes = bytes(response)
+        terminator_indexes = [
+            index
+            for marker in (b"\0", b"\n")
+            if (index := response_bytes.find(marker)) >= 0
+        ]
+        if terminator_indexes:
+            response_bytes = response_bytes[: min(terminator_indexes)]
+        ok = response_bytes.rstrip(b"\r") == b"PONG"
         return ok, "ready" if ok else "unavailable"
 
     return check
@@ -253,8 +326,11 @@ def _is_private_service_host(host: str) -> bool:
     try:
         address = ip_address(candidate)
     except ValueError:
-        return bool(_PRIVATE_SERVICE_HOST_PATTERN.fullmatch(candidate))
-    return address.is_private or address.is_loopback
+        return candidate in _ALLOWED_PRIVATE_SERVICE_HOSTS
+    return address.is_loopback or any(
+        address.version == network.version and address in network
+        for network in _PRIVATE_NETWORKS
+    )
 
 
 def _generation_enabled(environ: Mapping[str, str]) -> bool:
@@ -278,13 +354,18 @@ def build_dependency_checks(
     *,
     database: object,
     environ: Mapping[str, str],
+    http_client: Any | None = None,
+    redis_client: Any | None = None,
     http_client_factory: HttpClientFactory | None = None,
 ) -> list[DependencyCheck]:
     timeout_seconds = _bounded_timeout(settings.dependency_timeout_seconds)
     checks = [
         DependencyCheck(
             "postgresql",
-            postgres_schema_revision_check(database),
+            postgres_schema_revision_check(
+                database,
+                timeout_seconds=timeout_seconds,
+            ),
         ),
         DependencyCheck(
             "clickhouse",
@@ -292,6 +373,7 @@ def build_dependency_checks(
                 settings.clickhouse_url,
                 "/ping",
                 timeout_seconds,
+                client=http_client,
                 client_factory=http_client_factory,
                 expected_text=frozenset({"ok", "ok."}),
             ),
@@ -302,12 +384,17 @@ def build_dependency_checks(
                 settings.qdrant_url,
                 "/readyz",
                 timeout_seconds,
+                client=http_client,
                 client_factory=http_client_factory,
             ),
         ),
         DependencyCheck(
             "redis",
-            _redis_ping_check(settings.redis_url, timeout_seconds),
+            _redis_ping_check(
+                settings.redis_url,
+                timeout_seconds,
+                client=redis_client,
+            ),
         ),
         DependencyCheck(
             "clamav",
@@ -323,6 +410,7 @@ def build_dependency_checks(
                 settings.embedding_service_url,
                 "/readyz",
                 timeout_seconds,
+                client=http_client,
                 client_factory=http_client_factory,
                 require_ready_json=True,
             ),
@@ -336,6 +424,7 @@ def build_dependency_checks(
                     settings.llama_server_url,
                     "/health",
                     timeout_seconds,
+                    client=http_client,
                     client_factory=http_client_factory,
                 ),
             )
@@ -347,5 +436,7 @@ __all__ = [
     "DependencyCheck",
     "DependencyHealthRegistry",
     "build_dependency_checks",
+    "create_http_health_client",
+    "create_redis_health_client",
     "postgres_schema_revision_check",
 ]
