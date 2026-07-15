@@ -454,6 +454,18 @@ class LLMProviderTest(unittest.TestCase):
                 }
             )
 
+    def test_llm_provider_factory_rejects_malformed_offline_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "(?i)boolean"):
+            create_llm_provider(
+                {
+                    "OFFLINE_MODE": "treu",
+                    "LLM_PROVIDER": "openai_compatible",
+                    "LLM_API_BASE": "https://api.example.com/v1",
+                    "LLM_API_KEY": "test-key",
+                    "LLM_MODEL": "dc-agent-test-model",
+                }
+            )
+
     def test_llm_provider_factory_rejects_empty_api_key(self) -> None:
         with self.assertRaisesRegex(ValueError, "LLM_API_KEY is required"):
             create_llm_provider(

@@ -18,9 +18,19 @@ class OfflineSettingsTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertTrue(parse_bool(value))
 
-        self.assertFalse(parse_bool("false"))
+        for value in ("0", "false", "NO", " off "):
+            with self.subTest(value=value):
+                self.assertFalse(parse_bool(value))
+
+    def test_parse_bool_uses_default_for_missing_or_empty_values(self) -> None:
         self.assertFalse(parse_bool(None))
         self.assertTrue(parse_bool(None, default=True))
+        self.assertFalse(parse_bool(""))
+        self.assertTrue(parse_bool("  ", default=True))
+
+    def test_parse_bool_rejects_unrecognized_values(self) -> None:
+        with self.assertRaisesRegex(OfflineSettingsError, "(?i)boolean"):
+            parse_bool("treu", default=True)
 
     def test_require_private_url_accepts_private_hosts_and_strips_trailing_slash(self) -> None:
         for value, expected in (
@@ -76,6 +86,49 @@ class OfflineSettingsTest(unittest.TestCase):
                     "LLAMA_SERVER_URL": "https://api.example.com/v1",
                 }
             )
+
+    def test_rejects_postgres_routing_query_overrides_in_offline_mode(self) -> None:
+        for query in (
+            "host=api.example.com",
+            "hostaddr=8.8.8.8",
+            "service=external",
+            "servicefile=%2Ftmp%2Fpg_service.conf",
+        ):
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(
+                    OfflineSettingsError, "(?i)(private or loopback|offline.*routing)"
+                ):
+                    OfflineSettings.from_environ(
+                        {
+                            "OFFLINE_MODE": "true",
+                            "DATABASE_URL": (
+                                "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent"
+                                f"?{query}"
+                            ),
+                        }
+                    )
+
+    def test_allows_harmless_postgres_query_options_in_offline_mode(self) -> None:
+        database_url = (
+            "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?sslmode=require"
+        )
+
+        settings = OfflineSettings.from_environ(
+            {"OFFLINE_MODE": "true", "DATABASE_URL": database_url}
+        )
+
+        self.assertEqual(settings.database_url, database_url)
+
+    def test_allows_postgres_routing_overrides_when_offline_mode_is_disabled(self) -> None:
+        database_url = (
+            "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?host=api.example.com"
+        )
+
+        settings = OfflineSettings.from_environ(
+            {"OFFLINE_MODE": "false", "DATABASE_URL": database_url}
+        )
+
+        self.assertEqual(settings.database_url, database_url)
 
     def test_rejects_model_slots_outside_supported_range(self) -> None:
         for model_slots in ("0", "5"):

@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from .database import resolve_database_url
 
@@ -16,12 +16,31 @@ class OfflineSettingsError(ValueError):
 def parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise OfflineSettingsError(
+        "Boolean value must be one of: 1, true, yes, on, 0, false, no, off"
+    )
 
 
 def require_private_url(value: str, field: str) -> str:
     candidate = value.strip()
     parsed = urlparse(candidate)
+    if field.lower() == "database_url":
+        routing_keys = {
+            key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+        }
+        forbidden_keys = routing_keys & {"host", "hostaddr", "service", "servicefile"}
+        if forbidden_keys:
+            keys = ", ".join(sorted(forbidden_keys))
+            raise OfflineSettingsError(
+                f"{field} offline mode forbids PostgreSQL connection-routing query parameters: {keys}"
+            )
     host = parsed.hostname or ""
     if host in {
         "localhost",
