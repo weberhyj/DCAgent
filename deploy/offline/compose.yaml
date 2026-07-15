@@ -2,7 +2,7 @@ name: dc-agent-offline
 
 services:
   postgres:
-    image: ${POSTGRES_IMAGE}
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
     environment:
       POSTGRES_DB: dc_agent
       POSTGRES_USER: dc_agent
@@ -11,7 +11,7 @@ services:
       - postgres_password
     volumes:
       - type: bind
-        source: ${DATA_ROOT}/postgres
+        source: ${DATA_ROOT:?DATA_ROOT is required}/postgres
         target: /var/lib/postgresql/data
         bind:
           create_host_path: false
@@ -24,16 +24,16 @@ services:
       retries: 12
 
   clickhouse:
-    image: ${CLICKHOUSE_IMAGE}
+    image: ${CLICKHOUSE_IMAGE:?CLICKHOUSE_IMAGE is required}
     volumes:
       - type: bind
-        source: ${DATA_ROOT}/clickhouse
+        source: ${DATA_ROOT:?DATA_ROOT is required}/clickhouse
         target: /var/lib/clickhouse
         bind:
           create_host_path: false
     networks:
       - offline
-    mem_limit: ${CLICKHOUSE_MEMORY_LIMIT}
+    mem_limit: ${CLICKHOUSE_MEMORY_LIMIT:?CLICKHOUSE_MEMORY_LIMIT is required}
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 10s
@@ -41,16 +41,16 @@ services:
       retries: 12
 
   qdrant:
-    image: ${QDRANT_IMAGE}
+    image: ${QDRANT_IMAGE:?QDRANT_IMAGE is required}
     volumes:
       - type: bind
-        source: ${DATA_ROOT}/qdrant
+        source: ${DATA_ROOT:?DATA_ROOT is required}/qdrant
         target: /qdrant/storage
         bind:
           create_host_path: false
     networks:
       - offline
-    mem_limit: ${QDRANT_MEMORY_LIMIT}
+    mem_limit: ${QDRANT_MEMORY_LIMIT:?QDRANT_MEMORY_LIMIT is required}
     healthcheck:
       test: ["CMD", "bash", "-ec", ": >/dev/tcp/127.0.0.1/6333"]
       interval: 10s
@@ -58,11 +58,11 @@ services:
       retries: 12
 
   redis:
-    image: ${REDIS_IMAGE}
+    image: ${REDIS_IMAGE:?REDIS_IMAGE is required}
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - type: bind
-        source: ${DATA_ROOT}/redis
+        source: ${DATA_ROOT:?DATA_ROOT is required}/redis
         target: /data
         bind:
           create_host_path: false
@@ -75,7 +75,7 @@ services:
       retries: 12
 
   clamav:
-    image: ${CLAMAV_IMAGE}
+    image: ${CLAMAV_IMAGE:?CLAMAV_IMAGE is required}
     environment:
       CLAMAV_NO_FRESHCLAMD: "true"
     networks:
@@ -91,9 +91,9 @@ services:
       context: ../..
       dockerfile: deploy/docker/backend.Dockerfile
       args:
-        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
-        DCAGENT_UID: ${DCAGENT_UID}
-        DCAGENT_GID: ${DCAGENT_GID}
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:?PYTHON_BASE_IMAGE is required}
+        DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
+        DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
     command: ["python", "-m", "app.migration_entrypoint"]
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -110,16 +110,16 @@ services:
       context: ../..
       dockerfile: deploy/docker/embedding.Dockerfile
       args:
-        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
-        DCAGENT_UID: ${DCAGENT_UID}
-        DCAGENT_GID: ${DCAGENT_GID}
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:?PYTHON_BASE_IMAGE is required}
+        DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
+        DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
     environment:
       OFFLINE_MODE: "true"
-      EMBEDDING_MODEL_ROOT: /models/${EMBEDDING_MODEL_DIR}
-      EMBEDDING_MODEL_SHA256: ${EMBEDDING_MODEL_SHA256}
+      EMBEDDING_MODEL_ROOT: /models/${EMBEDDING_MODEL_DIR:?EMBEDDING_MODEL_DIR is required}
+      EMBEDDING_MODEL_SHA256: ${EMBEDDING_MODEL_SHA256:?EMBEDDING_MODEL_SHA256 is required}
     volumes:
       - type: bind
-        source: ${MODEL_ROOT}
+        source: ${MODEL_ROOT:?MODEL_ROOT is required}
         target: /models
         read_only: true
         bind:
@@ -137,9 +137,9 @@ services:
       context: ../..
       dockerfile: deploy/docker/backend.Dockerfile
       args:
-        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
-        DCAGENT_UID: ${DCAGENT_UID}
-        DCAGENT_GID: ${DCAGENT_GID}
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:?PYTHON_BASE_IMAGE is required}
+        DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
+        DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
     environment:
       OFFLINE_MODE: "true"
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -149,11 +149,11 @@ services:
       CLAMAV_HOST: clamav
       EMBEDDING_SERVICE_URL: http://embedding-service:8081
       LLAMA_SERVER_URL: http://llama:8080
-      MODEL_SLOTS: ${MODEL_SLOTS}
-      LLM_PROVIDER: ${LLM_PROVIDER}
-      LLM_API_BASE: ${LLM_API_BASE}
-      LLM_API_KEY: ${LLM_API_KEY}
-      LLM_MODEL: ${LLM_MODEL}
+      MODEL_SLOTS: ${MODEL_SLOTS:?MODEL_SLOTS is required}
+      LLM_PROVIDER: ${LLM_PROVIDER:?LLM_PROVIDER is required}
+      LLM_API_BASE: ${LLM_API_BASE:?LLM_API_BASE is required}
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY is required}
+      LLM_MODEL: ${LLM_MODEL:?LLM_MODEL is required}
       RAW_DATA_ROOT: /data/raw
       PARQUET_ROOT: /data/parquet
       MODEL_ROOT: /models
@@ -168,17 +168,17 @@ services:
       - database_url
     volumes:
       - type: bind
-        source: ${DATA_ROOT}/raw
+        source: ${DATA_ROOT:?DATA_ROOT is required}/raw
         target: /data/raw
         bind:
           create_host_path: false
       - type: bind
-        source: ${DATA_ROOT}/parquet
+        source: ${DATA_ROOT:?DATA_ROOT is required}/parquet
         target: /data/parquet
         bind:
           create_host_path: false
       - type: bind
-        source: ${MODEL_ROOT}
+        source: ${MODEL_ROOT:?MODEL_ROOT is required}
         target: /models
         read_only: true
         bind:
@@ -208,9 +208,9 @@ services:
       context: ../..
       dockerfile: deploy/docker/worker.Dockerfile
       args:
-        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
-        DCAGENT_UID: ${DCAGENT_UID}
-        DCAGENT_GID: ${DCAGENT_GID}
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:?PYTHON_BASE_IMAGE is required}
+        DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
+        DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
     environment:
       OFFLINE_MODE: "true"
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -233,17 +233,17 @@ services:
       - database_url
     volumes:
       - type: bind
-        source: ${DATA_ROOT}/raw
+        source: ${DATA_ROOT:?DATA_ROOT is required}/raw
         target: /data/raw
         bind:
           create_host_path: false
       - type: bind
-        source: ${DATA_ROOT}/parquet
+        source: ${DATA_ROOT:?DATA_ROOT is required}/parquet
         target: /data/parquet
         bind:
           create_host_path: false
       - type: bind
-        source: ${MODEL_ROOT}
+        source: ${MODEL_ROOT:?MODEL_ROOT is required}
         target: /models
         read_only: true
         bind:
@@ -268,12 +268,12 @@ services:
     profiles: ["indexing"]
 
   llama:
-    image: ${LLAMA_IMAGE}
+    image: ${LLAMA_IMAGE:?LLAMA_IMAGE is required}
     command:
-      ["--model", "/models/${LLAMA_MODEL_FILE}", "--host", "0.0.0.0", "--port", "8080", "--parallel", "${MODEL_SLOTS}"]
+      ["--model", "/models/${LLAMA_MODEL_FILE:?LLAMA_MODEL_FILE is required}", "--host", "0.0.0.0", "--port", "8080", "--parallel", "${MODEL_SLOTS:?MODEL_SLOTS is required}"]
     volumes:
       - type: bind
-        source: ${MODEL_ROOT}
+        source: ${MODEL_ROOT:?MODEL_ROOT is required}
         target: /models
         read_only: true
         bind:
@@ -288,6 +288,6 @@ networks:
 
 secrets:
   postgres_password:
-    file: ${POSTGRES_PASSWORD_FILE}
+    file: ${POSTGRES_PASSWORD_FILE:?POSTGRES_PASSWORD_FILE is required}
   database_url:
-    file: ${DATABASE_URL_SECRET_FILE}
+    file: ${DATABASE_URL_SECRET_FILE:?DATABASE_URL_SECRET_FILE is required}

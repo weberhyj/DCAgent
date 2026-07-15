@@ -14,7 +14,8 @@ $databasePath = Join-Path $secretDir "database-url"
 function Get-OfflineEnvValue {
     param(
         [string]$Path,
-        [string]$Name
+        [string]$Name,
+        [switch]$RejectQuotes
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -25,7 +26,13 @@ function Get-OfflineEnvValue {
         $pattern = "^\s*" + [regex]::Escape($Name) + "\s*=\s*(?<value>.*)\s*$"
         if ($line -match $pattern) {
             $value = $Matches["value"].Trim()
-            if ($value.Length -ge 2) {
+            if (
+                $RejectQuotes -and
+                ($value.Contains("'") -or $value.Contains('"'))
+            ) {
+                throw "$Name must use an unquoted direct path or exact unquoted `${VAR}"
+            }
+            if (-not $RejectQuotes -and $value.Length -ge 2) {
                 $first = $value.Substring(0, 1)
                 $last = $value.Substring($value.Length - 1, 1)
                 if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
@@ -186,7 +193,7 @@ function Assert-OfflineDeploymentSupport {
 function Resolve-OfflineComposePath {
     param([string]$Name)
 
-    $rawValue = Get-OfflineEnvValue -Path $envPath -Name $Name
+    $rawValue = Get-OfflineEnvValue -Path $envPath -Name $Name -RejectQuotes
     if ([string]::IsNullOrWhiteSpace($rawValue)) {
         throw "$Name must be explicitly defined in deploy/offline/.env"
     }
@@ -221,6 +228,9 @@ function Resolve-OfflineComposePath {
     if ($null -ne $shellOverride) {
         if ([string]::IsNullOrWhiteSpace($shellOverride)) {
             throw "$Name shell override must not be empty"
+        }
+        if ($shellOverride.Contains("'") -or $shellOverride.Contains('"')) {
+            throw "$Name shell override must be one unquoted direct host path"
         }
         if ($shellOverride.Contains('$')) {
             throw "$Name shell override must be one direct host path"
@@ -285,6 +295,50 @@ function Assert-OfflinePathIsNotLink {
     $item = Get-Item -LiteralPath $Path -Force
     if ($null -ne $item.LinkType -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
         throw "Offline paths must not be symbolic links or reparse points: $Path"
+    }
+}
+
+function Assert-OfflinePathAncestorsAreNotLinks {
+    param([string]$Path)
+
+    $currentPath = [IO.Path]::GetFullPath($Path)
+    while (-not [string]::IsNullOrWhiteSpace($currentPath)) {
+        $item = Get-Item -LiteralPath $currentPath -Force -ErrorAction SilentlyContinue
+        if (
+            $null -ne $item -and
+            ($null -ne $item.LinkType -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint))
+        ) {
+            throw "Offline path ancestors must not be symbolic links or reparse points: $currentPath"
+        }
+        $parent = [IO.Directory]::GetParent($currentPath)
+        if ($null -eq $parent) {
+            break
+        }
+        $parentPath = $parent.FullName
+        $comparison = if ($env:OS -eq "Windows_NT") {
+            [StringComparison]::OrdinalIgnoreCase
+        }
+        else {
+            [StringComparison]::Ordinal
+        }
+        if ([string]::Equals($parentPath, $currentPath, $comparison)) {
+            break
+        }
+        $currentPath = $parentPath
+    }
+}
+
+function Assert-OfflineRegularFile {
+    param([string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force
+    if (
+        $null -ne $item.LinkType -or
+        $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -or
+        $item.PSIsContainer -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)
+    ) {
+        throw "Offline secret must be one regular non-link file: $Path"
     }
 }
 
@@ -448,12 +502,17 @@ function Initialize-OfflineBindDirectories {
 function Remove-SafeSecretLeaf {
     param([string]$Path)
 
-    if (-not (Test-Path -LiteralPath $Path)) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) {
         return
     }
-    $item = Get-Item -LiteralPath $Path -Force
-    if ($item.PSIsContainer) {
-        throw "Refusing to replace a secret staging directory"
+    if (
+        $null -ne $item.LinkType -or
+        $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -or
+        $item.PSIsContainer -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)
+    ) {
+        throw "Refusing to replace a secret staging path that is not a regular leaf"
     }
     Remove-Item -LiteralPath $Path -Force
 }
@@ -581,8 +640,20 @@ $configuredPasswordPath = Resolve-OfflineComposePath -Name "POSTGRES_PASSWORD_FI
 $configuredDatabasePath = Resolve-OfflineComposePath -Name "DATABASE_URL_SECRET_FILE"
 Assert-OfflineExpectedPath -Name "POSTGRES_PASSWORD_FILE" -ActualPath $configuredPasswordPath -ExpectedPath $passwordPath
 Assert-OfflineExpectedPath -Name "DATABASE_URL_SECRET_FILE" -ActualPath $configuredDatabasePath -ExpectedPath $databasePath
-if (Test-Path -LiteralPath $dataRoot) {
-    Assert-OfflinePathIsNotLink -Path $dataRoot
+foreach ($targetPath in @(
+    $dataRoot,
+    $modelRoot,
+    $secretDir,
+    $passwordPath,
+    $databasePath
+)) {
+    Assert-OfflinePathAncestorsAreNotLinks -Path $targetPath
+}
+if (Test-Path -LiteralPath $secretDir) {
+    if (-not (Test-Path -LiteralPath $secretDir -PathType Container)) {
+        throw "Offline secret path must be a directory: $secretDir"
+    }
+    Assert-OfflinePathIsNotLink -Path $secretDir
 }
 $present = @(
     @($passwordPath, $databasePath) |
@@ -593,12 +664,10 @@ if ($present -eq 1) {
     throw "Both offline secret files must exist together; refusing partial configuration"
 }
 
-if (Test-Path -LiteralPath $secretDir) {
-    Assert-OfflinePathIsNotLink -Path $secretDir
-}
 if ($present -eq 2) {
-    Assert-OfflinePathIsNotLink -Path $passwordPath
-    Assert-OfflinePathIsNotLink -Path $databasePath
+    Assert-OfflineRegularFile -Path $passwordPath
+    Assert-OfflineRegularFile -Path $databasePath
+    Assert-OfflineSecretPair -PasswordFile $passwordPath -DatabaseFile $databasePath
 }
 if (Test-OfflineLinuxHost) {
     if (Test-Path -LiteralPath $secretDir) {

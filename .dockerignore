@@ -1,0 +1,48 @@
+# Deny the repository by default. Offline images only need the allowlist below.
+*
+
+# Repository metadata and local deployment state must never enter the context.
+.git
+.git/**
+.worktrees
+.worktrees/**
+artifacts/**
+
+# Offline wheelhouse used by all three Python images.
+!artifacts/
+!artifacts/wheels/
+!artifacts/wheels/**
+
+# Backend runtime and migration inputs copied by the Dockerfiles.
+!backend/
+!backend/app/
+!backend/app/**
+!backend/alembic.ini
+!backend/alembic/
+!backend/alembic/**
+!backend/requirements.txt
+!backend/requirements-offline.txt
+
+# Dockerfiles remain available to BuildKit from the repository-root context.
+!deploy/
+!deploy/docker/
+!deploy/docker/**
+
+# Reassert sensitive and bulky paths after the allowlist.
+deploy/offline/.env
+deploy/offline/.env.*
+**/.env
+**/.env.*
+**/uploads
+**/uploads/**
+**/models
+**/models/**
+**/benchmarks
+**/benchmarks/**
+**/secrets
+**/secrets/**
+**/node_modules
+**/node_modules/**
+**/__pycache__
+**/__pycache__/**
+**/*.pyc
