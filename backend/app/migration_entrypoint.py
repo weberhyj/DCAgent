@@ -291,6 +291,18 @@ BASELINE_FOREIGN_KEYS: dict[str, tuple[ForeignKeySignature, ...]] = {
 }
 
 
+def _build_postgres_trigger_counts() -> dict[str, int]:
+    counts = {table_name: 0 for table_name in BASELINE_COLUMNS}
+    for table_name, foreign_keys in BASELINE_FOREIGN_KEYS.items():
+        for foreign_key in foreign_keys:
+            counts[table_name] += 2
+            counts[foreign_key.referred_table] += 2
+    return counts
+
+
+BASELINE_POSTGRES_TRIGGER_COUNTS = _build_postgres_trigger_counts()
+
+
 class BaselineSchemaMismatch(RuntimeError):
     """Raised when an unmanaged database is not the exact frozen baseline."""
 
@@ -685,6 +697,47 @@ def _normalize_postgres_table_catalog_row(row: Any) -> tuple[str, ...]:
         semantic_options.append("missing-relforcerowsecurity")
     elif row.get("relforcerowsecurity") is not False:
         semantic_options.append("forced-row-security")
+    if "access_method" not in row:
+        semantic_options.append("missing-access-method")
+    elif row.get("access_method") != "heap":
+        semantic_options.append(
+            f"access_method={_semantic_value(row.get('access_method'))}"
+        )
+    for field, label in (
+        ("has_inheritance_parent", "inheritance-parent"),
+        ("has_inheritance_children", "inheritance-children"),
+    ):
+        if field not in row:
+            semantic_options.append(f"missing-{field}")
+        elif row.get(field) is not False:
+            semantic_options.append(label)
+    return tuple(sorted(set(semantic_options)))
+
+
+def _normalize_postgres_trigger_catalog_row(row: Any) -> tuple[str, ...]:
+    semantic_options: list[str] = []
+    if not str(row.get("trigger_name") or "").strip():
+        semantic_options.append("missing-trigger-name")
+    if "enabled" not in row:
+        semantic_options.append("missing-enabled-state")
+    elif row.get("enabled") != "O":
+        semantic_options.append(f"enabled={_semantic_value(row.get('enabled'))}")
+    if "is_internal" not in row:
+        semantic_options.append("missing-internal-state")
+    elif row.get("is_internal") is not True:
+        semantic_options.append("user-trigger")
+    if "constraint_oid" not in row:
+        semantic_options.append("missing-constraint-oid")
+    elif not row.get("constraint_oid"):
+        semantic_options.append("unbound-trigger")
+    if not str(row.get("constraint_name") or "").strip():
+        semantic_options.append("missing-constraint-name")
+    if "constraint_type" not in row:
+        semantic_options.append("missing-constraint-type")
+    elif row.get("constraint_type") != "f":
+        semantic_options.append(
+            f"constraint_type={_semantic_value(row.get('constraint_type'))}"
+        )
     return tuple(sorted(set(semantic_options)))
 
 
@@ -698,9 +751,60 @@ POSTGRES_TABLE_CATALOG_SQL = text(
         table_class.reloptions AS reloptions,
         table_class.reltablespace AS reltablespace,
         table_class.relrowsecurity AS relrowsecurity,
-        table_class.relforcerowsecurity AS relforcerowsecurity
-    FROM pg_class AS table_class
-    JOIN pg_namespace AS table_namespace
+        table_class.relforcerowsecurity AS relforcerowsecurity,
+        table_access_method.amname AS access_method,
+        EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_inherits AS inheritance_parent
+            WHERE inheritance_parent.inhrelid = table_class.oid
+        ) AS has_inheritance_parent,
+        EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_inherits AS inheritance_child
+            WHERE inheritance_child.inhparent = table_class.oid
+        ) AS has_inheritance_children
+    FROM pg_catalog.pg_class AS table_class
+    JOIN pg_catalog.pg_namespace AS table_namespace
+      ON table_namespace.oid = table_class.relnamespace
+    JOIN pg_catalog.pg_am AS table_access_method
+      ON table_access_method.oid = table_class.relam
+    WHERE table_namespace.nspname = :schema_name
+      AND table_class.relname = :table_name
+    """
+)
+
+
+POSTGRES_TRIGGER_CATALOG_SQL = text(
+    """
+    SELECT
+        trigger_row.tgname AS trigger_name,
+        trigger_row.tgenabled AS enabled,
+        trigger_row.tgisinternal AS is_internal,
+        trigger_row.tgconstraint AS constraint_oid,
+        constraint_row.conname AS constraint_name,
+        constraint_row.contype AS constraint_type
+    FROM pg_catalog.pg_trigger AS trigger_row
+    JOIN pg_catalog.pg_class AS table_class
+      ON table_class.oid = trigger_row.tgrelid
+    JOIN pg_catalog.pg_namespace AS table_namespace
+      ON table_namespace.oid = table_class.relnamespace
+    LEFT JOIN pg_catalog.pg_constraint AS constraint_row
+      ON constraint_row.oid = trigger_row.tgconstraint
+    WHERE table_namespace.nspname = :schema_name
+      AND table_class.relname = :table_name
+    """
+)
+
+
+POSTGRES_RULE_CATALOG_SQL = text(
+    """
+    SELECT
+        rule_row.rulename AS rule_name,
+        rule_row.ev_enabled AS enabled
+    FROM pg_catalog.pg_rewrite AS rule_row
+    JOIN pg_catalog.pg_class AS table_class
+      ON table_class.oid = rule_row.ev_class
+    JOIN pg_catalog.pg_namespace AS table_namespace
       ON table_namespace.oid = table_class.relnamespace
     WHERE table_namespace.nspname = :schema_name
       AND table_class.relname = :table_name
@@ -714,13 +818,13 @@ POSTGRES_FOREIGN_KEY_CATALOG_SQL = text(
         constraint_row.conname AS constraint_name,
         constraint_row.convalidated AS is_validated,
         COALESCE(
-            (to_jsonb(constraint_row)->>'conenforced')::boolean,
+            (pg_catalog.to_jsonb(constraint_row)->>'conenforced')::boolean,
             TRUE
         ) AS is_enforced
-    FROM pg_constraint AS constraint_row
-    JOIN pg_class AS table_class
+    FROM pg_catalog.pg_constraint AS constraint_row
+    JOIN pg_catalog.pg_class AS table_class
       ON table_class.oid = constraint_row.conrelid
-    JOIN pg_namespace AS table_namespace
+    JOIN pg_catalog.pg_namespace AS table_namespace
       ON table_namespace.oid = table_class.relnamespace
     WHERE table_namespace.nspname = :schema_name
       AND table_class.relname = :table_name
@@ -745,28 +849,28 @@ POSTGRES_INDEX_CATALOG_SQL = text(
         index_class.reloptions AS reloptions,
         index_tablespace.spcname AS tablespace,
         access_method.amname AS access_method,
-        pg_get_expr(index_state.indpred, index_state.indrelid) AS predicate,
-        pg_get_expr(index_state.indexprs, index_state.indrelid) AS expressions,
+        pg_catalog.pg_get_expr(index_state.indpred, index_state.indrelid) AS predicate,
+        pg_catalog.pg_get_expr(index_state.indexprs, index_state.indrelid) AS expressions,
         index_state.indnkeyatts AS key_attribute_count,
         index_state.indnatts AS total_attribute_count,
         ARRAY(
-            SELECT pg_get_indexdef(index_state.indexrelid, position, true)
-            FROM generate_series(1, index_state.indnkeyatts) AS position
+            SELECT pg_catalog.pg_get_indexdef(index_state.indexrelid, position, true)
+            FROM pg_catalog.generate_series(1, index_state.indnkeyatts) AS position
             ORDER BY position
         ) AS key_definitions
-    FROM pg_index AS index_state
-    JOIN pg_class AS table_class
+    FROM pg_catalog.pg_index AS index_state
+    JOIN pg_catalog.pg_class AS table_class
       ON table_class.oid = index_state.indrelid
-    JOIN pg_class AS index_class
+    JOIN pg_catalog.pg_class AS index_class
       ON index_class.oid = index_state.indexrelid
-    JOIN pg_namespace AS table_namespace
+    JOIN pg_catalog.pg_namespace AS table_namespace
       ON table_namespace.oid = table_class.relnamespace
-    JOIN pg_am AS access_method
+    JOIN pg_catalog.pg_am AS access_method
       ON access_method.oid = index_class.relam
-    LEFT JOIN pg_constraint AS primary_constraint
+    LEFT JOIN pg_catalog.pg_constraint AS primary_constraint
       ON primary_constraint.contype = 'p'
      AND primary_constraint.conindid = index_state.indexrelid
-    LEFT JOIN pg_tablespace AS index_tablespace
+    LEFT JOIN pg_catalog.pg_tablespace AS index_tablespace
       ON index_tablespace.oid = index_class.reltablespace
     WHERE table_namespace.nspname = :schema_name
       AND table_class.relname = :table_name
@@ -873,10 +977,51 @@ def _validate_postgres_table_catalog(
         ).mappings().all()
         if (
             len(rows) != 1
+            or str(rows[0].get("table_name") or "") != table_name
             or _normalize_postgres_table_catalog_row(rows[0])
         ):
             errors.append(
                 f"PostgreSQL table catalog differs for table {table_name}"
+            )
+
+
+def _validate_postgres_trigger_catalog(
+    connection: Any,
+    errors: list[str],
+    schema_name: str,
+    table_names: set[str],
+    expected_trigger_counts: dict[str, int],
+) -> None:
+    _require_supported_postgres_version(connection)
+    for table_name in sorted(table_names):
+        rows = connection.execute(
+            POSTGRES_TRIGGER_CATALOG_SQL,
+            {"schema_name": schema_name, "table_name": table_name},
+        ).mappings().all()
+        if (
+            len(rows) != expected_trigger_counts.get(table_name, 0)
+            or any(_normalize_postgres_trigger_catalog_row(row) for row in rows)
+        ):
+            errors.append(
+                f"PostgreSQL trigger catalog differs for table {table_name}"
+            )
+
+
+def _validate_postgres_rule_catalog(
+    connection: Any,
+    errors: list[str],
+    schema_name: str,
+    table_names: set[str],
+) -> None:
+    _require_supported_postgres_version(connection)
+    for table_name in sorted(table_names):
+        rows = connection.execute(
+            POSTGRES_RULE_CATALOG_SQL,
+            {"schema_name": schema_name, "table_name": table_name},
+        ).mappings().all()
+        if rows:
+            errors.append(
+                f"PostgreSQL rule catalog differs for table {table_name}"
             )
 
 
@@ -913,7 +1058,9 @@ def _schema_fingerprint(
     inspector = inspect(connection)
     current_schema_name = schema_name
     if connection.dialect.name == "postgresql" and current_schema_name is None:
-        current_schema_name = connection.scalar(text("SELECT current_schema()"))
+        current_schema_name = connection.scalar(
+            text("SELECT pg_catalog.current_schema()")
+        )
     schema_arguments = (
         {"schema": current_schema_name}
         if current_schema_name is not None
@@ -1047,7 +1194,7 @@ def _validate_baseline(
     schema_name: str | None = None,
 ) -> None:
     if connection.dialect.name == "postgresql" and schema_name is None:
-        schema_name = connection.scalar(text("SELECT current_schema()"))
+        schema_name = connection.scalar(text("SELECT pg_catalog.current_schema()"))
     actual = _schema_fingerprint(
         connection,
         ignored_tables=ignored_tables,
@@ -1099,6 +1246,35 @@ def _validate_baseline(
         try:
             if schema_name is None:
                 raise RuntimeError("current PostgreSQL schema is unavailable")
+            _validate_postgres_trigger_catalog(
+                connection,
+                errors,
+                schema_name,
+                expected_tables,
+                BASELINE_POSTGRES_TRIGGER_COUNTS,
+            )
+        except Exception as error:
+            errors.append(
+                "PostgreSQL trigger catalog could not be validated: "
+                f"{error}"
+            )
+        try:
+            if schema_name is None:
+                raise RuntimeError("current PostgreSQL schema is unavailable")
+            _validate_postgres_rule_catalog(
+                connection,
+                errors,
+                schema_name,
+                expected_tables,
+            )
+        except Exception as error:
+            errors.append(
+                "PostgreSQL rule catalog could not be validated: "
+                f"{error}"
+            )
+        try:
+            if schema_name is None:
+                raise RuntimeError("current PostgreSQL schema is unavailable")
             _validate_postgres_index_catalog(connection, errors, schema_name)
         except Exception as error:
             errors.append(
@@ -1143,10 +1319,12 @@ def _validate_alembic_version_table(
     _require_supported_postgres_version(connection)
     inspector = inspect(connection)
     if connection.dialect.name == "postgresql" and schema_name is None:
-        schema_name = connection.scalar(text("SELECT current_schema()"))
+        schema_name = connection.scalar(text("SELECT pg_catalog.current_schema()"))
     schema_arguments = {"schema": schema_name} if schema_name is not None else {}
     postgres_primary_indexes: tuple[IndexSignature, ...] | None = None
     postgres_table_catalog_valid: bool | None = None
+    postgres_trigger_catalog_valid: bool | None = None
+    postgres_rule_catalog_valid: bool | None = None
     try:
         columns = inspector.get_columns("alembic_version", **schema_arguments)
         primary_key = inspector.get_pk_constraint(
@@ -1176,6 +1354,23 @@ def _validate_alembic_version_table(
                 {"alembic_version"},
             )
             postgres_table_catalog_valid = not table_catalog_errors
+            trigger_catalog_errors: list[str] = []
+            _validate_postgres_trigger_catalog(
+                connection,
+                trigger_catalog_errors,
+                schema_name,
+                {"alembic_version"},
+                {"alembic_version": 0},
+            )
+            postgres_trigger_catalog_valid = not trigger_catalog_errors
+            rule_catalog_errors: list[str] = []
+            _validate_postgres_rule_catalog(
+                connection,
+                rule_catalog_errors,
+                schema_name,
+                {"alembic_version"},
+            )
+            postgres_rule_catalog_valid = not rule_catalog_errors
             catalog_rows = connection.execute(
                 POSTGRES_INDEX_CATALOG_SQL,
                 {
@@ -1216,6 +1411,14 @@ def _validate_alembic_version_table(
         or (
             connection.dialect.name == "postgresql"
             and postgres_table_catalog_valid is not True
+        )
+        or (
+            connection.dialect.name == "postgresql"
+            and postgres_trigger_catalog_valid is not True
+        )
+        or (
+            connection.dialect.name == "postgresql"
+            and postgres_rule_catalog_valid is not True
         )
         or has_server_default
         or unique_constraints
@@ -1266,7 +1469,7 @@ def _classify_and_validate(
     _require_supported_postgres_version(connection)
     schema_name: str | None = None
     if connection.dialect.name == "postgresql":
-        schema_name = connection.scalar(text("SELECT current_schema()"))
+        schema_name = connection.scalar(text("SELECT pg_catalog.current_schema()"))
     schema_arguments = {"schema": schema_name} if schema_name is not None else {}
     tables = set(inspect(connection).get_table_names(**schema_arguments))
     if not tables:
@@ -1295,7 +1498,7 @@ def _release_postgres_migration_lock(connection: Any) -> None:
     if connection.in_transaction():
         connection.rollback()
     connection.execute(
-        text("SELECT pg_advisory_unlock(:lock_id)"),
+        text("SELECT pg_catalog.pg_advisory_unlock(:lock_id)"),
         {"lock_id": POSTGRES_MIGRATION_LOCK_ID},
     )
     connection.commit()
@@ -1308,7 +1511,7 @@ def _postgres_migration_lock(connection: Any) -> Any:
         return
 
     connection.execute(
-        text("SELECT pg_advisory_lock(:lock_id)"),
+        text("SELECT pg_catalog.pg_advisory_lock(:lock_id)"),
         {"lock_id": POSTGRES_MIGRATION_LOCK_ID},
     )
     connection.commit()
@@ -1344,6 +1547,13 @@ def run_migrations(
                     if action == "stamp":
                         command.stamp(config, BASELINE_REVISION)
                     command.upgrade(config, "head")
+                    if connection.dialect.name == "postgresql":
+                        post_action = _classify_and_validate(connection, config)
+                        if post_action != "upgrade":
+                            raise RuntimeError(
+                                "PostgreSQL post-migration validation did not reach "
+                                "the managed upgrade state"
+                            )
     finally:
         engine.dispose()
 

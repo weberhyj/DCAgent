@@ -102,16 +102,39 @@ class FingerprintNormalizationTest(unittest.TestCase):
                 "reltablespace": 0,
                 "relrowsecurity": False,
                 "relforcerowsecurity": False,
+                "access_method": "heap",
+                "has_inheritance_parent": False,
+                "has_inheritance_children": False,
             }
         ]
+        trigger_result = MagicMock()
+        trigger_result.mappings.return_value.all.return_value = []
+        rule_result = MagicMock()
+        rule_result.mappings.return_value.all.return_value = []
         table_statement = getattr(
             migration_entrypoint,
             "POSTGRES_TABLE_CATALOG_SQL",
             None,
         )
+        trigger_statement = getattr(
+            migration_entrypoint,
+            "POSTGRES_TRIGGER_CATALOG_SQL",
+            None,
+        )
+        rule_statement = getattr(
+            migration_entrypoint,
+            "POSTGRES_RULE_CATALOG_SQL",
+            None,
+        )
         connection.execute.side_effect = (
             lambda statement, parameters: (
-                table_result if statement is table_statement else index_result
+                table_result
+                if statement is table_statement
+                else trigger_result
+                if statement is trigger_statement
+                else rule_result
+                if statement is rule_statement
+                else index_result
             )
         )
         return connection, inspector
@@ -272,6 +295,11 @@ class FingerprintNormalizationTest(unittest.TestCase):
         self.assertIn(":schema_name", catalog_sql)
         self.assertNotIn("current_schema()", catalog_sql)
         self.assertNotIn("NOT index_state.indisprimary", catalog_sql)
+        self.assertIn("FROM pg_catalog.pg_index AS index_state", catalog_sql)
+        self.assertIn(
+            "LEFT JOIN pg_catalog.pg_constraint AS primary_constraint",
+            catalog_sql,
+        )
 
     def test_postgres_primary_catalog_row_requires_plain_constraint(self) -> None:
         plain = {
@@ -333,7 +361,10 @@ class FingerprintNormalizationTest(unittest.TestCase):
     def test_postgres_catalog_sql_joins_primary_constraint(self) -> None:
         catalog_sql = str(migration_entrypoint.POSTGRES_INDEX_CATALOG_SQL)
 
-        self.assertIn("LEFT JOIN pg_constraint AS primary_constraint", catalog_sql)
+        self.assertIn(
+            "LEFT JOIN pg_catalog.pg_constraint AS primary_constraint",
+            catalog_sql,
+        )
         self.assertIn("primary_constraint.contype = 'p'", catalog_sql)
         self.assertIn(
             "primary_constraint.conindid = index_state.indexrelid",
@@ -385,12 +416,20 @@ class FingerprintNormalizationTest(unittest.TestCase):
                     {"schema_name": "tenant", "table_name": "alembic_version"},
                 ),
                 call(
+                    migration_entrypoint.POSTGRES_TRIGGER_CATALOG_SQL,
+                    {"schema_name": "tenant", "table_name": "alembic_version"},
+                ),
+                call(
+                    migration_entrypoint.POSTGRES_RULE_CATALOG_SQL,
+                    {"schema_name": "tenant", "table_name": "alembic_version"},
+                ),
+                call(
                     migration_entrypoint.POSTGRES_INDEX_CATALOG_SQL,
                     {"schema_name": "tenant", "table_name": "alembic_version"},
                 ),
             ]
         )
-        self.assertEqual(2, connection.execute.call_count)
+        self.assertEqual(4, connection.execute.call_count)
 
     def test_postgres_alembic_version_rejects_deferrable_primary_catalog_row(
         self,
@@ -458,6 +497,9 @@ class FingerprintNormalizationTest(unittest.TestCase):
                 "reltablespace": 0,
                 "relrowsecurity": False,
                 "relforcerowsecurity": False,
+                "access_method": "heap",
+                "has_inheritance_parent": False,
+                "has_inheritance_children": False,
             },
         )
 
@@ -616,7 +658,10 @@ class FingerprintNormalizationTest(unittest.TestCase):
         self.assertIsNotNone(statement)
         catalog_sql = str(statement)
 
-        self.assertIn("FROM pg_constraint AS constraint_row", catalog_sql)
+        self.assertIn(
+            "FROM pg_catalog.pg_constraint AS constraint_row",
+            catalog_sql,
+        )
         self.assertIn("constraint_row.contype = 'f'", catalog_sql)
         self.assertIn("constraint_row.convalidated AS is_validated", catalog_sql)
         self.assertIn("to_jsonb(constraint_row)->>'conenforced'", catalog_sql)
@@ -690,6 +735,9 @@ class FingerprintNormalizationTest(unittest.TestCase):
             "reltablespace": 0,
             "relrowsecurity": False,
             "relforcerowsecurity": False,
+            "access_method": "heap",
+            "has_inheritance_parent": False,
+            "has_inheritance_children": False,
         }
         self.assertEqual((), normalize(plain))
 
@@ -728,6 +776,20 @@ class FingerprintNormalizationTest(unittest.TestCase):
                 if name != "relforcerowsecurity"
             },
             {**plain, "relforcerowsecurity": True},
+            {name: value for name, value in plain.items() if name != "access_method"},
+            {**plain, "access_method": "custom_heap"},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "has_inheritance_parent"
+            },
+            {**plain, "has_inheritance_parent": True},
+            {
+                name: value
+                for name, value in plain.items()
+                if name != "has_inheritance_children"
+            },
+            {**plain, "has_inheritance_children": True},
         )
         for variant in variants:
             with self.subTest(variant=variant):
@@ -741,7 +803,9 @@ class FingerprintNormalizationTest(unittest.TestCase):
         )
         self.assertIsNotNone(statement)
         catalog_sql = str(statement)
-        self.assertIn("FROM pg_class AS table_class", catalog_sql)
+        self.assertIn("FROM pg_catalog.pg_class AS table_class", catalog_sql)
+        self.assertIn("JOIN pg_catalog.pg_am AS table_access_method", catalog_sql)
+        self.assertIn("FROM pg_catalog.pg_inherits", catalog_sql)
         for field in (
             "relkind",
             "relpersistence",
@@ -750,6 +814,9 @@ class FingerprintNormalizationTest(unittest.TestCase):
             "reltablespace",
             "relrowsecurity",
             "relforcerowsecurity",
+            "access_method",
+            "has_inheritance_parent",
+            "has_inheritance_children",
         ):
             self.assertIn(field, catalog_sql)
         self.assertIn(":schema_name", catalog_sql)
@@ -775,6 +842,9 @@ class FingerprintNormalizationTest(unittest.TestCase):
                 "reltablespace": 0,
                 "relrowsecurity": False,
                 "relforcerowsecurity": False,
+                "access_method": "heap",
+                "has_inheritance_parent": False,
+                "has_inheritance_children": False,
             }
         ]
         errors: list[str] = []
@@ -787,6 +857,93 @@ class FingerprintNormalizationTest(unittest.TestCase):
         )
         connection.execute.assert_called_once_with(
             migration_entrypoint.POSTGRES_TABLE_CATALOG_SQL,
+            {"schema_name": "tenant", "table_name": "messages"},
+        )
+
+    def test_postgres_trigger_catalog_requires_enabled_internal_ri_triggers(self) -> None:
+        normalize = getattr(
+            migration_entrypoint,
+            "_normalize_postgres_trigger_catalog_row",
+            None,
+        )
+        self.assertIsNotNone(normalize)
+        plain = {
+            "trigger_name": "RI_ConstraintTrigger_a_123",
+            "enabled": "O",
+            "is_internal": True,
+            "constraint_oid": 123,
+            "constraint_name": "messages_conversation_id_fkey",
+            "constraint_type": "f",
+        }
+        self.assertEqual((), normalize(plain))
+        variants = (
+            {**plain, "enabled": "D"},
+            {**plain, "is_internal": False},
+            {**plain, "constraint_oid": 0},
+            {**plain, "constraint_name": ""},
+            {**plain, "constraint_type": "p"},
+            {name: value for name, value in plain.items() if name != "enabled"},
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual((), normalize(variant))
+
+    def test_postgres_trigger_catalog_rejects_disabled_trigger(self) -> None:
+        validate = getattr(
+            migration_entrypoint,
+            "_validate_postgres_trigger_catalog",
+            None,
+        )
+        self.assertIsNotNone(validate)
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
+        connection.execute.return_value.mappings.return_value.all.return_value = [
+            {
+                "trigger_name": "RI_ConstraintTrigger_a_123",
+                "enabled": "D",
+                "is_internal": True,
+                "constraint_oid": 123,
+                "constraint_name": "messages_conversation_id_fkey",
+                "constraint_type": "f",
+            }
+        ]
+        errors: list[str] = []
+
+        validate(connection, errors, "tenant", {"messages"}, {"messages": 1})
+
+        self.assertEqual(
+            ["PostgreSQL trigger catalog differs for table messages"],
+            errors,
+        )
+        connection.execute.assert_called_once_with(
+            migration_entrypoint.POSTGRES_TRIGGER_CATALOG_SQL,
+            {"schema_name": "tenant", "table_name": "messages"},
+        )
+
+    def test_postgres_rule_catalog_rejects_user_rule(self) -> None:
+        validate = getattr(
+            migration_entrypoint,
+            "_validate_postgres_rule_catalog",
+            None,
+        )
+        self.assertIsNotNone(validate)
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
+        connection.execute.return_value.mappings.return_value.all.return_value = [
+            {"rule_name": "messages_update_rule", "enabled": "O"}
+        ]
+        errors: list[str] = []
+
+        validate(connection, errors, "tenant", {"messages"})
+
+        self.assertEqual(
+            ["PostgreSQL rule catalog differs for table messages"],
+            errors,
+        )
+        connection.execute.assert_called_once_with(
+            migration_entrypoint.POSTGRES_RULE_CATALOG_SQL,
             {"schema_name": "tenant", "table_name": "messages"},
         )
 
@@ -936,6 +1093,10 @@ class FingerprintNormalizationTest(unittest.TestCase):
 
         self.assertEqual("upgrade", action)
         inspector.get_table_names.assert_called_once_with(schema="tenant")
+        self.assertEqual(
+            "SELECT pg_catalog.current_schema()",
+            str(connection.scalar.call_args.args[0]),
+        )
 
     def test_postgres_14_empty_classification_fails_before_inspection(self) -> None:
         connection = MagicMock()
@@ -1324,6 +1485,32 @@ class MigrationEntrypointTest(unittest.TestCase):
         )
         self.assertIn("pg_advisory_lock", events[0][1] or "")
         self.assertIn("pg_advisory_unlock", events[-2][1] or "")
+
+    def test_postgres_revalidates_after_upgrade_before_commit(self) -> None:
+        connection = MagicMock()
+        connection.dialect.name = "postgresql"
+        connection.dialect.server_version_info = (15, 8)
+        connection.in_transaction.return_value = False
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with (
+            patch("app.migration_entrypoint.create_engine", return_value=engine),
+            patch(
+                "app.migration_entrypoint._classify_and_validate",
+                side_effect=("upgrade", "upgrade"),
+            ) as classify,
+            patch("app.migration_entrypoint.command.upgrade") as upgrade,
+        ):
+            run_migrations(
+                database_url="postgresql+psycopg://db",
+                config_path=BACKEND_ROOT / "alembic.ini",
+            )
+
+        self.assertEqual(2, classify.call_count)
+        for validation_call in classify.call_args_list:
+            self.assertIs(connection, validation_call.args[0])
+        upgrade.assert_called_once()
 
     def test_missing_column_refuses_to_stamp_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
