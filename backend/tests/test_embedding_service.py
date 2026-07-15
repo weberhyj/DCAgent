@@ -278,6 +278,13 @@ class EmbeddingServiceTest(unittest.TestCase):
                 self.assertEqual(len(loader_calls), 1)
                 self.assertEqual(loader_calls[0][0], root)
                 self.assertEqual(loader_calls[0][1].sha256, checksum)
+                self.assertEqual(
+                    [purpose for _, purpose in backend.calls],
+                    ["query", "document"],
+                )
+                self.assertTrue(
+                    all(len(texts) == 1 for texts, _ in backend.calls)
+                )
                 for text in ("first", "second"):
                     response = client.post(
                         "/v1/embeddings",
@@ -286,10 +293,39 @@ class EmbeddingServiceTest(unittest.TestCase):
                     self.assertEqual(response.status_code, 200)
 
             self.assertEqual(len(loader_calls), 1)
+            self.assertEqual(
+                [purpose for _, purpose in backend.calls],
+                ["query", "document", "query", "query"],
+            )
             self.assertEqual(environ["HF_HUB_OFFLINE"], "1")
             self.assertEqual(environ["TRANSFORMERS_OFFLINE"], "1")
             self.assertEqual(environ["HF_HUB_DISABLE_TELEMETRY"], "1")
             self.assertEqual(environ["TOKENIZERS_PARALLELISM"], "false")
+
+    def test_production_startup_aborts_when_backend_dimensions_do_not_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "model"
+            root.mkdir()
+            write_metadata_manifest(root, dimensions=4)
+            checksum = compute_model_directory_sha256(root)
+            backend = FakeEmbeddingBackend(dimensions=3)
+            app = create_production_app(
+                environ={
+                    "EMBEDDING_MODEL_ROOT": str(root),
+                    "EMBEDDING_MODEL_SHA256": checksum,
+                },
+                backend_loader=lambda model_root, model_metadata: backend,
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "embedding backend startup self-test failed"
+            ):
+                with TestClient(app):
+                    pass
+
+            self.assertFalse(app.state.embedding_ready)
+            self.assertEqual(len(backend.calls), 1)
+            self.assertEqual(backend.calls[0][1], "query")
 
     def test_production_startup_fails_before_loading_on_checksum_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

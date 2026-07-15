@@ -199,7 +199,10 @@ class HttpEmbeddingClient:
 def _validate_base_url(base_url: str) -> str:
     if not isinstance(base_url, str) or not base_url.strip():
         raise ValueError("base_url must be a nonempty URL")
-    candidate = require_private_url(base_url, "EMBEDDING_SERVICE_URL")
+    candidate = base_url.strip()
+    if "?" in candidate or "#" in candidate:
+        raise ValueError("EMBEDDING_SERVICE_URL must not include a query or fragment")
+    candidate = require_private_url(candidate, "EMBEDDING_SERVICE_URL")
     parsed = urlparse(candidate)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("EMBEDDING_SERVICE_URL must use HTTP or HTTPS")
@@ -233,14 +236,23 @@ def _validate_base_url(base_url: str) -> str:
             )
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("EMBEDDING_SERVICE_URL must not include credentials")
-    if parsed.query or parsed.fragment:
-        raise ValueError("EMBEDDING_SERVICE_URL must not include a query or fragment")
+    if parsed.query or parsed.fragment or parsed.params:
+        raise ValueError(
+            "EMBEDDING_SERVICE_URL must not include a query, fragment, or parameters"
+        )
     path = parsed.path.rstrip("/")
     if path not in {"", "/v1"}:
         raise ValueError("EMBEDDING_SERVICE_URL path must be empty or /v1")
-    if path == "/v1":
-        return candidate.rstrip("/")
-    return candidate.rstrip("/") + "/v1"
+    host = parsed.hostname
+    assert host is not None  # guarded above
+    if ":" in host:
+        authority_host = f"[{host}]"
+    else:
+        authority_host = host
+    authority = authority_host
+    if parsed.port is not None:
+        authority += f":{parsed.port}"
+    return f"{parsed.scheme.lower()}://{authority}/v1"
 
 
 def _metadata_from_expectation(

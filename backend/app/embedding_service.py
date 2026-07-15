@@ -48,6 +48,7 @@ _MANIFEST_FIELDS = {
     "encodingProfileSha256",
     "protocolVersion",
 }
+_STARTUP_PROBE_TEXT = "dc-agent-embedding-startup-probe"
 
 
 class EmbeddingBackend(Protocol):
@@ -248,6 +249,32 @@ def _materialize_vectors(
     return vectors
 
 
+def _validate_embedding_backend_startup(
+    backend: EmbeddingBackend,
+    metadata: EmbeddingModelMetadata,
+) -> None:
+    """Exercise both purpose paths before advertising readiness."""
+
+    try:
+        purposes: tuple[EmbeddingPurpose, ...] = ("query", "document")
+        for purpose in purposes:
+            raw_vectors = _invoke_backend(
+                backend,
+                [_STARTUP_PROBE_TEXT],
+                purpose,
+            )
+            vectors = _materialize_vectors(raw_vectors)
+            if len(vectors) != 1:
+                raise ValueError("startup probe returned the wrong vector count")
+            EmbeddingResponse.from_metadata(
+                metadata,
+                purpose=purpose,
+                vectors=vectors,
+            )
+    except Exception:
+        raise RuntimeError("embedding backend startup self-test failed") from None
+
+
 def create_production_app(
     *,
     environ: MutableMapping[str, str] | None = None,
@@ -263,6 +290,11 @@ def create_production_app(
         model_root, metadata = _load_pinned_model_configuration(target)
         target.update(OFFLINE_EMBEDDING_ENVIRONMENT)
         backend = await run_in_threadpool(loader, model_root, metadata)
+        await run_in_threadpool(
+            _validate_embedding_backend_startup,
+            backend,
+            metadata,
+        )
         app.state.embedding_backend = backend
         app.state.embedding_metadata = metadata
         app.state.embedding_ready = True
