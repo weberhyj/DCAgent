@@ -1,0 +1,233 @@
+name: dc-agent-offline
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_DB: dc_agent
+      POSTGRES_USER: dc_agent
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - ${DATA_ROOT}/postgres:/var/lib/postgresql/data
+    networks:
+      - offline
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dc_agent -d dc_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  clickhouse:
+    image: ${CLICKHOUSE_IMAGE}
+    volumes:
+      - ${DATA_ROOT}/clickhouse:/var/lib/clickhouse
+    networks:
+      - offline
+    mem_limit: ${CLICKHOUSE_MEMORY_LIMIT}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  qdrant:
+    image: ${QDRANT_IMAGE}
+    volumes:
+      - ${DATA_ROOT}/qdrant:/qdrant/storage
+    networks:
+      - offline
+    mem_limit: ${QDRANT_MEMORY_LIMIT}
+    healthcheck:
+      test: ["CMD", "bash", "-ec", ": >/dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: ${REDIS_IMAGE}
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ${DATA_ROOT}/redis:/data
+    networks:
+      - offline
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  clamav:
+    image: ${CLAMAV_IMAGE}
+    environment:
+      CLAMAV_NO_FRESHCLAMD: "true"
+    networks:
+      - offline
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  schema-migration:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/backend.Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
+    command: ["python", "-m", "app.migration_entrypoint"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - database_url
+    networks:
+      - offline
+
+  embedding-service:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/embedding.Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
+    environment:
+      OFFLINE_MODE: "true"
+      EMBEDDING_MODEL_ROOT: /models/${EMBEDDING_MODEL_DIR}
+      EMBEDDING_MODEL_SHA256: ${EMBEDDING_MODEL_SHA256}
+    volumes:
+      - ${MODEL_ROOT}:/models:ro
+    networks:
+      - offline
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/readyz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/backend.Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
+    environment:
+      OFFLINE_MODE: "true"
+      DATABASE_URL_FILE: /run/secrets/database_url
+      CLICKHOUSE_URL: http://clickhouse:8123
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      CLAMAV_HOST: clamav
+      EMBEDDING_SERVICE_URL: http://embedding-service:8081
+      LLAMA_SERVER_URL: http://llama:8080
+      MODEL_SLOTS: ${MODEL_SLOTS}
+      LLM_PROVIDER: ${LLM_PROVIDER}
+      LLM_API_BASE: ${LLM_API_BASE}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+      RAW_DATA_ROOT: /data/raw
+      PARQUET_ROOT: /data/parquet
+      MODEL_ROOT: /models
+      DOCLING_ARTIFACTS_PATH: /models/docling
+      PADDLEOCR_HOME: /models/paddleocr
+      LIBREOFFICE_BIN: /usr/bin/libreoffice
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
+    secrets:
+      - database_url
+    volumes:
+      - ${DATA_ROOT}/raw:/data/raw
+      - ${DATA_ROOT}/parquet:/data/parquet
+      - ${MODEL_ROOT}:/models:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      schema-migration:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    networks:
+      - offline
+
+  ingestion-worker:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/worker.Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE}
+    environment:
+      OFFLINE_MODE: "true"
+      DATABASE_URL_FILE: /run/secrets/database_url
+      CLICKHOUSE_URL: http://clickhouse:8123
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      CLAMAV_HOST: clamav
+      EMBEDDING_SERVICE_URL: http://embedding-service:8081
+      RAW_DATA_ROOT: /data/raw
+      PARQUET_ROOT: /data/parquet
+      MODEL_ROOT: /models
+      DOCLING_ARTIFACTS_PATH: /models/docling
+      PADDLEOCR_HOME: /models/paddleocr
+      LIBREOFFICE_BIN: /usr/bin/libreoffice
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
+    secrets:
+      - database_url
+    volumes:
+      - ${DATA_ROOT}/raw:/data/raw
+      - ${DATA_ROOT}/parquet:/data/parquet
+      - ${MODEL_ROOT}:/models:ro
+    depends_on:
+      schema-migration:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    networks:
+      - offline
+    profiles: ["indexing"]
+
+  llama:
+    image: ${LLAMA_IMAGE}
+    command:
+      ["--model", "/models/${LLAMA_MODEL_FILE}", "--host", "0.0.0.0", "--port", "8080", "--parallel", "${MODEL_SLOTS}"]
+    volumes:
+      - ${MODEL_ROOT}:/models:ro
+    networks:
+      - offline
+    profiles: ["generation"]
+
+networks:
+  offline:
+    internal: true
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE}
+  database_url:
+    file: ${DATABASE_URL_SECRET_FILE}

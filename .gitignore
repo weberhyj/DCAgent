@@ -22,3 +22,5 @@ artifacts/wheels/
 artifacts/models/
 artifacts/benchmarks/
 deploy/offline/artifacts.lock.json
+deploy/offline/.env
+artifacts/secrets/
