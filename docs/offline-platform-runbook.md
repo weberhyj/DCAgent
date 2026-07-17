@@ -211,7 +211,13 @@ artifacts/benchmarks/64gb/
   online-warm-report.json
 ```
 
-每份报告应同时保留 manifest/profile SHA-256、硬件总内存、CPU、向量维度、模型槽位、模型/Embedding 身份、服务版本、命令退出码、错误率和 P95 指标。没有真实运行结果时，报告状态应为 `not_run` 或不存在；不要提交生成的 benchmark JSON 到 Git。
+不同报告按其职责保留适用字段，报告集合共同形成验收证据：
+
+- `compose-smoke.json`：硬件基础信息、Python/平台、component versions、命令退出码、readiness 结果、migration head，以及 Compose YAML/wrapper SHA-256。
+- `service-report.json` 与 online/batch capacity report：manifest/profile SHA-256、硬件总内存与 CPU、向量维度、模型槽位、服务版本、命令退出码，以及对应 gate 的错误率、P95 或 round-trip 指标。
+- model probe report（如本次验收包含模型选型）：候选 artifact checksum/metadata、许可证、本地路径、实际 tokenizer/context、模型服务版本和适用的并发/时延/吞吐指标。
+
+没有真实运行结果时，对应报告状态应为 `not_run` 或文件不存在；不要提交生成的 benchmark JSON 到 Git。
 
 ## 7. 本地回归与目标主机验收清单
 
