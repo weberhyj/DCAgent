@@ -153,6 +153,10 @@ py tools\ui_smoke.py
 5. 确认 DCAgent 回答只基于知识库内容，不在用户侧暴露资料原文管理入口。
 6. 回到知识库管理端，确认“Agent 执行审计”中出现本次检索、资料检查、证据对比和回答生成步骤。
 
+## 离线平台运行手册
+
+离线单机部署、依赖锁定、模型与解析器 artifact 审核、Compose profile、容量门禁以及 32GB/64GB 结果记录，统一见 [`docs/offline-platform-runbook.md`](docs/offline-platform-runbook.md)。当前开发机没有 Docker，不能在本机宣称 Compose smoke 或容量门禁通过；请在满足手册前置条件的目标 Linux 主机上执行这些门禁。
+
 ## 当前能力
 
 - 用户侧一次性知识检索问答，不展示历史会话侧栏。
