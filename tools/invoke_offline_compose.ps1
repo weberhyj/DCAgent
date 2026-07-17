@@ -276,6 +276,36 @@ function Assert-RenderedOfflineCompose {
 
     foreach ($serviceProperty in $services.PSObject.Properties) {
         $service = $serviceProperty.Value
+        $rawPorts = Get-JsonPropertyValue -Object $service -Name "ports"
+        $ports = @()
+        if ($null -ne $rawPorts) {
+            $ports = @($rawPorts)
+        }
+        if ($serviceProperty.Name -eq "api") {
+            if ($ports.Count -ne 1) {
+                throw "api must publish exactly one loopback port"
+            }
+            $port = $ports[0]
+            $hostIp = [string](Get-JsonPropertyValue -Object $port -Name "host_ip")
+            $published = [string](Get-JsonPropertyValue -Object $port -Name "published")
+            $target = [string](Get-JsonPropertyValue -Object $port -Name "target")
+            $protocol = [string](Get-JsonPropertyValue -Object $port -Name "protocol")
+            if (
+                $hostIp -cne "127.0.0.1" -or
+                $published -cne "8000" -or
+                $target -cne "8000" -or
+                $protocol -cne "tcp"
+            ) {
+                throw "api port must be 127.0.0.1:8000:8000/tcp"
+            }
+        }
+        elseif ($ports.Count -ne 0) {
+            throw "$($serviceProperty.Name) must not publish ports"
+        }
+    }
+
+    foreach ($serviceProperty in $services.PSObject.Properties) {
+        $service = $serviceProperty.Value
         $image = Get-JsonPropertyValue -Object $service -Name "image"
         if ($null -ne $image) {
             Assert-InternalDigestImage -Image ([string]$image) -Context $serviceProperty.Name

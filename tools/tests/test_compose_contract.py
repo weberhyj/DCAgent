@@ -105,6 +105,21 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn("Invoke-Expression", wrapper_text)
         self.assertNotIn("cmd /c", wrapper_text.lower())
 
+    def test_compose_wrapper_validates_rendered_api_loopback_port(self) -> None:
+        wrapper_text = (
+            REPO_ROOT / "tools" / "invoke_offline_compose.ps1"
+        ).read_text(encoding="utf-8")
+
+        for token in (
+            'Get-JsonPropertyValue -Object $service -Name "ports"',
+            'Get-JsonPropertyValue -Object $port -Name "host_ip"',
+            'Get-JsonPropertyValue -Object $port -Name "published"',
+            'Get-JsonPropertyValue -Object $port -Name "target"',
+            'Get-JsonPropertyValue -Object $port -Name "protocol"',
+            '"127.0.0.1"',
+        ):
+            self.assertIn(token, wrapper_text)
+
     def test_compose_wrapper_cleans_overrides_and_rejects_rendered_bypasses(
         self,
     ) -> None:
@@ -179,6 +194,14 @@ class ComposeContractTest(unittest.TestCase):
                     },
                     "api": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "ports": [
+                            {
+                                "host_ip": "127.0.0.1",
+                                "published": "8000",
+                                "target": 8000,
+                                "protocol": "tcp",
+                            }
+                        ],
                         "volumes": [
                             bind(data_root / "raw", "/data/raw"),
                             bind(data_root / "parquet", "/data/parquet"),
@@ -448,6 +471,31 @@ class ComposeContractTest(unittest.TestCase):
             rejected_secret = run(unsafe_secret)
             self.assertNotEqual(0, rejected_secret.returncode)
             self.assertIn("secret", (rejected_secret.stdout + rejected_secret.stderr).lower())
+
+            public_api = json.loads(json.dumps(rendered))
+            public_api["services"]["api"]["ports"][0]["host_ip"] = "0.0.0.0"
+            rejected_public_api = run(public_api)
+            self.assertNotEqual(0, rejected_public_api.returncode)
+            self.assertIn(
+                "port",
+                (rejected_public_api.stdout + rejected_public_api.stderr).lower(),
+            )
+
+            published_internal_service = json.loads(json.dumps(rendered))
+            published_internal_service["services"]["qdrant"]["ports"] = [
+                {
+                    "host_ip": "127.0.0.1",
+                    "published": "6333",
+                    "target": 6333,
+                    "protocol": "tcp",
+                }
+            ]
+            rejected_internal_port = run(published_internal_service)
+            self.assertNotEqual(0, rejected_internal_port.returncode)
+            self.assertIn(
+                "port",
+                (rejected_internal_port.stdout + rejected_internal_port.stderr).lower(),
+            )
 
     def test_compose_requires_all_interpolated_values(self) -> None:
         compose_path = REPO_ROOT / "deploy" / "offline" / "compose.yaml"
