@@ -1,0 +1,30 @@
+{
+  "clickhouse_rows": 10000,
+  "qdrant_points": 2000,
+  "vector_dimension_candidates": [32],
+  "virtual_users": 3,
+  "think_time_seconds": 1,
+  "duration_seconds": 120,
+  "request_mix": {
+    "structured": 40,
+    "document": 40,
+    "mixed": 20
+  },
+  "filter_selectivity": [0.01, 0.1, 0.5],
+  "dense_candidates": 10,
+  "sparse_candidates": 10,
+  "fused_evidence_limit": 5,
+  "context_tokens": 512,
+  "output_tokens": 64,
+  "include_sparse_vectors": true,
+  "gate_profiles": {
+    "service-round-trip": [
+      {"metric": "postgresql_round_trip_ms", "lte": 1000},
+      {"metric": "clickhouse_round_trip_ms", "lte": 1000},
+      {"metric": "qdrant_round_trip_ms", "lte": 1000},
+      {"metric": "redis_round_trip_ms", "lte": 1000},
+      {"metric": "clamav_round_trip_ms", "lte": 1000},
+      {"metric": "embedding_round_trip_ms", "lte": 5000}
+    ]
+  }
+}
