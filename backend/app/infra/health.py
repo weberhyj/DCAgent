@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import atexit
+import json
 import math
 import re
 import socket
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from ipaddress import ip_address, ip_network
 from pathlib import Path
+from threading import BoundedSemaphore, Event, Lock, Thread
+from time import monotonic
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..offline_settings import OfflineSettings, parse_bool
 
@@ -21,6 +26,7 @@ HttpClientFactory = Callable[..., Any]
 _MAX_DETAIL_LENGTH = 160
 _MAX_DEPENDENCY_TIMEOUT_SECONDS = 10.0
 _MAX_CLAMAV_RESPONSE_BYTES = 64
+_MAX_HTTP_HEALTH_BODY_BYTES = 1024
 _ALLOWED_PRIVATE_SERVICE_HOSTS = frozenset({"clamav", "localhost"})
 _PRIVATE_NETWORKS = (
     ip_network("10.0.0.0/8"),
@@ -33,6 +39,24 @@ _SENSITIVE_DETAIL_PATTERN = re.compile(
     r"\b(?:api[_-]?key|authorization|password|secret|token)\s*[:=])",
     re.IGNORECASE,
 )
+_REDIS_UNSAFE_QUERY_KEYS = frozenset(
+    {
+        "socket_timeout",
+        "socket_connect_timeout",
+        "health_check_interval",
+        "timeout",
+        "retry_on_timeout",
+        "retry_on_error",
+        "retry",
+        "max_connections",
+        "host",
+        "port",
+        "username",
+        "password",
+    }
+)
+_SHARED_EXECUTOR: ThreadPoolExecutor | None = None
+_SHARED_EXECUTOR_LOCK = Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,21 +66,89 @@ class DependencyCheck:
 
 
 class DependencyHealthRegistry:
-    def __init__(self, checks: list[DependencyCheck] | None = None) -> None:
+    def __init__(
+        self,
+        checks: list[DependencyCheck] | None = None,
+        *,
+        cache_ttl_seconds: float = 0.0,
+        max_stale_seconds: float = 0.0,
+    ) -> None:
         materialized_checks = tuple(checks or ())
         names = [item.name for item in materialized_checks]
         if len(names) != len(set(names)):
             raise ValueError("duplicate dependency check name")
         self._checks = materialized_checks
+        self._cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
+        self._max_stale_seconds = max(0.0, float(max_stale_seconds))
+        self._state_lock = Lock()
+        self._inflight = False
+        self._last_report: DependencyReport | None = None
+        self._last_report_at: float | None = None
 
     def report(self) -> DependencyReport:
-        report: DependencyReport = {}
-        for item in self._checks:
-            report[item.name] = _evaluate_check(item.check)
-        return report
+        if not self._checks:
+            return {}
+        now = monotonic()
+        with self._state_lock:
+            if (
+                self._last_report is not None
+                and self._last_report_at is not None
+                and self._cache_ttl_seconds > 0
+                and now - self._last_report_at <= self._cache_ttl_seconds
+            ):
+                return _copy_report(self._last_report)
+            if self._inflight:
+                if (
+                    self._last_report is not None
+                    and self._last_report_at is not None
+                    and self._max_stale_seconds > 0
+                    and now - self._last_report_at
+                    <= self._max_stale_seconds
+                ):
+                    return _copy_report(self._last_report)
+                return {
+                    item.name: {
+                        "ok": False,
+                        "detail": "check in progress",
+                    }
+                    for item in self._checks
+                }
+            self._inflight = True
+
+        report: DependencyReport | None = None
+        try:
+            try:
+                report = dict(
+                    _shared_dependency_executor().map(
+                        _evaluate_named_check,
+                        self._checks,
+                    )
+                )
+            except Exception:
+                report = {
+                    item.name: {"ok": False, "detail": "check failed"}
+                    for item in self._checks
+                }
+            return _copy_report(report)
+        finally:
+            with self._state_lock:
+                if report is not None:
+                    self._last_report = _copy_report(report)
+                    self._last_report_at = monotonic()
+                self._inflight = False
 
     def ready(self) -> bool:
         return all(bool(item["ok"]) for item in self.report().values())
+
+    def close(self) -> None:
+        _shutdown_shared_executor()
+
+
+def _copy_report(report: DependencyReport) -> DependencyReport:
+    return {
+        name: dict(result)
+        for name, result in report.items()
+    }
 
 
 def _evaluate_check(check: DependencyCheckCallable) -> dict[str, bool | str]:
@@ -71,6 +163,35 @@ def _evaluate_check(check: DependencyCheckCallable) -> dict[str, bool | str]:
     if type(ok) is not bool or not isinstance(detail, str):
         return {"ok": False, "detail": "invalid check result"}
     return {"ok": ok, "detail": _sanitize_detail(detail, ok=ok)}
+
+
+def _evaluate_named_check(
+    item: DependencyCheck,
+) -> tuple[str, dict[str, bool | str]]:
+    return item.name, _evaluate_check(item.check)
+
+
+def _shared_dependency_executor() -> ThreadPoolExecutor:
+    global _SHARED_EXECUTOR
+    with _SHARED_EXECUTOR_LOCK:
+        if _SHARED_EXECUTOR is None:
+            _SHARED_EXECUTOR = ThreadPoolExecutor(
+                max_workers=8,
+                thread_name_prefix="dependency-health",
+            )
+        return _SHARED_EXECUTOR
+
+
+def _shutdown_shared_executor() -> None:
+    global _SHARED_EXECUTOR
+    with _SHARED_EXECUTOR_LOCK:
+        executor = _SHARED_EXECUTOR
+        _SHARED_EXECUTOR = None
+    if executor is not None:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+atexit.register(_shutdown_shared_executor)
 
 
 def _sanitize_detail(detail: str, *, ok: bool) -> str:
@@ -90,6 +211,51 @@ def _bounded_timeout(value: float) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         return 2.0
     return min(timeout, _MAX_DEPENDENCY_TIMEOUT_SECONDS)
+
+
+def _hard_timeout_check(
+    check: DependencyCheckCallable,
+    timeout_seconds: float,
+    *,
+    dependency_name: str,
+) -> DependencyCheckCallable:
+    timeout_seconds = _bounded_timeout(timeout_seconds)
+    gate = BoundedSemaphore(value=1)
+
+    def bounded_check() -> tuple[bool, str]:
+        if not gate.acquire(blocking=False):
+            return False, "unavailable"
+
+        done = Event()
+        outcome: list[tuple[bool, str]] = []
+
+        def run_check() -> None:
+            try:
+                outcome.append(check())
+            except BaseException:
+                outcome.append((False, "check failed"))
+            finally:
+                gate.release()
+                done.set()
+
+        worker = Thread(
+            target=run_check,
+            name=f"dependency-probe-{dependency_name}",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            gate.release()
+            return False, "check failed"
+
+        if not done.wait(timeout_seconds):
+            return False, "unavailable"
+        if not outcome:
+            return False, "check failed"
+        return outcome[0]
+
+    return bounded_check
 
 
 def _root_endpoint(service_url: str, path: str) -> str:
@@ -129,6 +295,215 @@ def create_http_health_client(
     )
 
 
+def _http_response_result(
+    client: Any,
+    endpoint: str,
+    timeout_seconds: float,
+    *,
+    require_ready_json: bool,
+    expected_text: frozenset[str] | None,
+) -> tuple[bool, str]:
+    deadline = monotonic() + timeout_seconds
+    stream = getattr(client, "stream", None)
+    if callable(stream):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, "unavailable"
+        try:
+            stream_context = stream(
+                "GET",
+                endpoint,
+                headers={"accept-encoding": "identity"},
+                timeout=max(0.001, remaining),
+            )
+            enter = getattr(stream_context, "__enter__", None)
+            if callable(enter):
+                with stream_context as response:
+                    return _inspect_http_response(
+                        response,
+                        deadline,
+                        require_ready_json=require_ready_json,
+                        expected_text=expected_text,
+                    )
+            try:
+                return _inspect_http_response(
+                    stream_context,
+                    deadline,
+                    require_ready_json=require_ready_json,
+                    expected_text=expected_text,
+                )
+            finally:
+                close = getattr(stream_context, "close", None)
+                if callable(close):
+                    with suppress(Exception):
+                        close()
+        except Exception:
+            return False, "unavailable"
+
+    # Keep compatibility with injected test/dummy clients that only expose
+    # ``get``. Production clients are httpx clients and always take the
+    # bounded streaming path above.
+    try:
+        response = client.get(endpoint)
+        return _inspect_buffered_http_response(
+            response,
+            deadline,
+            require_ready_json=require_ready_json,
+            expected_text=expected_text,
+        )
+    except Exception:
+        return False, "unavailable"
+
+
+def _response_content_length(response: Any) -> int | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get("content-length")
+    if value is None:
+        return None
+    try:
+        length = int(value)
+    except (TypeError, ValueError):
+        return -1
+    return length
+
+
+def _response_uses_unsupported_encoding(response: Any) -> bool:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return False
+    value = headers.get("content-encoding")
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"", "identity"}
+
+
+def _inspect_http_response(
+    response: Any,
+    deadline: float,
+    *,
+    require_ready_json: bool,
+    expected_text: frozenset[str] | None,
+) -> tuple[bool, str]:
+    if getattr(response, "status_code", None) != 200:
+        return False, "unavailable"
+    if _response_uses_unsupported_encoding(response):
+        return False, "invalid readiness response"
+    content_length = _response_content_length(response)
+    if content_length is not None and not (
+        0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES
+    ):
+        return False, "invalid readiness response"
+    if deadline - monotonic() <= 0:
+        return False, "unavailable"
+    if expected_text is None and not require_ready_json:
+        return True, "ready"
+
+    body = bytearray()
+    raw_iterator = getattr(response, "iter_raw", None)
+    if callable(raw_iterator):
+        iterator = iter(raw_iterator())
+    else:
+        iterator = iter(response.iter_bytes())
+    while True:
+        if deadline - monotonic() <= 0:
+            return False, "unavailable"
+        try:
+            chunk = next(iterator)
+        except StopIteration:
+            break
+        if not isinstance(chunk, (bytes, bytearray)):
+            return False, "invalid readiness response"
+        if len(body) + len(chunk) > _MAX_HTTP_HEALTH_BODY_BYTES:
+            return False, "invalid readiness response"
+        body.extend(chunk)
+        if deadline - monotonic() <= 0:
+            return False, "unavailable"
+
+    if expected_text is not None:
+        try:
+            response_text = bytes(body).decode("utf-8").strip().lower()
+        except UnicodeDecodeError:
+            return False, "invalid readiness response"
+        if response_text not in expected_text:
+            return False, "invalid readiness response"
+    if require_ready_json:
+        try:
+            payload = json.loads(bytes(body).decode("utf-8"))
+        except (UnicodeDecodeError, TypeError, ValueError):
+            return False, "invalid readiness response"
+        if not isinstance(payload, dict) or payload.get("status") not in {
+            "ok",
+            "ready",
+        }:
+            return False, "not ready"
+    return True, "ready"
+
+
+def _inspect_buffered_http_response(
+    response: Any,
+    deadline: float,
+    *,
+    require_ready_json: bool,
+    expected_text: frozenset[str] | None,
+) -> tuple[bool, str]:
+    if getattr(response, "status_code", None) != 200:
+        return False, "unavailable"
+    if _response_uses_unsupported_encoding(response):
+        return False, "invalid readiness response"
+    content_length = _response_content_length(response)
+    if content_length is not None and not (
+        0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES
+    ):
+        return False, "invalid readiness response"
+    if deadline - monotonic() <= 0:
+        return False, "unavailable"
+    if expected_text is None and not require_ready_json:
+        return True, "ready"
+    raw_content = getattr(response, "content", None)
+    if raw_content is None and require_ready_json and expected_text is None:
+        if deadline - monotonic() <= 0:
+            return False, "unavailable"
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            return False, "invalid readiness response"
+        if not isinstance(payload, dict) or payload.get("status") not in {
+            "ok",
+            "ready",
+        }:
+            return False, "not ready"
+        return True, "ready"
+    if raw_content is None:
+        raw_content = str(getattr(response, "text", "")).encode("utf-8")
+    if not isinstance(raw_content, (bytes, bytearray)):
+        return False, "invalid readiness response"
+    if len(raw_content) > _MAX_HTTP_HEALTH_BODY_BYTES:
+        return False, "invalid readiness response"
+    if deadline - monotonic() <= 0:
+        return False, "unavailable"
+    body = bytes(raw_content)
+    if expected_text is not None:
+        try:
+            response_text = body.decode("utf-8").strip().lower()
+        except UnicodeDecodeError:
+            return False, "invalid readiness response"
+        if response_text not in expected_text:
+            return False, "invalid readiness response"
+    if require_ready_json:
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, TypeError, ValueError):
+            return False, "invalid readiness response"
+        if not isinstance(payload, dict) or payload.get("status") not in {
+            "ok",
+            "ready",
+        }:
+            return False, "not ready"
+    return True, "ready"
+
+
 def _http_status_check(
     service_url: str,
     path: str,
@@ -144,26 +519,20 @@ def _http_status_check(
     def check() -> tuple[bool, str]:
         if client is None:
             with _http_client(timeout_seconds, client_factory) as one_shot_client:
-                response = one_shot_client.get(endpoint)
-        else:
-            response = client.get(endpoint)
-        if response.status_code != 200:
-            return False, "unavailable"
-        if expected_text is not None:
-            response_text = str(getattr(response, "text", "")).strip().lower()
-            if response_text not in expected_text:
-                return False, "invalid readiness response"
-        if require_ready_json:
-            try:
-                payload = response.json()
-            except (TypeError, ValueError):
-                return False, "invalid readiness response"
-            if not isinstance(payload, dict) or payload.get("status") not in {
-                "ok",
-                "ready",
-            }:
-                return False, "not ready"
-        return True, "ready"
+                return _http_response_result(
+                    one_shot_client,
+                    endpoint,
+                    timeout_seconds,
+                    require_ready_json=require_ready_json,
+                    expected_text=expected_text,
+                )
+        return _http_response_result(
+            client,
+            endpoint,
+            timeout_seconds,
+            require_ready_json=require_ready_json,
+            expected_text=expected_text,
+        )
 
     return check
 
@@ -192,7 +561,7 @@ def postgres_schema_revision_check(
         expected_heads = frozenset(
             ScriptDirectory.from_config(config).get_heads()
         )
-        engine = getattr(database, "engine")
+        engine = getattr(database, "engine", database)
         with engine.connect() as connection:
             if (
                 getattr(getattr(connection, "dialect", None), "name", None)
@@ -217,6 +586,23 @@ def postgres_schema_revision_check(
         return False, "schema revision mismatch"
 
     return check
+
+
+def create_postgres_health_engine(
+    database_url: str,
+    *,
+    engine_factory: Callable[..., Any] | None = None,
+) -> Any:
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    factory = engine_factory or create_engine
+    return factory(
+        database_url,
+        future=True,
+        pool_pre_ping=False,
+        poolclass=NullPool,
+    )
 
 
 def _redis_ping_check(
@@ -261,17 +647,33 @@ def create_redis_health_client(
     client_factory: HttpClientFactory | None = None,
 ) -> Any:
     timeout_seconds = _bounded_timeout(timeout_seconds)
+    parsed_url = urlsplit(redis_url)
+    safe_query = [
+        (key, value)
+        for key, value in parse_qsl(parsed_url.query, keep_blank_values=True)
+        if key.lower() not in _REDIS_UNSAFE_QUERY_KEYS
+    ]
+    health_redis_url = urlunsplit(
+        (
+            parsed_url.scheme,
+            parsed_url.netloc,
+            parsed_url.path,
+            urlencode(safe_query, doseq=True),
+            "",
+        )
+    )
     keyword_arguments = {
         "socket_connect_timeout": timeout_seconds,
         "socket_timeout": timeout_seconds,
         "health_check_interval": 0,
+        "max_connections": 8,
     }
     if client_factory is not None:
-        return client_factory(redis_url, **keyword_arguments)
+        return client_factory(health_redis_url, **keyword_arguments)
 
     from redis import Redis
 
-    return Redis.from_url(redis_url, **keyword_arguments)
+    return Redis.from_url(health_redis_url, **keyword_arguments)
 
 
 def _clamav_ping_check(
@@ -289,14 +691,25 @@ def _clamav_ping_check(
         if not 1 <= port <= 65535:
             return False, "invalid configuration"
 
+        deadline = monotonic() + timeout_seconds
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, "unavailable"
         with socket.create_connection(
             (host, port),
-            timeout=timeout_seconds,
+            timeout=max(0.001, remaining),
         ) as connection:
-            connection.settimeout(timeout_seconds)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False, "unavailable"
+            connection.settimeout(max(0.001, remaining))
             connection.sendall(b"zPING\0")
             response = bytearray()
             while len(response) < _MAX_CLAMAV_RESPONSE_BYTES:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                connection.settimeout(max(0.001, remaining))
                 chunk = connection.recv(
                     min(16, _MAX_CLAMAV_RESPONSE_BYTES - len(response))
                 )
@@ -320,13 +733,20 @@ def _clamav_ping_check(
 
 
 def _is_private_service_host(host: str) -> bool:
+    return _is_private_or_allowed_host(host, _ALLOWED_PRIVATE_SERVICE_HOSTS)
+
+
+def _is_private_or_allowed_host(
+    host: str,
+    allowed_hosts: frozenset[str],
+) -> bool:
     candidate = host.strip().lower().rstrip(".")
     if not candidate:
         return False
     try:
         address = ip_address(candidate)
     except ValueError:
-        return candidate in _ALLOWED_PRIVATE_SERVICE_HOSTS
+        return candidate in allowed_hosts
     return address.is_loopback or any(
         address.version == network.version and address in network
         for network in _PRIVATE_NETWORKS
@@ -349,6 +769,79 @@ def _generation_enabled(environ: Mapping[str, str]) -> bool:
     )
 
 
+def validate_health_service_urls(
+    settings: OfflineSettings,
+    environ: Mapping[str, str],
+) -> None:
+    services = [
+        (
+            "DATABASE_URL",
+            settings.database_url,
+            frozenset({"postgresql", "postgresql+psycopg"}),
+            frozenset({"postgres", "localhost"}),
+        ),
+        (
+            "CLICKHOUSE_URL",
+            settings.clickhouse_url,
+            frozenset({"http", "https"}),
+            frozenset({"clickhouse", "localhost"}),
+        ),
+        (
+            "QDRANT_URL",
+            settings.qdrant_url,
+            frozenset({"http", "https"}),
+            frozenset({"qdrant", "localhost"}),
+        ),
+        (
+            "REDIS_URL",
+            settings.redis_url,
+            frozenset({"redis", "rediss"}),
+            frozenset({"redis", "localhost"}),
+        ),
+        (
+            "EMBEDDING_SERVICE_URL",
+            settings.embedding_service_url,
+            frozenset({"http", "https"}),
+            frozenset({"embedding-service", "localhost"}),
+        ),
+    ]
+    if _generation_enabled(environ):
+        services.append(
+            (
+                "LLAMA_SERVER_URL",
+                settings.llama_server_url,
+                frozenset({"http", "https"}),
+                frozenset({"llama", "localhost"}),
+            )
+        )
+
+    for field, value, allowed_schemes, allowed_hosts in services:
+        scheme = ""
+        port_valid = True
+        port: int | None = None
+        try:
+            parsed = urlsplit(value)
+            scheme = parsed.scheme.lower()
+            host = parsed.hostname or ""
+            port = parsed.port
+        except ValueError:
+            host = ""
+            port_valid = False
+        if (
+            scheme not in allowed_schemes
+            or not host
+            or not port_valid
+            or (port is not None and not 1 <= port <= 65535)
+            or (
+                settings.offline_mode
+                and not _is_private_or_allowed_host(host, allowed_hosts)
+            )
+        ):
+            raise ValueError(
+                f"{field} health endpoint must use a private or loopback host"
+            )
+
+
 def build_dependency_checks(
     settings: OfflineSettings,
     *,
@@ -358,8 +851,9 @@ def build_dependency_checks(
     redis_client: Any | None = None,
     http_client_factory: HttpClientFactory | None = None,
 ) -> list[DependencyCheck]:
+    validate_health_service_urls(settings, environ)
     timeout_seconds = _bounded_timeout(settings.dependency_timeout_seconds)
-    checks = [
+    raw_checks = [
         DependencyCheck(
             "postgresql",
             postgres_schema_revision_check(
@@ -417,7 +911,7 @@ def build_dependency_checks(
         ),
     ]
     if _generation_enabled(environ):
-        checks.append(
+        raw_checks.append(
             DependencyCheck(
                 "llama",
                 _http_status_check(
@@ -429,7 +923,17 @@ def build_dependency_checks(
                 ),
             )
         )
-    return checks
+    return [
+        DependencyCheck(
+            item.name,
+            _hard_timeout_check(
+                item.check,
+                timeout_seconds,
+                dependency_name=item.name,
+            ),
+        )
+        for item in raw_checks
+    ]
 
 
 __all__ = [
@@ -437,6 +941,8 @@ __all__ = [
     "DependencyHealthRegistry",
     "build_dependency_checks",
     "create_http_health_client",
+    "create_postgres_health_engine",
     "create_redis_health_client",
     "postgres_schema_revision_check",
+    "validate_health_service_urls",
 ]

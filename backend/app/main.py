@@ -18,7 +18,9 @@ from .infra.health import (
     DependencyHealthRegistry,
     build_dependency_checks,
     create_http_health_client,
+    create_postgres_health_engine,
     create_redis_health_client,
+    validate_health_service_urls,
 )
 from .ingestion import KnowledgeIngestionQueue
 from .llm import LLMProvider, create_llm_provider
@@ -148,6 +150,7 @@ def create_production_app(
     storage_factory: Callable[[Path], object] | None = None,
     evaluation_import_service_factory: Callable[[], object] | None = None,
     health_http_client_factory: Callable[..., object] | None = None,
+    postgres_health_engine_factory: Callable[..., object] | None = None,
     health_redis_client_factory: Callable[..., object] | None = None,
     upload_dir: Path | None = None,
 ) -> FastAPI:
@@ -172,6 +175,8 @@ def create_production_app(
                 source = environment_override
 
             settings = OfflineSettings.from_environ(source)
+            if health_registry_factory is None:
+                validate_health_service_urls(settings, source)
             provider_builder = llm_provider_factory or create_llm_provider
             llm_provider = own(provider_builder(source))
 
@@ -210,6 +215,12 @@ def create_production_app(
             evaluation_service = own(evaluation_builder())
 
             if health_registry_factory is None:
+                postgres_health_engine = own(
+                    create_postgres_health_engine(
+                        database_url,
+                        engine_factory=postgres_health_engine_factory,
+                    )
+                )
                 health_http_client = own(
                     create_http_health_client(
                         settings.dependency_timeout_seconds,
@@ -223,15 +234,25 @@ def create_production_app(
                         client_factory=health_redis_client_factory,
                     )
                 )
+                bounded_health_timeout = settings.dependency_timeout_seconds
+                if (
+                    not math.isfinite(bounded_health_timeout)
+                    or bounded_health_timeout <= 0
+                ):
+                    bounded_health_timeout = 2.0
+                bounded_health_timeout = min(bounded_health_timeout, 10.0)
                 health_registry = DependencyHealthRegistry(
                     build_dependency_checks(
                         settings,
-                        database=database,
+                        database=postgres_health_engine,
                         environ=source,
                         http_client=health_http_client,
                         redis_client=health_redis_client,
-                    )
+                    ),
+                    cache_ttl_seconds=0.5,
+                    max_stale_seconds=bounded_health_timeout + 0.5,
                 )
+                own(health_registry)
             else:
                 health_registry = health_registry_factory()
                 if not isinstance(
@@ -242,6 +263,7 @@ def create_production_app(
                         "health_registry_factory must return "
                         "DependencyHealthRegistry"
                     )
+                own(health_registry)
 
             application.state.llm_provider = llm_provider
             application.state.database = database

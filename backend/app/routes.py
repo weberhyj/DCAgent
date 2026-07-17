@@ -69,12 +69,12 @@ def get_evaluation_import_service(request: Request) -> EvaluationImportService:
 
 
 @router.get("/health")
-def health() -> dict[str, str]:
+async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @router.get("/healthz")
-def healthz() -> dict[str, str]:
+async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 

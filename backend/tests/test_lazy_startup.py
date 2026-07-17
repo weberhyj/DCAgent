@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import importlib
 import tempfile
+import time
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
+from threading import Event, Thread
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -14,6 +16,8 @@ from app.infra.health import (
     DependencyCheck,
     DependencyHealthRegistry,
     build_dependency_checks,
+    create_postgres_health_engine,
+    create_redis_health_client,
     postgres_schema_revision_check,
 )
 from app.database import Database
@@ -123,9 +127,16 @@ class LazyStartupTest(unittest.TestCase):
             health_calls += 1
             return ready, "ready" if ready else "starting"
 
-        registry = DependencyHealthRegistry(
-            [DependencyCheck("fake", dependency_check)]
-        )
+        class TrackingHealthRegistry(DependencyHealthRegistry):
+            def __init__(self) -> None:
+                super().__init__([DependencyCheck("fake", dependency_check)])
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+                super().close()
+
+        registry = TrackingHealthRegistry()
         app = module.create_production_app(
             environ=private_environment(),
             repository_factory=build_repository,
@@ -180,6 +191,7 @@ class LazyStartupTest(unittest.TestCase):
             {name: resource.close_calls for name, resource in resources.items()},
             {name: 1 for name in resources},
         )
+        self.assertEqual(registry.close_calls, 1)
 
     def test_production_lifespan_reuses_and_closes_health_clients(self) -> None:
         module = importlib.import_module("app.main")
@@ -194,11 +206,22 @@ class LazyStartupTest(unittest.TestCase):
 
         class FakeResponse:
             status_code = 200
-            text = "Ok.\n"
+            headers: dict[str, str] = {}
 
-            @staticmethod
-            def json() -> dict[str, str]:
-                return {"status": "ready"}
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def iter_bytes(self, **_kwargs: object) -> object:
+                if self.url.endswith("/ping"):
+                    yield b"Ok.\n"
+                else:
+                    yield b'{"status":"ready"}'
 
         class FakeHttpClient:
             def __init__(self) -> None:
@@ -207,7 +230,16 @@ class LazyStartupTest(unittest.TestCase):
 
             def get(self, url: str) -> FakeResponse:
                 self.get_calls.append(url)
-                return FakeResponse()
+                return FakeResponse(url)
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                **kwargs: object,
+            ) -> FakeResponse:
+                self.get_calls.append(url)
+                return FakeResponse(url)
 
             def close(self) -> None:
                 self.close_calls += 1
@@ -223,6 +255,16 @@ class LazyStartupTest(unittest.TestCase):
 
             def close(self) -> None:
                 self.close_calls += 1
+
+        class TrackingHealthEngine:
+            def __init__(self) -> None:
+                self.dispose_calls = 0
+
+            def connect(self) -> object:
+                return database.engine.connect()
+
+            def dispose(self) -> None:
+                self.dispose_calls += 1
 
         class FakeClamAVSocket:
             def __enter__(self) -> "FakeClamAVSocket":
@@ -242,8 +284,10 @@ class LazyStartupTest(unittest.TestCase):
 
         http_client = FakeHttpClient()
         redis_client = FakeRedisClient()
+        health_engine = TrackingHealthEngine()
         http_factory_calls = 0
         redis_factory_calls = 0
+        health_engine_factory_calls = 0
 
         def build_http_client(**_kwargs: object) -> FakeHttpClient:
             nonlocal http_factory_calls
@@ -258,6 +302,14 @@ class LazyStartupTest(unittest.TestCase):
             redis_factory_calls += 1
             return redis_client
 
+        def build_health_engine(
+            _url: str,
+            **_kwargs: object,
+        ) -> TrackingHealthEngine:
+            nonlocal health_engine_factory_calls
+            health_engine_factory_calls += 1
+            return health_engine
+
         try:
             app = module.create_production_app(
                 environ=private_environment(),
@@ -270,6 +322,7 @@ class LazyStartupTest(unittest.TestCase):
                 ),
                 health_http_client_factory=build_http_client,
                 health_redis_client_factory=build_redis_client,
+                postgres_health_engine_factory=build_health_engine,
             )
 
             with patch(
@@ -279,13 +332,15 @@ class LazyStartupTest(unittest.TestCase):
                 with TestClient(app) as client:
                     self.assertEqual(http_factory_calls, 1)
                     self.assertEqual(redis_factory_calls, 1)
+                    self.assertEqual(health_engine_factory_calls, 1)
                     self.assertEqual(client.get("/api/readyz").status_code, 200)
                     self.assertEqual(client.get("/api/readyz").status_code, 200)
-                    self.assertEqual(len(http_client.get_calls), 6)
-                    self.assertEqual(redis_client.ping_calls, 2)
+                    self.assertEqual(len(http_client.get_calls), 3)
+                    self.assertEqual(redis_client.ping_calls, 1)
 
             self.assertEqual(http_client.close_calls, 1)
             self.assertEqual(redis_client.close_calls, 1)
+            self.assertEqual(health_engine.dispose_calls, 1)
         finally:
             database.engine.dispose()
 
@@ -466,14 +521,220 @@ class LazyStartupTest(unittest.TestCase):
                 parsed = make_url(url)
                 self.assertEqual(parsed.query["connect_timeout"], "2")
 
+    def test_redis_health_client_strips_timeout_overrides_from_url(self) -> None:
+        captured: dict[str, object] = {}
+        sentinel = object()
+
+        def factory(url: str, **kwargs: object) -> object:
+            captured["url"] = url
+            captured.update(kwargs)
+            return sentinel
+
+        client = create_redis_health_client(
+            "rediss://health:secret@127.0.0.1/4"
+            "?ssl_cert_reqs=required"
+            "&client_name=readiness"
+            "&db=4"
+            "&socket_connect_timeout=999999"
+            "&Socket_Timeout=999999"
+            "&health_check_interval=999999"
+            "&Retry_On_Timeout=true"
+            "&retry_on_error=TimeoutError"
+            "&TIMEOUT=999999"
+            "&max_connections=999999"
+            "&PoRt=80"
+            "#fragment",
+            2.0,
+            client_factory=factory,
+        )
+
+        self.assertIs(client, sentinel)
+        self.assertEqual(
+            captured["url"],
+            "rediss://health:secret@127.0.0.1/4"
+            "?ssl_cert_reqs=required&client_name=readiness&db=4",
+        )
+        self.assertEqual(captured["socket_connect_timeout"], 2.0)
+        self.assertEqual(captured["socket_timeout"], 2.0)
+        self.assertEqual(captured["health_check_interval"], 0)
+        self.assertEqual(captured["max_connections"], 8)
+
+    def test_redis_ping_hard_timeout_single_flights_stuck_client(self) -> None:
+        started = Event()
+        release = Event()
+        finished = Event()
+
+        class FakeRedisClient:
+            def __init__(self) -> None:
+                self.ping_calls = 0
+
+            def ping(self) -> bool:
+                self.ping_calls += 1
+                started.set()
+                if self.ping_calls == 1:
+                    release.wait()
+                    finished.set()
+                return True
+
+        client = FakeRedisClient()
+        environ = private_environment(DEPENDENCY_TIMEOUT_SECONDS="0.05")
+        checks = build_dependency_checks(
+            build_settings(environ),
+            database=object(),
+            environ=environ,
+            redis_client=client,
+        )
+        redis_check = next(
+            check for check in checks if check.name == "redis"
+        )
+
+        started_at = time.monotonic()
+        try:
+            self.assertEqual(redis_check.check(), (False, "unavailable"))
+            self.assertTrue(started.wait(timeout=0.2))
+            self.assertLess(time.monotonic() - started_at, 0.2)
+
+            follower_results: list[tuple[bool, str]] = []
+            follower_done = Event()
+
+            def follow_stuck_ping() -> None:
+                follower_results.append(redis_check.check())
+                follower_done.set()
+
+            follower = Thread(target=follow_stuck_ping)
+            follower.start()
+            self.assertTrue(follower_done.wait(timeout=0.2))
+            follower.join(timeout=0.2)
+            self.assertEqual(follower_results, [(False, "unavailable")])
+            self.assertEqual(client.ping_calls, 1)
+        finally:
+            release.set()
+
+        self.assertTrue(finished.wait(timeout=0.5))
+        retry_deadline = time.monotonic() + 0.5
+        retry_result = (False, "unavailable")
+        while time.monotonic() < retry_deadline:
+            retry_result = redis_check.check()
+            if retry_result == (True, "ready"):
+                break
+        self.assertEqual(retry_result, (True, "ready"))
+        self.assertEqual(client.ping_calls, 2)
+
+    def test_health_urls_allow_omitted_ports_but_reject_zero(self) -> None:
+        environ = private_environment(
+            DATABASE_URL="postgresql+psycopg://dc_agent:secret@postgres/dc_agent",
+            CLICKHOUSE_URL="https://localhost",
+            QDRANT_URL="http://qdrant",
+            REDIS_URL="redis://redis/0",
+            EMBEDDING_SERVICE_URL="http://embedding-service",
+        )
+
+        checks = build_dependency_checks(
+            build_settings(environ),
+            database=object(),
+            environ=environ,
+        )
+        self.assertEqual(
+            {check.name for check in checks},
+            {"postgresql", "clickhouse", "qdrant", "redis", "clamav", "embedding"},
+        )
+
+        invalid = private_environment(QDRANT_URL="http://127.0.0.1:0")
+        with self.assertRaisesRegex(ValueError, "private or loopback"):
+            build_dependency_checks(
+                build_settings(invalid),
+                database=object(),
+                environ=invalid,
+            )
+
+    def test_postgres_health_engine_uses_nullpool(self) -> None:
+        captured: dict[str, object] = {}
+        sentinel = object()
+
+        def factory(url: str, **kwargs: object) -> object:
+            captured["url"] = url
+            captured.update(kwargs)
+            return sentinel
+
+        engine = create_postgres_health_engine(
+            "postgresql+psycopg://dc_agent:secret@127.0.0.1/dc_agent"
+            "?connect_timeout=2",
+            engine_factory=factory,
+        )
+
+        self.assertIs(engine, sentinel)
+        self.assertEqual(
+            getattr(captured["poolclass"], "__name__", ""),
+            "NullPool",
+        )
+        self.assertIs(captured["pool_pre_ping"], False)
+
+    def test_health_urls_reject_link_local_and_unspecified_before_client_creation(
+        self,
+    ) -> None:
+        module = importlib.import_module("app.main")
+        cases = (
+            {"CLICKHOUSE_URL": "http://169.254.169.254:8123"},
+            {"QDRANT_URL": "http://0.0.0.0:6333"},
+            {"REDIS_URL": "redis://169.254.169.254:6379/0"},
+            {"EMBEDDING_SERVICE_URL": "http://0.0.0.0:8081"},
+            {"QDRANT_URL": "http://attacker:6333"},
+            {
+                "DATABASE_URL": (
+                    "postgresql+psycopg://dc_agent:secret@"
+                    "169.254.169.254:5432/dc_agent"
+                )
+            },
+            {
+                "LLAMA_SERVER_URL": "http://169.254.169.254:8080",
+                "LLM_PROVIDER": "openai_compatible",
+            },
+        )
+
+        for changes in cases:
+            with self.subTest(changes=changes):
+                calls = {"http": 0, "redis": 0}
+
+                def build_http(**_kwargs: object) -> object:
+                    calls["http"] += 1
+                    return ClosableFake("http")
+
+                def build_redis(_url: str, **_kwargs: object) -> object:
+                    calls["redis"] += 1
+                    return ClosableFake("redis")
+
+                app = module.create_production_app(
+                    environ=private_environment(**changes),
+                    repository_factory=lambda: ClosableFake("repository"),
+                    ingestion_queue_factory=lambda _repository: ClosableFake(
+                        "queue"
+                    ),
+                    storage_factory=lambda _root: ClosableFake("storage"),
+                    evaluation_import_service_factory=lambda: ClosableFake(
+                        "evaluation"
+                    ),
+                    health_http_client_factory=build_http,
+                    health_redis_client_factory=build_redis,
+                )
+
+                with self.assertRaisesRegex(ValueError, "private or loopback"):
+                    with TestClient(app):
+                        pass
+                self.assertEqual(calls, {"http": 0, "redis": 0})
+
     def test_embedding_readiness_uses_service_root_readyz(self) -> None:
         class FakeResponse:
             status_code = 200
-            text = "Ok.\n"
+            headers: dict[str, str] = {}
 
-            @staticmethod
-            def json() -> dict[str, str]:
-                return {"status": "ready"}
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def iter_bytes(self, **_kwargs: object) -> object:
+                yield b'{"status":"ready"}'
 
         class FakeHttpClient:
             def __init__(self) -> None:
@@ -486,6 +747,15 @@ class LazyStartupTest(unittest.TestCase):
                 return None
 
             def get(self, url: str) -> FakeResponse:
+                self.urls.append(url)
+                return FakeResponse()
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                **kwargs: object,
+            ) -> FakeResponse:
                 self.urls.append(url)
                 return FakeResponse()
 
@@ -573,6 +843,285 @@ class LazyStartupTest(unittest.TestCase):
             (False, "invalid readiness response"),
         )
 
+    def test_http_health_rejects_oversized_content_length_without_reading(
+        self,
+    ) -> None:
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-length": "4097"}
+
+            def __init__(self) -> None:
+                self.iterated = False
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            @staticmethod
+            def json() -> dict[str, str]:
+                return {"status": "ready"}
+
+            def iter_bytes(self) -> object:
+                self.iterated = True
+                yield b'{"status":"ready"}'
+
+        class FakeHttpClient:
+            def __init__(self, response: FakeResponse) -> None:
+                self.response = response
+                self.stream_calls = 0
+
+            def get(self, url: str) -> FakeResponse:
+                return self.response
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                **kwargs: object,
+            ) -> FakeResponse:
+                self.stream_calls += 1
+                return self.response
+
+        response = FakeResponse()
+        client = FakeHttpClient(response)
+        checks = build_dependency_checks(
+            build_settings(),
+            database=object(),
+            environ=private_environment(),
+            http_client=client,
+        )
+        embedding_check = next(
+            check for check in checks if check.name == "embedding"
+        )
+
+        self.assertEqual(
+            embedding_check.check(),
+            (False, "invalid readiness response"),
+        )
+        self.assertEqual(client.stream_calls, 1)
+        self.assertFalse(response.iterated)
+
+    def test_http_health_stream_stops_when_body_limit_is_exceeded(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self) -> None:
+                self.chunks_read = 0
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            @staticmethod
+            def json() -> dict[str, str]:
+                return {"status": "ready"}
+
+            def iter_bytes(self) -> object:
+                for chunk in (b"x" * 700, b"y" * 700, b"z" * 700):
+                    self.chunks_read += 1
+                    yield chunk
+
+        class FakeHttpClient:
+            def __init__(self, response: FakeResponse) -> None:
+                self.response = response
+
+            def get(self, url: str) -> FakeResponse:
+                return self.response
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                **kwargs: object,
+            ) -> FakeResponse:
+                return self.response
+
+        response = FakeResponse()
+        checks = build_dependency_checks(
+            build_settings(),
+            database=object(),
+            environ=private_environment(),
+            http_client=FakeHttpClient(response),
+        )
+        embedding_check = next(
+            check for check in checks if check.name == "embedding"
+        )
+
+        self.assertEqual(
+            embedding_check.check(),
+            (False, "invalid readiness response"),
+        )
+        self.assertEqual(response.chunks_read, 2)
+
+    def test_http_health_rejects_encoded_body_without_decompressing(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-encoding": "gzip"}
+
+            def __init__(self) -> None:
+                self.iterated = False
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            @staticmethod
+            def json() -> dict[str, str]:
+                return {"status": "ready"}
+
+            def iter_bytes(self, **_kwargs: object) -> object:
+                self.iterated = True
+                yield b'{"status":"ready"}'
+
+        class FakeHttpClient:
+            def __init__(self, response: FakeResponse) -> None:
+                self.response = response
+
+            def get(self, url: str) -> FakeResponse:
+                return self.response
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                **kwargs: object,
+            ) -> FakeResponse:
+                return self.response
+
+        response = FakeResponse()
+        checks = build_dependency_checks(
+            build_settings(),
+            database=object(),
+            environ=private_environment(),
+            http_client=FakeHttpClient(response),
+        )
+        embedding_check = next(
+            check for check in checks if check.name == "embedding"
+        )
+
+        self.assertEqual(
+            embedding_check.check(),
+            (False, "invalid readiness response"),
+        )
+        self.assertFalse(response.iterated)
+
+    def test_http_health_reads_unbuffered_raw_chunks(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self) -> None:
+                self.raw_calls = 0
+                self.decoded_calls = 0
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def iter_raw(self) -> object:
+                self.raw_calls += 1
+                yield b'{"status":"ready"}'
+
+            def iter_bytes(self, **_kwargs: object) -> object:
+                self.decoded_calls += 1
+                yield b'{"status":"ready"}'
+
+        class FakeHttpClient:
+            def __init__(self, response: FakeResponse) -> None:
+                self.response = response
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                **kwargs: object,
+            ) -> FakeResponse:
+                return self.response
+
+        response = FakeResponse()
+        checks = build_dependency_checks(
+            build_settings(),
+            database=object(),
+            environ=private_environment(),
+            http_client=FakeHttpClient(response),
+        )
+        embedding_check = next(
+            check for check in checks if check.name == "embedding"
+        )
+
+        self.assertEqual(embedding_check.check(), (True, "ready"))
+        self.assertEqual(response.raw_calls, 1)
+        self.assertEqual(response.decoded_calls, 0)
+
+    def test_http_health_stream_uses_one_total_deadline(self) -> None:
+        clock = [0.0]
+
+        class FakeResponse:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            @staticmethod
+            def json() -> dict[str, str]:
+                return {"status": "ready"}
+
+            def iter_bytes(self) -> object:
+                yield b'{"status":'
+                clock[0] = 1.1
+                yield b'"ready"}'
+
+        class FakeHttpClient:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def get(self, url: str) -> FakeResponse:
+                return FakeResponse()
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                **kwargs: object,
+            ) -> FakeResponse:
+                self.timeouts.append(float(kwargs["timeout"]))
+                return FakeResponse()
+
+        client = FakeHttpClient()
+        environ = private_environment(DEPENDENCY_TIMEOUT_SECONDS="1.0")
+        checks = build_dependency_checks(
+            build_settings(environ),
+            database=object(),
+            environ=environ,
+            http_client=client,
+        )
+        embedding_check = next(
+            check for check in checks if check.name == "embedding"
+        )
+
+        with patch(
+            "app.infra.health.monotonic",
+            side_effect=lambda: clock[0],
+        ):
+            self.assertEqual(
+                embedding_check.check(),
+                (False, "unavailable"),
+            )
+        self.assertEqual(client.timeouts, [1.0])
+
     def test_public_clamav_host_is_rejected_without_a_socket_call(self) -> None:
         environ = private_environment(CLAMAV_HOST="8.8.8.8")
         checks = build_dependency_checks(
@@ -646,6 +1195,57 @@ class LazyStartupTest(unittest.TestCase):
         ):
             self.assertEqual(clamav_check.check(), (True, "ready"))
         self.assertEqual(fake_socket.recv_calls, 3)
+
+    def test_clamav_ping_enforces_one_total_socket_deadline(self) -> None:
+        class SlowDripSocket:
+            def __init__(self) -> None:
+                self.recv_calls = 0
+
+            def __enter__(self) -> "SlowDripSocket":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def settimeout(self, timeout: float) -> None:
+                return None
+
+            def sendall(self, payload: bytes) -> None:
+                return None
+
+            def recv(self, size: int) -> bytes:
+                self.recv_calls += 1
+                return b"P"
+
+        fake_socket = SlowDripSocket()
+        environ = private_environment(
+            CLAMAV_HOST="clamav",
+            DEPENDENCY_TIMEOUT_SECONDS="1.0",
+        )
+        checks = build_dependency_checks(
+            build_settings(environ),
+            database=object(),
+            environ=environ,
+        )
+        clamav_check = next(check for check in checks if check.name == "clamav")
+
+        with (
+            patch(
+                "app.infra.health.socket.create_connection",
+                return_value=fake_socket,
+            ) as create_connection,
+            patch(
+                "app.infra.health.monotonic",
+                side_effect=(0.0, 0.2, 0.4, 0.6, 1.1),
+                create=True,
+            ),
+        ):
+            self.assertEqual(clamav_check.check(), (False, "unavailable"))
+        create_connection.assert_called_once_with(
+            ("clamav", 3310),
+            timeout=0.8,
+        )
+        self.assertEqual(fake_socket.recv_calls, 1)
 
 
 if __name__ == "__main__":
