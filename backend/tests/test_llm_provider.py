@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import httpx
 
+from app import llm as llm_module
 from app.llm import (
     NO_EVIDENCE_REPLY,
     RAG_SYSTEM_PROMPT,
@@ -134,8 +135,16 @@ class RecordingHttpClient:
 
 
 class FakePhysocResponse:
-    def __init__(self, lines: list[str]) -> None:
+    def __init__(
+        self,
+        lines: list[str],
+        *,
+        status_error: httpx.HTTPError | None = None,
+        line_error: httpx.HTTPError | None = None,
+    ) -> None:
         self.lines = lines
+        self.status_error = status_error
+        self.line_error = line_error
         self.status_checked = False
         self.exit_count = 0
 
@@ -148,8 +157,12 @@ class FakePhysocResponse:
 
     def raise_for_status(self) -> None:
         self.status_checked = True
+        if self.status_error is not None:
+            raise self.status_error
 
     def iter_lines(self):
+        if self.line_error is not None:
+            raise self.line_error
         return iter(self.lines)
 
 
@@ -492,6 +505,96 @@ class LLMProviderTest(unittest.TestCase):
                 self.assertEqual(response.exit_count, 1)
                 self.assertEqual(client.exit_count, 1)
 
+    def test_physoc_provider_wraps_timeout_as_safe_error_and_closes_resources(self) -> None:
+        response = FakePhysocResponse(
+            [],
+            line_error=httpx.ReadTimeout(
+                "secret payload from http://127.0.0.1:11434/private-stream"
+            ),
+        )
+        client = RecordingPhysocClient(response)
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434",
+            stream_path="/private-stream",
+            model="deepseek-r1",
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client):
+            with self.assertRaises(LLMProviderError) as error:
+                provider.generate_reply(
+                    LLMRequest(
+                        content="请分析现金流风险",
+                        mode="source",
+                        knowledge_hits=[indexed_hit()],
+                    )
+                )
+
+        message = str(error.exception)
+        self.assertIn("大模型响应超时", message)
+        for sensitive in ("http://127.0.0.1:11434/private-stream", "secret", "payload"):
+            self.assertNotIn(sensitive, message)
+        self.assertEqual(response.exit_count, 1)
+        self.assertEqual(client.exit_count, 1)
+
+    def test_physoc_provider_wraps_http_status_as_safe_error_and_closes_resources(self) -> None:
+        upstream_url = "http://127.0.0.1:11434/private-stream?secret=payload"
+        status_error = httpx.HTTPStatusError(
+            f"secret payload rejected by {upstream_url}",
+            request=httpx.Request("POST", upstream_url),
+            response=httpx.Response(503),
+        )
+        response = FakePhysocResponse([], status_error=status_error)
+        client = RecordingPhysocClient(response)
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434",
+            stream_path="/private-stream",
+            model="deepseek-r1",
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client):
+            with self.assertRaises(LLMProviderError) as error:
+                provider.generate_reply(
+                    LLMRequest(
+                        content="请分析现金流风险",
+                        mode="source",
+                        knowledge_hits=[indexed_hit()],
+                    )
+                )
+
+        message = str(error.exception)
+        self.assertIn("大模型服务暂时不可用", message)
+        for sensitive in (upstream_url, "secret", "payload"):
+            self.assertNotIn(sensitive, message)
+        self.assertEqual(response.exit_count, 1)
+        self.assertEqual(client.exit_count, 1)
+
+    def test_physoc_provider_wraps_malformed_stream_as_safe_error_and_closes_resources(self) -> None:
+        sensitive_payload = "secret payload from http://127.0.0.1:11434/private-stream"
+        response = FakePhysocResponse([f"data: {sensitive_payload}", ""])
+        client = RecordingPhysocClient(response)
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434",
+            stream_path="/private-stream",
+            model="deepseek-r1",
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client):
+            with self.assertRaises(LLMProviderError) as error:
+                provider.generate_reply(
+                    LLMRequest(
+                        content="请分析现金流风险",
+                        mode="source",
+                        knowledge_hits=[indexed_hit()],
+                    )
+                )
+
+        message = str(error.exception)
+        self.assertIn("大模型返回格式异常", message)
+        for sensitive in ("http://127.0.0.1:11434/private-stream", "secret", "payload"):
+            self.assertNotIn(sensitive, message)
+        self.assertEqual(response.exit_count, 1)
+        self.assertEqual(client.exit_count, 1)
+
     def test_repository_delegates_assistant_reply_to_injected_llm_provider(self) -> None:
         provider = RecordingLLMProvider()
         repository = InMemoryChatRepository(build_seed_state(), llm_provider=provider)
@@ -585,6 +688,120 @@ class LLMProviderTest(unittest.TestCase):
         )
 
         self.assertIsInstance(provider, OpenAICompatibleLLMProvider)
+
+    def test_physoc_stream_path_validator_accepts_single_slash_absolute_path(self) -> None:
+        self.assertEqual(
+            llm_module._validate_physoc_stream_path("  /api/physoc/custom/stream  "),
+            "/api/physoc/custom/stream",
+        )
+
+    def test_physoc_stream_path_validator_rejects_unsafe_paths(self) -> None:
+        invalid_paths = (
+            "",
+            "api/physoc/stream",
+            "//127.0.0.1/api/physoc/stream",
+            "https://127.0.0.1/api/physoc/stream",
+            "/api/physoc/stream?secret=payload",
+            "/api/physoc/stream#fragment",
+        )
+
+        for path in invalid_paths:
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, "LLM_STREAM_PATH"):
+                    llm_module._validate_physoc_stream_path(path)
+
+    def test_llm_provider_factory_creates_physoc_without_api_key_using_default_path(self) -> None:
+        provider = create_llm_provider(
+            {
+                "LLM_PROVIDER": "physoc_deepseek",
+                "LLM_API_BASE": "http://127.0.0.1:11434/",
+                "LLM_MODEL": "deepseek-r1",
+            }
+        )
+
+        self.assertIsInstance(provider, PhysocDeepSeekLLMProvider)
+        self.assertEqual(
+            llm_module.DEFAULT_PHYSOC_STREAM_PATH,
+            "/api/physoc/deepseek/stream",
+        )
+        self.assertEqual(provider.api_base, "http://127.0.0.1:11434")
+        self.assertEqual(provider.stream_path, llm_module.DEFAULT_PHYSOC_STREAM_PATH)
+        self.assertEqual(
+            provider.stream_url,
+            "http://127.0.0.1:11434/api/physoc/deepseek/stream",
+        )
+        self.assertEqual(provider.model, "deepseek-r1")
+
+    def test_llm_provider_factory_accepts_custom_physoc_stream_path(self) -> None:
+        provider = create_llm_provider(
+            {
+                "LLM_PROVIDER": "physoc_deepseek",
+                "LLM_API_BASE": "http://10.0.0.8:8080/root/",
+                "LLM_API_KEY": "ignored-secret",
+                "LLM_MODEL": "deepseek-r1",
+                "LLM_STREAM_PATH": "  /custom/stream  ",
+            }
+        )
+
+        self.assertIsInstance(provider, PhysocDeepSeekLLMProvider)
+        self.assertEqual(provider.stream_path, "/custom/stream")
+        self.assertEqual(provider.stream_url, "http://10.0.0.8:8080/root/custom/stream")
+
+    def test_llm_provider_factory_requires_physoc_base_and_model(self) -> None:
+        missing_values = (
+            (
+                {
+                    "LLM_PROVIDER": "physoc_deepseek",
+                    "LLM_MODEL": "deepseek-r1",
+                },
+                "LLM_API_BASE is required",
+            ),
+            (
+                {
+                    "LLM_PROVIDER": "physoc_deepseek",
+                    "LLM_API_BASE": "http://127.0.0.1:11434",
+                },
+                "LLM_MODEL is required",
+            ),
+        )
+
+        for environ, expected_error in missing_values:
+            with self.subTest(expected_error=expected_error):
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    create_llm_provider(environ)
+
+    def test_llm_provider_factory_always_rejects_public_physoc_base(self) -> None:
+        with self.assertRaisesRegex(ValueError, "private or loopback"):
+            create_llm_provider(
+                {
+                    "OFFLINE_MODE": "false",
+                    "LLM_PROVIDER": "physoc_deepseek",
+                    "LLM_API_BASE": "https://api.example.com/v1",
+                    "LLM_MODEL": "deepseek-r1",
+                }
+            )
+
+    def test_llm_provider_factory_rejects_invalid_physoc_stream_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "LLM_STREAM_PATH"):
+            create_llm_provider(
+                {
+                    "LLM_PROVIDER": "physoc_deepseek",
+                    "LLM_API_BASE": "http://127.0.0.1:11434",
+                    "LLM_MODEL": "deepseek-r1",
+                    "LLM_STREAM_PATH": "https://evil.example/stream",
+                }
+            )
+
+    def test_llm_provider_factory_normalizes_hyphenated_physoc_provider_name(self) -> None:
+        provider = create_llm_provider(
+            {
+                "LLM_PROVIDER": "physoc-deepseek",
+                "LLM_API_BASE": "http://[::1]:11434",
+                "LLM_MODEL": "deepseek-r1",
+            }
+        )
+
+        self.assertIsInstance(provider, PhysocDeepSeekLLMProvider)
 
     def test_llm_provider_factory_defaults_to_offline_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "private or loopback"):

@@ -4,6 +4,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -29,6 +30,8 @@ RAG_SYSTEM_PROMPT = (
     "回答必须使用纯文本，不要使用 Markdown 或 HTML，不要输出标题、列表符号、加粗、斜体、代码围栏或链接语法。"
     "不要在回答中输出 [1]、[2] 等引用编号，也不要输出资料来源名称。"
 )
+
+DEFAULT_PHYSOC_STREAM_PATH = "/api/physoc/deepseek/stream"
 
 
 @dataclass(slots=True)
@@ -178,6 +181,24 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
         )
 
 
+def _validate_physoc_stream_path(path: str) -> str:
+    candidate = path.strip()
+    parsed = urlsplit(candidate)
+    if (
+        not candidate
+        or not candidate.startswith("/")
+        or candidate.startswith("//")
+        or parsed.scheme
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or "?" in candidate
+        or "#" in candidate
+    ):
+        raise ValueError("LLM_STREAM_PATH must be an absolute path without a URL, query, or fragment")
+    return candidate
+
+
 def create_llm_provider(environ: Mapping[str, str] | None = None) -> LLMProvider:
     source = os.environ if environ is None else environ
     provider = source.get("LLM_PROVIDER", "template").strip().lower().replace("-", "_")
@@ -196,6 +217,22 @@ def create_llm_provider(environ: Mapping[str, str] | None = None) -> LLMProvider
         if parse_bool(source.get("OFFLINE_MODE"), default=True):
             api_base = require_private_url(api_base, "LLM_API_BASE")
         return OpenAICompatibleLLMProvider(api_base=api_base, api_key=api_key, model=model)
+    if provider == "physoc_deepseek":
+        api_base = source.get("LLM_API_BASE", "").strip()
+        model = source.get("LLM_MODEL", "").strip()
+        if not api_base:
+            raise ValueError("LLM_API_BASE is required")
+        if not model:
+            raise ValueError("LLM_MODEL is required")
+        stream_path = _validate_physoc_stream_path(
+            source.get("LLM_STREAM_PATH", DEFAULT_PHYSOC_STREAM_PATH)
+        )
+        require_private_url(api_base.rstrip("/") + stream_path, "LLM_API_BASE")
+        return PhysocDeepSeekLLMProvider(
+            api_base=api_base,
+            stream_path=stream_path,
+            model=model,
+        )
     raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
 
 
