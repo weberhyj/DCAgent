@@ -30,13 +30,13 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 
 ## Current development gates
 
-`backend/uv.lock` is the only dependency lock. From the repository root, resolve it for Python 3.12, then verify both offline groups only against the reviewed wheelhouse:
+`backend/uv.lock` is the only backend Python/uv dependency lock. Python 3.12 must be preinstalled on the target host; uv is forbidden from downloading or installing Python. From the repository root, resolve the lock, then verify both offline groups only against the reviewed wheelhouse:
 
 ```powershell
-uv lock --project backend --python 3.12
 $env:UV_PYTHON_DOWNLOADS = "never"
-uv sync --project backend --frozen --group offline --no-dev --no-index --find-links artifacts/wheels
-uv sync --project backend --frozen --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
+uv lock --project backend --python 3.12
+uv sync --project backend --frozen --offline --group offline --no-dev --no-index --find-links artifacts/wheels
+uv sync --project backend --frozen --offline --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
 ```
 
 The wheelhouse must contain all wheels and other artifacts required by `backend/uv.lock` for the target Linux platform and Python 3.12, together with approved checksum evidence. Offline hosts must set `UV_PYTHON_DOWNLOADS=never`; neither sync command may fall back to a public package index.

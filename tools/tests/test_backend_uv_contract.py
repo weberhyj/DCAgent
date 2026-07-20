@@ -13,6 +13,18 @@ class BackendUvContractTest(unittest.TestCase):
         without_powershell_continuations = re.sub(r"`[ \t]*\r?\n[ \t]*", " ", text)
         return re.sub(r"\s+", " ", without_powershell_continuations).strip()
 
+    def powershell_blocks(self, text: str) -> list[str]:
+        return re.findall(r"```powershell[ \t]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+
+    def powershell_block_containing(self, text: str, command: str) -> str:
+        matches = [
+            block
+            for block in self.powershell_blocks(text)
+            if command in self.normalize_command_text(block)
+        ]
+        self.assertEqual(len(matches), 1, f"Expected one PowerShell block containing: {command}")
+        return matches[0]
+
     def assert_exact_requirements(self, requirements: list[object], expected: set[str]) -> None:
         self.assertTrue(all(isinstance(requirement, str) for requirement in requirements))
         self.assertEqual(len(requirements), len(expected))
@@ -253,7 +265,10 @@ class BackendUvContractTest(unittest.TestCase):
         )
         forbidden_workflow_patterns = {
             "hashed requirements": r"\bhashed\s+requirements\b",
-            "pip installer": r"\b(?:pip3?\s+install|python\s+-m\s+pip\s+install)\b",
+            "pip installer": (
+                r"\b(?:(?:py(?:\.exe)?|python(?:3(?:\.\d+)*)?(?:\.exe)?)\s+-m\s+"
+                r"pip(?:\.exe)?|pip(?:3(?:\.\d+)*)?(?:\.exe)?|uv\s+pip)\s+install\b"
+            ),
             "pip-compile": r"\bpip-compile\b",
             "pip-tools": r"\bpip-tools\b",
         }
@@ -274,17 +289,31 @@ class BackendUvContractTest(unittest.TestCase):
         normalized = self.normalize_command_text(text)
 
         sync_command = "uv sync --project backend --group dev"
-        run_command = (
+        server_command = (
             "uv run --project . --group dev python -m uvicorn app.main:app "
             "--host 127.0.0.1 --port 8000"
         )
-        sync_index = normalized.index(sync_command)
-        backend_index = normalized.index("Set-Location backend", sync_index)
-        run_index = normalized.index(run_command, backend_index)
-        repository_index = normalized.index("Set-Location ..", run_index)
+        startup_block = self.powershell_block_containing(text, server_command)
+        normalized_startup = self.normalize_command_text(startup_block)
+        sync_index = normalized_startup.index(sync_command)
+        backend_index = normalized_startup.index("Set-Location backend", sync_index)
+        run_index = normalized_startup.index(server_command, backend_index)
+        repository_index = normalized_startup.index("Set-Location ..", run_index)
         self.assertLess(sync_index, backend_index)
         self.assertLess(backend_index, run_index)
         self.assertLess(run_index, repository_index)
+
+        test_command = (
+            "uv run --project . --group dev python -m unittest discover "
+            '-s tests -p "test_*.py" -v'
+        )
+        test_block = self.powershell_block_containing(text, test_command)
+        normalized_test = self.normalize_command_text(test_block)
+        backend_index = normalized_test.index("Set-Location backend")
+        test_index = normalized_test.index(test_command, backend_index)
+        repository_index = normalized_test.index("Set-Location ..", test_index)
+        self.assertLess(backend_index, test_index)
+        self.assertLess(test_index, repository_index)
         self.assertIn("uv run --project backend --group dev ruff check backend", normalized)
         self.assertIn("uv run --project backend --group dev ruff format backend", normalized)
 
@@ -292,48 +321,106 @@ class BackendUvContractTest(unittest.TestCase):
         documentation_contracts = (
             (
                 REPOSITORY_ROOT / "deploy" / "offline" / "README.md",
-                r"`backend/uv\.lock` is the only dependency lock\b",
+                r"`backend/uv\.lock` is the only backend Python/uv dependency lock\b",
+                r"Python 3\.12 must be preinstalled\b",
                 (
-                    r"The wheelhouse must contain all wheels and other artifacts required by "
-                    r"`backend/uv\.lock` for the target Linux platform and Python 3\.12\b"
+                    r"wheelhouse[^.]*all wheels and other artifacts[^.]*backend/uv\.lock"
+                    r"[^.]*target Linux[^.]*Python 3\.12"
                 ),
-                (
-                    r"Real offline sync, all three image builds, Compose rendering, and Compose "
-                    r"smoke therefore remain target-host gates\b"
-                ),
+                r"Real offline sync[^.]*image builds[^.]*Compose[^.]*target-host gates\b",
             ),
             (
                 REPOSITORY_ROOT / "docs" / "offline-platform-runbook.md",
-                r"`backend/uv\.lock` 是仓库唯一的依赖锁",
+                r"`backend/uv\.lock` 是仓库唯一的后端 Python/uv 依赖锁",
+                r"Python 3\.12 必须预先安装",
                 (
-                    r"wheelhouse 必须包含 `backend/uv\.lock` 对目标 Linux 平台和 Python 3\.12 "
-                    r"所需的全部发行制品"
+                    r"wheelhouse[^。]*backend/uv\.lock[^。]*目标 Linux[^。]*Python 3\.12"
+                    r"[^。]*全部发行制品"
                 ),
-                (
-                    r"真实 offline sync、三份离线镜像构建、Compose 渲染和 Compose smoke "
-                    r"仍是目标主机 gate"
-                ),
+                r"真实 offline sync[^。]*镜像构建[^。]*Compose[^。]*目标主机 gate",
             ),
         )
-        for path, lock_pattern, wheelhouse_pattern, gate_pattern in documentation_contracts:
+        for path, lock_pattern, python_pattern, wheelhouse_pattern, gate_pattern in documentation_contracts:
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
                 normalized = self.normalize_command_text(text)
-                self.assertIn("uv lock --project backend --python 3.12", normalized)
                 self.assertRegex(normalized, lock_pattern)
+                self.assertRegex(normalized, python_pattern)
                 self.assertRegex(normalized, wheelhouse_pattern)
                 self.assertRegex(normalized, gate_pattern)
-                self.assertRegex(normalized, r"UV_PYTHON_DOWNLOADS\s*=\s*[\"']?never\b")
-                self.assertIn(
-                    "uv sync --project backend --frozen --group offline --no-dev "
-                    "--no-index --find-links artifacts/wheels",
-                    normalized,
+                lock_command = "uv lock --project backend --python 3.12"
+                offline_sync = (
+                    "uv sync --project backend --frozen --offline --group offline --no-dev "
+                    "--no-index --find-links artifacts/wheels"
                 )
-                self.assertIn(
-                    "uv sync --project backend --frozen --no-default-groups --group benchmark "
-                    "--no-index --find-links artifacts/wheels",
-                    normalized,
+                benchmark_sync = (
+                    "uv sync --project backend --frozen --offline --no-default-groups "
+                    "--group benchmark --no-index --find-links artifacts/wheels"
                 )
+                dependency_block = self.powershell_block_containing(text, lock_command)
+                normalized_dependency_block = self.normalize_command_text(dependency_block)
+                environment_match = re.search(
+                    r"\$env:UV_PYTHON_DOWNLOADS\s*=\s*[\"']never[\"']",
+                    normalized_dependency_block,
+                )
+                self.assertIsNotNone(environment_match)
+                assert environment_match is not None
+                environment_index = environment_match.start()
+                lock_index = normalized_dependency_block.index(lock_command)
+                offline_index = normalized_dependency_block.index(offline_sync)
+                benchmark_index = normalized_dependency_block.index(benchmark_sync)
+                self.assertLess(environment_index, lock_index)
+                self.assertLess(environment_index, offline_index)
+                self.assertLess(environment_index, benchmark_index)
+
+        runbook_path = REPOSITORY_ROOT / "docs" / "offline-platform-runbook.md"
+        runbook = runbook_path.read_text(encoding="utf-8")
+        normalized_runbook = self.normalize_command_text(runbook)
+        lower_runbook = normalized_runbook.lower()
+        self.assertNotRegex(
+            lower_runbook,
+            r"\.venv(?:[/\\]bin[/\\]python|[/\\]scripts[/\\]python(?:\.exe)?)\b",
+        )
+        self.assertNotRegex(lower_runbook, r"\bpy(?:\.exe)?\s+-m\b")
+        for line in runbook.splitlines():
+            if "windows" in line.lower():
+                self.assertNotRegex(line.lower(), r"\bpy\b")
+
+        offline_uv = (
+            "uv run --project backend --frozen --offline --no-default-groups "
+            "--group offline python"
+        )
+        benchmark_uv = (
+            "uv run --project backend --frozen --offline --no-default-groups "
+            "--group benchmark python"
+        )
+        self.assertIn(f"{benchmark_uv} -c", normalized_runbook)
+        self.assertIn(f"{offline_uv} -c", normalized_runbook)
+        self.assertIn(f"{offline_uv} tools/compose_smoke.py", normalized_runbook)
+        self.assertIn(
+            f"{benchmark_uv} -m tools.benchmarks.run_capacity_benchmark",
+            normalized_runbook,
+        )
+        self.assertIn(
+            f"--benchmark-command {benchmark_uv} -m locust",
+            normalized_runbook,
+        )
+        self.assertIn(
+            "uv run --project . --frozen --offline --no-default-groups --group offline "
+            'python -m unittest discover -s tests -p "test_*.py" -v',
+            normalized_runbook,
+        )
+        self.assertIn(
+            f'{benchmark_uv} -m unittest discover -s tools/tests -p "test_*.py" -v',
+            normalized_runbook,
+        )
+        self.assertIn(f"{benchmark_uv} -m compileall -q tools", normalized_runbook)
+
+        validation_block = self.powershell_block_containing(runbook, "app.offline_artifacts")
+        normalized_validation = self.normalize_command_text(validation_block)
+        pythonpath_index = normalized_validation.index('$env:PYTHONPATH = "backend"')
+        validation_index = normalized_validation.index(f"{offline_uv} -c", pythonpath_index)
+        self.assertLess(pythonpath_index, validation_index)
 
     def test_smoke_backend_uses_uv_from_the_backend_project(self) -> None:
         path = REPOSITORY_ROOT / "tools" / "start_smoke_backend.cmd"

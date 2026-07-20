@@ -12,13 +12,13 @@
 
 ## 2. 离线依赖与 Python 3.12
 
-`backend/uv.lock` 是仓库唯一的依赖锁。先在可审核的解析环境中从仓库根目录为 Python 3.12 更新该锁；再把仓库与锁文件带到目标 Linux 主机，只使用已审核的内部 wheelhouse 执行冻结同步：
+`backend/uv.lock` 是仓库唯一的后端 Python/uv 依赖锁。Python 3.12 必须预先安装在目标主机上，禁止 uv 下载或自动安装 Python。先在可审核的解析环境中从仓库根目录更新该锁；再把仓库与锁文件带到目标 Linux 主机，只使用已审核的内部 wheelhouse 执行冻结同步：
 
 ```powershell
-uv lock --project backend --python 3.12
 $env:UV_PYTHON_DOWNLOADS = "never"
-uv sync --project backend --frozen --group offline --no-dev --no-index --find-links artifacts/wheels
-uv sync --project backend --frozen --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
+uv lock --project backend --python 3.12
+uv sync --project backend --frozen --offline --group offline --no-dev --no-index --find-links artifacts/wheels
+uv sync --project backend --frozen --offline --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
 ```
 
 提交或部署前检查：
@@ -51,7 +51,7 @@ uv sync --project backend --frozen --no-default-groups --group benchmark --no-in
 对文件或无符号链接目录使用仓库已有的确定性 artifact 哈希实现，禁止用下载 URL 代替本地路径：
 
 ```powershell
-& ./.venv/bin/python -c "from pathlib import Path; from tools.benchmarks.model_probe import sha256_artifact; print(sha256_artifact(Path(r'artifacts/vendor/example-artifact')))"
+uv run --project backend --frozen --offline --no-default-groups --group benchmark python -c "from pathlib import Path; from tools.benchmarks.model_probe import sha256_artifact; print(sha256_artifact(Path(r'artifacts/vendor/example-artifact')))"
 ```
 
 每个条目在进入清单前必须完成：
@@ -65,7 +65,7 @@ uv sync --project backend --frozen --no-default-groups --group benchmark --no-in
 
 ```powershell
 $env:PYTHONPATH = "backend"
-& ./.venv/bin/python -c "import json; from pathlib import Path; from app.offline_artifacts import validate_artifact_manifest; validate_artifact_manifest(json.loads(Path('deploy/offline/artifacts.lock.json').read_text(encoding='utf-8'))); print('artifact manifest valid')"
+uv run --project backend --frozen --offline --no-default-groups --group offline python -c "import json; from pathlib import Path; from app.offline_artifacts import validate_artifact_manifest; validate_artifact_manifest(json.loads(Path('deploy/offline/artifacts.lock.json').read_text(encoding='utf-8'))); print('artifact manifest valid')"
 ```
 
 ## 4. Compose profile、内存预算与准备
@@ -109,14 +109,14 @@ profile 约定：
 
 ```powershell
 $HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
-& ./.venv/bin/python tools/compose_smoke.py `
+uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py `
   --report "artifacts/benchmarks/$HardwareClass/compose-smoke.json"
 ```
 
 命令会依次执行 wrapper `config`、仅启动 `api` 及其核心依赖、通过 `exec` 检查 PostgreSQL/Alembic、ClickHouse、Qdrant、Redis、ClamAV、Embedding，并请求宿主 `127.0.0.1:8000/api/readyz`。默认 `down` 保留 volume；只有明确传入 `--remove-volumes` 才删除 volume。该选项是破坏性清理，不属于常规验收命令，执行前必须确认 volume 可删除并继续写入独立报告：
 
 ```powershell
-& ./.venv/bin/python tools/compose_smoke.py `
+uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py `
   --report "artifacts/benchmarks/$HardwareClass/compose-smoke-remove-volumes.json" `
   --remove-volumes
 ```
@@ -131,7 +131,7 @@ $HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
 
 ```powershell
 $HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
-& ./.venv/bin/python -m tools.benchmarks.run_capacity_benchmark `
+uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark `
   --manifest tools/benchmarks/manifests/smoke.json `
   --metrics "artifacts/benchmarks/$HardwareClass/service-metrics.json" `
   --report "artifacts/benchmarks/$HardwareClass/service-report.json" `
@@ -152,7 +152,7 @@ $HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
 
 ```powershell
 $HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
-& ./.venv/bin/python -m tools.benchmarks.run_capacity_benchmark `
+uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark `
   --manifest tools/benchmarks/manifests/acceptance-30m-5m.json `
   --metrics "artifacts/benchmarks/$HardwareClass/online-cold-metrics.json" `
   --report "artifacts/benchmarks/$HardwareClass/online-cold-report.json" `
@@ -161,7 +161,7 @@ $HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
   --cache-label cold `
   --vector-dimension 768 `
   --model-slots 2 `
-  --benchmark-command ./.venv/bin/python -m locust -f tools/benchmarks/locustfile.py --headless -u 15 -r 1 --run-time 30m --host http://127.0.0.1:8000
+  --benchmark-command uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m locust -f tools/benchmarks/locustfile.py --headless -u 15 -r 1 --run-time 30m --host http://127.0.0.1:8000
 ```
 
 `--benchmark-command` 使用 remainder 解析：它之后的全部 token 都属于内部 Locust 命令，不需要额外的 `--` 分隔符。`-u 15` 表示 15 个并发虚拟用户；实际同时在途请求数仍由任务执行时间和 5 秒 think time 决定。`--model-slots 2` 是报告字段，必须与本次运行的 `deploy/offline/.env` 中 `MODEL_SLOTS=2` 完全一致，不得只改报告参数。
@@ -202,22 +202,22 @@ artifacts/benchmarks/64gb/
 
 ## 7. 本地回归与目标主机验收清单
 
-目标 Linux 主机本地、无需 Docker 的回归（Windows 开发机可将 `./.venv/bin/python` 替换为 `py`）：
+目标 Linux 主机本地、无需 Docker 的回归统一使用锁定的 uv 项目环境：
 
 ```powershell
 Set-Location backend
-& ../.venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
+uv run --project . --frozen --offline --no-default-groups --group offline python -m unittest discover -s tests -p "test_*.py" -v
 Set-Location ..
-& ./.venv/bin/python -m unittest discover -s tools/tests -p "test_*.py" -v
-& ./.venv/bin/python -m compileall -q tools
+uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m unittest discover -s tools/tests -p "test_*.py" -v
+uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m compileall -q tools
 git diff --check
 ```
 
 目标主机 gate：
 
 ```powershell
-& ./.venv/bin/python tools/compose_smoke.py
-& ./.venv/bin/python -m tools.benchmarks.run_capacity_benchmark --help
+uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py
+uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark --help
 ```
 
 必须人工确认：本地 rootful daemon、镜像 digest、模型和 parser artifact checksum、许可证、secret 文件权限、PostgreSQL 备份/恢复演练、migration head、API loopback 绑定、Compose volume 保留策略以及 32GB/64GB 报告目录。当前开发机已完成单元回归，但没有 Docker，因此“目标主机 gate”仍未完成。

@@ -105,7 +105,9 @@ npm.cmd run dev
 后端测试：
 
 ```powershell
-uv run --project backend --group dev python -m unittest discover -s backend/tests -p "test_*.py" -v
+Set-Location backend
+uv run --project . --group dev python -m unittest discover -s tests -p "test_*.py" -v
+Set-Location ..
 ```
 
 后端代码质量：
