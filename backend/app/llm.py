@@ -144,7 +144,7 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
 
         query = RAG_SYSTEM_PROMPT + "\n\n" + build_prompt(request)
         try:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
+            with httpx.Client(timeout=self.timeout_seconds, trust_env=False) as client:
                 with client.stream(
                     "POST",
                     self.stream_url,
@@ -152,10 +152,12 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
                     headers={"Accept": "text/event-stream"},
                 ) as response:
                     response.raise_for_status()
-                    content = collect_physoc_response(
+                    collected = collect_physoc_response(
                         response.iter_lines(), expected_model=self.model
                     )
-            content = normalize_plain_text_answer(content)
+                    content = normalize_plain_text_answer(collected)
+                    if not content.strip():
+                        raise PhysocStreamError("Physoc response is empty after normalization")
         except httpx.TimeoutException as exc:
             raise LLMProviderError("大模型响应超时，请稍后重试。") from exc
         except httpx.HTTPError as exc:

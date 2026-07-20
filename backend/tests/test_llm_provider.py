@@ -137,11 +137,13 @@ class FakePhysocResponse:
     def __init__(self, lines: list[str]) -> None:
         self.lines = lines
         self.status_checked = False
+        self.exit_count = 0
 
     def __enter__(self) -> FakePhysocResponse:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        self.exit_count += 1
         return None
 
     def raise_for_status(self) -> None:
@@ -155,11 +157,13 @@ class RecordingPhysocClient:
     def __init__(self, response: FakePhysocResponse) -> None:
         self.response = response
         self.requests: list[dict] = []
+        self.exit_count = 0
 
     def __enter__(self) -> RecordingPhysocClient:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        self.exit_count += 1
         return None
 
     def stream(self, method: str, url: str, json: dict, headers: dict) -> FakePhysocResponse:
@@ -434,8 +438,10 @@ class LLMProviderTest(unittest.TestCase):
         with patch("app.llm.httpx.Client", return_value=client) as client_factory:
             reply = provider.generate_reply(request)
 
-        client_factory.assert_called_once_with(timeout=45.0)
+        client_factory.assert_called_once_with(timeout=45.0, trust_env=False)
         self.assertTrue(response.status_checked)
+        self.assertEqual(response.exit_count, 1)
+        self.assertEqual(client.exit_count, 1)
         self.assertEqual(len(client.requests), 1)
         recorded = client.requests[0]
         self.assertEqual(recorded["method"], "POST")
@@ -454,6 +460,37 @@ class LLMProviderTest(unittest.TestCase):
         self.assertEqual(reply.paragraphs[0].citations[0].source_id, "kb-llm")
         self.assertEqual(reply.paragraphs[0].citations[0].chunk_id, "chunk-llm")
         self.assertEqual(reply.artifacts, [])
+
+    def test_physoc_provider_rejects_normalized_empty_answer_and_closes_resources(self) -> None:
+        request = LLMRequest(
+            content="请分析现金流风险",
+            mode="source",
+            knowledge_hits=[indexed_hit()],
+            previous_messages=[],
+        )
+
+        for response_text in ("   ", "[1]"):
+            with self.subTest(response_text=response_text):
+                response = FakePhysocResponse(
+                    [
+                        f'data: {{"model":"deepseek-r1","response":"{response_text}","done":true}}',
+                        "",
+                    ]
+                )
+                client = RecordingPhysocClient(response)
+                provider = PhysocDeepSeekLLMProvider(
+                    api_base="http://127.0.0.1:11434/",
+                    stream_path="/api/chat",
+                    model="deepseek-r1",
+                )
+
+                with patch("app.llm.httpx.Client", return_value=client):
+                    with self.assertRaises(LLMProviderError) as error:
+                        provider.generate_reply(request)
+
+                self.assertIn("大模型返回格式异常", str(error.exception))
+                self.assertEqual(response.exit_count, 1)
+                self.assertEqual(client.exit_count, 1)
 
     def test_repository_delegates_assistant_reply_to_injected_llm_provider(self) -> None:
         provider = RecordingLLMProvider()
