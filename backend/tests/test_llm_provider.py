@@ -697,11 +697,25 @@ class LLMProviderTest(unittest.TestCase):
             "/api/physoc/custom/stream",
         )
 
-    def test_physoc_api_base_validator_accepts_private_base_path(self) -> None:
-        self.assertEqual(
-            llm_module._validate_physoc_api_base("  http://10.0.0.8:8080/root/  "),
+    def test_physoc_api_base_validator_accepts_only_supported_local_targets(self) -> None:
+        valid_bases = (
+            "http://localhost/root",
+            "http://127.0.0.1:8080/root",
             "http://10.0.0.8:8080/root",
+            "http://172.16.0.1:8080/root",
+            "http://172.31.255.254:8080/root",
+            "http://192.168.1.8:8080/root",
+            "http://[fc00::1]:8080/root",
+            "http://[fd12:3456::1]:8080/root",
+            "http://[::1]:8080/root",
         )
+
+        for api_base in valid_bases:
+            with self.subTest(api_base=api_base):
+                self.assertEqual(
+                    llm_module._validate_physoc_api_base(f"  {api_base}/  "),
+                    api_base,
+                )
 
     def test_physoc_api_base_validator_rejects_unsafe_urls(self) -> None:
         invalid_bases = (
@@ -710,7 +724,66 @@ class LLMProviderTest(unittest.TestCase):
             "http://user:password@127.0.0.1:8080/root",
             "ftp://127.0.0.1:8080/root",
             "http:///root",
+            "http://127.0.0.1:0/root",
             "http://127.0.0.1:99999/root",
+            "http://[::1/root",
+        )
+
+        for api_base in invalid_bases:
+            with self.subTest(api_base=api_base):
+                with self.assertRaisesRegex(ValueError, "LLM_API_BASE"):
+                    llm_module._validate_physoc_api_base(api_base)
+
+    def test_physoc_api_base_validator_rejects_non_local_targets(self) -> None:
+        invalid_targets = (
+            "http://llm.internal:8080/root",
+            "http://8.8.8.8:8080/root",
+            "http://169.254.169.254:8080/root",
+            "http://169.254.1.1:8080/root",
+            "http://0.0.0.0:8080/root",
+            "http://192.0.2.1:8080/root",
+            "http://224.0.0.1:8080/root",
+            "http://240.0.0.1:8080/root",
+            "http://[fe80::1]:8080/root",
+            "http://[::]:8080/root",
+            "http://[2001:db8::1]:8080/root",
+            "http://[ff02::1]:8080/root",
+        )
+
+        for api_base in invalid_targets:
+            with self.subTest(api_base=api_base):
+                with self.assertRaisesRegex(ValueError, "LLM_API_BASE"):
+                    llm_module._validate_physoc_api_base(api_base)
+
+    def test_physoc_api_base_validator_rejects_controls_and_internal_whitespace(self) -> None:
+        invalid_bases = (
+            "http://127.0.0.1:8080/\rroot",
+            "http://127.0.0.1:8080/\nroot",
+            "http://127.0.0.1:8080/\troot",
+            "http://127.0.0.1:8080/\x00root",
+            "http://127.0.0.1:8080/\x7froot",
+            "http://127.0.0.1:8080/root path",
+            "http://127.0.0.1:8080/root\u00a0path",
+            "http://127.0.0.1:8080/root\u3000path",
+        )
+
+        for api_base in invalid_bases:
+            with self.subTest(api_base=repr(api_base)):
+                with self.assertRaisesRegex(ValueError, "LLM_API_BASE"):
+                    llm_module._validate_physoc_api_base(api_base)
+
+    def test_physoc_api_base_validator_rejects_unsafe_base_paths(self) -> None:
+        invalid_bases = (
+            "http://127.0.0.1:8080/root/../stream",
+            "http://127.0.0.1:8080/root/./stream",
+            "http://127.0.0.1:8080/root\\stream",
+            "http://127.0.0.1:8080/root/%2e%2e/stream",
+            "http://127.0.0.1:8080/root/%252e%252e/stream",
+            "http://127.0.0.1:8080/root/%2fstream",
+            "http://127.0.0.1:8080/root/%252fstream",
+            "http://127.0.0.1:8080/root/%5cstream",
+            "http://127.0.0.1:8080/root/%255cstream",
+            "http://127.0.0.1:8080/root/%25stream",
         )
 
         for api_base in invalid_bases:
@@ -728,6 +801,14 @@ class LLMProviderTest(unittest.TestCase):
             "/api/physoc/stream#fragment",
             "/api/../stream",
             "/./stream",
+            "/api\\stream",
+            "/api/%2e%2e/stream",
+            "/api/%252e%252e/stream",
+            "/api/%2fstream",
+            "/api/%252fstream",
+            "/api/%5cstream",
+            "/api/%255cstream",
+            "/api/%25stream",
         )
 
         for path in invalid_paths:
@@ -779,7 +860,12 @@ class LLMProviderTest(unittest.TestCase):
             "http://user:password@127.0.0.1:8080/root",
             "ftp://127.0.0.1:8080/root",
             "http:///root",
+            "http://127.0.0.1:0/root",
             "http://127.0.0.1:99999/root",
+            "http://[::1/root",
+            "http://169.254.169.254:8080/root",
+            "http://0.0.0.0:8080/root",
+            "http://192.0.2.1:8080/root",
         )
 
         for api_base in invalid_bases:
@@ -817,7 +903,7 @@ class LLMProviderTest(unittest.TestCase):
                     create_llm_provider(environ)
 
     def test_llm_provider_factory_always_rejects_public_physoc_base(self) -> None:
-        with self.assertRaisesRegex(ValueError, "private or loopback"):
+        with self.assertRaisesRegex(ValueError, "LLM_API_BASE"):
             create_llm_provider(
                 {
                     "OFFLINE_MODE": "false",

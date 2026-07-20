@@ -4,6 +4,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from ipaddress import ip_address, ip_network
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -32,6 +33,12 @@ RAG_SYSTEM_PROMPT = (
 )
 
 DEFAULT_PHYSOC_STREAM_PATH = "/api/physoc/deepseek/stream"
+_PHYSOC_ALLOWED_NETWORKS = (
+    ip_network("10.0.0.0/8"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.168.0.0/16"),
+    ip_network("fc00::/7"),
+)
 
 
 @dataclass(slots=True)
@@ -194,6 +201,8 @@ def _validate_physoc_stream_path(path: str) -> str:
         or parsed.fragment
         or "?" in candidate
         or "#" in candidate
+        or "\\" in candidate
+        or "%" in candidate
         or any(segment in {".", ".."} for segment in parsed.path.split("/"))
     ):
         raise ValueError(
@@ -203,25 +212,44 @@ def _validate_physoc_stream_path(path: str) -> str:
 
 
 def _validate_physoc_api_base(api_base: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in api_base):
+        raise ValueError("LLM_API_BASE must not contain control characters")
     candidate = api_base.strip()
-    parsed = urlsplit(candidate)
+    if any(character.isspace() for character in candidate):
+        raise ValueError("LLM_API_BASE must not contain internal whitespace")
     try:
-        parsed.port
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        port = parsed.port
     except ValueError as exc:
-        raise ValueError("LLM_API_BASE must contain a valid port") from exc
+        raise ValueError("LLM_API_BASE must be a valid URL") from exc
     if (
         parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
+        or not hostname
+        or (port is not None and not 1 <= port <= 65535)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
         or "?" in candidate
         or "#" in candidate
+        or "\\" in candidate
+        or "%" in candidate
+        or any(segment in {".", ".."} for segment in parsed.path.split("/"))
     ):
         raise ValueError(
             "LLM_API_BASE must be an HTTP(S) URL without credentials, query, or fragment"
         )
+    if hostname != "localhost":
+        try:
+            address = ip_address(hostname)
+        except ValueError as exc:
+            raise ValueError("LLM_API_BASE must target an allowed local address") from exc
+        if not address.is_loopback and not any(
+            address.version == network.version and address in network
+            for network in _PHYSOC_ALLOWED_NETWORKS
+        ):
+            raise ValueError("LLM_API_BASE must target an allowed local address")
     return candidate.rstrip("/")
 
 
