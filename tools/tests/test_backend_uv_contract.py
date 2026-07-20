@@ -47,13 +47,11 @@ class BackendUvContractTest(unittest.TestCase):
         dependency_groups = pyproject["dependency-groups"]
         self.assertEqual(set(dependency_groups), {"offline", "benchmark", "dev"})
 
-        offline_dependencies = {
-            normalized_package_name(dependency)
-            for dependency in dependency_groups["offline"]
-            if isinstance(dependency, str)
-        }
+        offline_group = dependency_groups["offline"]
+        self.assertTrue(all(isinstance(dependency, str) for dependency in offline_group))
+        self.assertEqual(len(offline_group), 15)
         self.assertEqual(
-            offline_dependencies,
+            {normalized_package_name(dependency) for dependency in offline_group},
             {
                 "alembic",
                 "clickhouse-connect",
@@ -85,12 +83,10 @@ class BackendUvContractTest(unittest.TestCase):
             {"locust"},
         )
 
-        dev_dependencies = {
-            normalized_package_name(dependency)
-            for dependency in dependency_groups["dev"]
-            if isinstance(dependency, str)
-        }
-        self.assertEqual(dev_dependencies, {"alembic", "ruff"})
+        dev_group = dependency_groups["dev"]
+        self.assertTrue(all(isinstance(dependency, str) for dependency in dev_group))
+        self.assertEqual(len(dev_group), 2)
+        self.assertEqual({normalized_package_name(dependency) for dependency in dev_group}, {"alembic", "ruff"})
 
     def test_legacy_requirements_inputs_are_removed(self) -> None:
         for filename in (
