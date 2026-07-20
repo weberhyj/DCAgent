@@ -111,13 +111,17 @@ class BackendUvContractTest(unittest.TestCase):
                     active_normalized,
                     r"\bCOPY\s+backend/pyproject\.toml\s+backend/uv\.lock\s+\./",
                 )
+                self.assertRegex(
+                    active_normalized,
+                    r"\bCOPY\s+artifacts/wheels\s+/wheels\b",
+                )
                 self.assertRegex(environment, r"\bUV_NO_INDEX=1(?:\s|$)")
                 self.assertRegex(environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
                 self.assertRegex(environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
                 self.assertRegex(environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
                 self.assertRegex(
                     active_commands,
-                    r"(?m)^RUN\s+uv\s+sync"
+                    r"(?m)^RUN\b[^\n]*?\buv\s+sync"
                     r"(?=[^\n]*\s--frozen(?:\s|$))"
                     r"(?=[^\n]*\s--no-install-project(?:\s|$))"
                     r"(?=[^\n]*\s--no-dev(?:\s|$))"
