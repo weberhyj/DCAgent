@@ -4,7 +4,6 @@ import re
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENV_EXAMPLES = (
     REPO_ROOT / ".env.example",
@@ -25,9 +24,7 @@ SENSITIVE_ASSIGNMENT = re.compile(
 
 
 def physoc_env_block(text: str) -> str:
-    match = re.search(
-        rf"(?ms)^{re.escape(PHYSOC_BEGIN)}.*?^{re.escape(PHYSOC_END)}\s*$", text
-    )
+    match = re.search(rf"(?ms)^{re.escape(PHYSOC_BEGIN)}.*?^{re.escape(PHYSOC_END)}\s*$", text)
     return "" if match is None else match.group(0)
 
 
@@ -69,9 +66,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
     def test_env_examples_keep_template_as_the_active_default(self) -> None:
         for path in ENV_EXAMPLES:
             text = path.read_text(encoding="utf-8")
-            active_providers = re.findall(
-                r"(?m)^\s*LLM_PROVIDER\s*=\s*([^#\s]+)\s*$", text
-            )
+            active_providers = re.findall(r"(?m)^\s*LLM_PROVIDER\s*=\s*([^#\s]+)\s*$", text)
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertEqual(["template"], active_providers)
 
@@ -79,16 +74,12 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         for path in (*ENV_EXAMPLES, REPO_ROOT / "README.md"):
             text = path.read_text(encoding="utf-8")
             physoc_lines = (
-                physoc_readme_section(text)
-                if path.name == "README.md"
-                else physoc_env_block(text)
+                physoc_readme_section(text) if path.name == "README.md" else physoc_env_block(text)
             )
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertTrue(physoc_lines)
                 self.assertNotIn("physoc.internal", physoc_lines.lower())
-                self.assertNotRegex(
-                    physoc_lines, r"https?://(?!127\.0\.0\.1(?::|/|$))[^\s`]+"
-                )
+                self.assertNotRegex(physoc_lines, r"https?://(?!127\.0\.0\.1(?::|/|$))[^\s`]+")
                 self.assertIsNone(SENSITIVE_ASSIGNMENT.search(physoc_lines))
 
     def test_readme_documents_the_physoc_streaming_contract(self) -> None:
