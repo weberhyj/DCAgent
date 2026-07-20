@@ -52,7 +52,8 @@ class BackendUvContractTest(unittest.TestCase):
             for dependency in dependency_groups["offline"]
             if isinstance(dependency, str)
         }
-        self.assertTrue(
+        self.assertEqual(
+            offline_dependencies,
             {
                 "alembic",
                 "clickhouse-connect",
@@ -69,12 +70,16 @@ class BackendUvContractTest(unittest.TestCase):
                 "flagembedding",
                 "onnxruntime",
                 "psutil",
-            }.issubset(offline_dependencies),
-            "The offline dependency group must cover every non-recursive package from requirements-offline.in",
+            },
+            "The offline dependency group must exactly match the non-recursive requirements-offline.in packages",
         )
 
         benchmark_dependencies = dependency_groups["benchmark"]
-        self.assertIn({"include-group": "offline"}, benchmark_dependencies)
+        self.assertEqual(len(benchmark_dependencies), 2)
+        self.assertEqual(
+            [dependency for dependency in benchmark_dependencies if isinstance(dependency, dict)],
+            [{"include-group": "offline"}],
+        )
         self.assertEqual(
             {normalized_package_name(dependency) for dependency in benchmark_dependencies if isinstance(dependency, str)},
             {"locust"},
@@ -85,10 +90,16 @@ class BackendUvContractTest(unittest.TestCase):
             for dependency in dependency_groups["dev"]
             if isinstance(dependency, str)
         }
-        self.assertTrue({"alembic", "ruff"}.issubset(dev_dependencies))
+        self.assertEqual(dev_dependencies, {"alembic", "ruff"})
 
     def test_legacy_requirements_inputs_are_removed(self) -> None:
-        for filename in ("requirements.txt", "requirements-offline.in", "requirements-benchmark.in"):
+        for filename in (
+            "requirements.txt",
+            "requirements-offline.in",
+            "requirements-offline.txt",
+            "requirements-benchmark.in",
+            "requirements-benchmark.txt",
+        ):
             with self.subTest(filename=filename):
                 self.assertFalse((BACKEND_ROOT / filename).exists(), f"Legacy input remains: {filename}")
 
@@ -108,6 +119,15 @@ class BackendUvContractTest(unittest.TestCase):
         dockerignore = (REPOSITORY_ROOT / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("!backend/pyproject.toml", dockerignore)
         self.assertIn("!backend/uv.lock", dockerignore)
+        self.assertNotIn("!backend/requirements.txt", dockerignore)
+        self.assertNotIn("!backend/requirements-offline.txt", dockerignore)
+        self.assertFalse(
+            any(
+                line.strip().startswith("!") and "requirements" in line
+                for line in dockerignore.splitlines()
+            ),
+            "The Docker build context must not allowlist any requirements file",
+        )
 
     def test_ruff_is_configured_for_python_312(self) -> None:
         pyproject = self.load_pyproject()
@@ -116,7 +136,7 @@ class BackendUvContractTest(unittest.TestCase):
         self.assertEqual(ruff["line-length"], 100)
         self.assertEqual(ruff["lint"]["select"], ["E4", "E7", "E9", "F", "I", "UP"])
 
-    def test_documentation_does_not_reference_deleted_requirement_locks(self) -> None:
+    def test_documentation_does_not_reference_removed_requirements_files(self) -> None:
         for path in (
             REPOSITORY_ROOT / "README.md",
             REPOSITORY_ROOT / "deploy" / "offline" / "README.md",
@@ -124,8 +144,15 @@ class BackendUvContractTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                self.assertNotIn("requirements-offline.txt", text)
-                self.assertNotIn("requirements-benchmark.txt", text)
+                for filename in (
+                    "requirements.txt",
+                    "requirements-offline.in",
+                    "requirements-offline.txt",
+                    "requirements-benchmark.in",
+                    "requirements-benchmark.txt",
+                ):
+                    with self.subTest(filename=filename):
+                        self.assertNotIn(filename, text)
 
 
 if __name__ == "__main__":
