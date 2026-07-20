@@ -11,6 +11,7 @@ from app.llm import (
     LLMProviderError,
     LLMRequest,
     OpenAICompatibleLLMProvider,
+    PhysocDeepSeekLLMProvider,
     TemplateLLMProvider,
     build_knowledge_context,
     build_prompt,
@@ -130,6 +131,42 @@ class RecordingHttpClient:
     def post(self, url: str, json: dict, headers: dict) -> FakeLLMResponse:
         self.requests.append({"url": url, "json": json, "headers": headers})
         return FakeLLMResponse(self.response_content)
+
+
+class FakePhysocResponse:
+    def __init__(self, lines: list[str]) -> None:
+        self.lines = lines
+        self.status_checked = False
+
+    def __enter__(self) -> FakePhysocResponse:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        self.status_checked = True
+
+    def iter_lines(self):
+        return iter(self.lines)
+
+
+class RecordingPhysocClient:
+    def __init__(self, response: FakePhysocResponse) -> None:
+        self.response = response
+        self.requests: list[dict] = []
+
+    def __enter__(self) -> RecordingPhysocClient:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def stream(self, method: str, url: str, json: dict, headers: dict) -> FakePhysocResponse:
+        self.requests.append(
+            {"method": method, "url": url, "json": json, "headers": headers}
+        )
+        return self.response
 
 
 class LLMProviderTest(unittest.TestCase):
@@ -350,6 +387,75 @@ class LLMProviderTest(unittest.TestCase):
 
         self.assertIn("大模型响应超时", str(error.exception))
         self.assertNotIn("secret upstream timeout", str(error.exception))
+
+    def test_physoc_provider_refuses_without_external_call_when_no_knowledge_hits(self) -> None:
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434/",
+            stream_path="/api/chat",
+            model="deepseek-r1",
+        )
+
+        with patch("app.llm.httpx.Client") as client_factory:
+            reply = provider.generate_reply(
+                LLMRequest(
+                    content="请分析不存在的内部制度",
+                    mode="source",
+                    knowledge_hits=[],
+                    previous_messages=[],
+                )
+            )
+
+        client_factory.assert_not_called()
+        self.assertEqual(provider.stream_url, "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(reply.paragraphs[0].text, NO_EVIDENCE_REPLY)
+        self.assertEqual(reply.paragraphs[0].citations, [])
+        self.assertEqual(reply.artifacts, [])
+
+    def test_physoc_provider_streams_guarded_rag_query_and_attaches_citations(self) -> None:
+        response = FakePhysocResponse(
+            [
+                'data: {"model":"deepseek-r1","response":"- **现金","done":false}',
+                "",
+                'data: {"model":"deepseek-r1","response":"流风险**。 [1]","done":true}',
+                "",
+            ]
+        )
+        client = RecordingPhysocClient(response)
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434/",
+            stream_path="/api/chat",
+            model="deepseek-r1",
+        )
+        request = LLMRequest(
+            content="请分析现金流风险",
+            mode="source",
+            knowledge_hits=[indexed_hit()],
+            previous_messages=[],
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client) as client_factory:
+            reply = provider.generate_reply(request)
+
+        client_factory.assert_called_once_with(timeout=45.0)
+        self.assertTrue(response.status_checked)
+        self.assertEqual(len(client.requests), 1)
+        recorded = client.requests[0]
+        self.assertEqual(recorded["method"], "POST")
+        self.assertEqual(recorded["url"], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(recorded["headers"], {"Accept": "text/event-stream"})
+        self.assertEqual(
+            recorded["json"],
+            {
+                "query": RAG_SYSTEM_PROMPT + "\n\n" + build_prompt(request),
+                "model": "deepseek-r1",
+            },
+        )
+        self.assertIn(RAG_SYSTEM_PROMPT, recorded["json"]["query"])
+        self.assertIn("cashflow.txt", recorded["json"]["query"])
+        self.assertEqual(reply.paragraphs[0].text, "现金流风险。")
+        self.assertEqual(reply.paragraphs[0].citations[0].source_id, "kb-llm")
+        self.assertEqual(reply.paragraphs[0].citations[0].chunk_id, "chunk-llm")
+        self.assertEqual(reply.artifacts, [])
 
     def test_repository_delegates_assistant_reply_to_injected_llm_provider(self) -> None:
         provider = RecordingLLMProvider()

@@ -17,6 +17,7 @@ from .models import (
     ResponseParagraphModel,
 )
 from .offline_settings import parse_bool, require_private_url
+from .physoc_sse import PhysocStreamError, collect_physoc_response
 from .time_utils import display_datetime_label
 
 NO_EVIDENCE_REPLY = "未检索到足够依据。请先在知识库中补充相关资料，或换一个更具体的问题重新检索。"
@@ -108,6 +109,58 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         except httpx.HTTPError as exc:
             raise LLMProviderError("大模型服务暂时不可用，请稍后重试。") from exc
         except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMProviderError("大模型返回格式异常，请稍后重试。") from exc
+
+        return ChatMessageModel(
+            id=f"msg-{uuid4().hex[:8]}",
+            role="assistant",
+            time=now_label(),
+            paragraphs=[
+                ResponseParagraphModel(
+                    text=content,
+                    citations=build_citations(request.knowledge_hits),
+                )
+            ],
+        )
+
+
+class PhysocDeepSeekLLMProvider(LLMProvider):
+    def __init__(
+        self,
+        api_base: str,
+        stream_path: str,
+        model: str,
+        timeout_seconds: float = 45.0,
+    ) -> None:
+        self.api_base = api_base.rstrip("/")
+        self.stream_path = stream_path
+        self.stream_url = self.api_base + stream_path
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+
+    def generate_reply(self, request: LLMRequest) -> ChatMessageModel:
+        if not request.knowledge_hits:
+            return build_no_evidence_reply()
+
+        query = RAG_SYSTEM_PROMPT + "\n\n" + build_prompt(request)
+        try:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                with client.stream(
+                    "POST",
+                    self.stream_url,
+                    json={"query": query, "model": self.model},
+                    headers={"Accept": "text/event-stream"},
+                ) as response:
+                    response.raise_for_status()
+                    content = collect_physoc_response(
+                        response.iter_lines(), expected_model=self.model
+                    )
+            content = normalize_plain_text_answer(content)
+        except httpx.TimeoutException as exc:
+            raise LLMProviderError("大模型响应超时，请稍后重试。") from exc
+        except httpx.HTTPError as exc:
+            raise LLMProviderError("大模型服务暂时不可用，请稍后重试。") from exc
+        except PhysocStreamError as exc:
             raise LLMProviderError("大模型返回格式异常，请稍后重试。") from exc
 
         return ChatMessageModel(
