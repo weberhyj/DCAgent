@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 from urllib.parse import urlsplit
 
-
 REPOSITORY_ROOT = Path(__file__).parents[2]
 BACKEND_ROOT = REPOSITORY_ROOT / "backend"
 
@@ -15,7 +14,9 @@ class BackendUvContractTest(unittest.TestCase):
         return re.sub(r"\s+", " ", without_powershell_continuations).strip()
 
     def powershell_blocks(self, text: str) -> list[str]:
-        return re.findall(r"```powershell[ \t]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+        return re.findall(
+            r"```powershell[ \t]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL
+        )
 
     def powershell_block_containing(self, text: str, command: str) -> str:
         matches = [
@@ -23,11 +24,17 @@ class BackendUvContractTest(unittest.TestCase):
             for block in self.powershell_blocks(text)
             if command in self.normalize_command_text(block)
         ]
-        self.assertEqual(len(matches), 1, f"Expected one PowerShell block containing: {command}")
+        self.assertEqual(
+            len(matches), 1, f"Expected one PowerShell block containing: {command}"
+        )
         return matches[0]
 
-    def assert_exact_requirements(self, requirements: list[object], expected: set[str]) -> None:
-        self.assertTrue(all(isinstance(requirement, str) for requirement in requirements))
+    def assert_exact_requirements(
+        self, requirements: list[object], expected: set[str]
+    ) -> None:
+        self.assertTrue(
+            all(isinstance(requirement, str) for requirement in requirements)
+        )
         self.assertEqual(len(requirements), len(expected))
         self.assertEqual(set(requirements), expected)
 
@@ -44,7 +51,9 @@ class BackendUvContractTest(unittest.TestCase):
             return tomllib.load(file)
 
     def requirement_name_and_specifier(self, requirement: str) -> tuple[str, str]:
-        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^]]+])?(.*)", requirement)
+        match = re.fullmatch(
+            r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^]]+])?(.*)", requirement
+        )
         self.assertIsNotNone(match, f"Unsupported requirement format: {requirement}")
         assert match is not None
         return (match.group(1).lower().replace("_", "-"), match.group(2))
@@ -58,19 +67,29 @@ class BackendUvContractTest(unittest.TestCase):
                 expanded.append(dependency)
             else:
                 self.assertEqual(set(dependency), {"include-group"})
-                expanded.extend(self.expand_dependency_group(dependency_groups, dependency["include-group"]))
+                expanded.extend(
+                    self.expand_dependency_group(
+                        dependency_groups, dependency["include-group"]
+                    )
+                )
         return expanded
 
     def assert_lock_requirements_match(
         self, lock_requirements: list[dict[str, str]], expected_requirements: list[str]
     ) -> None:
-        actual = sorted((requirement["name"], requirement["specifier"]) for requirement in lock_requirements)
+        actual = sorted(
+            (requirement["name"], requirement["specifier"])
+            for requirement in lock_requirements
+        )
         expected = sorted(
-            self.requirement_name_and_specifier(requirement) for requirement in expected_requirements
+            self.requirement_name_and_specifier(requirement)
+            for requirement in expected_requirements
         )
         self.assertEqual(actual, expected)
 
-    def test_project_metadata_and_dependency_groups_match_the_migration_contract(self) -> None:
+    def test_project_metadata_and_dependency_groups_match_the_migration_contract(
+        self,
+    ) -> None:
         pyproject = self.load_pyproject()
         project = pyproject["project"]
         self.assertEqual(project["requires-python"], ">=3.12,<3.13")
@@ -121,11 +140,17 @@ class BackendUvContractTest(unittest.TestCase):
         benchmark_dependencies = dependency_groups["benchmark"]
         self.assertEqual(len(benchmark_dependencies), 2)
         self.assertEqual(
-            [dependency for dependency in benchmark_dependencies if isinstance(dependency, dict)],
+            [
+                dependency
+                for dependency in benchmark_dependencies
+                if isinstance(dependency, dict)
+            ],
             [{"include-group": "offline"}],
         )
         benchmark_strings = [
-            dependency for dependency in benchmark_dependencies if isinstance(dependency, str)
+            dependency
+            for dependency in benchmark_dependencies
+            if isinstance(dependency, str)
         ]
         self.assertEqual(benchmark_strings, ["locust>=2.37,<3"])
 
@@ -142,10 +167,16 @@ class BackendUvContractTest(unittest.TestCase):
         self.assertEqual(lock["requires-python"], "==3.12.*")
 
         root_package = next(
-            (package for package in lock["package"] if package["name"] == "dc-agent-backend"),
+            (
+                package
+                for package in lock["package"]
+                if package["name"] == "dc-agent-backend"
+            ),
             None,
         )
-        self.assertIsNotNone(root_package, "The backend package is missing from uv.lock")
+        self.assertIsNotNone(
+            root_package, "The backend package is missing from uv.lock"
+        )
         assert root_package is not None
         self.assertEqual(root_package["source"], {"virtual": "."})
 
@@ -154,16 +185,21 @@ class BackendUvContractTest(unittest.TestCase):
             group: self.expand_dependency_group(dependency_groups, group)
             for group in ("offline", "benchmark", "dev")
         }
-        self.assertEqual(set(root_package["dev-dependencies"]), set(expected_group_requirements))
+        self.assertEqual(
+            set(root_package["dev-dependencies"]), set(expected_group_requirements)
+        )
 
         self.assert_lock_requirements_match(
-            root_package["metadata"]["requires-dist"], pyproject["project"]["dependencies"]
+            root_package["metadata"]["requires-dist"],
+            pyproject["project"]["dependencies"],
         )
         lock_dev_requirements = root_package["metadata"]["requires-dev"]
         self.assertEqual(set(lock_dev_requirements), set(expected_group_requirements))
         for group, expected_requirements in expected_group_requirements.items():
             with self.subTest(group=group):
-                self.assert_lock_requirements_match(lock_dev_requirements[group], expected_requirements)
+                self.assert_lock_requirements_match(
+                    lock_dev_requirements[group], expected_requirements
+                )
 
     def test_legacy_requirements_inputs_are_removed(self) -> None:
         for filename in (
@@ -174,17 +210,26 @@ class BackendUvContractTest(unittest.TestCase):
             "requirements-benchmark.txt",
         ):
             with self.subTest(filename=filename):
-                self.assertFalse((BACKEND_ROOT / filename).exists(), f"Legacy input remains: {filename}")
+                self.assertFalse(
+                    (BACKEND_ROOT / filename).exists(),
+                    f"Legacy input remains: {filename}",
+                )
 
     def test_docker_builds_use_the_frozen_uv_project(self) -> None:
         self.assertTrue((BACKEND_ROOT / "uv.lock").is_file(), "Missing backend/uv.lock")
 
-        for filename in ("backend.Dockerfile", "embedding.Dockerfile", "worker.Dockerfile"):
+        for filename in (
+            "backend.Dockerfile",
+            "embedding.Dockerfile",
+            "worker.Dockerfile",
+        ):
             with self.subTest(filename=filename):
                 dockerfile = REPOSITORY_ROOT / "deploy" / "docker" / filename
                 text = dockerfile.read_text(encoding="utf-8")
                 active_text = "\n".join(
-                    line for line in text.splitlines() if not line.lstrip().startswith("#")
+                    line
+                    for line in text.splitlines()
+                    if not line.lstrip().startswith("#")
                 )
                 active_commands = re.sub(r"\\\s*\n\s*", " ", active_text)
                 active_normalized = re.sub(r"\s+", " ", active_commands)
@@ -196,22 +241,40 @@ class BackendUvContractTest(unittest.TestCase):
                     active_commands,
                     r"(?m)^COPY\s+artifacts/wheels\s+/wheels\s*$",
                 )
+                version_gate_parts = (
+                    'case "$(uv --version)" in',
+                    '"uv 0.11.29"|"uv 0.11.29 "*)',
+                    "*) exit 1 ;;",
+                )
+                version_gate_indices = [
+                    active_normalized.index(part) for part in version_gate_parts
+                ]
+                self.assertEqual(version_gate_indices, sorted(version_gate_indices))
                 sync_match = re.search(
-                    r"(?m)^RUN\s+(?:uv\s+--version\s+&&\s+)?uv\s+sync\s+"
+                    r"\besac\s+&&\s+uv\s+sync\s+"
                     r"(?P<args>.*?)(?:[ \t]*(?:&&|\|\||;)[ \t]*|$)",
                     active_commands,
                 )
                 if sync_match is None:
                     self.fail("Missing the required offline uv sync command")
+                self.assertLess(version_gate_indices[-1], sync_match.start())
                 before_sync_environment = "\n".join(
-                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands[:sync_match.start()])
+                    re.findall(
+                        r"(?m)^ENV\s+([^\n]+)$", active_commands[: sync_match.start()]
+                    )
                 )
                 after_sync_environment = "\n".join(
-                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands[sync_match.end():])
+                    re.findall(
+                        r"(?m)^ENV\s+([^\n]+)$", active_commands[sync_match.end() :]
+                    )
                 )
                 self.assertRegex(before_sync_environment, r"\bUV_NO_INDEX=1(?:\s|$)")
-                self.assertRegex(before_sync_environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
-                self.assertRegex(before_sync_environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
+                self.assertRegex(
+                    before_sync_environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)"
+                )
+                self.assertRegex(
+                    before_sync_environment, r"\bUV_LINK_MODE=copy(?:\s|$)"
+                )
                 self.assertRegex(
                     after_sync_environment,
                     r"\bPATH=(?:['\"])?/app/\.venv/bin(?=[:'\"\s]|$)",
@@ -247,10 +310,13 @@ class BackendUvContractTest(unittest.TestCase):
 
     def test_uv_lock_uses_only_approved_hashed_registry_artifacts(self) -> None:
         packages = self.load_uv_lock()["package"]
-        root_packages = [package for package in packages if package["name"] == "dc-agent-backend"]
+        root_packages = [
+            package for package in packages if package["name"] == "dc-agent-backend"
+        ]
         self.assertEqual(len(root_packages), 1)
 
         approved_registry = "https://pypi.org/simple"
+        approved_artifact_hosts = {"files.pythonhosted.org"}
         hash_pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
         for package in packages:
             package_name = package["name"]
@@ -270,10 +336,13 @@ class BackendUvContractTest(unittest.TestCase):
                 if "sdist" in package:
                     artifacts.append(package["sdist"])
                 artifacts.extend(package.get("wheels", []))
-                self.assertTrue(artifacts, "Registry packages must have an sdist or wheel")
+                self.assertTrue(
+                    artifacts, "Registry packages must have an sdist or wheel"
+                )
                 for artifact in artifacts:
                     artifact_url = urlsplit(artifact["url"])
                     self.assertEqual(artifact_url.scheme, "https")
+                    self.assertIn(artifact_url.hostname, approved_artifact_hosts)
                     self.assertIsNone(artifact_url.username)
                     self.assertIsNone(artifact_url.password)
                     self.assertRegex(artifact.get("hash", ""), hash_pattern)
@@ -347,10 +416,7 @@ class BackendUvContractTest(unittest.TestCase):
         self.assertLess(backend_index, run_index)
         self.assertLess(run_index, repository_index)
 
-        test_command = (
-            "uv run --project . --group dev python -m unittest discover "
-            '-s tests -p "test_*.py" -v'
-        )
+        test_command = 'uv run --project . --group dev python -m unittest discover -s tests -p "test_*.py" -v'
         test_block = self.powershell_block_containing(text, test_command)
         normalized_test = self.normalize_command_text(test_block)
         backend_index = normalized_test.index("Set-Location backend")
@@ -358,8 +424,12 @@ class BackendUvContractTest(unittest.TestCase):
         repository_index = normalized_test.index("Set-Location ..", test_index)
         self.assertLess(backend_index, test_index)
         self.assertLess(test_index, repository_index)
-        self.assertIn("uv run --project backend --group dev ruff check backend", normalized)
-        self.assertIn("uv run --project backend --group dev ruff format backend", normalized)
+        self.assertIn(
+            "uv run --project backend --group dev ruff check backend", normalized
+        )
+        self.assertIn(
+            "uv run --project backend --group dev ruff format backend", normalized
+        )
 
     def test_offline_documentation_uses_the_frozen_lock_and_wheelhouse(self) -> None:
         documentation_contracts = (
@@ -384,7 +454,13 @@ class BackendUvContractTest(unittest.TestCase):
                 r"真实 offline sync[^。]*镜像构建[^。]*Compose[^。]*目标主机 gate",
             ),
         )
-        for path, lock_pattern, python_pattern, wheelhouse_pattern, gate_pattern in documentation_contracts:
+        for (
+            path,
+            lock_pattern,
+            python_pattern,
+            wheelhouse_pattern,
+            gate_pattern,
+        ) in documentation_contracts:
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
                 normalized = self.normalize_command_text(text)
@@ -402,7 +478,9 @@ class BackendUvContractTest(unittest.TestCase):
                     "--group benchmark --no-index --find-links artifacts/wheels"
                 )
                 dependency_block = self.powershell_block_containing(text, lock_command)
-                normalized_dependency_block = self.normalize_command_text(dependency_block)
+                normalized_dependency_block = self.normalize_command_text(
+                    dependency_block
+                )
                 environment_match = re.search(
                     r"\$env:UV_PYTHON_DOWNLOADS\s*=\s*[\"']never[\"']",
                     normalized_dependency_block,
@@ -417,6 +495,20 @@ class BackendUvContractTest(unittest.TestCase):
                 self.assertLess(environment_index, offline_index)
                 self.assertLess(environment_index, benchmark_index)
 
+        offline_readme = (
+            REPOSITORY_ROOT / "deploy" / "offline" / "README.md"
+        ).read_text(encoding="utf-8")
+        for required_text in (
+            "digest-pinned PYTHON_BASE_IMAGE",
+            "uv 0.11.29",
+            "preinstalled on PATH",
+            "Dockerfiles do not download uv",
+            "uv --version",
+            "all three real image builds remain target-host gates",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, offline_readme)
+
         runbook_path = REPOSITORY_ROOT / "docs" / "offline-platform-runbook.md"
         runbook = runbook_path.read_text(encoding="utf-8")
         normalized_runbook = self.normalize_command_text(runbook)
@@ -430,10 +522,7 @@ class BackendUvContractTest(unittest.TestCase):
             if "windows" in line.lower():
                 self.assertNotRegex(line.lower(), r"\bpy\b")
 
-        offline_uv = (
-            "uv run --project backend --frozen --offline --no-default-groups "
-            "--group offline python"
-        )
+        offline_uv = "uv run --project backend --frozen --offline --no-default-groups --group offline python"
         benchmark_uv = (
             "uv run --project backend --frozen --offline --no-default-groups "
             "--group benchmark python"
@@ -460,10 +549,14 @@ class BackendUvContractTest(unittest.TestCase):
         )
         self.assertIn(f"{benchmark_uv} -m compileall -q tools", normalized_runbook)
 
-        validation_block = self.powershell_block_containing(runbook, "app.offline_artifacts")
+        validation_block = self.powershell_block_containing(
+            runbook, "app.offline_artifacts"
+        )
         normalized_validation = self.normalize_command_text(validation_block)
         pythonpath_index = normalized_validation.index('$env:PYTHONPATH = "backend"')
-        validation_index = normalized_validation.index(f"{offline_uv} -c", pythonpath_index)
+        validation_index = normalized_validation.index(
+            f"{offline_uv} -c", pythonpath_index
+        )
         self.assertLess(pythonpath_index, validation_index)
 
     def test_smoke_backend_uses_uv_from_the_backend_project(self) -> None:
@@ -483,7 +576,9 @@ class BackendUvContractTest(unittest.TestCase):
         run_index = lower_normalized.index(run_command, backend_index)
         self.assertLess(backend_index, run_index)
         self.assertNotIn("py -m uvicorn", lower_normalized)
-        self.assertNotRegex(lower_normalized, r"\b(?:pip3?|uv\s+pip|python\s+-m\s+pip)\s+install\b")
+        self.assertNotRegex(
+            lower_normalized, r"\b(?:pip3?|uv\s+pip|python\s+-m\s+pip)\s+install\b"
+        )
 
 
 if __name__ == "__main__":

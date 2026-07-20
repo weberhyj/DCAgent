@@ -2,10 +2,82 @@ from __future__ import annotations
 
 import unittest
 
-from app.physoc_sse import PhysocStreamError, collect_physoc_response, iter_message_data
+from app.physoc_sse import (
+    PhysocStreamError,
+    collect_physoc_response,
+    iter_message_data,
+    iter_sse_lines,
+)
 
 
 class PhysocSseTests(unittest.TestCase):
+    def test_iter_sse_lines_splits_raw_chunks_and_preserves_split_utf8(self) -> None:
+        chunks = [b"data: " + bytes([0xE4]), bytes([0xBD, 0xA0]) + b"\n", b"\n"]
+
+        self.assertEqual(list(iter_sse_lines(chunks)), ["data: 你\n", "\n"])
+
+    def test_iter_sse_lines_accepts_cr_lf_and_split_crlf_terminators(self) -> None:
+        chunks = [b"one\rtwo\r", b"\nthree\n", b"four\r"]
+
+        self.assertEqual(
+            list(iter_sse_lines(chunks)),
+            ["one\n", "two\n", "three\n", "four\n"],
+        )
+
+    def test_collect_accepts_bare_cr_sse_records(self) -> None:
+        chunks = [
+            b'data: {"response":"hello ","done":false}\r\r',
+            b'data: {"response":"world","done":true}\r\r',
+        ]
+
+        self.assertEqual(
+            collect_physoc_response(
+                iter_sse_lines(chunks),
+                expected_model="physoc-v1",
+            ),
+            "hello world",
+        )
+
+    def test_iter_sse_lines_rejects_invalid_utf8(self) -> None:
+        with self.assertRaisesRegex(PhysocStreamError, "UTF-8"):
+            list(iter_sse_lines([b"data: \xff\n"]))
+
+    def test_iter_sse_lines_rejects_unterminated_and_complete_oversized_lines(self) -> None:
+        for chunks in ([b"x" * 5], [b"x" * 5 + b"\n"]):
+            with self.subTest(chunks=chunks):
+                with self.assertRaisesRegex(PhysocStreamError, "line"):
+                    list(iter_sse_lines(chunks, max_line_bytes=4))
+
+    def test_iter_sse_lines_bounds_all_sse_field_types(self) -> None:
+        for prefix in (b":", b"event: ", b"unknown: "):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(PhysocStreamError, "line"):
+                    list(iter_sse_lines([prefix + b"x" * 8 + b"\n"], max_line_bytes=8))
+
+    def test_iter_sse_lines_stops_consuming_after_unterminated_line_limit(self) -> None:
+        def chunks():
+            yield b"abc"
+            yield b"de"
+            raise AssertionError("raw iterator consumed after the line limit was exceeded")
+
+        with self.assertRaisesRegex(PhysocStreamError, "line"):
+            list(iter_sse_lines(chunks(), max_line_bytes=4))
+
+    def test_iter_sse_lines_rejects_stream_over_total_byte_limit_before_append(self) -> None:
+        with self.assertRaisesRegex(PhysocStreamError, "stream"):
+            list(iter_sse_lines([b"abc", b"de"], max_stream_bytes=4))
+
+    def test_iter_sse_lines_validates_positive_integer_limits_before_consuming(self) -> None:
+        def unreadable_chunks():
+            raise AssertionError("invalid limits must be rejected before input is consumed")
+            yield b""
+
+        for limit_name in ("max_line_bytes", "max_stream_bytes"):
+            for limit in (0, -1, True, 1.5, "10"):
+                with self.subTest(limit_name=limit_name, limit=limit):
+                    with self.assertRaises(PhysocStreamError):
+                        list(iter_sse_lines(unreadable_chunks(), **{limit_name: limit}))
+
     def test_iterates_default_and_explicit_message_events(self) -> None:
         lines = [
             ": heartbeat\n",
@@ -253,6 +325,68 @@ class PhysocSseTests(unittest.TestCase):
                         unreadable_lines(),
                         expected_model="physoc-v1",
                         max_response_chars=limit,
+                    )
+
+    def test_collect_rejects_duplicate_json_keys(self) -> None:
+        for duplicate in ("response", "done", "model"):
+            with self.subTest(duplicate=duplicate):
+                payload = (
+                    '{"response":"ok","done":true,"model":"physoc-v1",'
+                    f'"{duplicate}":' + ('"other"' if duplicate != "done" else "false") + "}"
+                )
+                with self.assertRaises(PhysocStreamError):
+                    collect_physoc_response(
+                        [f"data: {payload}\n", "\n"], expected_model="physoc-v1"
+                    )
+
+    def test_collect_rejects_more_than_max_events_and_does_not_accumulate_empty_response(
+        self,
+    ) -> None:
+        lines = []
+        for _ in range(3):
+            lines.extend(['data: {"response":"","done":false}\n', "\n"])
+        lines.extend(['data: {"response":"ok","done":true}\n', "\n"])
+
+        with self.assertRaisesRegex(PhysocStreamError, "events"):
+            collect_physoc_response(lines, expected_model="physoc-v1", max_events=3)
+
+    def test_collect_bounds_an_unending_stream_of_empty_response_events(self) -> None:
+        consumed = 0
+
+        def lines():
+            nonlocal consumed
+            while True:
+                consumed += 1
+                yield 'data: {"response":"","done":false}\n'
+                yield "\n"
+
+        with self.assertRaisesRegex(PhysocStreamError, "events"):
+            collect_physoc_response(lines(), expected_model="physoc-v1", max_events=3)
+        self.assertEqual(consumed, 4)
+
+    def test_collect_accepts_exact_max_events_and_done_empty_fragments(self) -> None:
+        lines = []
+        for _ in range(3):
+            lines.extend(['data: {"response":"","done":false}\n', "\n"])
+        lines.extend(['data: {"response":"ok","done":true}\n', "\n"])
+
+        self.assertEqual(
+            collect_physoc_response(lines, expected_model="physoc-v1", max_events=4),
+            "ok",
+        )
+
+    def test_collect_rejects_invalid_max_events_before_consuming(self) -> None:
+        def unreadable_lines():
+            raise AssertionError("invalid max_events must be rejected before input is consumed")
+            yield ""
+
+        for limit in (0, -1, True, 1.5, "10"):
+            with self.subTest(limit=limit):
+                with self.assertRaises(PhysocStreamError):
+                    collect_physoc_response(
+                        unreadable_lines(),
+                        expected_model="physoc-v1",
+                        max_events=limit,
                     )
 
 

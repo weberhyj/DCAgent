@@ -87,20 +87,22 @@ If no reliable knowledge hits exist, the provider returns the existing no-eviden
 
 ## SSE Parsing
 
-The provider uses `httpx.Client.stream()` with a POST request, JSON body, and `Accept: text/event-stream`.
+The provider uses `httpx.Client.stream()` with a POST request, JSON body, and `Accept: text/event-stream`. It consumes `response.iter_raw(chunk_size=4096)` and passes the bytes through a bounded decoder before SSE record parsing.
 
 The parser:
 
 1. consumes the response incrementally rather than loading the full HTTP body;
-2. supports standard SSE records separated by a blank line;
-3. accepts `message` events and the SSE default event type when `event:` is omitted;
-4. joins multiple `data:` lines according to SSE rules before JSON decoding;
-5. ignores comment/heartbeat lines beginning with `:`;
-6. requires each decoded payload to be an object with a string `response` and boolean `done`;
-7. validates a non-empty upstream `model`, when present, against the configured model;
-8. appends each `response` value in arrival order;
-9. stops only after receiving `done: true`;
-10. rejects a stream that ends before `done: true` or completes with no answer text.
+2. enforces a 524,288 bytes maximum line and a 4,194,304 bytes maximum stream before appending raw chunks;
+3. enforces a maximum of 4,096 message events, including empty response fragments;
+4. supports standard SSE records separated by a blank line;
+5. accepts `message` events and the SSE default event type when `event:` is omitted;
+6. joins multiple `data:` lines according to SSE rules before JSON decoding;
+7. ignores comment/heartbeat lines beginning with `:`;
+8. requires each decoded payload to be an object with a string `response` and boolean `done`;
+9. validates a non-empty upstream `model`, when present, against the configured model;
+10. appends each `response` value in arrival order;
+11. stops only after receiving `done: true`;
+12. rejects a stream that ends before `done: true` or completes with no answer text.
 
 The accumulated answer is passed through the existing `normalize_plain_text_answer()` function before it is converted to `ChatMessageModel`. Existing citation attachment remains unchanged.
 

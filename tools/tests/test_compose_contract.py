@@ -106,9 +106,9 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn("cmd /c", wrapper_text.lower())
 
     def test_compose_wrapper_validates_rendered_api_loopback_port(self) -> None:
-        wrapper_text = (
-            REPO_ROOT / "tools" / "invoke_offline_compose.ps1"
-        ).read_text(encoding="utf-8")
+        wrapper_text = (REPO_ROOT / "tools" / "invoke_offline_compose.ps1").read_text(
+            encoding="utf-8"
+        )
 
         for token in (
             'Get-JsonPropertyValue -Object $service -Name "ports"',
@@ -141,11 +141,11 @@ class ComposeContractTest(unittest.TestCase):
             )
             data_root = (root / "artifacts" / "data").resolve()
             model_root = (root / "artifacts" / "models").resolve()
-            password_path = (root / "artifacts" / "secrets" / "postgres-password").resolve()
+            password_path = (
+                root / "artifacts" / "secrets" / "postgres-password"
+            ).resolve()
             database_path = (root / "artifacts" / "secrets" / "database-url").resolve()
-            safe_image = (
-                "registry.internal/dc-agent/runtime@sha256:" + "a" * 64
-            )
+            safe_image = "registry.internal/dc-agent/runtime@sha256:" + "a" * 64
             (root / "deploy" / "offline" / ".env").write_text(
                 f"DATA_ROOT={data_root}\n"
                 f"MODEL_ROOT={model_root}\n"
@@ -170,11 +170,15 @@ class ComposeContractTest(unittest.TestCase):
                 "services": {
                     "postgres": {
                         "image": safe_image,
-                        "volumes": [bind(data_root / "postgres", "/var/lib/postgresql/data")],
+                        "volumes": [
+                            bind(data_root / "postgres", "/var/lib/postgresql/data")
+                        ],
                     },
                     "clickhouse": {
                         "image": safe_image,
-                        "volumes": [bind(data_root / "clickhouse", "/var/lib/clickhouse")],
+                        "volumes": [
+                            bind(data_root / "clickhouse", "/var/lib/clickhouse")
+                        ],
                     },
                     "qdrant": {
                         "image": safe_image,
@@ -253,7 +257,9 @@ class ComposeContractTest(unittest.TestCase):
             )
 
             process_environment = os.environ.copy()
-            process_environment["PATH"] = str(fake_bin) + os.pathsep + process_environment.get("PATH", "")
+            process_environment["PATH"] = (
+                str(fake_bin) + os.pathsep + process_environment.get("PATH", "")
+            )
             process_environment["FAKE_DOCKER_RENDER"] = str(render_path)
             process_environment["FAKE_DOCKER_LOG"] = str(log_path)
             process_environment["FAKE_PYTHON"] = sys.executable
@@ -262,7 +268,9 @@ class ComposeContractTest(unittest.TestCase):
             )
             process_environment["POSTGRES_IMAGE"] = "docker.io/library/postgres:latest"
             process_environment["DATA_ROOT"] = str(root / "external-data")
-            process_environment["POSTGRES_PASSWORD_FILE"] = str(root / "external-secret")
+            process_environment["POSTGRES_PASSWORD_FILE"] = str(
+                root / "external-secret"
+            )
             process_environment["COMPOSE_PROJECT_NAME"] = "attacker-project"
 
             def run(
@@ -296,7 +304,10 @@ class ComposeContractTest(unittest.TestCase):
 
             accepted = run(rendered)
             self.assertEqual(0, accepted.returncode, accepted.stderr)
-            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
             self.assertEqual(2, len(records))
             for record in records:
                 self.assertIsNone(record["POSTGRES_IMAGE"])
@@ -354,10 +365,7 @@ class ComposeContractTest(unittest.TestCase):
                     self.assertNotEqual(0, rejected_arguments.returncode)
                     self.assertIn(
                         "override",
-                        (
-                            rejected_arguments.stdout
-                            + rejected_arguments.stderr
-                        ).lower(),
+                        (rejected_arguments.stdout + rejected_arguments.stderr).lower(),
                     )
 
             scale_arguments = ("scale", "schema-migration=0")
@@ -366,8 +374,7 @@ class ComposeContractTest(unittest.TestCase):
                     log_path.unlink()
                 rejected_scale = run(rendered, *scale_arguments)
                 self.assertFalse(
-                    log_path.exists()
-                    and log_path.read_text(encoding="utf-8").strip(),
+                    log_path.exists() and log_path.read_text(encoding="utf-8").strip(),
                     "standalone scale must be rejected before Docker is invoked",
                 )
                 self.assertNotEqual(0, rejected_scale.returncode)
@@ -390,8 +397,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn(
                 "service",
                 (
-                    rejected_missing_profile.stdout
-                    + rejected_missing_profile.stderr
+                    rejected_missing_profile.stdout + rejected_missing_profile.stderr
                 ).lower(),
             )
 
@@ -401,10 +407,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_project_name.returncode)
             self.assertIn(
                 "project",
-                (
-                    rejected_project_name.stdout
-                    + rejected_project_name.stderr
-                ).lower(),
+                (rejected_project_name.stdout + rejected_project_name.stderr).lower(),
             )
 
             process_environment["DOCKER_CONTEXT"] = "remote-prod"
@@ -413,8 +416,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn(
                 "context",
                 (
-                    rejected_remote_context.stdout
-                    + rejected_remote_context.stderr
+                    rejected_remote_context.stdout + rejected_remote_context.stderr
                 ).lower(),
             )
             process_environment.pop("DOCKER_CONTEXT")
@@ -427,8 +429,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn(
                 "context",
                 (
-                    rejected_remote_default.stdout
-                    + rejected_remote_default.stderr
+                    rejected_remote_default.stdout + rejected_remote_default.stderr
                 ).lower(),
             )
             process_environment["FAKE_DOCKER_CONTEXT_HOST"] = (
@@ -436,10 +437,14 @@ class ComposeContractTest(unittest.TestCase):
             )
 
             unsafe_image = json.loads(json.dumps(rendered))
-            unsafe_image["services"]["postgres"]["image"] = "docker.io/library/postgres:latest"
+            unsafe_image["services"]["postgres"]["image"] = (
+                "docker.io/library/postgres:latest"
+            )
             rejected_image = run(unsafe_image)
             self.assertNotEqual(0, rejected_image.returncode)
-            self.assertIn("image", (rejected_image.stdout + rejected_image.stderr).lower())
+            self.assertIn(
+                "image", (rejected_image.stdout + rejected_image.stderr).lower()
+            )
             self.assertEqual(1, len(log_path.read_text(encoding="utf-8").splitlines()))
 
             uppercase_digest = json.loads(json.dumps(rendered))
@@ -451,8 +456,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn(
                 "image",
                 (
-                    rejected_uppercase_digest.stdout
-                    + rejected_uppercase_digest.stderr
+                    rejected_uppercase_digest.stdout + rejected_uppercase_digest.stderr
                 ).lower(),
             )
 
@@ -470,7 +474,9 @@ class ComposeContractTest(unittest.TestCase):
             )
             rejected_secret = run(unsafe_secret)
             self.assertNotEqual(0, rejected_secret.returncode)
-            self.assertIn("secret", (rejected_secret.stdout + rejected_secret.stderr).lower())
+            self.assertIn(
+                "secret", (rejected_secret.stdout + rejected_secret.stderr).lower()
+            )
 
             public_api = json.loads(json.dumps(rendered))
             public_api["services"]["api"]["ports"][0]["host_ip"] = "0.0.0.0"
@@ -559,7 +565,9 @@ class ComposeContractTest(unittest.TestCase):
         self.assertIn("LASTEXITCODE", text)
         self.assertIn("SetAccessRuleProtection", text)
         self.assertIn("Set-Acl", text)
-        self.assertIn("artifacts/secrets/", (REPO_ROOT / ".gitignore").read_text(encoding="utf-8"))
+        self.assertIn(
+            "artifacts/secrets/", (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        )
 
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if powershell is None:
@@ -635,8 +643,12 @@ class ComposeContractTest(unittest.TestCase):
             first_env = env_path.read_bytes()
             first_password = password_path.read_bytes()
             first_database = database_path.read_bytes()
-            self.assertNotIn(first_password.decode("ascii"), first.stdout + first.stderr)
-            self.assertNotIn(first_database.decode("ascii"), first.stdout + first.stderr)
+            self.assertNotIn(
+                first_password.decode("ascii"), first.stdout + first.stderr
+            )
+            self.assertNotIn(
+                first_database.decode("ascii"), first.stdout + first.stderr
+            )
             self.assertNotIn(b"\n", first_password)
             self.assertNotIn(b"\n", first_database)
             self.assertIn(b"postgresql+psycopg://dc_agent:", first_database)
@@ -646,7 +658,9 @@ class ComposeContractTest(unittest.TestCase):
             self.assertEqual(first_env, env_path.read_bytes())
             self.assertEqual(first_password, password_path.read_bytes())
             self.assertEqual(first_database, database_path.read_bytes())
-            self.assertTrue(all(path.read_text(encoding="utf-8") == "kept\n" for path in sentinels))
+            self.assertTrue(
+                all(path.read_text(encoding="utf-8") == "kept\n" for path in sentinels)
+            )
 
             identity_lines = [
                 line
@@ -681,7 +695,9 @@ class ComposeContractTest(unittest.TestCase):
             self.assertTrue(password_path.exists())
             self.assertFalse(database_path.exists())
 
-    def test_initialized_postgres_rotation_refuses_without_changing_secrets(self) -> None:
+    def test_initialized_postgres_rotation_refuses_without_changing_secrets(
+        self,
+    ) -> None:
         script = REPO_ROOT / "tools" / "prepare_offline_env.ps1"
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if powershell is None:
@@ -743,10 +759,16 @@ class ComposeContractTest(unittest.TestCase):
             self.assertEqual(before_password, password_path.read_bytes())
             self.assertEqual(before_database, database_path.read_bytes())
             self.assertIn("ALTER ROLE", rotated.stderr + rotated.stdout)
-            self.assertNotIn(before_password.decode("ascii"), rotated.stderr + rotated.stdout)
-            self.assertNotIn(before_database.decode("ascii"), rotated.stderr + rotated.stdout)
+            self.assertNotIn(
+                before_password.decode("ascii"), rotated.stderr + rotated.stdout
+            )
+            self.assertNotIn(
+                before_database.decode("ascii"), rotated.stderr + rotated.stdout
+            )
 
-    def test_variable_data_root_rotation_fails_closed_without_secret_changes(self) -> None:
+    def test_variable_data_root_rotation_fails_closed_without_secret_changes(
+        self,
+    ) -> None:
         script = REPO_ROOT / "tools" / "prepare_offline_env.ps1"
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if powershell is None:
@@ -951,7 +973,9 @@ class ComposeContractTest(unittest.TestCase):
             copied_script = root / "tools" / "prepare_offline_env.ps1"
             copied_script.write_bytes(script.read_bytes())
 
-            def run(*arguments: str, override: str | None) -> subprocess.CompletedProcess[str]:
+            def run(
+                *arguments: str, override: str | None
+            ) -> subprocess.CompletedProcess[str]:
                 process_environment = os.environ.copy()
                 process_environment.pop("POSTGRES_PASSWORD_FILE", None)
                 process_environment.pop("DATABASE_URL_SECRET_FILE", None)
@@ -991,7 +1015,9 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rotated.returncode)
             self.assertEqual(before_password, password_path.read_bytes())
             self.assertEqual(before_database, database_path.read_bytes())
-            self.assertEqual(before_entries, sorted(path.name for path in secret_dir.iterdir()))
+            self.assertEqual(
+                before_entries, sorted(path.name for path in secret_dir.iterdir())
+            )
 
     def test_writable_bind_preflight_leaves_no_partial_directory(self) -> None:
         script = REPO_ROOT / "tools" / "prepare_offline_env.ps1"
@@ -1130,7 +1156,14 @@ class ComposeContractTest(unittest.TestCase):
             artifacts_link = root / "artifacts"
             if os.name == "nt":
                 linked = subprocess.run(
-                    ["cmd", "/c", "mklink", "/J", str(artifacts_link), str(real_artifacts)],
+                    [
+                        "cmd",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(artifacts_link),
+                        str(real_artifacts),
+                    ],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -1192,7 +1225,10 @@ class ComposeContractTest(unittest.TestCase):
             "active-pair-are-directories",
             "malformed-active-pair",
         ):
-            with self.subTest(case_name=case_name), tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                self.subTest(case_name=case_name),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 root = Path(temp_dir)
                 for directory in (
                     root / "artifacts" / "data" / "postgres",
@@ -1268,7 +1304,9 @@ class ComposeContractTest(unittest.TestCase):
                 self.assertFalse((root / "artifacts" / "data" / "raw").exists())
                 self.assertFalse((root / "artifacts" / "data" / "parquet").exists())
 
-    def test_identity_contract_rejects_invalid_duplicate_or_overridden_values(self) -> None:
+    def test_identity_contract_rejects_invalid_duplicate_or_overridden_values(
+        self,
+    ) -> None:
         script = REPO_ROOT / "tools" / "prepare_offline_env.ps1"
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if powershell is None:
@@ -1286,24 +1324,24 @@ class ComposeContractTest(unittest.TestCase):
             (base_lines + "DCAGENT_UID=0\nDCAGENT_GID=1000\n", {}),
             (base_lines + "DCAGENT_UID=abc\nDCAGENT_GID=1000\n", {}),
             (
-                base_lines
-                + "DCAGENT_UID=1000\nDCAGENT_UID=1001\nDCAGENT_GID=1000\n",
+                base_lines + "DCAGENT_UID=1000\nDCAGENT_UID=1001\nDCAGENT_GID=1000\n",
                 {},
             ),
             (
-                base_lines
-                + f"DCAGENT_UID={current_uid}\nDCAGENT_GID={current_gid}\n",
+                base_lines + f"DCAGENT_UID={current_uid}\nDCAGENT_GID={current_gid}\n",
                 {"DCAGENT_UID": str(int(current_uid) + 1)},
             ),
             (
-                base_lines
-                + f"DCAGENT_UID={current_uid}\nDCAGENT_GID={current_gid}\n",
+                base_lines + f"DCAGENT_UID={current_uid}\nDCAGENT_GID={current_gid}\n",
                 {"DCAGENT_UID": ""},
             ),
         )
 
         for env_text, overrides in variants:
-            with self.subTest(env_text=env_text, overrides=overrides), tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                self.subTest(env_text=env_text, overrides=overrides),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 root = Path(temp_dir)
                 (root / "deploy" / "offline").mkdir(parents=True)
                 (root / "tools").mkdir()
@@ -1364,7 +1402,10 @@ class ComposeContractTest(unittest.TestCase):
             Path("artifacts/models"),
         )
         for missing_path in required_relative_paths:
-            with self.subTest(missing_path=missing_path), tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                self.subTest(missing_path=missing_path),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 root = Path(temp_dir)
                 (root / "deploy" / "offline").mkdir(parents=True)
                 (root / "tools").mkdir()
@@ -1465,7 +1506,11 @@ class ComposeContractTest(unittest.TestCase):
             self.assertEqual(before_database, database_path.read_bytes())
 
     def test_dockerfiles_have_no_floating_syntax_directive(self) -> None:
-        for dockerfile_name in ("backend.Dockerfile", "worker.Dockerfile", "embedding.Dockerfile"):
+        for dockerfile_name in (
+            "backend.Dockerfile",
+            "worker.Dockerfile",
+            "embedding.Dockerfile",
+        ):
             text = (REPO_ROOT / "deploy" / "docker" / dockerfile_name).read_text(
                 encoding="utf-8"
             )
@@ -1574,13 +1619,17 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotIn("COPY --chown", text)
             self.assertNotRegex(text, r"\bchown\b")
             self.assertNotRegex(text, r"\bchown\s+-R\b[^\n]*\s/app(?:\s|$)")
+            version_gate = 'case "$(uv --version)" in'
+            version_pattern = '"uv 0.11.29"|"uv 0.11.29 "*)'
             sync_command = (
-                "RUN uv --version && uv sync --frozen --offline --no-install-project --no-dev "
+                "uv sync --frozen --offline --no-install-project --no-dev "
                 "--group offline --find-links=/wheels"
             )
             self.assertIn("UV_NO_INDEX=1", text)
             self.assertIn("UV_PYTHON_DOWNLOADS=never", text)
             self.assertIn("UV_LINK_MODE=copy", text)
+            self.assertIn(version_gate, text)
+            self.assertIn(version_pattern, text)
             self.assertIn(sync_command, text)
             self.assertNotRegex(
                 text,
@@ -1588,8 +1637,12 @@ class ComposeContractTest(unittest.TestCase):
             )
             self.assertNotRegex(text, r"\brequirements[^\s/]*\.(?:txt|in)\b")
             self.assertLess(text.index("UV_NO_INDEX=1"), text.index(sync_command))
-            self.assertLess(text.index("UV_PYTHON_DOWNLOADS=never"), text.index(sync_command))
+            self.assertLess(
+                text.index("UV_PYTHON_DOWNLOADS=never"), text.index(sync_command)
+            )
             self.assertLess(text.index("UV_LINK_MODE=copy"), text.index(sync_command))
+            self.assertLess(text.index(version_gate), text.index(sync_command))
+            self.assertLess(text.index(version_pattern), text.index(sync_command))
             self.assertLess(
                 text.index(sync_command),
                 text.index('ENV PATH="/app/.venv/bin:$PATH"'),
@@ -1602,11 +1655,19 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn(useradd_command, text)
             self.assertNotRegex(text, r"(?<!no-)--create-home\b")
             self.assertIn("ENV HOME=/nonexistent", text)
-            self.assertLess(text.index("useradd --uid"), text.index(writable_directory_command))
+            self.assertLess(
+                text.index("useradd --uid"), text.index(writable_directory_command)
+            )
             self.assertLess(text.index("useradd --uid"), text.rindex("USER dcagent"))
-            self.assertLess(text.index(writable_directory_command), text.rindex("USER dcagent"))
-            self.assertLess(text.index("ENV HOME=/nonexistent"), text.rindex("USER dcagent"))
-            commands.add(next(line for line in text.splitlines() if line.startswith("CMD ")))
+            self.assertLess(
+                text.index(writable_directory_command), text.rindex("USER dcagent")
+            )
+            self.assertLess(
+                text.index("ENV HOME=/nonexistent"), text.rindex("USER dcagent")
+            )
+            commands.add(
+                next(line for line in text.splitlines() if line.startswith("CMD "))
+            )
         self.assertEqual(3, len(commands))
 
     def test_bind_mounts_never_implicitly_create_host_paths(self) -> None:

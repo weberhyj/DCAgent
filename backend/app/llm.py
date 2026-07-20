@@ -19,7 +19,7 @@ from .models import (
     ResponseParagraphModel,
 )
 from .offline_settings import parse_bool, require_private_url
-from .physoc_sse import PhysocStreamError, collect_physoc_response
+from .physoc_sse import PhysocStreamError, collect_physoc_response, iter_sse_lines
 from .time_utils import display_datetime_label
 
 NO_EVIDENCE_REPLY = "未检索到足够依据。请先在知识库中补充相关资料，或换一个更具体的问题重新检索。"
@@ -159,11 +159,22 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
                     "POST",
                     self.stream_url,
                     json={"query": query, "model": self.model},
-                    headers={"Accept": "text/event-stream"},
+                    headers={
+                        "Accept": "text/event-stream",
+                        "Accept-Encoding": "identity",
+                    },
                 ) as response:
                     response.raise_for_status()
+                    content_type = response.headers.get("Content-Type", "")
+                    media_type = content_type.split(";", 1)[0].strip().lower()
+                    if media_type != "text/event-stream":
+                        raise PhysocStreamError("Physoc response Content-Type is invalid")
+                    content_encoding = response.headers.get("Content-Encoding", "")
+                    if content_encoding.strip().lower() not in {"", "identity"}:
+                        raise PhysocStreamError("Physoc response Content-Encoding is invalid")
                     collected = collect_physoc_response(
-                        response.iter_lines(), expected_model=self.model
+                        iter_sse_lines(response.iter_raw(chunk_size=4096)),
+                        expected_model=self.model,
                     )
                     content = normalize_plain_text_answer(collected)
                     if not content.strip():

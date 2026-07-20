@@ -12,7 +12,11 @@ COPY backend/pyproject.toml backend/uv.lock ./
 ENV UV_NO_INDEX=1 \
     UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy
-RUN uv --version && uv sync --frozen --offline --no-install-project --no-dev --group offline --find-links=/wheels \
+RUN case "$(uv --version)" in \
+        "uv 0.11.29"|"uv 0.11.29 "*) ;; \
+        *) exit 1 ;; \
+    esac \
+    && uv sync --frozen --offline --no-install-project --no-dev --group offline --find-links=/wheels \
     && rm -rf /root/.cache/uv
 ENV PATH="/app/.venv/bin:$PATH"
 

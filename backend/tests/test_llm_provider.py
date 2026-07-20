@@ -139,13 +139,17 @@ class FakePhysocResponse:
         self,
         lines: list[str],
         *,
+        headers: dict[str, str] | None = None,
+        chunks: list[bytes] | None = None,
         status_error: httpx.HTTPError | None = None,
         line_error: httpx.HTTPError | None = None,
     ) -> None:
-        self.lines = lines
+        self.chunks = chunks or [f"{line}\n".encode() for line in lines]
+        self.headers = {"Content-Type": "text/event-stream"} if headers is None else headers
         self.status_error = status_error
         self.line_error = line_error
         self.status_checked = False
+        self.raw_chunk_sizes: list[int] = []
         self.exit_count = 0
 
     def __enter__(self) -> FakePhysocResponse:
@@ -160,10 +164,11 @@ class FakePhysocResponse:
         if self.status_error is not None:
             raise self.status_error
 
-    def iter_lines(self):
+    def iter_raw(self, *, chunk_size: int):
+        self.raw_chunk_sizes.append(chunk_size)
         if self.line_error is not None:
             raise self.line_error
-        return iter(self.lines)
+        return iter(self.chunks)
 
 
 class RecordingPhysocClient:
@@ -453,13 +458,17 @@ class LLMProviderTest(unittest.TestCase):
 
         client_factory.assert_called_once_with(timeout=45.0, trust_env=False)
         self.assertTrue(response.status_checked)
+        self.assertEqual(response.raw_chunk_sizes, [4096])
         self.assertEqual(response.exit_count, 1)
         self.assertEqual(client.exit_count, 1)
         self.assertEqual(len(client.requests), 1)
         recorded = client.requests[0]
         self.assertEqual(recorded["method"], "POST")
         self.assertEqual(recorded["url"], "http://127.0.0.1:11434/api/chat")
-        self.assertEqual(recorded["headers"], {"Accept": "text/event-stream"})
+        self.assertEqual(
+            recorded["headers"],
+            {"Accept": "text/event-stream", "Accept-Encoding": "identity"},
+        )
         self.assertEqual(
             recorded["json"],
             {
@@ -473,6 +482,81 @@ class LLMProviderTest(unittest.TestCase):
         self.assertEqual(reply.paragraphs[0].citations[0].source_id, "kb-llm")
         self.assertEqual(reply.paragraphs[0].citations[0].chunk_id, "chunk-llm")
         self.assertEqual(reply.artifacts, [])
+
+    def test_physoc_provider_accepts_event_stream_content_type_parameters(self) -> None:
+        response = FakePhysocResponse(
+            ['data: {"response":"ok","done":true}', ""],
+            headers={"Content-Type": "text/event-stream; charset=utf-8"},
+        )
+        client = RecordingPhysocClient(response)
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434",
+            stream_path="/private-stream",
+            model="deepseek-r1",
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client):
+            reply = provider.generate_reply(
+                LLMRequest(content="question", mode="source", knowledge_hits=[indexed_hit()])
+            )
+
+        self.assertEqual(reply.paragraphs[0].text, "ok")
+
+    def test_physoc_provider_rejects_missing_or_wrong_content_type_as_safe_error(self) -> None:
+        for headers in ({}, {"Content-Type": "application/json"}):
+            with self.subTest(headers=headers):
+                response = FakePhysocResponse(
+                    ['data: {"response":"secret","done":true}', ""],
+                    headers=headers,
+                )
+                client = RecordingPhysocClient(response)
+                provider = PhysocDeepSeekLLMProvider(
+                    api_base="http://127.0.0.1:11434",
+                    stream_path="/private-stream",
+                    model="deepseek-r1",
+                )
+
+                with patch("app.llm.httpx.Client", return_value=client):
+                    with self.assertRaises(LLMProviderError) as error:
+                        provider.generate_reply(
+                            LLMRequest(
+                                content="question",
+                                mode="source",
+                                knowledge_hits=[indexed_hit()],
+                            )
+                        )
+
+                self.assertNotIn("secret", str(error.exception))
+                self.assertEqual(response.raw_chunk_sizes, [])
+
+    def test_physoc_provider_rejects_compressed_raw_stream_as_safe_error(self) -> None:
+        response = FakePhysocResponse(
+            [],
+            headers={
+                "Content-Type": "text/event-stream",
+                "Content-Encoding": "gzip",
+            },
+            chunks=[b"secret compressed bytes"],
+        )
+        client = RecordingPhysocClient(response)
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434",
+            stream_path="/private-stream",
+            model="deepseek-r1",
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client):
+            with self.assertRaises(LLMProviderError) as error:
+                provider.generate_reply(
+                    LLMRequest(
+                        content="question",
+                        mode="source",
+                        knowledge_hits=[indexed_hit()],
+                    )
+                )
+
+        self.assertNotIn("secret", str(error.exception))
+        self.assertEqual(response.raw_chunk_sizes, [])
 
     def test_physoc_provider_rejects_normalized_empty_answer_and_closes_resources(self) -> None:
         request = LLMRequest(
