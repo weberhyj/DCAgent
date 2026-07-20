@@ -163,9 +163,7 @@ class RecordingPhysocClient:
         return None
 
     def stream(self, method: str, url: str, json: dict, headers: dict) -> FakePhysocResponse:
-        self.requests.append(
-            {"method": method, "url": url, "json": json, "headers": headers}
-        )
+        self.requests.append({"method": method, "url": url, "json": json, "headers": headers})
         return self.response
 
 
