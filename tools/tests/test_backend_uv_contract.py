@@ -102,18 +102,36 @@ class BackendUvContractTest(unittest.TestCase):
                 active_text = "\n".join(
                     line for line in text.splitlines() if not line.lstrip().startswith("#")
                 )
-                normalized_commands = re.sub(r"\\\s*\n\s*", " ", active_text)
-                self.assertIn("pyproject.toml", text)
-                self.assertIn("uv.lock", text)
+                active_commands = re.sub(r"\\\s*\n\s*", " ", active_text)
+                active_normalized = re.sub(r"\s+", " ", active_commands)
+                environment = "\n".join(
+                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands)
+                )
                 self.assertRegex(
-                    normalized_commands,
-                    r"(?m)^RUN\s+uv\s+sync(?:\s+\S+)*\s+--frozen(?:\s|$)",
+                    active_normalized,
+                    r"\bCOPY\s+backend/pyproject\.toml\s+backend/uv\.lock\s+\./",
+                )
+                self.assertRegex(environment, r"\bUV_NO_INDEX=1(?:\s|$)")
+                self.assertRegex(environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
+                self.assertRegex(environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
+                self.assertRegex(environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
+                self.assertRegex(
+                    active_commands,
+                    r"(?m)^RUN\s+uv\s+sync"
+                    r"(?=[^\n]*\s--frozen(?:\s|$))"
+                    r"(?=[^\n]*\s--no-install-project(?:\s|$))"
+                    r"(?=[^\n]*\s--no-dev(?:\s|$))"
+                    r"(?=[^\n]*\s--group\s+offline(?:\s|$))"
+                    r"(?=[^\n]*\s--find-links=/wheels(?:\s|$))[^\n]*$",
                 )
                 self.assertNotRegex(
-                    active_text,
+                    active_normalized,
                     r"\brequirements[^\s/]*\.(?:txt|in)\b",
                 )
-                self.assertNotIn("pip install", active_text)
+                self.assertNotRegex(
+                    active_normalized,
+                    r"\b(?:pip3?|uv\s+pip|python\s+-m\s+pip)\s+install\b",
+                )
 
         dockerignore = (REPOSITORY_ROOT / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("!backend/pyproject.toml", dockerignore)
