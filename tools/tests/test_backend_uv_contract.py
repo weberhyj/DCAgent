@@ -112,22 +112,26 @@ class BackendUvContractTest(unittest.TestCase):
                     r"\bCOPY\s+backend/pyproject\.toml\s+backend/uv\.lock\s+\./",
                 )
                 self.assertRegex(
-                    active_normalized,
-                    r"(?<!\S)COPY\s+artifacts/wheels\s+/wheels(?=\s|$)",
+                    active_commands,
+                    r"(?m)^COPY\s+artifacts/wheels\s+/wheels\s*$",
                 )
                 self.assertRegex(environment, r"\bUV_NO_INDEX=1(?:\s|$)")
                 self.assertRegex(environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
                 self.assertRegex(environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
                 self.assertRegex(environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
-                self.assertRegex(
-                    active_commands,
+                sync_match = re.search(
                     r"(?m)^RUN\s+(?:uv\s+--version\s+&&\s+)?uv\s+sync\s+"
-                    r"(?=[^\n]*(?<!\S)--frozen(?:\s|$))"
-                    r"(?=[^\n]*(?<!\S)--no-install-project(?:\s|$))"
-                    r"(?=[^\n]*(?<!\S)--no-dev(?:\s|$))"
-                    r"(?=[^\n]*(?<!\S)--group\s+offline(?:\s|$))"
-                    r"(?=[^\n]*(?<!\S)--find-links=/wheels(?:\s|$))[^\n]*$",
+                    r"(?P<args>.*?)(?:[ \t]*(?:&&|\|\||;)[ \t]*|$)",
+                    active_commands,
                 )
+                if sync_match is None:
+                    self.fail("Missing the required offline uv sync command")
+                sync_args = sync_match["args"]
+                self.assertRegex(sync_args, r"(?<!\S)--frozen(?!\S)")
+                self.assertRegex(sync_args, r"(?<!\S)--no-install-project(?!\S)")
+                self.assertRegex(sync_args, r"(?<!\S)--no-dev(?!\S)")
+                self.assertRegex(sync_args, r"(?<!\S)--group\s+offline(?!\S)")
+                self.assertRegex(sync_args, r"(?<!\S)--find-links=/wheels(?!\S)")
                 self.assertNotRegex(
                     active_normalized,
                     r"\brequirements[^\s/]*\.(?:txt|in)\b",
