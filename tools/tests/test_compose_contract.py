@@ -1501,12 +1501,16 @@ class ComposeContractTest(unittest.TestCase):
             "!backend/app/**",
             "!backend/alembic.ini",
             "!backend/alembic/**",
-            "!backend/requirements.txt",
-            "!backend/requirements-offline.txt",
+            "!backend/pyproject.toml",
+            "!backend/uv.lock",
             "!deploy/",
             "!deploy/docker/**",
         ):
             self.assertIn(required, lines)
+        self.assertFalse(
+            any(line.startswith("!") and "requirements" in line for line in lines),
+            "The Docker build context must not allowlist legacy requirements files",
+        )
         self.assertLess(
             lines.index("artifacts/**"),
             lines.index("!artifacts/wheels/**"),
@@ -1562,8 +1566,26 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn('case "$DCAGENT_GID"', text)
             self.assertIn("id -u dcagent", text)
             self.assertIn("id -g dcagent", text)
-            self.assertIn("--no-index", text)
-            self.assertIn("--require-hashes", text)
+            sync_command = (
+                "RUN uv --version && uv sync --frozen --no-install-project --no-dev "
+                "--group offline --find-links=/wheels"
+            )
+            self.assertIn("UV_NO_INDEX=1", text)
+            self.assertIn("UV_PYTHON_DOWNLOADS=never", text)
+            self.assertIn("UV_LINK_MODE=copy", text)
+            self.assertIn(sync_command, text)
+            self.assertNotRegex(
+                text,
+                r"\b(?:pip3?|uv\s+pip|python\s+-m\s+pip)\s+install\b",
+            )
+            self.assertNotRegex(text, r"\brequirements[^\s/]*\.(?:txt|in)\b")
+            self.assertLess(text.index("UV_NO_INDEX=1"), text.index(sync_command))
+            self.assertLess(text.index("UV_PYTHON_DOWNLOADS=never"), text.index(sync_command))
+            self.assertLess(text.index("UV_LINK_MODE=copy"), text.index(sync_command))
+            self.assertLess(
+                text.index(sync_command),
+                text.index('ENV PATH="/app/.venv/bin:$PATH"'),
+            )
             self.assertLess(text.index("USER root"), text.index("useradd --uid"))
             self.assertLess(text.index("useradd --uid"), text.rindex("USER dcagent"))
             commands.add(next(line for line in text.splitlines() if line.startswith("CMD ")))

@@ -20,8 +20,8 @@ artifacts/**
 !backend/alembic.ini
 !backend/alembic/
 !backend/alembic/**
-!backend/requirements.txt
-!backend/requirements-offline.txt
+!backend/pyproject.toml
+!backend/uv.lock
 
 # Dockerfiles remain available to BuildKit from the repository-root context.
 !deploy/

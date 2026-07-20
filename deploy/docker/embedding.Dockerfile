@@ -8,9 +8,13 @@ USER root
 WORKDIR /app
 
 COPY artifacts/wheels /wheels
-COPY backend/requirements.txt backend/requirements-offline.txt ./
-RUN python -m pip install --no-index --find-links=/wheels --require-hashes -r requirements-offline.txt \
-    && rm -rf /root/.cache/pip
+COPY backend/pyproject.toml backend/uv.lock ./
+ENV UV_NO_INDEX=1 \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy
+RUN uv --version && uv sync --frozen --no-install-project --no-dev --group offline --find-links=/wheels \
+    && rm -rf /root/.cache/uv
+ENV PATH="/app/.venv/bin:$PATH"
 
 COPY backend/app ./app
 
