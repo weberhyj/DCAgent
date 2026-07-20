@@ -4,7 +4,6 @@ import math
 import os
 from collections.abc import Mapping
 
-
 DEFAULT_RETRIEVAL_MIN_SCORE = 2.2
 
 

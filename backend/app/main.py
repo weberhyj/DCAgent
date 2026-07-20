@@ -49,15 +49,15 @@ def create_app(
 ) -> FastAPI:
     app = _build_app()
     app.state.repository = repository or create_default_repository(llm_provider)
-    app.state.knowledge_ingestion_queue = ingestion_queue or KnowledgeIngestionQueue(app.state.repository)
+    app.state.knowledge_ingestion_queue = ingestion_queue or KnowledgeIngestionQueue(
+        app.state.repository
+    )
     app.state.knowledge_file_storage = KnowledgeFileStorage(
         upload_dir or Path(__file__).resolve().parents[1] / "uploads" / "knowledge"
     )
     app.state.evaluation_import_service = EvaluationImportService(ttl_seconds=1800)
     app.state.health_registry = (
-        health_registry
-        if health_registry is not None
-        else DependencyHealthRegistry()
+        health_registry if health_registry is not None else DependencyHealthRegistry()
     )
     app.state.health_checks_active = True
 
@@ -139,13 +139,9 @@ def create_production_app(
     *,
     environ: Mapping[str, str] | None = None,
     repository_factory: Callable[[], ChatRepository] | None = None,
-    health_registry_factory: Callable[
-        [], DependencyHealthRegistry
-    ] | None = None,
+    health_registry_factory: Callable[[], DependencyHealthRegistry] | None = None,
     database_factory: Callable[[str], object] | None = None,
-    llm_provider_factory: Callable[
-        [Mapping[str, str]], LLMProvider
-    ] | None = None,
+    llm_provider_factory: Callable[[Mapping[str, str]], LLMProvider] | None = None,
     ingestion_queue_factory: Callable[[ChatRepository], object] | None = None,
     storage_factory: Callable[[Path], object] | None = None,
     evaluation_import_service_factory: Callable[[], object] | None = None,
@@ -201,16 +197,12 @@ def create_production_app(
 
             storage_builder = storage_factory or KnowledgeFileStorage
             storage_root = (
-                upload_dir
-                or Path(__file__).resolve().parents[1]
-                / "uploads"
-                / "knowledge"
+                upload_dir or Path(__file__).resolve().parents[1] / "uploads" / "knowledge"
             )
             storage = own(storage_builder(storage_root))
 
-            evaluation_builder = (
-                evaluation_import_service_factory
-                or (lambda: EvaluationImportService(ttl_seconds=1800))
+            evaluation_builder = evaluation_import_service_factory or (
+                lambda: EvaluationImportService(ttl_seconds=1800)
             )
             evaluation_service = own(evaluation_builder())
 
@@ -235,10 +227,7 @@ def create_production_app(
                     )
                 )
                 bounded_health_timeout = settings.dependency_timeout_seconds
-                if (
-                    not math.isfinite(bounded_health_timeout)
-                    or bounded_health_timeout <= 0
-                ):
+                if not math.isfinite(bounded_health_timeout) or bounded_health_timeout <= 0:
                     bounded_health_timeout = 2.0
                 bounded_health_timeout = min(bounded_health_timeout, 10.0)
                 health_registry = DependencyHealthRegistry(
@@ -259,10 +248,7 @@ def create_production_app(
                     health_registry,
                     DependencyHealthRegistry,
                 ):
-                    raise TypeError(
-                        "health_registry_factory must return "
-                        "DependencyHealthRegistry"
-                    )
+                    raise TypeError("health_registry_factory must return DependencyHealthRegistry")
                 own(health_registry)
 
             application.state.llm_provider = llm_provider

@@ -7,15 +7,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from alembic.util.exc import CommandError
 from sqlalchemy import Engine, create_engine, inspect, text
 
-from .database import resolve_database_url
+from alembic import command
 
+from .database import resolve_database_url
 
 BASELINE_REVISION = "20260715_00"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "alembic.ini"
@@ -275,19 +275,13 @@ BASELINE_INDEXES: dict[str, dict[str, IndexSignature]] = {
 }
 
 BASELINE_FOREIGN_KEYS: dict[str, tuple[ForeignKeySignature, ...]] = {
-    "messages": (
-        _foreign_key(("conversation_id",), "conversations", ("id",), "CASCADE"),
-    ),
-    "agent_steps": (
-        _foreign_key(("run_id",), "agent_runs", ("id",), "CASCADE"),
-    ),
+    "messages": (_foreign_key(("conversation_id",), "conversations", ("id",), "CASCADE"),),
+    "agent_steps": (_foreign_key(("run_id",), "agent_runs", ("id",), "CASCADE"),),
     "evaluation_runs": (
         _foreign_key(("case_id",), "evaluation_cases", ("id",), "CASCADE"),
         _foreign_key(("batch_id",), "evaluation_batches", ("id",), "SET NULL"),
     ),
-    "knowledge_chunks": (
-        _foreign_key(("source_id",), "knowledge_sources", ("id",), "CASCADE"),
-    ),
+    "knowledge_chunks": (_foreign_key(("source_id",), "knowledge_sources", ("id",), "CASCADE"),),
 }
 
 
@@ -338,8 +332,7 @@ def _normalize_type(column_type: Any) -> TypeSignature:
     family = family_by_visit_name.get(visit_name)
     if family is None:
         family = (
-            "unsupported:"
-            f"{column_type.__class__.__module__}.{column_type.__class__.__qualname__}"
+            f"unsupported:{column_type.__class__.__module__}.{column_type.__class__.__qualname__}"
         )
 
     string_family = family in {"varchar", "nvarchar", "char", "nchar", "text"}
@@ -375,9 +368,11 @@ def _has_semantic_value(value: Any) -> bool:
 
 def _semantic_value(value: Any) -> str:
     if isinstance(value, dict):
-        return "{" + ",".join(
-            f"{key}:{_semantic_value(item)}" for key, item in sorted(value.items())
-        ) + "}"
+        return (
+            "{"
+            + ",".join(f"{key}:{_semantic_value(item)}" for key, item in sorted(value.items()))
+            + "}"
+        )
     if isinstance(value, (tuple, list, set, frozenset)):
         return "[" + ",".join(_semantic_value(item) for item in value) + "]"
     return str(value).strip()
@@ -396,14 +391,10 @@ def _normalize_column(
     semantic_options: list[str] = []
     for field in ("computed", "identity"):
         if field in column and column.get(field) is not None:
-            semantic_options.append(
-                f"{field}={_semantic_value(column.get(field))}"
-            )
+            semantic_options.append(f"{field}={_semantic_value(column.get(field))}")
     autoincrement = column.get("autoincrement")
     if autoincrement is not None and autoincrement is not False:
-        semantic_options.append(
-            f"autoincrement={_semantic_value(autoincrement)}"
-        )
+        semantic_options.append(f"autoincrement={_semantic_value(autoincrement)}")
     if semantic_options:
         return (*signature, tuple(sorted(set(semantic_options))))
     return signature
@@ -453,9 +444,7 @@ def _normalize_index(index: Any) -> IndexSignature:
 
     duplicates_constraint = index.get("duplicates_constraint")
     if _has_semantic_value(duplicates_constraint):
-        semantic_options.append(
-            f"duplicates_constraint={_semantic_value(duplicates_constraint)}"
-        )
+        semantic_options.append(f"duplicates_constraint={_semantic_value(duplicates_constraint)}")
 
     for name, value in (index.get("dialect_options") or {}).items():
         if not _is_default_dialect_index_option(str(name), value):
@@ -499,10 +488,7 @@ def _plain_postgres_index_column(definition: Any) -> str | None:
 def _normalize_postgres_index_catalog_row(row: Any) -> IndexSignature:
     semantic_options: list[str] = []
     if row.get("is_primary") is True:
-        if (
-            "primary_constraint_oid" not in row
-            or row.get("primary_constraint_oid") is None
-        ):
+        if "primary_constraint_oid" not in row or row.get("primary_constraint_oid") is None:
             semantic_options.append("missing-primary-constraint")
         if "primary_constraint_deferrable" not in row:
             semantic_options.append("missing-primary-constraint-deferrable")
@@ -525,15 +511,11 @@ def _normalize_postgres_index_catalog_row(row: Any) -> IndexSignature:
     if "reloptions" not in row:
         semantic_options.append("missing-reloptions")
     elif row.get("reloptions") is not None:
-        semantic_options.append(
-            f"reloptions={_semantic_value(row.get('reloptions'))}"
-        )
+        semantic_options.append(f"reloptions={_semantic_value(row.get('reloptions'))}")
     if "tablespace" not in row:
         semantic_options.append("missing-tablespace")
     elif row.get("tablespace") is not None:
-        semantic_options.append(
-            f"tablespace={_semantic_value(row.get('tablespace'))}"
-        )
+        semantic_options.append(f"tablespace={_semantic_value(row.get('tablespace'))}")
     if str(row.get("access_method") or "").lower() != "btree":
         semantic_options.append(f"access_method={row.get('access_method')}")
     for field in ("predicate", "expressions"):
@@ -580,18 +562,16 @@ def _normalize_foreign_key(
     if referred_schema in {None, "", inspected_schema_name}:
         referred_schema = None
 
-    options = {str(name).lower(): value for name, value in (
-        foreign_key.get("options") or {}
-    ).items()}
+    options = {
+        str(name).lower(): value for name, value in (foreign_key.get("options") or {}).items()
+    }
     ondelete = _normalize_action(options.pop("ondelete", None), "NO ACTION")
     onupdate = _normalize_action(options.pop("onupdate", None), "NO ACTION")
     deferrable_value = options.pop("deferrable", None)
     deferrable = bool(deferrable_value) if deferrable_value is not None else False
     initially_value = options.pop("initially", None)
     initially = (
-        str(initially_value).strip().upper()
-        if _has_semantic_value(initially_value)
-        else None
+        str(initially_value).strip().upper() if _has_semantic_value(initially_value) else None
     )
     match = _normalize_action(options.pop("match", None), "SIMPLE")
 
@@ -670,9 +650,7 @@ def _normalize_postgres_table_catalog_row(row: Any) -> tuple[str, ...]:
     if "relpersistence" not in row:
         semantic_options.append("missing-relpersistence")
     elif row.get("relpersistence") != "p":
-        semantic_options.append(
-            f"relpersistence={_semantic_value(row.get('relpersistence'))}"
-        )
+        semantic_options.append(f"relpersistence={_semantic_value(row.get('relpersistence'))}")
     if "relispartition" not in row:
         semantic_options.append("missing-relispartition")
     elif row.get("relispartition") is not False:
@@ -680,15 +658,11 @@ def _normalize_postgres_table_catalog_row(row: Any) -> tuple[str, ...]:
     if "reloptions" not in row:
         semantic_options.append("missing-reloptions")
     elif row.get("reloptions") is not None:
-        semantic_options.append(
-            f"reloptions={_semantic_value(row.get('reloptions'))}"
-        )
+        semantic_options.append(f"reloptions={_semantic_value(row.get('reloptions'))}")
     if "reltablespace" not in row:
         semantic_options.append("missing-reltablespace")
     elif row.get("reltablespace") != 0:
-        semantic_options.append(
-            f"reltablespace={_semantic_value(row.get('reltablespace'))}"
-        )
+        semantic_options.append(f"reltablespace={_semantic_value(row.get('reltablespace'))}")
     if "relrowsecurity" not in row:
         semantic_options.append("missing-relrowsecurity")
     elif row.get("relrowsecurity") is not False:
@@ -700,9 +674,7 @@ def _normalize_postgres_table_catalog_row(row: Any) -> tuple[str, ...]:
     if "access_method" not in row:
         semantic_options.append("missing-access-method")
     elif row.get("access_method") != "heap":
-        semantic_options.append(
-            f"access_method={_semantic_value(row.get('access_method'))}"
-        )
+        semantic_options.append(f"access_method={_semantic_value(row.get('access_method'))}")
     for field, label in (
         ("has_inheritance_parent", "inheritance-parent"),
         ("has_inheritance_children", "inheritance-children"),
@@ -735,9 +707,7 @@ def _normalize_postgres_trigger_catalog_row(row: Any) -> tuple[str, ...]:
     if "constraint_type" not in row:
         semantic_options.append("missing-constraint-type")
     elif row.get("constraint_type") != "f":
-        semantic_options.append(
-            f"constraint_type={_semantic_value(row.get('constraint_type'))}"
-        )
+        semantic_options.append(f"constraint_type={_semantic_value(row.get('constraint_type'))}")
     return tuple(sorted(set(semantic_options)))
 
 
@@ -880,9 +850,7 @@ POSTGRES_INDEX_CATALOG_SQL = text(
 
 def _sqlite_index_list(connection: Any, table_name: str) -> list[Any]:
     quoted_table = table_name.replace('"', '""')
-    return connection.execute(
-        text(f'PRAGMA index_list("{quoted_table}")')
-    ).mappings().all()
+    return connection.execute(text(f'PRAGMA index_list("{quoted_table}")')).mappings().all()
 
 
 def _normalize_sqlite_index_catalog_row(
@@ -891,9 +859,7 @@ def _normalize_sqlite_index_catalog_row(
 ) -> IndexSignature:
     index_name = str(index["name"])
     quoted_name = index_name.replace('"', '""')
-    rows = connection.execute(
-        text(f'PRAGMA index_xinfo("{quoted_name}")')
-    ).mappings().all()
+    rows = connection.execute(text(f'PRAGMA index_xinfo("{quoted_name}")')).mappings().all()
     semantic_options: list[str] = []
     if bool(index.get("partial")):
         semantic_options.append("sqlite-partial")
@@ -924,9 +890,7 @@ def _require_supported_postgres_version(connection: Any) -> None:
         return
     server_version = tuple(connection.dialect.server_version_info or ())
     if server_version < (15,):
-        raise RuntimeError(
-            "PostgreSQL 15+ required for exact index validation"
-        )
+        raise RuntimeError("PostgreSQL 15+ required for exact index validation")
 
 
 def _validate_postgres_index_catalog(
@@ -936,10 +900,14 @@ def _validate_postgres_index_catalog(
 ) -> None:
     _require_supported_postgres_version(connection)
     for table_name, expected_indexes in BASELINE_INDEXES.items():
-        rows = connection.execute(
-            POSTGRES_INDEX_CATALOG_SQL,
-            {"schema_name": schema_name, "table_name": table_name},
-        ).mappings().all()
+        rows = (
+            connection.execute(
+                POSTGRES_INDEX_CATALOG_SQL,
+                {"schema_name": schema_name, "table_name": table_name},
+            )
+            .mappings()
+            .all()
+        )
         primary_rows = [row for row in rows if row.get("is_primary") is True]
         expected_primary_key = BASELINE_PRIMARY_KEYS[table_name]
         expected_primary_index = IndexSignature(
@@ -948,12 +916,9 @@ def _validate_postgres_index_catalog(
         )
         if (
             len(primary_rows) != 1
-            or _normalize_postgres_index_catalog_row(primary_rows[0])
-            != expected_primary_index
+            or _normalize_postgres_index_catalog_row(primary_rows[0]) != expected_primary_index
         ):
-            errors.append(
-                f"PostgreSQL primary index catalog differs for table {table_name}"
-            )
+            errors.append(f"PostgreSQL primary index catalog differs for table {table_name}")
         actual_indexes = {
             str(row["index_name"]): _normalize_postgres_index_catalog_row(row)
             for row in rows
@@ -971,18 +936,20 @@ def _validate_postgres_table_catalog(
 ) -> None:
     _require_supported_postgres_version(connection)
     for table_name in sorted(table_names):
-        rows = connection.execute(
-            POSTGRES_TABLE_CATALOG_SQL,
-            {"schema_name": schema_name, "table_name": table_name},
-        ).mappings().all()
+        rows = (
+            connection.execute(
+                POSTGRES_TABLE_CATALOG_SQL,
+                {"schema_name": schema_name, "table_name": table_name},
+            )
+            .mappings()
+            .all()
+        )
         if (
             len(rows) != 1
             or str(rows[0].get("table_name") or "") != table_name
             or _normalize_postgres_table_catalog_row(rows[0])
         ):
-            errors.append(
-                f"PostgreSQL table catalog differs for table {table_name}"
-            )
+            errors.append(f"PostgreSQL table catalog differs for table {table_name}")
 
 
 def _validate_postgres_trigger_catalog(
@@ -994,17 +961,18 @@ def _validate_postgres_trigger_catalog(
 ) -> None:
     _require_supported_postgres_version(connection)
     for table_name in sorted(table_names):
-        rows = connection.execute(
-            POSTGRES_TRIGGER_CATALOG_SQL,
-            {"schema_name": schema_name, "table_name": table_name},
-        ).mappings().all()
-        if (
-            len(rows) != expected_trigger_counts.get(table_name, 0)
-            or any(_normalize_postgres_trigger_catalog_row(row) for row in rows)
-        ):
-            errors.append(
-                f"PostgreSQL trigger catalog differs for table {table_name}"
+        rows = (
+            connection.execute(
+                POSTGRES_TRIGGER_CATALOG_SQL,
+                {"schema_name": schema_name, "table_name": table_name},
             )
+            .mappings()
+            .all()
+        )
+        if len(rows) != expected_trigger_counts.get(table_name, 0) or any(
+            _normalize_postgres_trigger_catalog_row(row) for row in rows
+        ):
+            errors.append(f"PostgreSQL trigger catalog differs for table {table_name}")
 
 
 def _validate_postgres_rule_catalog(
@@ -1015,14 +983,16 @@ def _validate_postgres_rule_catalog(
 ) -> None:
     _require_supported_postgres_version(connection)
     for table_name in sorted(table_names):
-        rows = connection.execute(
-            POSTGRES_RULE_CATALOG_SQL,
-            {"schema_name": schema_name, "table_name": table_name},
-        ).mappings().all()
-        if rows:
-            errors.append(
-                f"PostgreSQL rule catalog differs for table {table_name}"
+        rows = (
+            connection.execute(
+                POSTGRES_RULE_CATALOG_SQL,
+                {"schema_name": schema_name, "table_name": table_name},
             )
+            .mappings()
+            .all()
+        )
+        if rows:
+            errors.append(f"PostgreSQL rule catalog differs for table {table_name}")
 
 
 def _validate_postgres_foreign_key_catalog(
@@ -1034,20 +1004,18 @@ def _validate_postgres_foreign_key_catalog(
 ) -> None:
     _require_supported_postgres_version(connection)
     for table_name in sorted(table_names):
-        rows = connection.execute(
-            POSTGRES_FOREIGN_KEY_CATALOG_SQL,
-            {"schema_name": schema_name, "table_name": table_name},
-        ).mappings().all()
-        if (
-            len(rows) != len(actual_foreign_keys.get(table_name, ()))
-            or any(
-                _normalize_postgres_foreign_key_catalog_row(row)
-                for row in rows
+        rows = (
+            connection.execute(
+                POSTGRES_FOREIGN_KEY_CATALOG_SQL,
+                {"schema_name": schema_name, "table_name": table_name},
             )
+            .mappings()
+            .all()
+        )
+        if len(rows) != len(actual_foreign_keys.get(table_name, ())) or any(
+            _normalize_postgres_foreign_key_catalog_row(row) for row in rows
         ):
-            errors.append(
-                f"PostgreSQL foreign key catalog differs for table {table_name}"
-            )
+            errors.append(f"PostgreSQL foreign key catalog differs for table {table_name}")
 
 
 def _schema_fingerprint(
@@ -1058,14 +1026,8 @@ def _schema_fingerprint(
     inspector = inspect(connection)
     current_schema_name = schema_name
     if connection.dialect.name == "postgresql" and current_schema_name is None:
-        current_schema_name = connection.scalar(
-            text("SELECT pg_catalog.current_schema()")
-        )
-    schema_arguments = (
-        {"schema": current_schema_name}
-        if current_schema_name is not None
-        else {}
-    )
+        current_schema_name = connection.scalar(text("SELECT pg_catalog.current_schema()"))
+    schema_arguments = {"schema": current_schema_name} if current_schema_name is not None else {}
     tables = set(inspector.get_table_names(**schema_arguments)) - set(ignored_tables)
     columns: dict[str, tuple[ColumnSignature, ...]] = {}
     primary_keys: dict[str, PrimaryKeySignature] = {}
@@ -1085,8 +1047,7 @@ def _schema_fingerprint(
         primary_keys[table_name] = primary_key_signature
         primary_key_column_names = set(primary_key_signature.columns)
         columns[table_name] = tuple(
-            _normalize_column(column, primary_key_column_names)
-            for column in table_columns
+            _normalize_column(column, primary_key_column_names) for column in table_columns
         )
         defaults[table_name] = tuple(
             (column["name"], column.get("default")) for column in table_columns
@@ -1094,9 +1055,7 @@ def _schema_fingerprint(
         if connection.dialect.name == "sqlite":
             sqlite_indexes = _sqlite_index_list(connection, table_name)
             indexes[table_name] = {
-                str(index["name"]): _normalize_sqlite_index_catalog_row(
-                    connection, index
-                )
+                str(index["name"]): _normalize_sqlite_index_catalog_row(connection, index)
                 for index in sqlite_indexes
                 if str(index.get("origin") or "").lower() == "c"
             }
@@ -1116,9 +1075,7 @@ def _schema_fingerprint(
                 table_name,
                 connection.dialect.name,
                 schema_name=(
-                    current_schema_name
-                    if connection.dialect.name == "postgresql"
-                    else None
+                    current_schema_name if connection.dialect.name == "postgresql" else None
                 ),
             )
         )
@@ -1126,9 +1083,7 @@ def _schema_fingerprint(
             unique_constraints[table_name] = tuple(
                 (
                     index.get("name"),
-                    _normalize_sqlite_index_catalog_row(
-                        connection, index
-                    ).columns,
+                    _normalize_sqlite_index_catalog_row(connection, index).columns,
                 )
                 for index in sqlite_indexes
                 if str(index.get("origin") or "").lower() == "u"
@@ -1139,18 +1094,14 @@ def _schema_fingerprint(
                     constraint.get("name"),
                     tuple(constraint.get("column_names") or ()),
                 )
-                for constraint in inspector.get_unique_constraints(
-                    table_name, **schema_arguments
-                )
+                for constraint in inspector.get_unique_constraints(table_name, **schema_arguments)
             )
         check_constraints[table_name] = tuple(
             (
                 constraint.get("name"),
                 constraint.get("sqltext"),
             )
-            for constraint in inspector.get_check_constraints(
-                table_name, **schema_arguments
-            )
+            for constraint in inspector.get_check_constraints(table_name, **schema_arguments)
         )
 
     return {
@@ -1168,10 +1119,7 @@ def _schema_fingerprint(
 def _validate_counter_row(connection: Any, errors: list[str]) -> None:
     try:
         counter = connection.execute(
-            text(
-                "SELECT next_value FROM evaluation_counters "
-                "WHERE name = 'evaluation_runs'"
-            )
+            text("SELECT next_value FROM evaluation_counters WHERE name = 'evaluation_runs'")
         ).scalar_one_or_none()
         max_sequence = connection.execute(
             text("SELECT COALESCE(MAX(sequence), 0) FROM evaluation_runs")
@@ -1239,10 +1187,7 @@ def _validate_baseline(
                 expected_tables,
             )
         except Exception as error:
-            errors.append(
-                "PostgreSQL table catalog could not be validated: "
-                f"{error}"
-            )
+            errors.append(f"PostgreSQL table catalog could not be validated: {error}")
         try:
             if schema_name is None:
                 raise RuntimeError("current PostgreSQL schema is unavailable")
@@ -1254,10 +1199,7 @@ def _validate_baseline(
                 BASELINE_POSTGRES_TRIGGER_COUNTS,
             )
         except Exception as error:
-            errors.append(
-                "PostgreSQL trigger catalog could not be validated: "
-                f"{error}"
-            )
+            errors.append(f"PostgreSQL trigger catalog could not be validated: {error}")
         try:
             if schema_name is None:
                 raise RuntimeError("current PostgreSQL schema is unavailable")
@@ -1268,19 +1210,13 @@ def _validate_baseline(
                 expected_tables,
             )
         except Exception as error:
-            errors.append(
-                "PostgreSQL rule catalog could not be validated: "
-                f"{error}"
-            )
+            errors.append(f"PostgreSQL rule catalog could not be validated: {error}")
         try:
             if schema_name is None:
                 raise RuntimeError("current PostgreSQL schema is unavailable")
             _validate_postgres_index_catalog(connection, errors, schema_name)
         except Exception as error:
-            errors.append(
-                "PostgreSQL index catalog could not be validated: "
-                f"{error}"
-            )
+            errors.append(f"PostgreSQL index catalog could not be validated: {error}")
         try:
             if schema_name is None:
                 raise RuntimeError("current PostgreSQL schema is unavailable")
@@ -1292,10 +1228,7 @@ def _validate_baseline(
                 expected_tables & actual["tables"],
             )
         except Exception as error:
-            errors.append(
-                "PostgreSQL foreign key catalog could not be validated: "
-                f"{error}"
-            )
+            errors.append(f"PostgreSQL foreign key catalog could not be validated: {error}")
 
     _validate_counter_row(connection, errors)
     if errors:
@@ -1327,16 +1260,10 @@ def _validate_alembic_version_table(
     postgres_rule_catalog_valid: bool | None = None
     try:
         columns = inspector.get_columns("alembic_version", **schema_arguments)
-        primary_key = inspector.get_pk_constraint(
-            "alembic_version", **schema_arguments
-        )
-        unique_constraints = inspector.get_unique_constraints(
-            "alembic_version", **schema_arguments
-        )
+        primary_key = inspector.get_pk_constraint("alembic_version", **schema_arguments)
+        unique_constraints = inspector.get_unique_constraints("alembic_version", **schema_arguments)
         indexes = inspector.get_indexes("alembic_version", **schema_arguments)
-        check_constraints = inspector.get_check_constraints(
-            "alembic_version", **schema_arguments
-        )
+        check_constraints = inspector.get_check_constraints("alembic_version", **schema_arguments)
         foreign_keys = _get_foreign_keys(
             inspector,
             "alembic_version",
@@ -1371,13 +1298,17 @@ def _validate_alembic_version_table(
                 {"alembic_version"},
             )
             postgres_rule_catalog_valid = not rule_catalog_errors
-            catalog_rows = connection.execute(
-                POSTGRES_INDEX_CATALOG_SQL,
-                {
-                    "schema_name": schema_name,
-                    "table_name": "alembic_version",
-                },
-            ).mappings().all()
+            catalog_rows = (
+                connection.execute(
+                    POSTGRES_INDEX_CATALOG_SQL,
+                    {
+                        "schema_name": schema_name,
+                        "table_name": "alembic_version",
+                    },
+                )
+                .mappings()
+                .all()
+            )
             postgres_primary_indexes = tuple(
                 _normalize_postgres_index_catalog_row(row)
                 for row in catalog_rows
@@ -1390,12 +1321,9 @@ def _validate_alembic_version_table(
 
     primary_key_signature = _normalize_primary_key(primary_key)
     column_signatures = tuple(
-        _normalize_column(column, set(primary_key_signature.columns))
-        for column in columns
+        _normalize_column(column, set(primary_key_signature.columns)) for column in columns
     )
-    expected_columns: tuple[ColumnSignature, ...] = (
-        ("version_num", _string(32), False, True),
-    )
+    expected_columns: tuple[ColumnSignature, ...] = (("version_num", _string(32), False, True),)
     expected_primary_index = IndexSignature(
         columns=("version_num",),
         unique=True,
@@ -1408,18 +1336,9 @@ def _validate_alembic_version_table(
             connection.dialect.name == "postgresql"
             and postgres_primary_indexes != (expected_primary_index,)
         )
-        or (
-            connection.dialect.name == "postgresql"
-            and postgres_table_catalog_valid is not True
-        )
-        or (
-            connection.dialect.name == "postgresql"
-            and postgres_trigger_catalog_valid is not True
-        )
-        or (
-            connection.dialect.name == "postgresql"
-            and postgres_rule_catalog_valid is not True
-        )
+        or (connection.dialect.name == "postgresql" and postgres_table_catalog_valid is not True)
+        or (connection.dialect.name == "postgresql" and postgres_trigger_catalog_valid is not True)
+        or (connection.dialect.name == "postgresql" and postgres_rule_catalog_valid is not True)
         or has_server_default
         or unique_constraints
         or indexes
@@ -1438,13 +1357,9 @@ def _read_managed_revision(
     try:
         revisions = tuple(MigrationContext.configure(connection).get_current_heads())
     except Exception as error:
-        raise ManagedRevisionStateError(
-            "Alembic revision state could not be read"
-        ) from error
+        raise ManagedRevisionStateError("Alembic revision state could not be read") from error
     if len(revisions) != 1:
-        raise ManagedRevisionStateError(
-            "Alembic revision table must contain exactly one revision"
-        )
+        raise ManagedRevisionStateError("Alembic revision table must contain exactly one revision")
 
     revision = revisions[0]
     if not isinstance(revision, str) or not revision or revision != revision.strip():
@@ -1452,13 +1367,9 @@ def _read_managed_revision(
     try:
         resolved_revision = script_directory.get_revision(revision)
     except CommandError as error:
-        raise ManagedRevisionStateError(
-            f"Alembic revision is unknown: {revision}"
-        ) from error
+        raise ManagedRevisionStateError(f"Alembic revision is unknown: {revision}") from error
     if resolved_revision is None or resolved_revision.revision != revision:
-        raise ManagedRevisionStateError(
-            "Alembic revision must not be symbolic or abbreviated"
-        )
+        raise ManagedRevisionStateError("Alembic revision must not be symbolic or abbreviated")
     return revision
 
 

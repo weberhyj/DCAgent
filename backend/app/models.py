@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-
 ComposerMode = Literal["quick", "deep", "source"]
 MessageRole = Literal["user", "assistant"]
 KnowledgeStatus = Literal["已索引", "解析中", "待复核", "解析失败"]

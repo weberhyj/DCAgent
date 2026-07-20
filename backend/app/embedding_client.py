@@ -6,19 +6,19 @@ import math
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from ipaddress import IPv4Network, IPv6Network, ip_address
-from typing import Any, Protocol
+from typing import Protocol
 from urllib.parse import urlparse
 
 import httpx
 
 from .embedding_contracts import (
+    MAX_EMBEDDING_REQUEST_BYTES,
+    MAX_EMBEDDING_TEXT_BYTES,
+    MAX_EMBEDDING_TEXTS,
     EmbeddingMetadataExpectation,
     EmbeddingModelMetadata,
     EmbeddingPurpose,
     EmbeddingResponse,
-    MAX_EMBEDDING_REQUEST_BYTES,
-    MAX_EMBEDDING_TEXT_BYTES,
-    MAX_EMBEDDING_TEXTS,
     embedding_request_json_size,
 )
 from .offline_settings import require_private_url
@@ -171,9 +171,7 @@ class HttpEmbeddingClient:
             except EmbeddingClientError:
                 raise
             except Exception as error:
-                raise EmbeddingServiceError(
-                    "embedding service request failed"
-                ) from error
+                raise EmbeddingServiceError("embedding service request failed") from error
 
             try:
                 response = EmbeddingResponse.model_validate(raw_response)
@@ -237,9 +235,7 @@ def _validate_base_url(base_url: str) -> str:
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("EMBEDDING_SERVICE_URL must not include credentials")
     if parsed.query or parsed.fragment or parsed.params:
-        raise ValueError(
-            "EMBEDDING_SERVICE_URL must not include a query, fragment, or parameters"
-        )
+        raise ValueError("EMBEDDING_SERVICE_URL must not include a query, fragment, or parameters")
     path = parsed.path.rstrip("/")
     if path not in {"", "/v1"}:
         raise ValueError("EMBEDDING_SERVICE_URL path must be empty or /v1")
@@ -291,17 +287,14 @@ def _validate_texts(texts: Sequence[str]) -> list[str]:
     return values
 
 
-def _split_batches(
-    texts: Sequence[str], purpose: EmbeddingPurpose
-) -> list[list[str]]:
+def _split_batches(texts: Sequence[str], purpose: EmbeddingPurpose) -> list[list[str]]:
     batches: list[list[str]] = []
     current: list[str] = []
     for text in texts:
         candidate = current + [text]
         if current and (
             len(candidate) > MAX_EMBEDDING_TEXTS
-            or embedding_request_json_size(candidate, purpose)
-            > MAX_EMBEDDING_REQUEST_BYTES
+            or embedding_request_json_size(candidate, purpose) > MAX_EMBEDDING_REQUEST_BYTES
         ):
             batches.append(current)
             current = [text]

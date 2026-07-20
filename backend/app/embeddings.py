@@ -5,7 +5,6 @@ import math
 import re
 from typing import Protocol
 
-
 SEMANTIC_GROUPS = [
     {"回款", "应收", "账款", "现金流", "周期", "收款"},
     {"风险", "压力", "预警", "异常", "缺口"},
@@ -18,8 +17,7 @@ SEMANTIC_GROUPS = [
 class EmbeddingProvider(Protocol):
     dimensions: int
 
-    def embed(self, text: str) -> list[float]:
-        ...
+    def embed(self, text: str) -> list[float]: ...
 
 
 class HashingEmbeddingProvider:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import inspect
+import io
 import json
 import time
 import unittest
@@ -285,7 +285,7 @@ class EvaluationImportServiceTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.read_count = 0
 
-            def __iter__(self) -> "GuardedRows":
+            def __iter__(self) -> GuardedRows:
                 return self
 
             def __next__(self) -> dict[str, object]:
@@ -556,9 +556,7 @@ class EvaluationImportServiceTest(unittest.TestCase):
             expired_service.consume(expired.token)
 
     def test_preview_token_uses_24_bytes_of_urlsafe_entropy(self) -> None:
-        content = json.dumps(
-            [{"question": "无需答案", "expect_answer": False}]
-        ).encode("utf-8")
+        content = json.dumps([{"question": "无需答案", "expect_answer": False}]).encode("utf-8")
 
         with patch(
             "app.evaluation_import.secrets.token_urlsafe",
@@ -570,9 +568,7 @@ class EvaluationImportServiceTest(unittest.TestCase):
         token_urlsafe.assert_called_once_with(24)
 
     def test_concurrent_consume_allows_exactly_one_success(self) -> None:
-        content = json.dumps(
-            [{"question": "无需答案", "expect_answer": False}]
-        ).encode("utf-8")
+        content = json.dumps([{"question": "无需答案", "expect_answer": False}]).encode("utf-8")
         preview = self.service.preview("cases.json", content, self.sources)
 
         def consume() -> str:
@@ -588,9 +584,7 @@ class EvaluationImportServiceTest(unittest.TestCase):
         self.assertEqual(sorted(results), ["expired", "success"])
 
     def test_concurrent_reserve_reports_confirming_and_release_allows_retry(self) -> None:
-        content = json.dumps(
-            [{"question": "可恢复令牌", "expect_answer": False}]
-        ).encode("utf-8")
+        content = json.dumps([{"question": "可恢复令牌", "expect_answer": False}]).encode("utf-8")
         preview = self.service.preview("cases.json", content, self.sources)
         self.assertTrue(hasattr(self.service, "reserve"))
         self.assertTrue(hasattr(self.service, "complete"))
@@ -620,9 +614,7 @@ class EvaluationImportServiceTest(unittest.TestCase):
 
     def test_new_preview_cleans_expired_entries_before_capacity_check(self) -> None:
         service = EvaluationImportService(ttl_seconds=10, max_previews=1)
-        content = json.dumps(
-            [{"question": "无需答案", "expect_answer": False}]
-        ).encode("utf-8")
+        content = json.dumps([{"question": "无需答案", "expect_answer": False}]).encode("utf-8")
         with patch("app.evaluation_import.time.time", return_value=100):
             expired = service.preview("first.json", content, self.sources)
 
@@ -634,9 +626,7 @@ class EvaluationImportServiceTest(unittest.TestCase):
 
     def test_rejects_preview_when_capacity_is_full(self) -> None:
         service = EvaluationImportService(ttl_seconds=1800, max_previews=1)
-        content = json.dumps(
-            [{"question": "无需答案", "expect_answer": False}]
-        ).encode("utf-8")
+        content = json.dumps([{"question": "无需答案", "expect_answer": False}]).encode("utf-8")
         service.preview("first.json", content, self.sources)
 
         with self.assertRaisesRegex(EvaluationImportFileError, "预览数量已达上限"):
@@ -679,9 +669,9 @@ class EvaluationImportServiceTest(unittest.TestCase):
         existing_cases = [
             SimpleNamespace(external_key=None, question="Hello   World"),
         ]
-        content = json.dumps(
-            [{"question": "  hello world  ", "expect_answer": False}]
-        ).encode("utf-8")
+        content = json.dumps([{"question": "  hello world  ", "expect_answer": False}]).encode(
+            "utf-8"
+        )
 
         preview = self.service.preview(
             "cases.json",
@@ -713,12 +703,11 @@ class EvaluationImportServiceTest(unittest.TestCase):
 
     def test_materializes_existing_case_generator_once_for_duplicate_detection(self) -> None:
         existing_cases = (
-            case
-            for case in [SimpleNamespace(external_key=None, question="Generator Case")]
+            case for case in [SimpleNamespace(external_key=None, question="Generator Case")]
         )
-        content = json.dumps(
-            [{"question": "generator case", "expect_answer": False}]
-        ).encode("utf-8")
+        content = json.dumps([{"question": "generator case", "expect_answer": False}]).encode(
+            "utf-8"
+        )
 
         preview = self.service.preview(
             "cases.json",
@@ -731,9 +720,7 @@ class EvaluationImportServiceTest(unittest.TestCase):
         self.assertEqual(preview.duplicate_keys, ["generator case"])
 
     def test_existing_cases_default_is_none(self) -> None:
-        parameter = inspect.signature(EvaluationImportService.preview).parameters[
-            "existing_cases"
-        ]
+        parameter = inspect.signature(EvaluationImportService.preview).parameters["existing_cases"]
 
         self.assertIsNone(parameter.default)
 
@@ -924,9 +911,7 @@ class EvaluationImportApiTest(unittest.TestCase):
                 self.assertIn(message, response.json()["detail"])
 
     def test_confirm_token_is_single_use_with_consistent_chinese_error(self) -> None:
-        preview = self.preview(
-            [{"question": "一次性 token", "expect_answer": False}]
-        ).json()
+        preview = self.preview([{"question": "一次性 token", "expect_answer": False}]).json()
 
         first = self.client.post(
             "/api/admin/evaluations/import/confirm",
@@ -1000,12 +985,8 @@ class EvaluationImportApiTest(unittest.TestCase):
         self.assertEqual(len(self.repository.list_evaluation_cases()), 1)
 
     def test_confirm_expired_token_uses_the_same_chinese_gone_response(self) -> None:
-        self.client.app.state.evaluation_import_service = EvaluationImportService(
-            ttl_seconds=0
-        )
-        preview = self.preview(
-            [{"question": "立即过期", "expect_answer": False}]
-        ).json()
+        self.client.app.state.evaluation_import_service = EvaluationImportService(ttl_seconds=0)
+        preview = self.preview([{"question": "立即过期", "expect_answer": False}]).json()
 
         response = self.client.post(
             "/api/admin/evaluations/import/confirm",
@@ -1475,9 +1456,7 @@ class EvaluationImportSqlRepositoryTest(unittest.TestCase):
                 lambda worker: EvaluationImportRow(
                     row_number=2,
                     question=(
-                        "Concurrent   Question"
-                        if worker == 0
-                        else "  concurrent question  "
+                        "Concurrent   Question" if worker == 0 else "  concurrent question  "
                     ),
                     expect_answer=False,
                     expected_source_ids=[],
@@ -1497,9 +1476,7 @@ class EvaluationImportSqlRepositoryTest(unittest.TestCase):
                     database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
                     databases = [Database(database_url), Database(database_url)]
                     databases[0].create_schema()
-                    repositories = [
-                        SqlChatRepository(database) for database in databases
-                    ]
+                    repositories = [SqlChatRepository(database) for database in databases]
                     barrier = Barrier(2)
                     verifier_database = None
 
@@ -1622,45 +1599,7 @@ class EvaluationImportSqlRepositoryTest(unittest.TestCase):
 
     def test_postgres_import_locks_use_sorted_database_hashed_dedup_keys(self) -> None:
         session = MagicMock()
-        session.get_bind.return_value = SimpleNamespace(
-            dialect=SimpleNamespace(name="postgresql")
-        )
-        rows = [
-            EvaluationImportRow(
-                row_number=2,
-                question="Second question",
-                expect_answer=False,
-                expected_source_ids=[],
-                expected_terms=[],
-                category=None,
-                tags=[],
-                top_k=5,
-                external_key="key-b",
-            ),
-            EvaluationImportRow(
-                row_number=3,
-                question="  Normalize   Me ",
-                expect_answer=False,
-                expected_source_ids=[],
-                expected_terms=[],
-                category=None,
-                tags=[],
-                top_k=5,
-                external_key=None,
-            ),
-            EvaluationImportRow(
-                row_number=4,
-                question="First question",
-                expect_answer=False,
-                expected_source_ids=[],
-                expected_terms=[],
-                category=None,
-                tags=[],
-                top_k=5,
-                external_key="key-a",
-            ),
-        ]
-
+        session.get_bind.return_value = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
         self.repository._lock_evaluation_case_dedup_keys(
             session,
             [

@@ -6,7 +6,6 @@ from typing import Literal
 
 from .evaluation import EvaluationBatchModel, EvaluationCaseModel, EvaluationRunModel
 
-
 EvaluationFailureReason = Literal[
     "false_positive",
     "no_hit",
@@ -110,9 +109,7 @@ def summarize_evaluation_runs(
     for run in runs:
         case = cases_by_id.get(run.case_id)
         category = (case.category or "").strip() if case is not None else ""
-        category_statuses.setdefault(category or "未分类", []).append(
-            run.status == "passed"
-        )
+        category_statuses.setdefault(category or "未分类", []).append(run.status == "passed")
         if case is None:
             continue
         for tag in sorted(set(tag.strip() for tag in case.tags if tag.strip())):
@@ -134,14 +131,10 @@ def summarize_evaluation_runs(
         false_positive_count=false_positive_count,
         false_positive_rate=ratio(false_positive_count, len(no_answer_runs)),
         average_source_recall=average(
-            run.source_recall
-            for run in runs
-            if run.expect_answer and run.expected_source_ids
+            run.source_recall for run in runs if run.expect_answer and run.expected_source_ids
         ),
         average_term_recall=average(
-            run.term_recall
-            for run in runs
-            if run.expect_answer and run.expected_terms
+            run.term_recall for run in runs if run.expect_answer and run.expected_terms
         ),
         average_top_score=average(run.top_score for run in runs),
         maximum_top_score=max((run.top_score for run in runs), default=0.0),
@@ -190,9 +183,7 @@ def _metric_delta(
             right.no_answer_accuracy,
             left.no_answer_accuracy,
         ),
-        false_positive_count=(
-            right.false_positive_count - left.false_positive_count
-        ),
+        false_positive_count=(right.false_positive_count - left.false_positive_count),
         false_positive_rate=_float_delta(
             right.false_positive_rate,
             left.false_positive_rate,
@@ -290,13 +281,9 @@ def compare_evaluation_batches(
             and right_runs_by_case_id[case_id].status == "failed"
         ],
         left_only_case_ids=[
-            case_id
-            for case_id in left_case_ids
-            if case_id not in right_case_id_set
+            case_id for case_id in left_case_ids if case_id not in right_case_id_set
         ],
         right_only_case_ids=[
-            case_id
-            for case_id in right_case_ids
-            if case_id not in left_case_id_set
+            case_id for case_id in right_case_ids if case_id not in left_case_id_set
         ],
     )

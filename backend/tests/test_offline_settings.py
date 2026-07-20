@@ -102,16 +102,13 @@ class OfflineSettingsTest(unittest.TestCase):
                         {
                             "OFFLINE_MODE": "true",
                             "DATABASE_URL": (
-                                "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent"
-                                f"?{query}"
+                                f"postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?{query}"
                             ),
                         }
                     )
 
     def test_allows_harmless_postgres_query_options_in_offline_mode(self) -> None:
-        database_url = (
-            "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?sslmode=require"
-        )
+        database_url = "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?sslmode=require"
 
         settings = OfflineSettings.from_environ(
             {"OFFLINE_MODE": "true", "DATABASE_URL": database_url}
@@ -120,9 +117,7 @@ class OfflineSettingsTest(unittest.TestCase):
         self.assertEqual(settings.database_url, database_url)
 
     def test_allows_postgres_routing_overrides_when_offline_mode_is_disabled(self) -> None:
-        database_url = (
-            "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?host=api.example.com"
-        )
+        database_url = "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?host=api.example.com"
 
         settings = OfflineSettings.from_environ(
             {"OFFLINE_MODE": "false", "DATABASE_URL": database_url}

@@ -3,18 +3,29 @@ from __future__ import annotations
 import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BeforeValidator
 
 from .evaluation import (
-    EvaluationCaseFilterStatus,
     EvaluationCaseDuplicateError,
+    EvaluationCaseFilterStatus,
     parse_evaluation_category_filter,
     parse_evaluation_expect_answer_filter,
     parse_evaluation_status_filter,
     parse_evaluation_tag_filter,
 )
+from .evaluation_batches import compare_evaluation_batches, summarize_evaluation_runs
 from .evaluation_import import (
     MAX_IMPORT_BYTES,
     EvaluationImportFileError,
@@ -22,7 +33,6 @@ from .evaluation_import import (
     EvaluationImportTokenBusyError,
     EvaluationImportTokenError,
 )
-from .evaluation_batches import compare_evaluation_batches, summarize_evaluation_runs
 from .ingestion import KnowledgeIngestionQueue
 from .llm import LLMProviderError
 from .repository import ChatRepository
@@ -30,12 +40,12 @@ from .schemas import (
     AgentRunAudit,
     ChatMessage,
     ConversationBundle,
-    EvaluationCaseCollection,
-    EvaluationCaseRequest,
     EvaluationBatch,
     EvaluationBatchComparison,
     EvaluationBatchDetail,
     EvaluationBatchRequest,
+    EvaluationCaseCollection,
+    EvaluationCaseRequest,
     EvaluationDashboard,
     EvaluationImportConfirmRequest,
     EvaluationImportConfirmResponse,
@@ -47,7 +57,6 @@ from .schemas import (
     SendMessageRequest,
 )
 from .storage import KnowledgeFileStorage
-
 
 router = APIRouter(prefix="/api")
 
@@ -87,9 +96,7 @@ def readyz(request: Request) -> JSONResponse:
     else:
         registry = getattr(request.app.state, "health_registry", None)
         if registry is None:
-            report = {
-                "startup": {"ok": False, "detail": "not initialized"}
-            }
+            report = {"startup": {"ok": False, "detail": "not initialized"}}
         else:
             try:
                 report = registry.report()
@@ -295,10 +302,7 @@ def create_evaluation_batch(
 def list_evaluation_batches(
     repository: ChatRepository = Depends(get_repository),
 ) -> list[EvaluationBatch]:
-    return [
-        EvaluationBatch.from_model(batch)
-        for batch in repository.list_evaluation_batches()
-    ]
+    return [EvaluationBatch.from_model(batch) for batch in repository.list_evaluation_batches()]
 
 
 @router.get(
@@ -338,15 +342,8 @@ def get_evaluation_batch_detail(
 ) -> EvaluationBatchDetail:
     batch = repository.get_evaluation_batch(batch_id)
     runs = repository.list_evaluation_runs_for_batch(batch_id)
-    cases_by_id = {
-        case.id: case
-        for case in repository.list_evaluation_cases()
-    }
-    cases = [
-        cases_by_id[case_id]
-        for case_id in batch.case_ids
-        if case_id in cases_by_id
-    ]
+    cases_by_id = {case.id: case for case in repository.list_evaluation_cases()}
+    cases = [cases_by_id[case_id] for case_id in batch.case_ids if case_id in cases_by_id]
     summary = summarize_evaluation_runs(runs, cases_by_id)
     return EvaluationBatchDetail.from_models(
         batch=batch,
@@ -450,11 +447,15 @@ def reindex_knowledge_source(
     repository: ChatRepository = Depends(get_repository),
     ingestion_queue: KnowledgeIngestionQueue = Depends(get_ingestion_queue),
 ) -> list[KnowledgeSource]:
-    source = next((item for item in repository.list_knowledge_sources() if item.id == source_id), None)
+    source = next(
+        (item for item in repository.list_knowledge_sources() if item.id == source_id), None
+    )
     if source is None:
         raise HTTPException(status_code=404, detail="Knowledge source not found")
     if not source.file_path:
-        raise HTTPException(status_code=400, detail="Knowledge source has no uploaded file to reindex")
+        raise HTTPException(
+            status_code=400, detail="Knowledge source has no uploaded file to reindex"
+        )
 
     retried = repository.reindex_knowledge_source(source_id)
     ingestion_queue.discard_source(source_id)
@@ -501,4 +502,6 @@ def list_knowledge_chunks(
     ingestion_queue: KnowledgeIngestionQueue = Depends(get_ingestion_queue),
 ) -> list[KnowledgeChunk]:
     ingestion_queue.drain()
-    return [KnowledgeChunk.from_model(chunk) for chunk in repository.list_knowledge_chunks(source_id)]
+    return [
+        KnowledgeChunk.from_model(chunk) for chunk in repository.list_knowledge_chunks(source_id)
+    ]

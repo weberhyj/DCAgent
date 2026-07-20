@@ -8,10 +8,11 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app.infra.health import DependencyCheck, DependencyHealthRegistry
 from app.infra import health as health_module
+from app.infra.health import DependencyCheck, DependencyHealthRegistry
 from app.main import create_app
 from app.repository import InMemoryChatRepository
+from app.routes import router as app_router
 from app.seed import build_seed_state
 
 
@@ -24,9 +25,7 @@ class InfraHealthTest(unittest.TestCase):
             calls += 1
             return False, "unavailable"
 
-        registry = DependencyHealthRegistry(
-            [DependencyCheck("qdrant", qdrant_check)]
-        )
+        registry = DependencyHealthRegistry([DependencyCheck("qdrant", qdrant_check)])
         client = TestClient(
             create_app(
                 InMemoryChatRepository(build_seed_state()),
@@ -47,17 +46,13 @@ class InfraHealthTest(unittest.TestCase):
             readiness.json(),
             {
                 "status": "not_ready",
-                "dependencies": {
-                    "qdrant": {"ok": False, "detail": "unavailable"}
-                },
+                "dependencies": {"qdrant": {"ok": False, "detail": "unavailable"}},
             },
         )
         self.assertEqual(calls, 1)
 
     def test_registry_reports_success_and_empty_registry_is_ready(self) -> None:
-        registry = DependencyHealthRegistry(
-            [DependencyCheck("redis", lambda: (True, "ready"))]
-        )
+        registry = DependencyHealthRegistry([DependencyCheck("redis", lambda: (True, "ready"))])
 
         self.assertEqual(
             registry.report(),
@@ -69,13 +64,9 @@ class InfraHealthTest(unittest.TestCase):
 
     def test_registry_sanitizes_check_exceptions(self) -> None:
         def failing_check() -> tuple[bool, str]:
-            raise RuntimeError(
-                "postgresql://admin:secret@example.invalid/private-database"
-            )
+            raise RuntimeError("postgresql://admin:secret@example.invalid/private-database")
 
-        registry = DependencyHealthRegistry(
-            [DependencyCheck("postgresql", failing_check)]
-        )
+        registry = DependencyHealthRegistry([DependencyCheck("postgresql", failing_check)])
 
         report = registry.report()
 
@@ -143,9 +134,7 @@ class InfraHealthTest(unittest.TestCase):
         )
 
     def test_registries_share_one_bounded_executor(self) -> None:
-        registry = DependencyHealthRegistry(
-            [DependencyCheck("redis", lambda: (True, "ready"))]
-        )
+        registry = DependencyHealthRegistry([DependencyCheck("redis", lambda: (True, "ready"))])
         shared_executor = None
         with patch.object(
             health_module,
@@ -169,9 +158,7 @@ class InfraHealthTest(unittest.TestCase):
     def test_registry_close_shuts_down_and_later_report_rebuilds_executor(
         self,
     ) -> None:
-        registry = DependencyHealthRegistry(
-            [DependencyCheck("redis", lambda: (True, "ready"))]
-        )
+        registry = DependencyHealthRegistry([DependencyCheck("redis", lambda: (True, "ready"))])
         with patch.object(
             health_module,
             "_SHARED_EXECUTOR",
@@ -211,9 +198,7 @@ class InfraHealthTest(unittest.TestCase):
             release.wait(timeout=1.0)
             return True, "ready"
 
-        registry = DependencyHealthRegistry(
-            [DependencyCheck("redis", slow_check)]
-        )
+        registry = DependencyHealthRegistry([DependencyCheck("redis", slow_check)])
         leader_results: list[dict[str, dict[str, bool | str]]] = []
         follower_results: list[dict[str, dict[str, bool | str]]] = []
 
@@ -321,9 +306,7 @@ class InfraHealthTest(unittest.TestCase):
                 {"redis": {"ok": True, "detail": "ready 1"}},
             )
             clock[0] = 21.0
-            refresh = Thread(
-                target=lambda: refresh_results.append(registry.report())
-            )
+            refresh = Thread(target=lambda: refresh_results.append(registry.report()))
             refresh.start()
             self.assertTrue(refresh_started.wait(timeout=1.0))
 
@@ -369,9 +352,7 @@ class InfraHealthTest(unittest.TestCase):
         self.assertFalse(hasattr(check, "__dict__"))
 
     def test_health_compatibility_endpoint_is_unchanged(self) -> None:
-        client = TestClient(
-            create_app(InMemoryChatRepository(build_seed_state()))
-        )
+        client = TestClient(create_app(InMemoryChatRepository(build_seed_state())))
 
         response = client.get("/api/health")
 
@@ -379,11 +360,8 @@ class InfraHealthTest(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "ok"})
 
     def test_liveness_handlers_do_not_use_the_worker_thread_pool(self) -> None:
-        app = create_app(InMemoryChatRepository(build_seed_state()))
         endpoints = {
-            route.path: route.endpoint
-            for route in app.routes
-            if hasattr(route, "endpoint")
+            route.path: route.endpoint for route in app_router.routes if hasattr(route, "endpoint")
         }
 
         self.assertTrue(inspect.iscoroutinefunction(endpoints["/api/health"]))

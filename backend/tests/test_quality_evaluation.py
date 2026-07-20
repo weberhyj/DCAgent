@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier
-import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -89,10 +89,13 @@ def persist_evaluation_runs(
 ) -> None:
     if isinstance(repository, InMemoryChatRepository):
         repository._evaluation_runs = list(runs)
-        repository._evaluation_run_sequence = max(
-            (run.sequence for run in runs),
-            default=0,
-        ) + 1
+        repository._evaluation_run_sequence = (
+            max(
+                (run.sequence for run in runs),
+                default=0,
+            )
+            + 1
+        )
         return
 
     assert database is not None
@@ -436,9 +439,7 @@ class EvaluationCaseFilterApiTest(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
-        return next(
-            case for case in response.json()["cases"] if case["question"] == question
-        )
+        return next(case for case in response.json()["cases"] if case["question"] == question)
 
     def assert_full_metadata_summary(self, payload: dict) -> None:
         self.assertEqual(payload["categories"], sorted(["合同", "福利", "其他"]))
@@ -481,9 +482,7 @@ class EvaluationCaseFilterApiTest(unittest.TestCase):
 
     def test_status_filter_uses_latest_sequence_not_list_order(self) -> None:
         previous_run = next(
-            run
-            for run in self.repository._evaluation_runs
-            if run.case_id == self.passed_case["id"]
+            run for run in self.repository._evaluation_runs if run.case_id == self.passed_case["id"]
         )
         newer_failed_run = evaluation_run(
             next(
@@ -554,9 +553,7 @@ class EvaluationCaseFilterApiTest(unittest.TestCase):
             "/api/admin/evaluations/cases"
         ]["get"]["parameters"]
         expect_answer_parameter = next(
-            parameter
-            for parameter in parameters
-            if parameter["name"] == "expectAnswer"
+            parameter for parameter in parameters if parameter["name"] == "expectAnswer"
         )
 
         self.assertEqual(
@@ -741,8 +738,7 @@ class EvaluationCaseRepositoryFilterParityTest(unittest.TestCase):
                         )
                     ],
                     "exact_tag": [
-                        case.question
-                        for case in repository.list_evaluation_cases(tag="法")
+                        case.question for case in repository.list_evaluation_cases(tag="法")
                     ],
                     "blank": [
                         case.question
@@ -854,9 +850,7 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
         convert_run.assert_not_called()
         self.assertTrue(run_selects)
         self.assertTrue(any("max(" in statement for statement in run_selects))
-        self.assertTrue(
-            all("evaluation_runs.hits" not in statement for statement in run_selects)
-        )
+        self.assertTrue(all("evaluation_runs.hits" not in statement for statement in run_selects))
 
     def test_adding_run_after_large_history_never_updates_evaluation_runs(self) -> None:
         database = Database("sqlite+pysqlite:///:memory:")
@@ -905,15 +899,11 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
 
         self.assertEqual(created.sequence, 201)
         self.assertFalse(
-            any(
-                statement.startswith("update evaluation_runs")
-                for statement in write_statements
-            )
+            any(statement.startswith("update evaluation_runs") for statement in write_statements)
         )
         self.assertTrue(
             any(
-                statement.startswith("update evaluation_counters")
-                and "returning" in statement
+                statement.startswith("update evaluation_counters") and "returning" in statement
                 for statement in write_statements
             )
         )
@@ -946,9 +936,7 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
 
                 verifier_database = Database(database_url)
                 verifier = SqlChatRepository(verifier_database)
-                listed_sequences = [
-                    item.sequence for item in verifier.list_evaluation_runs()
-                ]
+                listed_sequences = [item.sequence for item in verifier.list_evaluation_runs()]
                 with verifier_database.session() as session:
                     next_value = session.scalar(
                         text(
@@ -1143,9 +1131,7 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
 
         inspector = inspect(database.engine)
         columns = {column["name"] for column in inspector.get_columns("evaluation_runs")}
-        indexes = {
-            index["name"]: index for index in inspector.get_indexes("evaluation_runs")
-        }
+        indexes = {index["name"]: index for index in inspector.get_indexes("evaluation_runs")}
         with database.session() as session:
             ordered_runs = session.execute(
                 select(EvaluationRunRecord.id, EvaluationRunRecord.sequence).order_by(
@@ -1159,10 +1145,7 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
                 )
             ).all()
             next_value = session.scalar(
-                text(
-                    "SELECT next_value FROM evaluation_counters "
-                    "WHERE name = 'evaluation_runs'"
-                )
+                text("SELECT next_value FROM evaluation_counters WHERE name = 'evaluation_runs'")
             )
 
         self.assertIn("sort_order", columns)
@@ -1184,23 +1167,17 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
                 [
                     statement
                     for statement in migration_statements
-                    if statement.startswith("with ranked")
-                    and "update evaluation_runs" in statement
+                    if statement.startswith("with ranked") and "update evaluation_runs" in statement
                 ]
             ),
             1,
         )
 
-        continued_run = SqlChatRepository(database).run_evaluation_cases(
-            ["legacy-case"]
-        )[0]
+        continued_run = SqlChatRepository(database).run_evaluation_cases(["legacy-case"])[0]
         self.assertEqual(continued_run.sequence, 4)
         with database.session() as session:
             continued_next_value = session.scalar(
-                text(
-                    "SELECT next_value FROM evaluation_counters "
-                    "WHERE name = 'evaluation_runs'"
-                )
+                text("SELECT next_value FROM evaluation_counters WHERE name = 'evaluation_runs'")
             )
         self.assertEqual(continued_next_value, 5)
 
@@ -1262,15 +1239,10 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
 
         with database.session() as session:
             sequences = session.scalars(
-                select(EvaluationRunRecord.sequence).order_by(
-                    EvaluationRunRecord.sequence
-                )
+                select(EvaluationRunRecord.sequence).order_by(EvaluationRunRecord.sequence)
             ).all()
             next_value = session.scalar(
-                text(
-                    "SELECT next_value FROM evaluation_counters "
-                    "WHERE name = 'evaluation_runs'"
-                )
+                text("SELECT next_value FROM evaluation_counters WHERE name = 'evaluation_runs'")
             )
         index = next(
             index
@@ -1515,9 +1487,7 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
         indexes = {index["name"] for index in inspector.get_indexes("evaluation_cases")}
         persisted = SqlChatRepository(database).list_evaluation_cases()
 
-        self.assertTrue(
-            {"category", "tags", "external_key", "import_batch_id"} <= columns
-        )
+        self.assertTrue({"category", "tags", "external_key", "import_batch_id"} <= columns)
         self.assertTrue(
             {
                 "ix_evaluation_cases_category",

@@ -13,7 +13,6 @@ from app import migration_entrypoint
 from app.database import Database
 from app.migration_entrypoint import BaselineSchemaMismatch, run_migrations
 
-
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -126,16 +125,14 @@ class FingerprintNormalizationTest(unittest.TestCase):
             "POSTGRES_RULE_CATALOG_SQL",
             None,
         )
-        connection.execute.side_effect = (
-            lambda statement, parameters: (
-                table_result
-                if statement is table_statement
-                else trigger_result
-                if statement is trigger_statement
-                else rule_result
-                if statement is rule_statement
-                else index_result
-            )
+        connection.execute.side_effect = lambda statement, parameters: (
+            table_result
+            if statement is table_statement
+            else trigger_result
+            if statement is trigger_statement
+            else rule_result
+            if statement is rule_statement
+            else index_result
         )
         return connection, inspector
 
@@ -262,11 +259,7 @@ class FingerprintNormalizationTest(unittest.TestCase):
             {**plain, "is_live": False},
             {name: value for name, value in plain.items() if name != "is_live"},
             {**plain, "nulls_not_distinct": True},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "nulls_not_distinct"
-            },
+            {name: value for name, value in plain.items() if name != "nulls_not_distinct"},
             {**plain, "reloptions": ["fillfactor=90"]},
             {name: value for name, value in plain.items() if name != "reloptions"},
             {**plain, "tablespace": "fastspace"},
@@ -324,17 +317,11 @@ class FingerprintNormalizationTest(unittest.TestCase):
         }
         self.assertEqual(
             (),
-            migration_entrypoint._normalize_postgres_index_catalog_row(
-                plain
-            ).semantic_options,
+            migration_entrypoint._normalize_postgres_index_catalog_row(plain).semantic_options,
         )
 
         variants = (
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "primary_constraint_oid"
-            },
+            {name: value for name, value in plain.items() if name != "primary_constraint_oid"},
             {**plain, "primary_constraint_oid": None},
             {
                 name: value
@@ -342,11 +329,7 @@ class FingerprintNormalizationTest(unittest.TestCase):
                 if name != "primary_constraint_deferrable"
             },
             {**plain, "primary_constraint_deferrable": True},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "primary_constraint_deferred"
-            },
+            {name: value for name, value in plain.items() if name != "primary_constraint_deferred"},
             {**plain, "primary_constraint_deferred": True},
         )
         for variant in variants:
@@ -529,9 +512,7 @@ class FingerprintNormalizationTest(unittest.TestCase):
             connection.dialect.name = "postgresql"
             connection.scalar.return_value = "tenant"
             with patch("app.migration_entrypoint.inspect", return_value=inspector):
-                return migration_entrypoint._schema_fingerprint(connection)[
-                    "primary_keys"
-                ]
+                return migration_entrypoint._schema_fingerprint(connection)["primary_keys"]
 
         plain = {
             "name": "items_pkey",
@@ -591,9 +572,7 @@ class FingerprintNormalizationTest(unittest.TestCase):
             "referred_columns": ["id"],
             "options": {"ondelete": "CASCADE"},
         }
-        normalized = migration_entrypoint._normalize_foreign_key(
-            plain, default_schema_name="main"
-        )
+        normalized = migration_entrypoint._normalize_foreign_key(plain, default_schema_name="main")
         same_default_schema = {
             **plain,
             "name": "different_generated_name",
@@ -744,51 +723,23 @@ class FingerprintNormalizationTest(unittest.TestCase):
         variants = (
             {name: value for name, value in plain.items() if name != "relkind"},
             {**plain, "relkind": "p"},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "relpersistence"
-            },
+            {name: value for name, value in plain.items() if name != "relpersistence"},
             {**plain, "relpersistence": "u"},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "relispartition"
-            },
+            {name: value for name, value in plain.items() if name != "relispartition"},
             {**plain, "relispartition": True},
             {name: value for name, value in plain.items() if name != "reloptions"},
             {**plain, "reloptions": ["fillfactor=90"]},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "reltablespace"
-            },
+            {name: value for name, value in plain.items() if name != "reltablespace"},
             {**plain, "reltablespace": 12345},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "relrowsecurity"
-            },
+            {name: value for name, value in plain.items() if name != "relrowsecurity"},
             {**plain, "relrowsecurity": True},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "relforcerowsecurity"
-            },
+            {name: value for name, value in plain.items() if name != "relforcerowsecurity"},
             {**plain, "relforcerowsecurity": True},
             {name: value for name, value in plain.items() if name != "access_method"},
             {**plain, "access_method": "custom_heap"},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "has_inheritance_parent"
-            },
+            {name: value for name, value in plain.items() if name != "has_inheritance_parent"},
             {**plain, "has_inheritance_parent": True},
-            {
-                name: value
-                for name, value in plain.items()
-                if name != "has_inheritance_children"
-            },
+            {name: value for name, value in plain.items() if name != "has_inheritance_children"},
             {**plain, "has_inheritance_children": True},
         )
         for variant in variants:
@@ -1049,11 +1000,7 @@ class FingerprintNormalizationTest(unittest.TestCase):
 
         self.assertEqual(
             fingerprint["primary_keys"],
-            {
-                "items": migration_entrypoint.PrimaryKeySignature(
-                    ("item_id", "tenant_id")
-                )
-            },
+            {"items": migration_entrypoint.PrimaryKeySignature(("item_id", "tenant_id"))},
         )
         self.assertEqual(
             tuple(column[3] for column in fingerprint["columns"]["items"]),
@@ -1061,21 +1008,15 @@ class FingerprintNormalizationTest(unittest.TestCase):
         )
         inspector.get_table_names.assert_called_once_with(schema="tenant")
         inspector.get_columns.assert_called_once_with("items", schema="tenant")
-        inspector.get_pk_constraint.assert_called_once_with(
-            "items", schema="tenant"
-        )
+        inspector.get_pk_constraint.assert_called_once_with("items", schema="tenant")
         inspector.get_indexes.assert_called_once_with("items", schema="tenant")
         inspector.get_foreign_keys.assert_called_once_with(
             "items",
             schema="tenant",
             postgresql_ignore_search_path=True,
         )
-        inspector.get_unique_constraints.assert_called_once_with(
-            "items", schema="tenant"
-        )
-        inspector.get_check_constraints.assert_called_once_with(
-            "items", schema="tenant"
-        )
+        inspector.get_unique_constraints.assert_called_once_with("items", schema="tenant")
+        inspector.get_check_constraints.assert_called_once_with("items", schema="tenant")
 
     def test_postgres_classification_locks_table_lookup_to_current_schema(self) -> None:
         inspector = MagicMock()
@@ -1173,8 +1114,7 @@ class MigrationEntrypointTest(unittest.TestCase):
                 primary_key_sql = " PRIMARY KEY" if primary_key else ""
                 extra_column_sql = ", unexpected INTEGER" if extra_column else ""
                 foreign_key_sql = (
-                    ", FOREIGN KEY (version_num) "
-                    "REFERENCES alembic_version(version_num)"
+                    ", FOREIGN KEY (version_num) REFERENCES alembic_version(version_num)"
                     if foreign_key
                     else ""
                 )
@@ -1187,10 +1127,7 @@ class MigrationEntrypointTest(unittest.TestCase):
                 )
                 for revision in revisions:
                     connection.execute(
-                        text(
-                            "INSERT INTO alembic_version (version_num) "
-                            "VALUES (:revision)"
-                        ),
+                        text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
                         {"revision": revision},
                     )
         finally:
@@ -1238,9 +1175,7 @@ class MigrationEntrypointTest(unittest.TestCase):
                     **variant,
                 )
 
-                with self.assertRaises(
-                    migration_entrypoint.ManagedRevisionStateError
-                ):
+                with self.assertRaises(migration_entrypoint.ManagedRevisionStateError):
                     run_migrations(
                         database_url=database_url,
                         config_path=BACKEND_ROOT / "alembic.ini",
@@ -1335,7 +1270,9 @@ class MigrationEntrypointTest(unittest.TestCase):
             patch("app.migration_entrypoint.inspect", return_value=inspector),
             patch("app.migration_entrypoint.command.upgrade", side_effect=fake_upgrade),
         ):
-            run_migrations(database_url="sqlite+pysqlite:///:memory:", config_path=BACKEND_ROOT / "alembic.ini")
+            run_migrations(
+                database_url="sqlite+pysqlite:///:memory:", config_path=BACKEND_ROOT / "alembic.ini"
+            )
 
         self.assertEqual(received_connections, [connection])
         engine.connect.assert_called_once_with()
@@ -1347,9 +1284,7 @@ class MigrationEntrypointTest(unittest.TestCase):
         engine = MagicMock()
         engine.connect.return_value.__enter__.return_value = connection
         inspector = MagicMock()
-        inspector.get_table_names.return_value = list(
-            migration_entrypoint.BASELINE_COLUMNS
-        )
+        inspector.get_table_names.return_value = list(migration_entrypoint.BASELINE_COLUMNS)
         events: list[tuple[str, object]] = []
 
         def validate(
@@ -1372,7 +1307,9 @@ class MigrationEntrypointTest(unittest.TestCase):
             patch("app.migration_entrypoint.command.stamp", side_effect=stamp),
             patch("app.migration_entrypoint.command.upgrade", side_effect=upgrade),
         ):
-            run_migrations(database_url="sqlite+pysqlite:///:memory:", config_path=BACKEND_ROOT / "alembic.ini")
+            run_migrations(
+                database_url="sqlite+pysqlite:///:memory:", config_path=BACKEND_ROOT / "alembic.ini"
+            )
 
         self.assertEqual(
             events,
@@ -1409,9 +1346,7 @@ class MigrationEntrypointTest(unittest.TestCase):
         inspect_database.assert_not_called()
         stamp.assert_not_called()
         upgrade.assert_not_called()
-        executed_sql = tuple(
-            str(call.args[0]) for call in connection.execute.call_args_list
-        )
+        executed_sql = tuple(str(call.args[0]) for call in connection.execute.call_args_list)
         self.assertEqual(2, len(executed_sql))
         self.assertIn("pg_advisory_lock", executed_sql[0])
         self.assertIn("pg_advisory_unlock", executed_sql[1])
@@ -1435,7 +1370,9 @@ class MigrationEntrypointTest(unittest.TestCase):
             patch("app.migration_entrypoint.command.upgrade", side_effect=fail_upgrade),
             self.assertRaises(RuntimeError),
         ):
-            run_migrations(database_url="postgresql+psycopg://db", config_path=BACKEND_ROOT / "alembic.ini")
+            run_migrations(
+                database_url="postgresql+psycopg://db", config_path=BACKEND_ROOT / "alembic.ini"
+            )
 
         executed_sql = " ".join(str(call.args[0]) for call in connection.execute.call_args_list)
         self.assertIn("pg_advisory_lock", executed_sql)
@@ -1453,7 +1390,7 @@ class MigrationEntrypointTest(unittest.TestCase):
             return MagicMock()
 
         class Transaction:
-            def __enter__(self) -> "Transaction":
+            def __enter__(self) -> Transaction:
                 events.append(("begin", None))
                 return self
 
@@ -1476,7 +1413,9 @@ class MigrationEntrypointTest(unittest.TestCase):
             patch("app.migration_entrypoint.inspect", return_value=inspector),
             patch("app.migration_entrypoint.command.upgrade", side_effect=record_upgrade),
         ):
-            run_migrations(database_url="postgresql+psycopg://db", config_path=BACKEND_ROOT / "alembic.ini")
+            run_migrations(
+                database_url="postgresql+psycopg://db", config_path=BACKEND_ROOT / "alembic.ini"
+            )
 
         event_names = [name for name, _ in events]
         self.assertEqual(
@@ -1569,10 +1508,7 @@ class MigrationEntrypointTest(unittest.TestCase):
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(
-                    text(
-                        "CREATE INDEX ix_conversations_unexpected "
-                        "ON conversations (title)"
-                    )
+                    text("CREATE INDEX ix_conversations_unexpected ON conversations (title)")
                 )
             engine.dispose()
 
@@ -1621,10 +1557,7 @@ class MigrationEntrypointTest(unittest.TestCase):
             with engine.begin() as connection:
                 connection.execute(text("DROP INDEX ix_evaluation_runs_sequence"))
                 connection.execute(
-                    text(
-                        "CREATE INDEX ix_evaluation_runs_sequence "
-                        "ON evaluation_runs (sequence)"
-                    )
+                    text("CREATE INDEX ix_evaluation_runs_sequence ON evaluation_runs (sequence)")
                 )
             engine.dispose()
 
@@ -1736,10 +1669,7 @@ class MigrationEntrypointTest(unittest.TestCase):
                     )
                 )
                 connection.execute(
-                    text(
-                        "INSERT INTO evaluation_counters (name) "
-                        "VALUES ('evaluation_runs')"
-                    )
+                    text("INSERT INTO evaluation_counters (name) VALUES ('evaluation_runs')")
                 )
             engine.dispose()
 
@@ -1769,10 +1699,7 @@ class MigrationEntrypointTest(unittest.TestCase):
                     )
                 )
                 connection.execute(
-                    text(
-                        "CREATE INDEX ix_messages_conversation_id "
-                        "ON messages (conversation_id)"
-                    )
+                    text("CREATE INDEX ix_messages_conversation_id ON messages (conversation_id)")
                 )
             engine.dispose()
 
@@ -1802,10 +1729,7 @@ class MigrationEntrypointTest(unittest.TestCase):
                     )
                 )
                 connection.execute(
-                    text(
-                        "CREATE INDEX ix_messages_conversation_id "
-                        "ON messages (conversation_id)"
-                    )
+                    text("CREATE INDEX ix_messages_conversation_id ON messages (conversation_id)")
                 )
             engine.dispose()
 
@@ -1834,10 +1758,7 @@ class MigrationEntrypointTest(unittest.TestCase):
                     )
                 )
                 connection.execute(
-                    text(
-                        "CREATE INDEX ix_messages_conversation_id "
-                        "ON messages (conversation_id)"
-                    )
+                    text("CREATE INDEX ix_messages_conversation_id ON messages (conversation_id)")
                 )
             engine.dispose()
 

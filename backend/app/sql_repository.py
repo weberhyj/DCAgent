@@ -10,16 +10,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Update
 
 from .agent import AgentRunAudit, AgentStep, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
-from .embeddings import DEFAULT_EMBEDDING_PROVIDER
-from .llm import LLMProvider, TemplateLLMProvider
 from .database import (
     AgentRunRecord,
     AgentStepRecord,
     ConversationRecord,
     Database,
     EvaluationBatchRecord,
-    EvaluationCounterRecord,
     EvaluationCaseRecord,
+    EvaluationCounterRecord,
     EvaluationImportBatchRecord,
     EvaluationRunRecord,
     KnowledgeChunkRecord,
@@ -27,26 +25,28 @@ from .database import (
     MessageRecord,
     has_seed_data,
 )
+from .embeddings import DEFAULT_EMBEDDING_PROVIDER
 from .evaluation import (
-    EvaluationCaseFacets,
-    EvaluationCaseDuplicateError,
-    EvaluationCaseModel,
     EvaluationBatchModel,
+    EvaluationCaseDuplicateError,
+    EvaluationCaseFacets,
+    EvaluationCaseModel,
     EvaluationHitModel,
     EvaluationRunModel,
-    build_failed_evaluation_run,
     build_evaluation_case_facets,
     build_evaluation_run,
+    build_failed_evaluation_run,
     evaluation_case_dedup_key,
     evaluation_case_lookup_keys,
     filter_evaluation_cases,
     filter_evaluation_cases_by_status,
+    normalize_evaluation_case_metadata,
     normalize_evaluation_case_status,
     normalize_evaluation_filter_value,
-    normalize_evaluation_case_metadata,
     normalized_unique,
 )
 from .evaluation_import import EvaluationImportRow
+from .llm import LLMProvider, TemplateLLMProvider
 from .models import (
     ArtifactModel,
     ChatMessageModel,
@@ -64,17 +64,17 @@ from .models import (
     VideoArtifactModel,
 )
 from .repository import (
-    EvaluationImportBatchModel,
-    EvaluationImportCreateResult,
+    KNOWLEDGE_SEARCH_LIMIT,
     STATUS_FAILED,
     STATUS_INDEXED,
     STATUS_INDEXING,
-    KNOWLEDGE_SEARCH_LIMIT,
+    EvaluationImportBatchModel,
+    EvaluationImportCreateResult,
     build_context_summary,
     build_conversation_title,
     ensure_chunk_embeddings,
-    now_label,
     normalize_evaluation_batch_request,
+    now_label,
     rank_knowledge_hits,
     score_knowledge_hit_components,
     today_label,
@@ -471,10 +471,14 @@ class SqlChatRepository:
             )
         return self._bundle(conversation_id)
 
-    def delete_conversation(self, conversation_id: str) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
+    def delete_conversation(
+        self, conversation_id: str
+    ) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
         with self._database.session() as session:
             self._get_conversation_record(session, conversation_id)
-            session.execute(delete(ConversationRecord).where(ConversationRecord.id == conversation_id))
+            session.execute(
+                delete(ConversationRecord).where(ConversationRecord.id == conversation_id)
+            )
 
         conversations = self.list_conversations()
         if not conversations:
@@ -522,11 +526,18 @@ class SqlChatRepository:
 
         with self._database.session() as session:
             conversation = self._get_conversation_record(session, conversation_id)
-            next_order = session.scalar(
-                select(func.count(MessageRecord.id)).where(MessageRecord.conversation_id == conversation_id)
-            ) or 0
+            next_order = (
+                session.scalar(
+                    select(func.count(MessageRecord.id)).where(
+                        MessageRecord.conversation_id == conversation_id
+                    )
+                )
+                or 0
+            )
             session.add(self._message_record(conversation_id, user_message, int(next_order)))
-            session.add(self._message_record(conversation_id, agent_result.reply, int(next_order) + 1))
+            session.add(
+                self._message_record(conversation_id, agent_result.reply, int(next_order) + 1)
+            )
             self._persist_agent_run(session, agent_result.to_audit())
 
             conversation.updated_at = now_label()
@@ -587,10 +598,8 @@ class SqlChatRepository:
                         ).join(
                             latest_run_orders,
                             and_(
-                                EvaluationRunRecord.case_id
-                                == latest_run_orders.c.case_id,
-                                EvaluationRunRecord.sequence
-                                == latest_run_orders.c.sequence,
+                                EvaluationRunRecord.case_id == latest_run_orders.c.case_id,
+                                EvaluationRunRecord.sequence == latest_run_orders.c.sequence,
                             ),
                         )
                     ).all()
@@ -651,9 +660,7 @@ class SqlChatRepository:
                     )
                 }
                 if dedup_key in existing_dedup_keys:
-                    raise EvaluationCaseDuplicateError(
-                        "评测用例已存在，请勿重复创建"
-                    )
+                    raise EvaluationCaseDuplicateError("评测用例已存在，请勿重复创建")
 
                 timestamp = now_label()
                 record = EvaluationCaseRecord(
@@ -693,10 +700,7 @@ class SqlChatRepository:
         created_records: list[EvaluationCaseRecord] = []
         final_duplicate_count = 0
 
-        dedup_keys = [
-            evaluation_case_dedup_key(row.question, row.external_key)
-            for row in rows
-        ]
+        dedup_keys = [evaluation_case_dedup_key(row.question, row.external_key) for row in rows]
         with self._database.write_lock:
             with self._database.session() as session:
                 self._lock_evaluation_case_dedup_keys(session, dedup_keys)
@@ -766,9 +770,7 @@ class SqlChatRepository:
                 if created_records:
                     session.execute(
                         update(EvaluationCaseRecord).values(
-                            sort_order=(
-                                EvaluationCaseRecord.sort_order + len(created_records)
-                            )
+                            sort_order=(EvaluationCaseRecord.sort_order + len(created_records))
                         )
                     )
                     session.add_all(created_records)
@@ -804,9 +806,7 @@ class SqlChatRepository:
             return
 
         lock_statement = text(
-            "SELECT pg_advisory_xact_lock("
-            "hashtextextended(CAST(:dedup_key AS text), 0)"
-            ")"
+            "SELECT pg_advisory_xact_lock(hashtextextended(CAST(:dedup_key AS text), 0))"
         )
         for dedup_key in sorted(set(dedup_keys)):
             session.execute(lock_statement, {"dedup_key": dedup_key})
@@ -825,15 +825,15 @@ class SqlChatRepository:
             record = session.get(EvaluationCaseRecord, case_id)
             if record is None:
                 raise HTTPException(status_code=404, detail="Evaluation case not found")
-            batch_case_ids = session.scalars(
-                select(EvaluationBatchRecord.case_ids)
-            ).all()
+            batch_case_ids = session.scalars(select(EvaluationBatchRecord.case_ids)).all()
             if any(case_id in list(item or []) for item in batch_case_ids):
                 raise HTTPException(
                     status_code=409,
                     detail="评测用例已被评测批次引用，不能删除",
                 )
-            session.execute(delete(EvaluationRunRecord).where(EvaluationRunRecord.case_id == case_id))
+            session.execute(
+                delete(EvaluationRunRecord).where(EvaluationRunRecord.case_id == case_id)
+            )
             session.delete(record)
 
     def run_evaluation_cases(self, case_ids: list[str] | None = None) -> list[EvaluationRunModel]:
@@ -853,9 +853,7 @@ class SqlChatRepository:
             for case in cases
         ]
         with self._database.session() as session:
-            next_value = session.scalar(
-                evaluation_run_sequence_allocation_statement(len(runs))
-            )
+            next_value = session.scalar(evaluation_run_sequence_allocation_statement(len(runs)))
             if next_value is None:
                 raise RuntimeError("evaluation run counter is missing")
             first_sequence = int(next_value) - len(runs)
@@ -903,12 +901,10 @@ class SqlChatRepository:
         case_ids: list[str],
         retrieval_min_score: float | None = None,
     ) -> EvaluationBatchModel:
-        normalized_name, normalized_case_ids, effective_score = (
-            normalize_evaluation_batch_request(
-                name,
-                case_ids,
-                retrieval_min_score,
-            )
+        normalized_name, normalized_case_ids, effective_score = normalize_evaluation_batch_request(
+            name,
+            case_ids,
+            retrieval_min_score,
         )
         with self._database.session() as session:
             existing_ids = set(
@@ -919,9 +915,7 @@ class SqlChatRepository:
                 ).all()
             )
             missing_ids = [
-                case_id
-                for case_id in normalized_case_ids
-                if case_id not in existing_ids
+                case_id for case_id in normalized_case_ids if case_id not in existing_ids
             ]
             if missing_ids:
                 raise HTTPException(
@@ -975,8 +969,7 @@ class SqlChatRepository:
                     )
                 ).all()
                 cases_by_id = {
-                    record.id: evaluation_case_from_record(record)
-                    for record in case_records
+                    record.id: evaluation_case_from_record(record) for record in case_records
                 }
                 if any(case_id not in cases_by_id for case_id in batch_record.case_ids):
                     batch_record.status = "failed"
@@ -998,9 +991,7 @@ class SqlChatRepository:
                     run = build_failed_evaluation_run(case, batch_id=batch_id)
 
                 with self._database.session() as session:
-                    next_value = session.scalar(
-                        evaluation_run_sequence_allocation_statement(1)
-                    )
+                    next_value = session.scalar(evaluation_run_sequence_allocation_statement(1))
                     if next_value is None:
                         raise RuntimeError("evaluation run counter is missing")
                     run.sequence = int(next_value) - 1
@@ -1106,7 +1097,11 @@ class SqlChatRepository:
         classification: str,
     ) -> list[KnowledgeSourceModel]:
         with self._database.session() as session:
-            session.execute(update(KnowledgeSourceRecord).values(sort_order=KnowledgeSourceRecord.sort_order + 1))
+            session.execute(
+                update(KnowledgeSourceRecord).values(
+                    sort_order=KnowledgeSourceRecord.sort_order + 1
+                )
+            )
             session.add(
                 KnowledgeSourceRecord(
                     id=f"kb-{uuid4().hex[:6]}",
@@ -1136,7 +1131,11 @@ class SqlChatRepository:
         mime_type: str | None,
     ) -> list[KnowledgeSourceModel]:
         with self._database.session() as session:
-            session.execute(update(KnowledgeSourceRecord).values(sort_order=KnowledgeSourceRecord.sort_order + 1))
+            session.execute(
+                update(KnowledgeSourceRecord).values(
+                    sort_order=KnowledgeSourceRecord.sort_order + 1
+                )
+            )
             session.add(
                 KnowledgeSourceRecord(
                     id=source_id,
@@ -1154,7 +1153,9 @@ class SqlChatRepository:
             )
         return self.list_knowledge_sources()
 
-    def delete_knowledge_source(self, source_id: str) -> tuple[list[KnowledgeSourceModel], KnowledgeSourceModel]:
+    def delete_knowledge_source(
+        self, source_id: str
+    ) -> tuple[list[KnowledgeSourceModel], KnowledgeSourceModel]:
         with self._database.session() as session:
             source = self._get_knowledge_source_record(session, source_id)
             deleted = knowledge_source_from_record(source)
@@ -1169,7 +1170,9 @@ class SqlChatRepository:
     ) -> KnowledgeSourceModel:
         with self._database.session() as session:
             source = self._get_knowledge_source_record(session, source_id)
-            session.execute(delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id))
+            session.execute(
+                delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id)
+            )
             embedded_chunks = ensure_chunk_embeddings(chunks)
             for chunk in embedded_chunks:
                 session.add(
@@ -1195,7 +1198,9 @@ class SqlChatRepository:
     ) -> KnowledgeSourceModel:
         with self._database.session() as session:
             source = self._get_knowledge_source_record(session, source_id)
-            session.execute(delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id))
+            session.execute(
+                delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id)
+            )
             source.records = 0
             source.status = STATUS_FAILED
             source.error_message = error_message
@@ -1205,7 +1210,9 @@ class SqlChatRepository:
     def reindex_knowledge_source(self, source_id: str) -> KnowledgeSourceModel:
         with self._database.session() as session:
             source = self._get_knowledge_source_record(session, source_id)
-            session.execute(delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id))
+            session.execute(
+                delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id)
+            )
             source.records = 0
             source.status = STATUS_INDEXING
             source.error_message = None
@@ -1237,14 +1244,18 @@ class SqlChatRepository:
                 effective_minimum_score,
             )
 
-    def _bundle(self, active_conversation_id: str) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
+    def _bundle(
+        self, active_conversation_id: str
+    ) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
         return (
             self.list_conversations(),
             active_conversation_id,
             self.get_messages(active_conversation_id),
         )
 
-    def _message_record(self, conversation_id: str, message: ChatMessageModel, sort_order: int) -> MessageRecord:
+    def _message_record(
+        self, conversation_id: str, message: ChatMessageModel, sort_order: int
+    ) -> MessageRecord:
         return MessageRecord(
             id=message.id,
             conversation_id=conversation_id,

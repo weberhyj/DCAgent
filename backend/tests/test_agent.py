@@ -97,7 +97,10 @@ class AgentTest(unittest.TestCase):
         self.assertNotEqual(search_calls[0], search_calls[1])
         self.assertEqual(result.reply.id, "msg-agent-answer")
         self.assertIsNotNone(provider.request)
-        self.assertEqual({item.source.id for item in provider.request.knowledge_hits}, {"kb-policy", "kb-finance"})
+        self.assertEqual(
+            {item.source.id for item in provider.request.knowledge_hits},
+            {"kb-policy", "kb-finance"},
+        )
         search_steps = [step for step in result.steps if step.tool_name == "search_knowledge"]
         self.assertEqual(len(search_steps), 2)
         self.assertTrue(all(step.read_only for step in result.steps))
@@ -145,7 +148,9 @@ class AgentTest(unittest.TestCase):
         agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
                 search_knowledge=lambda query, limit: [],
-                inspect_document=lambda source_id: self.fail("empty search must not inspect a document"),
+                inspect_document=lambda source_id: self.fail(
+                    "empty search must not inspect a document"
+                ),
             ),
             llm_provider=provider,
         )
@@ -158,7 +163,10 @@ class AgentTest(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "completed")
-        self.assertEqual([step.tool_name for step in result.steps], ["plan_retrieval", "search_knowledge", "compose_answer"])
+        self.assertEqual(
+            [step.tool_name for step in result.steps],
+            ["plan_retrieval", "search_knowledge", "compose_answer"],
+        )
         self.assertIsNotNone(provider.request)
         self.assertEqual(provider.request.knowledge_hits, [])
 

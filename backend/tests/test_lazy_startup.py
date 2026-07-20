@@ -12,6 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
 
+from app.database import Database
 from app.infra.health import (
     DependencyCheck,
     DependencyHealthRegistry,
@@ -20,7 +21,6 @@ from app.infra.health import (
     create_redis_health_client,
     postgres_schema_revision_check,
 )
-from app.database import Database
 from app.main import _database_url_with_connect_timeout
 from app.offline_settings import OfflineSettings
 
@@ -211,7 +211,7 @@ class LazyStartupTest(unittest.TestCase):
             def __init__(self, url: str) -> None:
                 self.url = url
 
-            def __enter__(self) -> "FakeResponse":
+            def __enter__(self) -> FakeResponse:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -267,7 +267,7 @@ class LazyStartupTest(unittest.TestCase):
                 self.dispose_calls += 1
 
         class FakeClamAVSocket:
-            def __enter__(self) -> "FakeClamAVSocket":
+            def __enter__(self) -> FakeClamAVSocket:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -317,9 +317,7 @@ class LazyStartupTest(unittest.TestCase):
                 repository_factory=lambda: ClosableFake("repository"),
                 ingestion_queue_factory=lambda _repository: ClosableFake("queue"),
                 storage_factory=lambda _root: ClosableFake("storage"),
-                evaluation_import_service_factory=lambda: ClosableFake(
-                    "evaluation"
-                ),
+                evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
                 health_http_client_factory=build_http_client,
                 health_redis_client_factory=build_redis_client,
                 postgres_health_engine_factory=build_health_engine,
@@ -446,7 +444,7 @@ class LazyStartupTest(unittest.TestCase):
 
             dialect = Dialect()
 
-            def __enter__(self) -> "FakeConnection":
+            def __enter__(self) -> FakeConnection:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -483,8 +481,7 @@ class LazyStartupTest(unittest.TestCase):
                 patch(
                     "alembic.runtime.migration.MigrationContext.configure",
                     side_effect=lambda _connection: (
-                        events.append("migration-context")
-                        or FakeMigrationContext()
+                        events.append("migration-context") or FakeMigrationContext()
                     ),
                 ),
             ):
@@ -551,8 +548,7 @@ class LazyStartupTest(unittest.TestCase):
         self.assertIs(client, sentinel)
         self.assertEqual(
             captured["url"],
-            "rediss://health:secret@127.0.0.1/4"
-            "?ssl_cert_reqs=required&client_name=readiness&db=4",
+            "rediss://health:secret@127.0.0.1/4?ssl_cert_reqs=required&client_name=readiness&db=4",
         )
         self.assertEqual(captured["socket_connect_timeout"], 2.0)
         self.assertEqual(captured["socket_timeout"], 2.0)
@@ -584,9 +580,7 @@ class LazyStartupTest(unittest.TestCase):
             environ=environ,
             redis_client=client,
         )
-        redis_check = next(
-            check for check in checks if check.name == "redis"
-        )
+        redis_check = next(check for check in checks if check.name == "redis")
 
         started_at = time.monotonic()
         try:
@@ -657,8 +651,7 @@ class LazyStartupTest(unittest.TestCase):
             return sentinel
 
         engine = create_postgres_health_engine(
-            "postgresql+psycopg://dc_agent:secret@127.0.0.1/dc_agent"
-            "?connect_timeout=2",
+            "postgresql+psycopg://dc_agent:secret@127.0.0.1/dc_agent?connect_timeout=2",
             engine_factory=factory,
         )
 
@@ -681,8 +674,7 @@ class LazyStartupTest(unittest.TestCase):
             {"QDRANT_URL": "http://attacker:6333"},
             {
                 "DATABASE_URL": (
-                    "postgresql+psycopg://dc_agent:secret@"
-                    "169.254.169.254:5432/dc_agent"
+                    "postgresql+psycopg://dc_agent:secret@169.254.169.254:5432/dc_agent"
                 )
             },
             {
@@ -706,13 +698,9 @@ class LazyStartupTest(unittest.TestCase):
                 app = module.create_production_app(
                     environ=private_environment(**changes),
                     repository_factory=lambda: ClosableFake("repository"),
-                    ingestion_queue_factory=lambda _repository: ClosableFake(
-                        "queue"
-                    ),
+                    ingestion_queue_factory=lambda _repository: ClosableFake("queue"),
                     storage_factory=lambda _root: ClosableFake("storage"),
-                    evaluation_import_service_factory=lambda: ClosableFake(
-                        "evaluation"
-                    ),
+                    evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
                     health_http_client_factory=build_http,
                     health_redis_client_factory=build_redis,
                 )
@@ -727,7 +715,7 @@ class LazyStartupTest(unittest.TestCase):
             status_code = 200
             headers: dict[str, str] = {}
 
-            def __enter__(self) -> "FakeResponse":
+            def __enter__(self) -> FakeResponse:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -740,7 +728,7 @@ class LazyStartupTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.urls: list[str] = []
 
-            def __enter__(self) -> "FakeHttpClient":
+            def __enter__(self) -> FakeHttpClient:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -760,18 +748,14 @@ class LazyStartupTest(unittest.TestCase):
                 return FakeResponse()
 
         fake_client = FakeHttpClient()
-        environ = private_environment(
-            EMBEDDING_SERVICE_URL="http://127.0.0.1:8081/v1"
-        )
+        environ = private_environment(EMBEDDING_SERVICE_URL="http://127.0.0.1:8081/v1")
         checks = build_dependency_checks(
             build_settings(environ),
             database=object(),
             environ=environ,
             http_client_factory=lambda **_kwargs: fake_client,
         )
-        embedding_check = next(
-            check for check in checks if check.name == "embedding"
-        )
+        embedding_check = next(check for check in checks if check.name == "embedding")
 
         self.assertEqual(embedding_check.check(), (True, "ready"))
         self.assertEqual(
@@ -785,7 +769,7 @@ class LazyStartupTest(unittest.TestCase):
             text = "Ok.\n"
 
         class FakeHttpClient:
-            def __enter__(self) -> "FakeHttpClient":
+            def __enter__(self) -> FakeHttpClient:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -806,9 +790,7 @@ class LazyStartupTest(unittest.TestCase):
             environ=private_environment(),
             http_client_factory=factory,
         )
-        clickhouse_check = next(
-            check for check in checks if check.name == "clickhouse"
-        )
+        clickhouse_check = next(check for check in checks if check.name == "clickhouse")
 
         self.assertEqual(clickhouse_check.check(), (True, "ready"))
         self.assertIs(captured["trust_env"], False)
@@ -819,7 +801,7 @@ class LazyStartupTest(unittest.TestCase):
             text = "not clickhouse"
 
         class FakeHttpClient:
-            def __enter__(self) -> "FakeHttpClient":
+            def __enter__(self) -> FakeHttpClient:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -834,9 +816,7 @@ class LazyStartupTest(unittest.TestCase):
             environ=private_environment(),
             http_client_factory=lambda **_kwargs: FakeHttpClient(),
         )
-        clickhouse_check = next(
-            check for check in checks if check.name == "clickhouse"
-        )
+        clickhouse_check = next(check for check in checks if check.name == "clickhouse")
 
         self.assertEqual(
             clickhouse_check.check(),
@@ -853,7 +833,7 @@ class LazyStartupTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.iterated = False
 
-            def __enter__(self) -> "FakeResponse":
+            def __enter__(self) -> FakeResponse:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -892,9 +872,7 @@ class LazyStartupTest(unittest.TestCase):
             environ=private_environment(),
             http_client=client,
         )
-        embedding_check = next(
-            check for check in checks if check.name == "embedding"
-        )
+        embedding_check = next(check for check in checks if check.name == "embedding")
 
         self.assertEqual(
             embedding_check.check(),
@@ -911,7 +889,7 @@ class LazyStartupTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.chunks_read = 0
 
-            def __enter__(self) -> "FakeResponse":
+            def __enter__(self) -> FakeResponse:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -948,9 +926,7 @@ class LazyStartupTest(unittest.TestCase):
             environ=private_environment(),
             http_client=FakeHttpClient(response),
         )
-        embedding_check = next(
-            check for check in checks if check.name == "embedding"
-        )
+        embedding_check = next(check for check in checks if check.name == "embedding")
 
         self.assertEqual(
             embedding_check.check(),
@@ -966,7 +942,7 @@ class LazyStartupTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.iterated = False
 
-            def __enter__(self) -> "FakeResponse":
+            def __enter__(self) -> FakeResponse:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -1002,9 +978,7 @@ class LazyStartupTest(unittest.TestCase):
             environ=private_environment(),
             http_client=FakeHttpClient(response),
         )
-        embedding_check = next(
-            check for check in checks if check.name == "embedding"
-        )
+        embedding_check = next(check for check in checks if check.name == "embedding")
 
         self.assertEqual(
             embedding_check.check(),
@@ -1021,7 +995,7 @@ class LazyStartupTest(unittest.TestCase):
                 self.raw_calls = 0
                 self.decoded_calls = 0
 
-            def __enter__(self) -> "FakeResponse":
+            def __enter__(self) -> FakeResponse:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -1054,9 +1028,7 @@ class LazyStartupTest(unittest.TestCase):
             environ=private_environment(),
             http_client=FakeHttpClient(response),
         )
-        embedding_check = next(
-            check for check in checks if check.name == "embedding"
-        )
+        embedding_check = next(check for check in checks if check.name == "embedding")
 
         self.assertEqual(embedding_check.check(), (True, "ready"))
         self.assertEqual(response.raw_calls, 1)
@@ -1069,7 +1041,7 @@ class LazyStartupTest(unittest.TestCase):
             status_code = 200
             headers: dict[str, str] = {}
 
-            def __enter__(self) -> "FakeResponse":
+            def __enter__(self) -> FakeResponse:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -1108,9 +1080,7 @@ class LazyStartupTest(unittest.TestCase):
             environ=environ,
             http_client=client,
         )
-        embedding_check = next(
-            check for check in checks if check.name == "embedding"
-        )
+        embedding_check = next(check for check in checks if check.name == "embedding")
 
         with patch(
             "app.infra.health.monotonic",
@@ -1164,7 +1134,7 @@ class LazyStartupTest(unittest.TestCase):
                 self.chunks = [b"PO", b"NG", b"\0"]
                 self.recv_calls = 0
 
-            def __enter__(self) -> "FakeClamAVSocket":
+            def __enter__(self) -> FakeClamAVSocket:
                 return self
 
             def __exit__(self, *args: object) -> None:
@@ -1201,7 +1171,7 @@ class LazyStartupTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.recv_calls = 0
 
-            def __enter__(self) -> "SlowDripSocket":
+            def __enter__(self) -> SlowDripSocket:
                 return self
 
             def __exit__(self, *args: object) -> None:

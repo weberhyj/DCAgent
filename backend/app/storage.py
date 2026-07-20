@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-
 SOURCE_TYPE_BY_SUFFIX = {
     ".pdf": "PDF",
     ".xlsx": "表格",

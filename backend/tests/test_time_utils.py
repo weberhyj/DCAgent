@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
 import unittest
+from datetime import datetime
 
 from app.time_utils import display_datetime_label, normalize_display_timestamp
 

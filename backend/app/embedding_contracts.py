@@ -12,10 +12,9 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Annotated, Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
 
 EmbeddingPurpose = Literal["query", "document"]
 
@@ -60,9 +59,7 @@ def _text(value: object, index: int | None = None) -> str:
     if not value.strip():
         raise ValueError(f"{field} must not be empty")
     if len(value.encode("utf-8")) > MAX_EMBEDDING_TEXT_BYTES:
-        raise ValueError(
-            f"{field} must not exceed {MAX_EMBEDDING_TEXT_BYTES} UTF-8 bytes"
-        )
+        raise ValueError(f"{field} must not exceed {MAX_EMBEDDING_TEXT_BYTES} UTF-8 bytes")
     return value
 
 
@@ -151,18 +148,14 @@ class EmbeddingMetadataResponse(_WireModel):
     _validate_name = field_validator("model_name", "model_version", "protocol_version")(
         lambda value: _nonempty_string(value, "metadata field")
     )
-    _validate_checksum = field_validator(
-        "model_checksum", "encoding_profile_sha256"
-    )(lambda value: _sha256(value, "metadata checksum"))
-    _validate_dimensions = field_validator("dimensions")(
-        lambda value: _dimensions(value)
+    _validate_checksum = field_validator("model_checksum", "encoding_profile_sha256")(
+        lambda value: _sha256(value, "metadata checksum")
     )
-    _validate_normalized = field_validator("normalized")(
-        lambda value: _normalized(value)
-    )
+    _validate_dimensions = field_validator("dimensions")(lambda value: _dimensions(value))
+    _validate_normalized = field_validator("normalized")(lambda value: _normalized(value))
 
     @classmethod
-    def from_metadata(cls, metadata: EmbeddingModelMetadata) -> "EmbeddingMetadataResponse":
+    def from_metadata(cls, metadata: EmbeddingModelMetadata) -> EmbeddingMetadataResponse:
         return cls(
             modelName=metadata.name,
             modelVersion=metadata.version,
@@ -195,7 +188,7 @@ class EmbeddingRequest(_WireModel):
         return [_text(value, index) for index, value in enumerate(values)]
 
     @model_validator(mode="after")
-    def validate_payload_size(self) -> "EmbeddingRequest":
+    def validate_payload_size(self) -> EmbeddingRequest:
         if embedding_request_json_size(self.texts, self.purpose) > MAX_EMBEDDING_REQUEST_BYTES:
             raise ValueError(
                 f"embedding request must not exceed {MAX_EMBEDDING_REQUEST_BYTES} bytes"
@@ -218,13 +211,11 @@ class EmbeddingResponse(EmbeddingMetadataResponse):
                 raise ValueError(f"vectors[{vector_index}] must not be empty")
             for coordinate_index, coordinate in enumerate(vector):
                 if type(coordinate) not in {int, float} or not math.isfinite(float(coordinate)):
-                    raise ValueError(
-                        f"vectors[{vector_index}][{coordinate_index}] must be finite"
-                    )
+                    raise ValueError(f"vectors[{vector_index}][{coordinate_index}] must be finite")
         return vectors
 
     @model_validator(mode="after")
-    def validate_vector_dimensions(self) -> "EmbeddingResponse":
+    def validate_vector_dimensions(self) -> EmbeddingResponse:
         for vector_index, vector in enumerate(self.vectors):
             if len(vector) != self.dimensions:
                 raise ValueError(
@@ -240,7 +231,7 @@ class EmbeddingResponse(EmbeddingMetadataResponse):
         *,
         purpose: EmbeddingPurpose,
         vectors: list[list[float]],
-    ) -> "EmbeddingResponse":
+    ) -> EmbeddingResponse:
         return cls(
             **EmbeddingMetadataResponse.from_metadata(metadata).model_dump(),
             purpose=purpose,
@@ -248,9 +239,7 @@ class EmbeddingResponse(EmbeddingMetadataResponse):
         )
 
 
-def embedding_request_json_size(
-    texts: Sequence[str], purpose: EmbeddingPurpose
-) -> int:
+def embedding_request_json_size(texts: Sequence[str], purpose: EmbeddingPurpose) -> int:
     """Return the exact compact UTF-8 JSON size used by the HTTP client."""
 
     return len(

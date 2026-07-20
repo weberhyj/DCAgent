@@ -7,7 +7,6 @@ from pathlib import Path
 
 from app.offline_artifacts import validate_artifact_manifest
 
-
 REQUIRED_ARTIFACT_FIELDS = {
     "name",
     "kind",
@@ -43,9 +42,7 @@ class OfflineArtifactManifestTest(unittest.TestCase):
                     else:
                         artifact[field] = value
 
-                    with self.assertRaisesRegex(
-                        ValueError, rf"^artifact is missing {field}$"
-                    ):
+                    with self.assertRaisesRegex(ValueError, rf"^artifact is missing {field}$"):
                         validate_artifact_manifest({"artifacts": [artifact]})
 
     def test_rejects_missing_empty_or_non_list_artifacts(self) -> None:
@@ -59,9 +56,7 @@ class OfflineArtifactManifestTest(unittest.TestCase):
     def test_rejects_non_object_artifact_entries(self) -> None:
         for artifact in ("model", 1, None, []):
             with self.subTest(artifact=artifact):
-                with self.assertRaisesRegex(
-                    ValueError, "^artifact entries must be objects$"
-                ):
+                with self.assertRaisesRegex(ValueError, "^artifact entries must be objects$"):
                     validate_artifact_manifest({"artifacts": [artifact]})
 
     def test_requires_exactly_64_lowercase_hexadecimal_sha256_characters(self) -> None:
@@ -121,9 +116,7 @@ class OfflineArtifactManifestTest(unittest.TestCase):
     def test_rejects_properties_outside_the_locked_contract(self) -> None:
         artifact = valid_artifact()
         artifact["downloadUrl"] = "https://models.example/docling"
-        with self.assertRaisesRegex(
-            ValueError, "^artifact has unexpected fields: downloadUrl$"
-        ):
+        with self.assertRaisesRegex(ValueError, "^artifact has unexpected fields: downloadUrl$"):
             validate_artifact_manifest({"artifacts": [artifact]})
 
         with self.assertRaisesRegex(
@@ -138,10 +131,7 @@ class OfflineArtifactManifestTest(unittest.TestCase):
 
     def test_json_schema_matches_the_runtime_manifest_contract(self) -> None:
         schema_path = (
-            Path(__file__).resolve().parents[2]
-            / "deploy"
-            / "offline"
-            / "artifacts.schema.json"
+            Path(__file__).resolve().parents[2] / "deploy" / "offline" / "artifacts.schema.json"
         )
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         artifact_schema = schema["$defs"]["artifact"]

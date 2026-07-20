@@ -1,16 +1,35 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock
-from typing import Iterator
 
-from sqlalchemy import BigInteger, JSON, Boolean, Float, ForeignKey, Index, Integer, String, Text, create_engine, inspect, select, text
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    inspect,
+    select,
+    text,
+)
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    relationship,
+    sessionmaker,
+)
 from sqlalchemy.pool import StaticPool
-
 
 DEFAULT_DATABASE_URL = "postgresql+psycopg://postgres:123456@127.0.0.1:5432/dc_agent"
 
@@ -37,9 +56,7 @@ def resolve_database_url(environ: Mapping[str, str] | None = None) -> str:
     try:
         secret_url = secret_path.read_text(encoding="utf-8").strip()
     except OSError as error:
-        raise ValueError(
-            f"database URL secret file could not be read: {secret_path}"
-        ) from error
+        raise ValueError(f"database URL secret file could not be read: {secret_path}") from error
     if not secret_url:
         raise ValueError("database URL secret file must not be empty")
     return secret_url
@@ -62,7 +79,7 @@ class ConversationRecord(Base):
     turn_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
 
-    messages: Mapped[list["MessageRecord"]] = relationship(
+    messages: Mapped[list[MessageRecord]] = relationship(
         back_populates="conversation",
         cascade="all, delete-orphan",
         order_by="MessageRecord.sort_order",
@@ -102,7 +119,7 @@ class AgentRunRecord(Base):
     evidence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     source_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    steps: Mapped[list["AgentStepRecord"]] = relationship(
+    steps: Mapped[list[AgentStepRecord]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
         order_by="AgentStepRecord.step_index",
@@ -148,7 +165,7 @@ class EvaluationCaseRecord(Base):
     import_batch_id: Mapped[str | None] = mapped_column(String(64), index=True)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
 
-    runs: Mapped[list["EvaluationRunRecord"]] = relationship(
+    runs: Mapped[list[EvaluationRunRecord]] = relationship(
         back_populates="case",
         cascade="all, delete-orphan",
     )
@@ -192,7 +209,7 @@ class EvaluationBatchRecord(Base):
     completed_at: Mapped[str | None] = mapped_column(String(40))
     error_message: Mapped[str | None] = mapped_column(Text)
 
-    runs: Mapped[list["EvaluationRunRecord"]] = relationship(back_populates="batch")
+    runs: Mapped[list[EvaluationRunRecord]] = relationship(back_populates="batch")
 
 
 class EvaluationRunRecord(Base):
@@ -260,7 +277,7 @@ class KnowledgeSourceRecord(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
 
-    chunks: Mapped[list["KnowledgeChunkRecord"]] = relationship(
+    chunks: Mapped[list[KnowledgeChunkRecord]] = relationship(
         back_populates="source",
         cascade="all, delete-orphan",
         order_by="KnowledgeChunkRecord.chunk_index",
@@ -361,9 +378,13 @@ class Database:
                     "ALTER TABLE evaluation_cases ADD COLUMN tags JSON NOT NULL DEFAULT '[]'"
                 )
             if "external_key" not in case_columns:
-                statements.append("ALTER TABLE evaluation_cases ADD COLUMN external_key VARCHAR(120)")
+                statements.append(
+                    "ALTER TABLE evaluation_cases ADD COLUMN external_key VARCHAR(120)"
+                )
             if "import_batch_id" not in case_columns:
-                statements.append("ALTER TABLE evaluation_cases ADD COLUMN import_batch_id VARCHAR(64)")
+                statements.append(
+                    "ALTER TABLE evaluation_cases ADD COLUMN import_batch_id VARCHAR(64)"
+                )
             if "ix_evaluation_cases_category" not in case_indexes:
                 statements.append(
                     "CREATE INDEX IF NOT EXISTS ix_evaluation_cases_category "
@@ -383,8 +404,7 @@ class Database:
         if has_evaluation_runs:
             run_columns = {column["name"] for column in inspector.get_columns("evaluation_runs")}
             run_indexes = {
-                index["name"]: index
-                for index in inspector.get_indexes("evaluation_runs")
+                index["name"]: index for index in inspector.get_indexes("evaluation_runs")
             }
             if "expect_answer" not in run_columns:
                 statements.append(
@@ -404,18 +424,14 @@ class Database:
                     "REFERENCES evaluation_batches(id) ON DELETE SET NULL"
                 )
             if "sequence" not in run_columns:
-                statements.append(
-                    "ALTER TABLE evaluation_runs ADD COLUMN sequence BIGINT"
-                )
+                statements.append("ALTER TABLE evaluation_runs ADD COLUMN sequence BIGINT")
                 evaluation_run_sequence_column_created = True
                 backfill_evaluation_run_sequence = True
             sequence_index = run_indexes.get("ix_evaluation_runs_sequence")
             if sequence_index is None:
                 create_evaluation_run_sequence_index = True
             elif not sequence_index.get("unique"):
-                statements.append(
-                    "DROP INDEX IF EXISTS ix_evaluation_runs_sequence"
-                )
+                statements.append("DROP INDEX IF EXISTS ix_evaluation_runs_sequence")
                 create_evaluation_run_sequence_index = True
             else:
                 evaluation_run_sequence_index_is_unique = True
@@ -448,16 +464,10 @@ class Database:
                     )
                 ).one()
                 backfill_evaluation_run_sequence = (
-                    total_count != non_null_count
-                    or non_null_count != distinct_count
+                    total_count != non_null_count or non_null_count != distinct_count
                 )
-                if (
-                    backfill_evaluation_run_sequence
-                    and evaluation_run_sequence_index_is_unique
-                ):
-                    connection.execute(
-                        text("DROP INDEX IF EXISTS ix_evaluation_runs_sequence")
-                    )
+                if backfill_evaluation_run_sequence and evaluation_run_sequence_index_is_unique:
+                    connection.execute(text("DROP INDEX IF EXISTS ix_evaluation_runs_sequence"))
                     create_evaluation_run_sequence_index = True
             if backfill_evaluation_run_sequence:
                 connection.execute(

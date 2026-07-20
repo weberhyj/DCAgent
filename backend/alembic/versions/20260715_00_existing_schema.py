@@ -5,9 +5,9 @@ Revises:
 Create Date: 2026-07-15
 """
 
-from alembic import op
 import sqlalchemy as sa
 
+from alembic import op
 
 revision = "20260715_00"
 down_revision = None
@@ -39,9 +39,7 @@ def upgrade() -> None:
         sa.Column("paragraphs", sa.JSON(), nullable=False),
         sa.Column("artifacts", sa.JSON(), nullable=False),
         sa.Column("sort_order", sa.Integer(), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["conversation_id"], ["conversations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["conversation_id"], ["conversations.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_table(
@@ -151,12 +149,8 @@ def upgrade() -> None:
         sa.Column("completed_at", sa.String(length=40), nullable=False),
         sa.Column("sequence", sa.BigInteger(), nullable=False),
         sa.Column("hits", sa.JSON(), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["batch_id"], ["evaluation_batches.id"], ondelete="SET NULL"
-        ),
-        sa.ForeignKeyConstraint(
-            ["case_id"], ["evaluation_cases.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["batch_id"], ["evaluation_batches.id"], ondelete="SET NULL"),
+        sa.ForeignKeyConstraint(["case_id"], ["evaluation_cases.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_table(
@@ -183,25 +177,17 @@ def upgrade() -> None:
         sa.Column("text", sa.Text(), nullable=False),
         sa.Column("token_count", sa.Integer(), nullable=False),
         sa.Column("embedding", sa.JSON(), nullable=True),
-        sa.ForeignKeyConstraint(
-            ["source_id"], ["knowledge_sources.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["source_id"], ["knowledge_sources.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
 
-    op.create_index(
-        "ix_conversations_sort_order", "conversations", ["sort_order"], unique=False
-    )
-    op.create_index(
-        "ix_messages_conversation_id", "messages", ["conversation_id"], unique=False
-    )
+    op.create_index("ix_conversations_sort_order", "conversations", ["sort_order"], unique=False)
+    op.create_index("ix_messages_conversation_id", "messages", ["conversation_id"], unique=False)
     op.create_index(
         "ix_agent_runs_conversation_id", "agent_runs", ["conversation_id"], unique=False
     )
     op.create_index("ix_agent_steps_run_id", "agent_steps", ["run_id"], unique=False)
-    op.create_index(
-        "ix_evaluation_cases_category", "evaluation_cases", ["category"], unique=False
-    )
+    op.create_index("ix_evaluation_cases_category", "evaluation_cases", ["category"], unique=False)
     op.create_index(
         "ix_evaluation_cases_external_key",
         "evaluation_cases",
@@ -220,24 +206,16 @@ def upgrade() -> None:
         ["sort_order"],
         unique=False,
     )
-    op.create_index(
-        "ix_evaluation_batches_status", "evaluation_batches", ["status"], unique=False
-    )
+    op.create_index("ix_evaluation_batches_status", "evaluation_batches", ["status"], unique=False)
     op.create_index(
         "ix_evaluation_batches_started_at",
         "evaluation_batches",
         ["started_at"],
         unique=False,
     )
-    op.create_index(
-        "ix_evaluation_runs_case_id", "evaluation_runs", ["case_id"], unique=False
-    )
-    op.create_index(
-        "ix_evaluation_runs_batch_id", "evaluation_runs", ["batch_id"], unique=False
-    )
-    op.create_index(
-        "ix_evaluation_runs_sequence", "evaluation_runs", ["sequence"], unique=True
-    )
+    op.create_index("ix_evaluation_runs_case_id", "evaluation_runs", ["case_id"], unique=False)
+    op.create_index("ix_evaluation_runs_batch_id", "evaluation_runs", ["batch_id"], unique=False)
+    op.create_index("ix_evaluation_runs_sequence", "evaluation_runs", ["sequence"], unique=True)
     op.create_index(
         "ix_evaluation_runs_case_id_sequence",
         "evaluation_runs",

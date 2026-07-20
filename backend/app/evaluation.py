@@ -9,7 +9,6 @@ from uuid import uuid4
 from .models import KnowledgeSearchHitModel
 from .time_utils import display_datetime_label
 
-
 EvaluationRunStatus = Literal["passed", "failed"]
 EvaluationBatchStatus = Literal["queued", "running", "completed", "failed"]
 EvaluationCaseFilterStatus = Literal["passed", "failed", "idle"]
@@ -124,18 +123,14 @@ def normalize_evaluation_case_status(
 
 
 def parse_evaluation_category_filter(value: object) -> str | None:
-    normalized = normalize_evaluation_filter_value(
-        None if value is None else str(value)
-    )
+    normalized = normalize_evaluation_filter_value(None if value is None else str(value))
     if normalized is not None and len(normalized) > EVALUATION_CATEGORY_MAX_LENGTH:
         raise ValueError("分类筛选不能超过 80 个字符")
     return normalized
 
 
 def parse_evaluation_tag_filter(value: object) -> str | None:
-    normalized = normalize_evaluation_filter_value(
-        None if value is None else str(value)
-    )
+    normalized = normalize_evaluation_filter_value(None if value is None else str(value))
     if normalized is not None and len(normalized) > EVALUATION_TAG_MAX_LENGTH:
         raise ValueError("标签筛选不能超过 80 个字符")
     return normalized
@@ -144,9 +139,7 @@ def parse_evaluation_tag_filter(value: object) -> str | None:
 def parse_evaluation_status_filter(
     value: object,
 ) -> EvaluationCaseFilterStatus | None:
-    return normalize_evaluation_case_status(
-        None if value is None else str(value)
-    )
+    return normalize_evaluation_case_status(None if value is None else str(value))
 
 
 def parse_evaluation_expect_answer_filter(value: object) -> bool | None:
@@ -191,11 +184,7 @@ def filter_evaluation_cases_by_status(
     normalized_status = normalize_evaluation_case_status(status)
     if normalized_status is None:
         return cases
-    return [
-        case
-        for case in cases
-        if latest_statuses.get(case.id, "idle") == normalized_status
-    ]
+    return [case for case in cases if latest_statuses.get(case.id, "idle") == normalized_status]
 
 
 def latest_evaluation_runs_by_case(
@@ -321,20 +310,11 @@ def build_evaluation_run(
     started_at = display_datetime_label()
     matched_source_ids = list(dict.fromkeys(hit.source.id for hit in hits))
     missing_source_ids = [
-        source_id
-        for source_id in case.expected_source_ids
-        if source_id not in matched_source_ids
+        source_id for source_id in case.expected_source_ids if source_id not in matched_source_ids
     ]
 
-    evidence_text = " ".join(
-        f"{hit.source.name} {hit.chunk.text}".lower()
-        for hit in hits
-    )
-    found_terms = [
-        term
-        for term in case.expected_terms
-        if term.lower() in evidence_text
-    ]
+    evidence_text = " ".join(f"{hit.source.name} {hit.chunk.text}".lower() for hit in hits)
+    found_terms = [term for term in case.expected_terms if term.lower() in evidence_text]
     missing_terms = [term for term in case.expected_terms if term not in found_terms]
 
     source_recall = (

@@ -6,10 +6,10 @@ from unittest.mock import patch
 import httpx
 
 from app.llm import (
-    LLMRequest,
-    LLMProviderError,
     NO_EVIDENCE_REPLY,
     RAG_SYSTEM_PROMPT,
+    LLMProviderError,
+    LLMRequest,
     OpenAICompatibleLLMProvider,
     TemplateLLMProvider,
     build_knowledge_context,
@@ -25,7 +25,7 @@ from app.models import (
     KnowledgeSourceModel,
     ResponseParagraphModel,
 )
-from app.repository import InMemoryChatRepository, STATUS_INDEXED
+from app.repository import STATUS_INDEXED, InMemoryChatRepository
 from app.seed import build_seed_state
 
 
@@ -121,7 +121,7 @@ class RecordingHttpClient:
         self.requests: list[dict] = []
         self.response_content = response_content
 
-    def __enter__(self) -> "RecordingHttpClient":
+    def __enter__(self) -> RecordingHttpClient:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -335,7 +335,9 @@ class LLMProviderTest(unittest.TestCase):
             model="dc-agent-test-model",
         )
 
-        with patch("app.llm.httpx.Client", side_effect=httpx.TimeoutException("secret upstream timeout")):
+        with patch(
+            "app.llm.httpx.Client", side_effect=httpx.TimeoutException("secret upstream timeout")
+        ):
             with self.assertRaises(LLMProviderError) as error:
                 provider.generate_reply(
                     LLMRequest(

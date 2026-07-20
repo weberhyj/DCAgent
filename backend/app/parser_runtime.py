@@ -8,7 +8,6 @@ from types import MappingProxyType
 
 from .offline_artifacts import is_local_filesystem_path
 
-
 OFFLINE_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
     {
         "HF_HUB_OFFLINE": "1",
@@ -34,11 +33,9 @@ class ParserRuntime:
         cls,
         environ: Mapping[str, str],
         path_exists: Callable[[Path], bool] | None = None,
-    ) -> "ParserRuntime":
+    ) -> ParserRuntime:
         exists = Path.exists if path_exists is None else path_exists
-        docling_artifacts_path = _read_local_path(
-            environ, "DOCLING_ARTIFACTS_PATH"
-        )
+        docling_artifacts_path = _read_local_path(environ, "DOCLING_ARTIFACTS_PATH")
         paddleocr_home = _read_local_path(environ, "PADDLEOCR_HOME")
         libreoffice_bin = _read_local_path(environ, "LIBREOFFICE_BIN")
 
@@ -46,9 +43,7 @@ class ParserRuntime:
             ("DOCLING_ARTIFACTS_PATH", docling_artifacts_path),
             ("PADDLEOCR_HOME", paddleocr_home),
         )
-        configured_paths = directory_paths + (
-            ("LIBREOFFICE_BIN", libreoffice_bin),
-        )
+        configured_paths = directory_paths + (("LIBREOFFICE_BIN", libreoffice_bin),)
         for variable, path in configured_paths:
             if not exists(path):
                 raise ParserRuntimeError(
@@ -62,8 +57,7 @@ class ParserRuntime:
                 )
         if not libreoffice_bin.is_file():
             raise ParserRuntimeError(
-                "LIBREOFFICE_BIN must reference an existing local regular file: "
-                f"{libreoffice_bin}"
+                f"LIBREOFFICE_BIN must reference an existing local regular file: {libreoffice_bin}"
             )
 
         return cls(

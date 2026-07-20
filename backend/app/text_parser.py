@@ -8,7 +8,6 @@ from uuid import uuid4
 
 from .models import KnowledgeChunkModel
 
-
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 120
 
@@ -79,7 +78,9 @@ def extract_docx_text(path: Path) -> str:
         table_rows = []
         for table in document.tables:
             for row in table.rows:
-                table_rows.append(" | ".join(cell.text.strip() for cell in row.cells if cell.text.strip()))
+                table_rows.append(
+                    " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                )
         return "\n".join([*paragraphs, *table_rows])
     except Exception:
         return read_binary_as_text(path)
@@ -97,7 +98,9 @@ def extract_xlsx_text(path: Path) -> str:
         for sheet in workbook.worksheets:
             rows.append(f"[{sheet.title}]")
             for row in sheet.iter_rows(values_only=True):
-                values = [str(value).strip() for value in row if value is not None and str(value).strip()]
+                values = [
+                    str(value).strip() for value in row if value is not None and str(value).strip()
+                ]
                 if values:
                     rows.append(" | ".join(values))
         workbook.close()

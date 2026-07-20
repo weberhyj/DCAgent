@@ -60,7 +60,9 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
 
     def test_parser_splits_long_text_file_into_ordered_chunks(self) -> None:
         path = Path(self.temp_dir.name) / "risk-note.md"
-        path.write_text("\n".join([f"风险提示 {index}: 回款周期变化" for index in range(120)]), encoding="utf-8")
+        path.write_text(
+            "\n".join([f"风险提示 {index}: 回款周期变化" for index in range(120)]), encoding="utf-8"
+        )
 
         chunks = parse_knowledge_file(path, source_id="kb-parser", source_type="文档")
 
@@ -71,7 +73,7 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
 
     def test_parser_removes_nul_bytes_before_chunks_are_indexed(self) -> None:
         path = Path(self.temp_dir.name) / "nul-note.txt"
-        path.write_bytes("差旅制度".encode("utf-8") + b"\x00" + "审批流程".encode("utf-8"))
+        path.write_bytes("差旅制度".encode() + b"\x00" + "审批流程".encode())
 
         chunks = parse_knowledge_file(path, source_id="kb-nul", source_type="文档")
 

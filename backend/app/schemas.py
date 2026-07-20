@@ -5,12 +5,13 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .agent import AgentRunAudit as AgentRunAuditModel
+from .agent import AgentStep as AgentStepModel
 from .answer_text import remove_inline_citation_markers
-from .agent import AgentRunAudit as AgentRunAuditModel, AgentStep as AgentStepModel
 from .evaluation import (
+    EvaluationBatchModel,
     EvaluationCaseFacets,
     EvaluationCaseModel,
-    EvaluationBatchModel,
     EvaluationHitModel,
     EvaluationRunModel,
     normalize_evaluation_case_metadata,
@@ -26,6 +27,8 @@ from .evaluation_batches import (
 )
 from .evaluation_import import (
     EvaluationImportError as EvaluationImportErrorModel,
+)
+from .evaluation_import import (
     EvaluationImportPreview,
     EvaluationImportRow,
 )
@@ -61,7 +64,7 @@ class Citation(ApiModel):
     matched_terms: list[str] = Field(default_factory=list, alias="matchedTerms")
 
     @classmethod
-    def from_model(cls, citation: CitationModel) -> "Citation":
+    def from_model(cls, citation: CitationModel) -> Citation:
         return cls(
             label=citation.label,
             classification=citation.classification,
@@ -81,14 +84,18 @@ class ResponseParagraph(ApiModel):
     citations: list[Citation] = Field(default_factory=list)
 
     @classmethod
-    def from_model(cls, paragraph: ResponseParagraphModel, expose_citations: bool = False) -> "ResponseParagraph":
+    def from_model(
+        cls, paragraph: ResponseParagraphModel, expose_citations: bool = False
+    ) -> ResponseParagraph:
         return cls(
             text=(
                 paragraph.text
                 if expose_citations
                 else remove_inline_citation_markers(paragraph.text)
             ),
-            citations=[Citation.from_model(citation) for citation in paragraph.citations] if expose_citations else [],
+            citations=[Citation.from_model(citation) for citation in paragraph.citations]
+            if expose_citations
+            else [],
         )
 
 
@@ -99,7 +106,9 @@ class SummaryArtifact(ApiModel):
     bullets: list[str]
 
     @classmethod
-    def from_model(cls, artifact: SummaryArtifactModel, expose_source: bool = False) -> "SummaryArtifact":
+    def from_model(
+        cls, artifact: SummaryArtifactModel, expose_source: bool = False
+    ) -> SummaryArtifact:
         return cls(
             type=artifact.type,
             title=artifact.title,
@@ -115,7 +124,7 @@ class ImageArtifact(ApiModel):
     asset_key: Literal["city", "analysis"] = Field(alias="assetKey")
 
     @classmethod
-    def from_model(cls, artifact: ImageArtifactModel, expose_source: bool = False) -> "ImageArtifact":
+    def from_model(cls, artifact: ImageArtifactModel, expose_source: bool = False) -> ImageArtifact:
         return cls(
             type=artifact.type,
             title=artifact.title,
@@ -132,7 +141,7 @@ class VideoArtifact(ApiModel):
     asset_key: Literal["city", "analysis"] = Field(alias="assetKey")
 
     @classmethod
-    def from_model(cls, artifact: VideoArtifactModel, expose_source: bool = False) -> "VideoArtifact":
+    def from_model(cls, artifact: VideoArtifactModel, expose_source: bool = False) -> VideoArtifact:
         return cls(
             type=artifact.type,
             title=artifact.title,
@@ -150,7 +159,7 @@ class TableArtifact(ApiModel):
     rows: list[list[str]]
 
     @classmethod
-    def from_model(cls, artifact: TableArtifactModel, expose_source: bool = False) -> "TableArtifact":
+    def from_model(cls, artifact: TableArtifactModel, expose_source: bool = False) -> TableArtifact:
         return cls(
             type=artifact.type,
             title=artifact.title,
@@ -193,7 +202,7 @@ class ChatMessage(ApiModel):
         message: ChatMessageModel,
         expose_citations: bool = False,
         expose_artifact_sources: bool = False,
-    ) -> "ChatMessage":
+    ) -> ChatMessage:
         return cls(
             id=message.id,
             role=message.role,
@@ -219,7 +228,7 @@ class Conversation(ApiModel):
     pinned: bool = False
 
     @classmethod
-    def from_model(cls, conversation: ConversationModel) -> "Conversation":
+    def from_model(cls, conversation: ConversationModel) -> Conversation:
         return cls(
             id=conversation.id,
             title=conversation.title,
@@ -241,7 +250,7 @@ class ConversationBundle(ApiModel):
         conversations: list[ConversationModel],
         active_conversation_id: str,
         messages: list[ChatMessageModel],
-    ) -> "ConversationBundle":
+    ) -> ConversationBundle:
         return cls(
             conversations=[Conversation.from_model(conversation) for conversation in conversations],
             activeConversationId=active_conversation_id,
@@ -275,7 +284,7 @@ class KnowledgeSource(ApiModel):
     error_message: str | None = Field(default=None, alias="errorMessage")
 
     @classmethod
-    def from_model(cls, source: KnowledgeSourceModel) -> "KnowledgeSource":
+    def from_model(cls, source: KnowledgeSourceModel) -> KnowledgeSource:
         return cls(
             id=source.id,
             name=source.name,
@@ -298,7 +307,7 @@ class KnowledgeChunk(ApiModel):
     token_count: int = Field(alias="tokenCount")
 
     @classmethod
-    def from_model(cls, chunk: KnowledgeChunkModel) -> "KnowledgeChunk":
+    def from_model(cls, chunk: KnowledgeChunkModel) -> KnowledgeChunk:
         return cls(
             id=chunk.id,
             sourceId=chunk.source_id,
@@ -335,7 +344,7 @@ class AgentStepAudit(ApiModel):
     completed_at: str = Field(alias="completedAt")
 
     @classmethod
-    def from_model(cls, step: AgentStepModel) -> "AgentStepAudit":
+    def from_model(cls, step: AgentStepModel) -> AgentStepAudit:
         return cls(
             id=step.id,
             stepIndex=step.step_index,
@@ -364,7 +373,7 @@ class AgentRunAudit(ApiModel):
     steps: list[AgentStepAudit] = Field(default_factory=list)
 
     @classmethod
-    def from_model(cls, run: AgentRunAuditModel) -> "AgentRunAudit":
+    def from_model(cls, run: AgentRunAuditModel) -> AgentRunAudit:
         return cls(
             id=run.id,
             conversationId=run.conversation_id,
@@ -405,7 +414,7 @@ class EvaluationCaseRequest(ApiModel):
         return normalized_unique(value)
 
     @model_validator(mode="after")
-    def normalize_metadata(self) -> "EvaluationCaseRequest":
+    def normalize_metadata(self) -> EvaluationCaseRequest:
         self.category, self.tags, self.external_key, self.import_batch_id = (
             normalize_evaluation_case_metadata(
                 category=self.category,
@@ -417,7 +426,7 @@ class EvaluationCaseRequest(ApiModel):
         return self
 
     @model_validator(mode="after")
-    def require_expected_evidence(self) -> "EvaluationCaseRequest":
+    def require_expected_evidence(self) -> EvaluationCaseRequest:
         if self.expect_answer and not self.expected_source_ids and not self.expected_terms:
             raise ValueError("at least one expected source or term is required")
         return self
@@ -497,6 +506,7 @@ class EvaluationBatchRequest(ApiModel):
             raise ValueError("检索阈值必须是大于等于 0 的有限数")
         return value
 
+
 class EvaluationCase(ApiModel):
     id: str
     question: str
@@ -512,7 +522,7 @@ class EvaluationCase(ApiModel):
     updated_at: str = Field(alias="updatedAt")
 
     @classmethod
-    def from_model(cls, case: EvaluationCaseModel) -> "EvaluationCase":
+    def from_model(cls, case: EvaluationCaseModel) -> EvaluationCase:
         return cls(
             id=case.id,
             question=case.question,
@@ -540,7 +550,7 @@ class EvaluationCaseCollection(ApiModel):
         cls,
         items: list[EvaluationCaseModel],
         facets: EvaluationCaseFacets,
-    ) -> "EvaluationCaseCollection":
+    ) -> EvaluationCaseCollection:
         return cls(
             items=[EvaluationCase.from_model(case) for case in items],
             categories=facets.categories,
@@ -562,7 +572,7 @@ class EvaluationHit(ApiModel):
     excerpt: str
 
     @classmethod
-    def from_model(cls, hit: EvaluationHitModel) -> "EvaluationHit":
+    def from_model(cls, hit: EvaluationHitModel) -> EvaluationHit:
         return cls(
             rank=hit.rank,
             sourceId=hit.source_id,
@@ -605,7 +615,7 @@ class EvaluationRun(ApiModel):
     hits: list[EvaluationHit] = Field(default_factory=list)
 
     @classmethod
-    def from_model(cls, run: EvaluationRunModel) -> "EvaluationRun":
+    def from_model(cls, run: EvaluationRunModel) -> EvaluationRun:
         return cls(
             id=run.id,
             caseId=run.case_id,
@@ -648,7 +658,7 @@ class EvaluationBatch(ApiModel):
     error_message: str | None = Field(default=None, alias="errorMessage")
 
     @classmethod
-    def from_model(cls, batch: EvaluationBatchModel) -> "EvaluationBatch":
+    def from_model(cls, batch: EvaluationBatchModel) -> EvaluationBatch:
         return cls(
             id=batch.id,
             name=batch.name,
@@ -677,7 +687,7 @@ class EvaluationMetricGroup(ApiModel):
     pass_rate: float = Field(alias="passRate")
 
     @classmethod
-    def from_model(cls, group: EvaluationMetricGroupModel) -> "EvaluationMetricGroup":
+    def from_model(cls, group: EvaluationMetricGroupModel) -> EvaluationMetricGroup:
         return cls(
             name=group.name,
             total=group.total,
@@ -706,7 +716,7 @@ class EvaluationBatchSummary(ApiModel):
     def from_model(
         cls,
         summary: EvaluationBatchSummaryModel,
-    ) -> "EvaluationBatchSummary":
+    ) -> EvaluationBatchSummary:
         return cls(
             total=summary.total,
             passed=summary.passed,
@@ -721,12 +731,10 @@ class EvaluationBatchSummary(ApiModel):
             averageTopScore=summary.average_top_score,
             maximumTopScore=summary.maximum_top_score,
             categoryBreakdown=[
-                EvaluationMetricGroup.from_model(group)
-                for group in summary.category_breakdown
+                EvaluationMetricGroup.from_model(group) for group in summary.category_breakdown
             ],
             tagBreakdown=[
-                EvaluationMetricGroup.from_model(group)
-                for group in summary.tag_breakdown
+                EvaluationMetricGroup.from_model(group) for group in summary.tag_breakdown
             ],
         )
 
@@ -749,7 +757,7 @@ class EvaluationBatchMetricDelta(ApiModel):
     def from_model(
         cls,
         delta: EvaluationBatchMetricDeltaModel,
-    ) -> "EvaluationBatchMetricDelta":
+    ) -> EvaluationBatchMetricDelta:
         return cls(
             total=delta.total,
             passed=delta.passed,
@@ -780,13 +788,11 @@ class EvaluationBatchComparison(ApiModel):
     def from_model(
         cls,
         comparison: EvaluationBatchComparisonModel,
-    ) -> "EvaluationBatchComparison":
+    ) -> EvaluationBatchComparison:
         return cls(
             leftBatchId=comparison.left_batch_id,
             rightBatchId=comparison.right_batch_id,
-            metricDelta=EvaluationBatchMetricDelta.from_model(
-                comparison.metric_delta
-            ),
+            metricDelta=EvaluationBatchMetricDelta.from_model(comparison.metric_delta),
             sharedCaseCount=comparison.shared_case_count,
             improvedCaseIds=comparison.improved_case_ids,
             regressedCaseIds=comparison.regressed_case_ids,
@@ -807,7 +813,7 @@ class EvaluationBatchDetail(EvaluationBatch):
         summary: EvaluationBatchSummaryModel,
         runs: list[EvaluationRunModel],
         cases: list[EvaluationCaseModel],
-    ) -> "EvaluationBatchDetail":
+    ) -> EvaluationBatchDetail:
         return cls(
             **EvaluationBatch.from_model(batch).model_dump(by_alias=True),
             summary=EvaluationBatchSummary.from_model(summary),
@@ -825,7 +831,7 @@ class EvaluationDashboard(ApiModel):
         cls,
         cases: list[EvaluationCaseModel],
         runs: list[EvaluationRunModel],
-    ) -> "EvaluationDashboard":
+    ) -> EvaluationDashboard:
         return cls(
             cases=[EvaluationCase.from_model(case) for case in cases],
             runs=[EvaluationRun.from_model(run) for run in runs],
@@ -844,7 +850,7 @@ class EvaluationImportRowResponse(ApiModel):
     external_key: str | None = Field(default=None, alias="externalKey")
 
     @classmethod
-    def from_model(cls, row: EvaluationImportRow) -> "EvaluationImportRowResponse":
+    def from_model(cls, row: EvaluationImportRow) -> EvaluationImportRowResponse:
         return cls(
             rowNumber=row.row_number,
             question=row.question,
@@ -867,7 +873,7 @@ class EvaluationImportErrorResponse(ApiModel):
     def from_model(
         cls,
         error: EvaluationImportErrorModel,
-    ) -> "EvaluationImportErrorResponse":
+    ) -> EvaluationImportErrorResponse:
         return cls(
             rowNumber=error.row_number,
             field=error.field,
@@ -890,7 +896,7 @@ class EvaluationImportPreviewResponse(ApiModel):
     def from_model(
         cls,
         preview: EvaluationImportPreview,
-    ) -> "EvaluationImportPreviewResponse":
+    ) -> EvaluationImportPreviewResponse:
         return cls(
             previewToken=preview.token,
             fileName=preview.file_name,
@@ -899,10 +905,7 @@ class EvaluationImportPreviewResponse(ApiModel):
             invalidRows=preview.invalid_rows,
             duplicateRows=preview.duplicate_rows,
             rows=[EvaluationImportRowResponse.from_model(row) for row in preview.rows],
-            errors=[
-                EvaluationImportErrorResponse.from_model(error)
-                for error in preview.errors
-            ],
+            errors=[EvaluationImportErrorResponse.from_model(error) for error in preview.errors],
             duplicateKeys=preview.duplicate_keys,
         )
 

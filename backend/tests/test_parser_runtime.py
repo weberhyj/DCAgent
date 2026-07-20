@@ -15,7 +15,6 @@ from app.parser_runtime import (
     configure_parser_runtime,
 )
 
-
 OFFLINE_ENVIRONMENT_KEYS = (
     "HF_HUB_OFFLINE",
     "TRANSFORMERS_OFFLINE",
@@ -69,9 +68,7 @@ class ParserRuntimeTest(unittest.TestCase):
         self.assertEqual(environ["HF_HUB_OFFLINE"], "1")
         self.assertEqual(environ["TRANSFORMERS_OFFLINE"], "1")
         self.assertEqual(environ["HF_HUB_DISABLE_TELEMETRY"], "1")
-        self.assertEqual(
-            environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"], "True"
-        )
+        self.assertEqual(environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"], "True")
         create_connection.assert_not_called()
         urlopen.assert_not_called()
         with self.assertRaises(FrozenInstanceError):
@@ -92,9 +89,7 @@ class ParserRuntimeTest(unittest.TestCase):
                     else:
                         environ[variable] = missing_value
 
-                    with self.assertRaisesRegex(
-                        ParserRuntimeError, rf"^{variable} is required$"
-                    ):
+                    with self.assertRaisesRegex(ParserRuntimeError, rf"^{variable} is required$"):
                         configure_parser_runtime(environ, path_exists=lambda _: True)
 
     def test_rejects_uri_and_network_share_paths_before_filesystem_checks(self) -> None:
@@ -131,9 +126,7 @@ class ParserRuntimeTest(unittest.TestCase):
                             rf"^{variable} must reference a local filesystem path; "
                             "network shares and URI schemes are not allowed$",
                         ):
-                            configure_parser_runtime(
-                                environ, path_exists=path_exists
-                            )
+                            configure_parser_runtime(environ, path_exists=path_exists)
 
                     path_exists.assert_not_called()
                     path_is_dir.assert_not_called()
@@ -150,16 +143,10 @@ class ParserRuntimeTest(unittest.TestCase):
                 path_exists = Mock(return_value=True)
 
                 with (
-                    patch.object(
-                        Path, "is_dir", autospec=True, return_value=True
-                    ) as path_is_dir,
-                    patch.object(
-                        Path, "is_file", autospec=True, return_value=True
-                    ) as path_is_file,
+                    patch.object(Path, "is_dir", autospec=True, return_value=True) as path_is_dir,
+                    patch.object(Path, "is_file", autospec=True, return_value=True) as path_is_file,
                 ):
-                    runtime = configure_parser_runtime(
-                        environ, path_exists=path_exists
-                    )
+                    runtime = configure_parser_runtime(environ, path_exists=path_exists)
 
                 self.assertEqual(
                     runtime.docling_artifacts_path,

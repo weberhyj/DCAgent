@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass
-import re
 from threading import Lock
 from typing import Protocol
 from uuid import uuid4
@@ -10,21 +10,25 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from .agent import AgentRunAudit, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
-from .embeddings import DEFAULT_EMBEDDING_PROVIDER, EmbeddingProvider, cosine_similarity, expand_terms
+from .embeddings import (
+    DEFAULT_EMBEDDING_PROVIDER,
+    EmbeddingProvider,
+    cosine_similarity,
+    expand_terms,
+)
 from .evaluation import (
-    EvaluationCaseFacets,
-    EvaluationCaseDuplicateError,
-    EvaluationCaseModel,
     EvaluationBatchModel,
+    EvaluationCaseDuplicateError,
+    EvaluationCaseFacets,
+    EvaluationCaseModel,
     EvaluationRunModel,
-    build_failed_evaluation_run,
-    build_evaluation_run,
     build_evaluation_case_facets,
+    build_evaluation_run,
+    build_failed_evaluation_run,
     evaluation_case_dedup_key,
     evaluation_case_lookup_keys,
     filter_evaluation_cases,
     normalize_evaluation_case_metadata,
-    normalize_evaluation_question_key,
     normalized_unique,
 )
 from .evaluation_import import EvaluationImportRow
@@ -46,7 +50,6 @@ from .retrieval import (
     resolve_retrieval_min_score,
 )
 from .time_utils import display_datetime_label
-
 
 STATUS_INDEXED = "已索引"
 STATUS_INDEXING = "解析中"
@@ -125,9 +128,7 @@ def normalize_evaluation_batch_request(
         if retrieval_min_score < 0:
             raise ValueError("检索阈值必须是大于等于 0 的有限数")
         try:
-            effective_score = resolve_effective_retrieval_min_score(
-                retrieval_min_score
-            )
+            effective_score = resolve_effective_retrieval_min_score(retrieval_min_score)
         except ValueError as error:
             raise ValueError("检索阈值必须是大于等于 0 的有限数") from error
     return normalized_name, normalized_case_ids, effective_score
@@ -158,7 +159,9 @@ def build_search_terms(query: str) -> list[str]:
     ]
 
 
-def score_knowledge_text(query: str, source: KnowledgeSourceModel, chunk: KnowledgeChunkModel) -> int:
+def score_knowledge_text(
+    query: str, source: KnowledgeSourceModel, chunk: KnowledgeChunkModel
+) -> int:
     terms = build_search_terms(query)
     if not terms:
         return 0
@@ -273,8 +276,7 @@ def build_knowledge_paragraph(hits: list[KnowledgeSearchHitModel]) -> ResponsePa
         for index, hit in enumerate(hits, start=1)
     ]
     evidence = "；".join(
-        f"{index}. {snippet_text(hit.chunk.text)}"
-        for index, hit in enumerate(hits, start=1)
+        f"{index}. {snippet_text(hit.chunk.text)}" for index, hit in enumerate(hits, start=1)
     )
     return ResponseParagraphModel(
         text=f"已检索到管理员资料库中的相关片段，优先参考以下证据：{evidence}",
@@ -282,38 +284,34 @@ def build_knowledge_paragraph(hits: list[KnowledgeSearchHitModel]) -> ResponsePa
     )
 
 
-
 class ChatRepository(Protocol):
-    def list_conversations(self) -> list[ConversationModel]:
-        ...
+    def list_conversations(self) -> list[ConversationModel]: ...
 
-    def create_conversation(self) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
-        ...
+    def create_conversation(
+        self,
+    ) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]: ...
 
-    def delete_conversation(self, conversation_id: str) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
-        ...
+    def delete_conversation(
+        self, conversation_id: str
+    ) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]: ...
 
-    def get_messages(self, conversation_id: str) -> list[ChatMessageModel]:
-        ...
+    def get_messages(self, conversation_id: str) -> list[ChatMessageModel]: ...
 
     def send_message(
         self,
         conversation_id: str,
         content: str,
         mode: ComposerMode,
-    ) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
-        ...
+    ) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]: ...
 
-    def list_knowledge_sources(self) -> list[KnowledgeSourceModel]:
-        ...
+    def list_knowledge_sources(self) -> list[KnowledgeSourceModel]: ...
 
     def add_knowledge_source(
         self,
         name: str,
         source_type: str,
         classification: str,
-    ) -> list[KnowledgeSourceModel]:
-        ...
+    ) -> list[KnowledgeSourceModel]: ...
 
     def add_uploaded_knowledge_source(
         self,
@@ -325,42 +323,36 @@ class ChatRepository(Protocol):
         file_path: str,
         file_size: int,
         mime_type: str | None,
-    ) -> list[KnowledgeSourceModel]:
-        ...
+    ) -> list[KnowledgeSourceModel]: ...
 
-    def delete_knowledge_source(self, source_id: str) -> tuple[list[KnowledgeSourceModel], KnowledgeSourceModel]:
-        ...
+    def delete_knowledge_source(
+        self, source_id: str
+    ) -> tuple[list[KnowledgeSourceModel], KnowledgeSourceModel]: ...
 
     def complete_knowledge_source_indexing(
         self,
         source_id: str,
         chunks: list[KnowledgeChunkModel],
-    ) -> KnowledgeSourceModel:
-        ...
+    ) -> KnowledgeSourceModel: ...
 
     def fail_knowledge_source_indexing(
         self,
         source_id: str,
         error_message: str | None = None,
-    ) -> KnowledgeSourceModel:
-        ...
+    ) -> KnowledgeSourceModel: ...
 
-    def reindex_knowledge_source(self, source_id: str) -> KnowledgeSourceModel:
-        ...
+    def reindex_knowledge_source(self, source_id: str) -> KnowledgeSourceModel: ...
 
-    def list_knowledge_chunks(self, source_id: str) -> list[KnowledgeChunkModel]:
-        ...
+    def list_knowledge_chunks(self, source_id: str) -> list[KnowledgeChunkModel]: ...
 
     def search_knowledge_chunks(
         self,
         query: str,
         limit: int = KNOWLEDGE_SEARCH_LIMIT,
         minimum_score: float | None = None,
-    ) -> list[KnowledgeSearchHitModel]:
-        ...
+    ) -> list[KnowledgeSearchHitModel]: ...
 
-    def list_agent_runs(self, limit: int = 50) -> list[AgentRunAudit]:
-        ...
+    def list_agent_runs(self, limit: int = 50) -> list[AgentRunAudit]: ...
 
     def list_evaluation_cases(
         self,
@@ -368,11 +360,9 @@ class ChatRepository(Protocol):
         tag: str | None = None,
         expect_answer: bool | None = None,
         status: str | None = None,
-    ) -> list[EvaluationCaseModel]:
-        ...
+    ) -> list[EvaluationCaseModel]: ...
 
-    def get_evaluation_case_facets(self) -> EvaluationCaseFacets:
-        ...
+    def get_evaluation_case_facets(self) -> EvaluationCaseFacets: ...
 
     def create_evaluation_case(
         self,
@@ -385,8 +375,7 @@ class ChatRepository(Protocol):
         tags: list[str] | None = None,
         external_key: str | None = None,
         import_batch_id: str | None = None,
-    ) -> EvaluationCaseModel:
-        ...
+    ) -> EvaluationCaseModel: ...
 
     def create_evaluation_cases(
         self,
@@ -396,43 +385,35 @@ class ChatRepository(Protocol):
         total_rows: int,
         valid_rows: int,
         invalid_rows: int,
-    ) -> EvaluationImportCreateResult:
-        ...
+    ) -> EvaluationImportCreateResult: ...
 
-    def list_evaluation_import_batches(self) -> list[EvaluationImportBatchModel]:
-        ...
+    def list_evaluation_import_batches(self) -> list[EvaluationImportBatchModel]: ...
 
-    def delete_evaluation_case(self, case_id: str) -> None:
-        ...
+    def delete_evaluation_case(self, case_id: str) -> None: ...
 
-    def run_evaluation_cases(self, case_ids: list[str] | None = None) -> list[EvaluationRunModel]:
-        ...
+    def run_evaluation_cases(
+        self, case_ids: list[str] | None = None
+    ) -> list[EvaluationRunModel]: ...
 
-    def list_evaluation_runs(self, limit: int = 100) -> list[EvaluationRunModel]:
-        ...
+    def list_evaluation_runs(self, limit: int = 100) -> list[EvaluationRunModel]: ...
 
     def create_evaluation_batch(
         self,
         name: str,
         case_ids: list[str],
         retrieval_min_score: float | None = None,
-    ) -> EvaluationBatchModel:
-        ...
+    ) -> EvaluationBatchModel: ...
 
-    def run_evaluation_batch(self, batch_id: str) -> EvaluationBatchModel:
-        ...
+    def run_evaluation_batch(self, batch_id: str) -> EvaluationBatchModel: ...
 
-    def list_evaluation_batches(self) -> list[EvaluationBatchModel]:
-        ...
+    def list_evaluation_batches(self) -> list[EvaluationBatchModel]: ...
 
-    def get_evaluation_batch(self, batch_id: str) -> EvaluationBatchModel:
-        ...
+    def get_evaluation_batch(self, batch_id: str) -> EvaluationBatchModel: ...
 
     def list_evaluation_runs_for_batch(
         self,
         batch_id: str,
-    ) -> list[EvaluationRunModel]:
-        ...
+    ) -> list[EvaluationRunModel]: ...
 
 
 class InMemoryChatRepository:
@@ -472,11 +453,15 @@ class InMemoryChatRepository:
             self._state.messages_by_conversation[conversation_id] = []
             return self._bundle(conversation_id)
 
-    def delete_conversation(self, conversation_id: str) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
+    def delete_conversation(
+        self, conversation_id: str
+    ) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
         with self._lock:
             self._find_conversation(conversation_id)
             self._state.conversations = [
-                conversation for conversation in self._state.conversations if conversation.id != conversation_id
+                conversation
+                for conversation in self._state.conversations
+                if conversation.id != conversation_id
             ]
             self._state.messages_by_conversation.pop(conversation_id, None)
 
@@ -703,10 +688,7 @@ class InMemoryChatRepository:
         with self._lock:
             if not any(case.id == case_id for case in self._evaluation_cases):
                 raise HTTPException(status_code=404, detail="Evaluation case not found")
-            if any(
-                case_id in batch.case_ids
-                for batch in self._evaluation_batches
-            ):
+            if any(case_id in batch.case_ids for batch in self._evaluation_batches):
                 raise HTTPException(
                     status_code=409,
                     detail="评测用例已被评测批次引用，不能删除",
@@ -723,9 +705,7 @@ class InMemoryChatRepository:
                 if not selected_ids or case.id in selected_ids
             ]
             missing_ids = [
-                case_id
-                for case_id in selected_ids
-                if not any(case.id == case_id for case in cases)
+                case_id for case_id in selected_ids if not any(case.id == case_id for case in cases)
             ]
         if missing_ids:
             raise HTTPException(status_code=404, detail="Evaluation case not found")
@@ -756,20 +736,14 @@ class InMemoryChatRepository:
         case_ids: list[str],
         retrieval_min_score: float | None = None,
     ) -> EvaluationBatchModel:
-        normalized_name, normalized_case_ids, effective_score = (
-            normalize_evaluation_batch_request(
-                name,
-                case_ids,
-                retrieval_min_score,
-            )
+        normalized_name, normalized_case_ids, effective_score = normalize_evaluation_batch_request(
+            name,
+            case_ids,
+            retrieval_min_score,
         )
         with self._lock:
             cases_by_id = {case.id: case for case in self._evaluation_cases}
-            missing_ids = [
-                case_id
-                for case_id in normalized_case_ids
-                if case_id not in cases_by_id
-            ]
+            missing_ids = [case_id for case_id in normalized_case_ids if case_id not in cases_by_id]
             if missing_ids:
                 raise HTTPException(
                     status_code=404,
@@ -865,11 +839,7 @@ class InMemoryChatRepository:
         with self._lock:
             self._find_evaluation_batch(batch_id)
             runs = sorted(
-                (
-                    run
-                    for run in self._evaluation_runs
-                    if run.batch_id == batch_id
-                ),
+                (run for run in self._evaluation_runs if run.batch_id == batch_id),
                 key=lambda run: run.sequence,
             )
             return deepcopy(runs)
@@ -928,7 +898,9 @@ class InMemoryChatRepository:
             )
             return deepcopy(self._state.knowledge_sources)
 
-    def delete_knowledge_source(self, source_id: str) -> tuple[list[KnowledgeSourceModel], KnowledgeSourceModel]:
+    def delete_knowledge_source(
+        self, source_id: str
+    ) -> tuple[list[KnowledgeSourceModel], KnowledgeSourceModel]:
         with self._lock:
             deleted = deepcopy(self._find_knowledge_source(source_id))
             self._state.knowledge_sources = [
@@ -1056,7 +1028,9 @@ class InMemoryChatRepository:
         hits.sort(key=lambda hit: (-hit.score, hit.source.name, hit.chunk.chunk_index))
         return deepcopy(rank_knowledge_hits(query, hits, limit))
 
-    def _bundle(self, active_conversation_id: str) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
+    def _bundle(
+        self, active_conversation_id: str
+    ) -> tuple[list[ConversationModel], str, list[ChatMessageModel]]:
         return (
             deepcopy(self._state.conversations),
             active_conversation_id,

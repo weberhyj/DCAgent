@@ -20,16 +20,15 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
 
 from .embedding_contracts import (
+    MAX_EMBEDDING_REQUEST_BYTES,
+    SHA256_PATTERN,
     EmbeddingMetadataResponse,
     EmbeddingModelMetadata,
     EmbeddingPurpose,
     EmbeddingRequest,
     EmbeddingResponse,
-    MAX_EMBEDDING_REQUEST_BYTES,
-    SHA256_PATTERN,
 )
 from .offline_artifacts import is_local_filesystem_path
-
 
 EMBEDDING_METADATA_FILENAME = "embedding-metadata.json"
 OFFLINE_EMBEDDING_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
@@ -138,9 +137,7 @@ def _build_embedding_app(*, lifespan: Any | None = None) -> FastAPI:
         _, metadata = require_runtime()
         return {
             "status": "ready",
-            **EmbeddingMetadataResponse.from_metadata(metadata).model_dump(
-                by_alias=True
-            ),
+            **EmbeddingMetadataResponse.from_metadata(metadata).model_dump(by_alias=True),
         }
 
     @app.get(
@@ -234,9 +231,7 @@ def _materialize_vectors(
             raise TypeError("each vector must be a numeric sequence")
         materialized: list[float] = []
         for coordinate in vector:
-            if isinstance(coordinate, bool) or isinstance(
-                coordinate, (str, bytes, bytearray)
-            ):
+            if isinstance(coordinate, bool) or isinstance(coordinate, (str, bytes, bytearray)):
                 raise TypeError("vector coordinates must be numbers")
             try:
                 numeric_coordinate = float(coordinate)
@@ -319,9 +314,7 @@ def _load_pinned_model_configuration(
     if not model_root.exists() or not model_root.is_dir():
         raise ValueError("EMBEDDING_MODEL_ROOT must reference an existing local directory")
 
-    expected_checksum = _required_environment_value(
-        environ, "EMBEDDING_MODEL_SHA256"
-    )
+    expected_checksum = _required_environment_value(environ, "EMBEDDING_MODEL_SHA256")
     if SHA256_PATTERN.fullmatch(expected_checksum) is None:
         raise ValueError(
             "EMBEDDING_MODEL_SHA256 must be exactly 64 lowercase hexadecimal characters"
@@ -348,9 +341,7 @@ def _read_model_metadata_manifest(
 ) -> EmbeddingModelMetadata:
     manifest_path = model_root / EMBEDDING_METADATA_FILENAME
     if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise ValueError(
-            f"{EMBEDDING_METADATA_FILENAME} must be a regular file in the model root"
-        )
+        raise ValueError(f"{EMBEDDING_METADATA_FILENAME} must be a regular file in the model root")
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -366,9 +357,7 @@ def _read_model_metadata_manifest(
             details.append(f"missing fields: {', '.join(missing)}")
         if unexpected:
             details.append(f"unexpected fields: {', '.join(unexpected)}")
-        raise ValueError(
-            f"invalid {EMBEDDING_METADATA_FILENAME}: {'; '.join(details)}"
-        )
+        raise ValueError(f"invalid {EMBEDDING_METADATA_FILENAME}: {'; '.join(details)}")
     try:
         wire_metadata = EmbeddingMetadataResponse.model_validate(
             {**payload, "modelChecksum": model_checksum}

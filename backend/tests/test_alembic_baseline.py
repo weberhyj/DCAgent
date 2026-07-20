@@ -5,10 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 
+from alembic import command
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 REVISION = "20260715_00"
@@ -234,10 +234,7 @@ class AlembicBaselineTest(unittest.TestCase):
             self.assertEqual(
                 ("version_num",),
                 tuple(
-                    inspector.get_pk_constraint("alembic_version").get(
-                        "constrained_columns"
-                    )
-                    or ()
+                    inspector.get_pk_constraint("alembic_version").get("constrained_columns") or ()
                 ),
             )
 
@@ -254,7 +251,10 @@ class AlembicBaselineTest(unittest.TestCase):
                     )
                     self.assertEqual(expected_columns, actual_columns)
                     self.assertTrue(
-                        all(column["default"] is None for column in inspector.get_columns(table_name))
+                        all(
+                            column["default"] is None
+                            for column in inspector.get_columns(table_name)
+                        )
                     )
                     actual_indexes = {
                         index["name"]: (
@@ -280,7 +280,9 @@ class AlembicBaselineTest(unittest.TestCase):
                     )
 
             with engine.connect() as connection:
-                current_revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
+                current_revision = connection.scalar(
+                    text("SELECT version_num FROM alembic_version")
+                )
                 counter_row = connection.execute(
                     text(
                         "SELECT name, next_value FROM evaluation_counters "
@@ -292,12 +294,7 @@ class AlembicBaselineTest(unittest.TestCase):
             self.assertEqual(("evaluation_runs", 1), counter_row)
 
     def test_revision_is_explicit_and_does_not_depend_on_live_metadata(self) -> None:
-        revision_path = (
-            BACKEND_ROOT
-            / "alembic"
-            / "versions"
-            / "20260715_00_existing_schema.py"
-        )
+        revision_path = BACKEND_ROOT / "alembic" / "versions" / "20260715_00_existing_schema.py"
         source = revision_path.read_text(encoding="utf-8")
         self.assertIn('revision = "20260715_00"', source)
         self.assertIn("down_revision = None", source)

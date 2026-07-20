@@ -23,18 +23,14 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise OfflineSettingsError(
-        "Boolean value must be one of: 1, true, yes, on, 0, false, no, off"
-    )
+    raise OfflineSettingsError("Boolean value must be one of: 1, true, yes, on, 0, false, no, off")
 
 
 def require_private_url(value: str, field: str) -> str:
     candidate = value.strip()
     parsed = urlparse(candidate)
     if field.lower() == "database_url":
-        routing_keys = {
-            key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
-        }
+        routing_keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
         forbidden_keys = routing_keys & {"host", "hostaddr", "service", "servicefile"}
         if forbidden_keys:
             keys = ", ".join(sorted(forbidden_keys))
@@ -55,9 +51,7 @@ def require_private_url(value: str, field: str) -> str:
     try:
         address = ip_address(host)
     except ValueError as error:
-        raise OfflineSettingsError(
-            f"{field} must use a private or loopback host"
-        ) from error
+        raise OfflineSettingsError(f"{field} must use a private or loopback host") from error
     if not (address.is_private or address.is_loopback):
         raise OfflineSettingsError(f"{field} must use a private or loopback host")
     return candidate.rstrip("/")
@@ -80,33 +74,23 @@ class OfflineSettings:
     dependency_timeout_seconds: float
 
     @classmethod
-    def from_environ(cls, environ: Mapping[str, str]) -> "OfflineSettings":
+    def from_environ(cls, environ: Mapping[str, str]) -> OfflineSettings:
         offline_mode = parse_bool(environ.get("OFFLINE_MODE"), default=True)
         values = {
             "database_url": resolve_database_url(environ),
-            "clickhouse_url": environ.get(
-                "CLICKHOUSE_URL", "http://127.0.0.1:8123"
-            ),
+            "clickhouse_url": environ.get("CLICKHOUSE_URL", "http://127.0.0.1:8123"),
             "qdrant_url": environ.get("QDRANT_URL", "http://127.0.0.1:6333"),
             "redis_url": environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"),
-            "embedding_service_url": environ.get(
-                "EMBEDDING_SERVICE_URL", "http://127.0.0.1:8081"
-            ),
-            "llama_server_url": environ.get(
-                "LLAMA_SERVER_URL", "http://127.0.0.1:8080"
-            ),
+            "embedding_service_url": environ.get("EMBEDDING_SERVICE_URL", "http://127.0.0.1:8081"),
+            "llama_server_url": environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080"),
         }
         if offline_mode:
-            values = {
-                key: require_private_url(value, key) for key, value in values.items()
-            }
+            values = {key: require_private_url(value, key) for key, value in values.items()}
 
         try:
             model_slots = int(environ.get("MODEL_SLOTS", "2"))
         except ValueError as error:
-            raise OfflineSettingsError(
-                "MODEL_SLOTS must be between 1 and 4"
-            ) from error
+            raise OfflineSettingsError("MODEL_SLOTS must be between 1 and 4") from error
         if model_slots not in {1, 2, 3, 4}:
             raise OfflineSettingsError("MODEL_SLOTS must be between 1 and 4")
 
@@ -117,8 +101,6 @@ class OfflineSettings:
             parquet_root=Path(environ.get("PARQUET_ROOT", "./data/parquet")),
             model_root=Path(environ.get("MODEL_ROOT", "./models")),
             model_slots=model_slots,
-            dependency_timeout_seconds=float(
-                environ.get("DEPENDENCY_TIMEOUT_SECONDS", "2.0")
-            ),
+            dependency_timeout_seconds=float(environ.get("DEPENDENCY_TIMEOUT_SECONDS", "2.0")),
             **values,
         )

@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 
 from app.models import ChatState, KnowledgeChunkModel
-from app.repository import InMemoryChatRepository, is_reliable_knowledge_score, resolve_retrieval_min_score
+from app.repository import (
+    InMemoryChatRepository,
+    is_reliable_knowledge_score,
+    resolve_retrieval_min_score,
+)
 
 
 class RetrievalThresholdTest(unittest.TestCase):

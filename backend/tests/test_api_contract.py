@@ -20,7 +20,6 @@ from app.models import (
 from app.repository import InMemoryChatRepository
 from app.seed import build_seed_state
 
-
 DISPLAY_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
 

@@ -18,7 +18,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..offline_settings import OfflineSettings, parse_bool
 
-
 DependencyCheckCallable = Callable[[], tuple[bool, str]]
 DependencyReport = dict[str, dict[str, bool | str]]
 HttpClientFactory = Callable[..., Any]
@@ -102,8 +101,7 @@ class DependencyHealthRegistry:
                     self._last_report is not None
                     and self._last_report_at is not None
                     and self._max_stale_seconds > 0
-                    and now - self._last_report_at
-                    <= self._max_stale_seconds
+                    and now - self._last_report_at <= self._max_stale_seconds
                 ):
                     return _copy_report(self._last_report)
                 return {
@@ -126,8 +124,7 @@ class DependencyHealthRegistry:
                 )
             except Exception:
                 report = {
-                    item.name: {"ok": False, "detail": "check failed"}
-                    for item in self._checks
+                    item.name: {"ok": False, "detail": "check failed"} for item in self._checks
                 }
             return _copy_report(report)
         finally:
@@ -145,10 +142,7 @@ class DependencyHealthRegistry:
 
 
 def _copy_report(report: DependencyReport) -> DependencyReport:
-    return {
-        name: dict(result)
-        for name, result in report.items()
-    }
+    return {name: dict(result) for name, result in report.items()}
 
 
 def _evaluate_check(check: DependencyCheckCallable) -> dict[str, bool | str]:
@@ -391,9 +385,7 @@ def _inspect_http_response(
     if _response_uses_unsupported_encoding(response):
         return False, "invalid readiness response"
     content_length = _response_content_length(response)
-    if content_length is not None and not (
-        0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES
-    ):
+    if content_length is not None and not (0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES):
         return False, "invalid readiness response"
     if deadline - monotonic() <= 0:
         return False, "unavailable"
@@ -453,9 +445,7 @@ def _inspect_buffered_http_response(
     if _response_uses_unsupported_encoding(response):
         return False, "invalid readiness response"
     content_length = _response_content_length(response)
-    if content_length is not None and not (
-        0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES
-    ):
+    if content_length is not None and not (0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES):
         return False, "invalid readiness response"
     if deadline - monotonic() <= 0:
         return False, "unavailable"
@@ -544,8 +534,7 @@ def postgres_schema_revision_check(
     timeout_seconds: float = 2.0,
 ) -> DependencyCheckCallable:
     resolved_config_path = Path(
-        config_path
-        or Path(__file__).resolve().parents[2] / "alembic.ini"
+        config_path or Path(__file__).resolve().parents[2] / "alembic.ini"
     ).resolve()
 
     def check() -> tuple[bool, str]:
@@ -558,30 +547,17 @@ def postgres_schema_revision_check(
             "script_location",
             str(resolved_config_path.parent / "alembic"),
         )
-        expected_heads = frozenset(
-            ScriptDirectory.from_config(config).get_heads()
-        )
+        expected_heads = frozenset(ScriptDirectory.from_config(config).get_heads())
         engine = getattr(database, "engine", database)
         with engine.connect() as connection:
-            if (
-                getattr(getattr(connection, "dialect", None), "name", None)
-                == "postgresql"
-            ):
+            if getattr(getattr(connection, "dialect", None), "name", None) == "postgresql":
                 timeout_milliseconds = max(
                     1,
                     math.ceil(_bounded_timeout(timeout_seconds) * 1000),
                 )
-                connection.exec_driver_sql(
-                    f"SET LOCAL statement_timeout = {timeout_milliseconds}"
-                )
-            current_heads = frozenset(
-                MigrationContext.configure(connection).get_current_heads()
-            )
-        if (
-            len(expected_heads) == 1
-            and len(current_heads) == 1
-            and current_heads == expected_heads
-        ):
+                connection.exec_driver_sql(f"SET LOCAL statement_timeout = {timeout_milliseconds}")
+            current_heads = frozenset(MigrationContext.configure(connection).get_current_heads())
+        if len(expected_heads) == 1 and len(current_heads) == 1 and current_heads == expected_heads:
             return True, "schema current"
         return False, "schema revision mismatch"
 
@@ -710,9 +686,7 @@ def _clamav_ping_check(
                 if remaining <= 0:
                     break
                 connection.settimeout(max(0.001, remaining))
-                chunk = connection.recv(
-                    min(16, _MAX_CLAMAV_RESPONSE_BYTES - len(response))
-                )
+                chunk = connection.recv(min(16, _MAX_CLAMAV_RESPONSE_BYTES - len(response)))
                 if not chunk:
                     break
                 response.extend(chunk)
@@ -720,9 +694,7 @@ def _clamav_ping_check(
                     break
         response_bytes = bytes(response)
         terminator_indexes = [
-            index
-            for marker in (b"\0", b"\n")
-            if (index := response_bytes.find(marker)) >= 0
+            index for marker in (b"\0", b"\n") if (index := response_bytes.find(marker)) >= 0
         ]
         if terminator_indexes:
             response_bytes = response_bytes[: min(terminator_indexes)]
@@ -748,18 +720,12 @@ def _is_private_or_allowed_host(
     except ValueError:
         return candidate in allowed_hosts
     return address.is_loopback or any(
-        address.version == network.version and address in network
-        for network in _PRIVATE_NETWORKS
+        address.version == network.version and address in network for network in _PRIVATE_NETWORKS
     )
 
 
 def _generation_enabled(environ: Mapping[str, str]) -> bool:
-    provider = (
-        environ.get("LLM_PROVIDER", "template")
-        .strip()
-        .lower()
-        .replace("-", "_")
-    )
+    provider = environ.get("LLM_PROVIDER", "template").strip().lower().replace("-", "_")
     if provider == "openai_compatible":
         return True
     return any(
@@ -832,14 +798,9 @@ def validate_health_service_urls(
             or not host
             or not port_valid
             or (port is not None and not 1 <= port <= 65535)
-            or (
-                settings.offline_mode
-                and not _is_private_or_allowed_host(host, allowed_hosts)
-            )
+            or (settings.offline_mode and not _is_private_or_allowed_host(host, allowed_hosts))
         ):
-            raise ValueError(
-                f"{field} health endpoint must use a private or loopback host"
-            )
+            raise ValueError(f"{field} health endpoint must use a private or loopback host")
 
 
 def build_dependency_checks(

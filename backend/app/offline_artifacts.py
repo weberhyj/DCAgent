@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-
 ARTIFACT_FIELDS = (
     "name",
     "kind",
@@ -24,9 +23,7 @@ def is_local_filesystem_path(value: str) -> bool:
         return False
     if WINDOWS_DRIVE_ROOT_PATTERN.match(candidate):
         return True
-    return not (
-        URI_SCHEME_PATTERN.match(candidate) or NETWORK_SHARE_PATTERN.match(candidate)
-    )
+    return not (URI_SCHEME_PATTERN.match(candidate) or NETWORK_SHARE_PATTERN.match(candidate))
 
 
 def validate_artifact_manifest(payload: Mapping[str, object]) -> None:
@@ -48,9 +45,7 @@ def validate_artifact_manifest(payload: Mapping[str, object]) -> None:
 
         unexpected_artifact_fields = set(artifact) - set(ARTIFACT_FIELDS)
         if unexpected_artifact_fields:
-            fields = ", ".join(
-                sorted(str(field) for field in unexpected_artifact_fields)
-            )
+            fields = ", ".join(sorted(str(field) for field in unexpected_artifact_fields))
             raise ValueError(f"artifact has unexpected fields: {fields}")
 
         for field in ARTIFACT_FIELDS:
@@ -60,9 +55,7 @@ def validate_artifact_manifest(payload: Mapping[str, object]) -> None:
 
         sha256 = artifact["sha256"]
         if not SHA256_PATTERN.fullmatch(sha256):
-            raise ValueError(
-                "artifact sha256 must be exactly 64 lowercase hexadecimal characters"
-            )
+            raise ValueError("artifact sha256 must be exactly 64 lowercase hexadecimal characters")
 
         if not is_local_filesystem_path(artifact["localPath"]):
             raise ValueError(

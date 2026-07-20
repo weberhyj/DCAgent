@@ -19,7 +19,6 @@ from .models import (
 from .offline_settings import parse_bool, require_private_url
 from .time_utils import display_datetime_label
 
-
 NO_EVIDENCE_REPLY = "未检索到足够依据。请先在知识库中补充相关资料，或换一个更具体的问题重新检索。"
 RAG_SYSTEM_PROMPT = (
     "你是 DCAgent，面向公司内部资料库的知识检索智能体。"
@@ -98,12 +97,12 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.post(f"{self.api_base}/chat/completions", json=payload, headers=headers)
+                response = client.post(
+                    f"{self.api_base}/chat/completions", json=payload, headers=headers
+                )
                 response.raise_for_status()
                 data = response.json()
-            content = normalize_plain_text_answer(
-                str(data["choices"][0]["message"]["content"])
-            )
+            content = normalize_plain_text_answer(str(data["choices"][0]["message"]["content"]))
         except httpx.TimeoutException as exc:
             raise LLMProviderError("大模型响应超时，请稍后重试。") from exc
         except httpx.HTTPError as exc:

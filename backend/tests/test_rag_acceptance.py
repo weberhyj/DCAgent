@@ -17,12 +17,16 @@ class RagAcceptanceTest(unittest.TestCase):
         repository = InMemoryChatRepository(
             ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[])
         )
-        self.client = TestClient(create_app(repository=repository, upload_dir=Path(self.temp_dir.name)))
+        self.client = TestClient(
+            create_app(repository=repository, upload_dir=Path(self.temp_dir.name))
+        )
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_upload_index_and_user_question_returns_grounded_answer_without_source_internals(self) -> None:
+    def test_upload_index_and_user_question_returns_grounded_answer_without_source_internals(
+        self,
+    ) -> None:
         policy_text = (
             "差旅报销制度规定：员工出差前必须先提交审批单。"
             "返程后需要在五个工作日内上传发票、行程单和审批记录。"

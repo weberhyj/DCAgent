@@ -7,7 +7,12 @@ from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
-from .embeddings import DEFAULT_EMBEDDING_PROVIDER, cosine_similarity, expand_terms, extract_embedding_terms
+from .embeddings import (
+    DEFAULT_EMBEDDING_PROVIDER,
+    cosine_similarity,
+    expand_terms,
+    extract_embedding_terms,
+)
 from .llm import LLMProvider, LLMRequest
 from .models import (
     ChatMessageModel,
@@ -17,7 +22,6 @@ from .models import (
 )
 from .retrieval import is_reliable_knowledge_score
 from .time_utils import display_datetime_label
-
 
 AgentRunStatus = Literal["completed", "failed"]
 AgentStepStatus = Literal["completed", "failed"]
@@ -51,7 +55,7 @@ class AgentRunResult:
     evidence_count: int
     source_count: int
 
-    def to_audit(self) -> "AgentRunAudit":
+    def to_audit(self) -> AgentRunAudit:
         return AgentRunAudit(
             id=self.id,
             conversation_id=self.conversation_id,

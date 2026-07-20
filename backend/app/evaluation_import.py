@@ -7,17 +7,16 @@ import re
 import secrets
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Iterable
 from zipfile import BadZipFile, ZipFile
 
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
 from .evaluation import normalize_evaluation_case_metadata
-
 
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_IMPORT_FILE_NAME_LENGTH = 240
@@ -172,18 +171,14 @@ def _read_xlsx_records(content: bytes) -> list[dict[str, object]]:
         if headers_row is None:
             return []
         headers = [str(value or "").strip() for value in headers_row]
-        return _read_bounded_records(
-            dict(zip(headers, values, strict=False)) for values in rows
-        )
+        return _read_bounded_records(dict(zip(headers, values, strict=False)) for values in rows)
     finally:
         workbook.close()
 
 
 def _record_value(record: dict[str, object], field: str, *aliases: str) -> object:
     normalized_record = {
-        str(key).strip(): value
-        for key, value in record.items()
-        if key is not None
+        str(key).strip(): value for key, value in record.items() if key is not None
     }
     for name in (field, *aliases):
         if name in normalized_record:
@@ -290,9 +285,7 @@ class EvaluationImportService:
         duplicate_keys: list[str] = []
         for row_number, raw_record in enumerate(records, start=2):
             if not isinstance(raw_record, dict):
-                errors.append(
-                    EvaluationImportError(row_number, "row", "每行数据必须是字段对象")
-                )
+                errors.append(EvaluationImportError(row_number, "row", "每行数据必须是字段对象"))
                 continue
             try:
                 row = self._parse_row(row_number, raw_record, source_ids_by_name)
@@ -374,9 +367,7 @@ class EvaluationImportService:
 
     def _purge_expired_locked(self, now: float) -> None:
         expired_tokens = [
-            token
-            for token, preview in self._previews.items()
-            if preview.expires_at <= now
+            token for token, preview in self._previews.items() if preview.expires_at <= now
         ]
         for token in expired_tokens:
             self._previews.pop(token, None)

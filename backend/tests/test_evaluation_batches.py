@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
 import importlib
 import importlib.util
 import inspect
 import os
+import unittest
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier, Event, Lock, Thread
-import unittest
 from unittest.mock import patch
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import event, inspect as sqlalchemy_inspect, text
+from sqlalchemy import event, text
+from sqlalchemy import inspect as sqlalchemy_inspect
 
 from app.database import Database, EvaluationCaseRecord
 from app.embeddings import DEFAULT_EMBEDDING_PROVIDER
@@ -24,7 +25,6 @@ from app.models import ChatState, KnowledgeChunkModel
 from app.repository import ChatRepository, InMemoryChatRepository
 from app.routes import router
 from app.sql_repository import SqlChatRepository
-
 
 Repository = InMemoryChatRepository | SqlChatRepository
 QUERY = "cashflow risk"
@@ -95,11 +95,7 @@ def make_evaluation_run(
         else []
     )
     term_ids = (
-        list(expected_terms)
-        if expected_terms is not None
-        else ["term"]
-        if expect_answer
-        else []
+        list(expected_terms) if expected_terms is not None else ["term"] if expect_answer else []
     )
     return EvaluationRunModel(
         id=run_id or f"run-{case_id}-{status}",
@@ -117,9 +113,7 @@ def make_evaluation_run(
         missing_terms=list(missing_terms or []),
         source_recall=source_recall,
         term_recall=term_recall,
-        top_score=(1.0 if status == "passed" else 0.0)
-        if top_score is None
-        else top_score,
+        top_score=(1.0 if status == "passed" else 0.0) if top_score is None else top_score,
         hit_count=1 if status == "passed" else 0,
         started_at="2026-07-13 10:00:00",
         completed_at=completed_at,
@@ -231,9 +225,7 @@ class EvaluationRetrievalThresholdOverrideTest(unittest.TestCase):
     def test_search_signatures_expose_call_scoped_minimum_score(self) -> None:
         for repository_type in (ChatRepository, InMemoryChatRepository, SqlChatRepository):
             with self.subTest(repository_type=repository_type.__name__):
-                parameters = inspect.signature(
-                    repository_type.search_knowledge_chunks
-                ).parameters
+                parameters = inspect.signature(repository_type.search_knowledge_chunks).parameters
 
                 self.assertEqual(
                     list(parameters),
@@ -455,11 +447,17 @@ class EvaluationBatchSummaryTest(unittest.TestCase):
         self.assertEqual(summary.average_top_score, 2.0)
         self.assertEqual(summary.maximum_top_score, 3.0)
         self.assertEqual(
-            [(group.name, group.total, group.passed, group.pass_rate) for group in summary.category_breakdown],
+            [
+                (group.name, group.total, group.passed, group.pass_rate)
+                for group in summary.category_breakdown
+            ],
             [("未分类", 1, 0, 0.0), ("财务", 2, 1, 0.5)],
         )
         self.assertEqual(
-            [(group.name, group.total, group.passed, group.pass_rate) for group in summary.tag_breakdown],
+            [
+                (group.name, group.total, group.passed, group.pass_rate)
+                for group in summary.tag_breakdown
+            ],
             [("日报", 1, 1, 1.0), ("重点", 2, 1, 0.5)],
         )
 
@@ -1231,9 +1229,7 @@ class EvaluationBatchExecutionReturnTest(unittest.TestCase):
                 if isinstance(repository, InMemoryChatRepository):
                     with repository._lock:
                         repository._evaluation_cases = [
-                            item
-                            for item in repository._evaluation_cases
-                            if item.id != case.id
+                            item for item in repository._evaluation_cases if item.id != case.id
                         ]
                 else:
                     with repository._database.session() as session:
@@ -1291,10 +1287,7 @@ class EvaluationBatchCaseDeletionProtectionTest(unittest.TestCase):
                     runs_before,
                 )
                 self.assertTrue(
-                    any(
-                        case.id == protected_case.id
-                        for case in repository.list_evaluation_cases()
-                    )
+                    any(case.id == protected_case.id for case in repository.list_evaluation_cases())
                 )
 
                 unbatched_case = create_evaluation_case(
@@ -1304,10 +1297,7 @@ class EvaluationBatchCaseDeletionProtectionTest(unittest.TestCase):
                 )
                 repository.delete_evaluation_case(unbatched_case.id)
                 self.assertFalse(
-                    any(
-                        case.id == unbatched_case.id
-                        for case in repository.list_evaluation_cases()
-                    )
+                    any(case.id == unbatched_case.id for case in repository.list_evaluation_cases())
                 )
 
 
@@ -1365,9 +1355,7 @@ class SqlEvaluationBatchTest(unittest.TestCase):
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     results = list(
                         executor.map(
-                            lambda repository: repository.run_evaluation_batch(
-                                batch.id
-                            ),
+                            lambda repository: repository.run_evaluation_batch(batch.id),
                             repositories,
                         )
                     )
@@ -1446,9 +1434,7 @@ class SqlEvaluationBatchTest(unittest.TestCase):
             self.assertEqual(persisted_batch.failed_count, 0)
             self.assertEqual([run.case_id for run in persisted_runs], [second.id, first.id])
             self.assertTrue(all(run.batch_id == batch.id for run in persisted_runs))
-            self.assertIsNone(
-                next(run for run in all_runs if run.id == manual_run.id).batch_id
-            )
+            self.assertIsNone(next(run for run in all_runs if run.id == manual_run.id).batch_id)
             self.assertGreater(persisted_runs[0].sequence, manual_run.sequence)
 
     def test_migrates_legacy_runs_with_nullable_batch_foreign_key_and_index(self) -> None:
@@ -1507,8 +1493,7 @@ class SqlEvaluationBatchTest(unittest.TestCase):
             )
             connection.execute(
                 text(
-                    "CREATE UNIQUE INDEX ix_evaluation_runs_sequence "
-                    "ON evaluation_runs (sequence)"
+                    "CREATE UNIQUE INDEX ix_evaluation_runs_sequence ON evaluation_runs (sequence)"
                 )
             )
 
@@ -1517,18 +1502,11 @@ class SqlEvaluationBatchTest(unittest.TestCase):
 
         inspector = sqlalchemy_inspect(database.engine)
         run_columns = {
-            column["name"]: column
-            for column in inspector.get_columns("evaluation_runs")
+            column["name"]: column for column in inspector.get_columns("evaluation_runs")
         }
-        run_indexes = {
-            index["name"]
-            for index in inspector.get_indexes("evaluation_runs")
-        }
+        run_indexes = {index["name"] for index in inspector.get_indexes("evaluation_runs")}
         run_foreign_keys = inspector.get_foreign_keys("evaluation_runs")
-        batch_columns = {
-            column["name"]
-            for column in inspector.get_columns("evaluation_batches")
-        }
+        batch_columns = {column["name"] for column in inspector.get_columns("evaluation_batches")}
 
         self.assertIn("batch_id", run_columns)
         self.assertTrue(run_columns["batch_id"]["nullable"])
@@ -1700,9 +1678,7 @@ class EvaluationBatchApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
         missing_query_fields = {
-            error["loc"][-1]
-            for error in response.json()["detail"]
-            if error["type"] == "missing"
+            error["loc"][-1] for error in response.json()["detail"] if error["type"] == "missing"
         }
         self.assertEqual(missing_query_fields, {"left", "right"})
 
@@ -1737,9 +1713,7 @@ class EvaluationBatchApiTest(unittest.TestCase):
         created = create_response.json()
         self.assertEqual(created["name"], "nightly regression")
         batch_id = created["id"]
-        detail_response = self.client.get(
-            f"/api/admin/evaluations/batches/{batch_id}"
-        )
+        detail_response = self.client.get(f"/api/admin/evaluations/batches/{batch_id}")
         list_response = self.client.get("/api/admin/evaluations/batches")
 
         self.assertEqual(detail_response.status_code, 200)
@@ -1852,9 +1826,7 @@ class EvaluationBatchApiTest(unittest.TestCase):
         batch_before = self.repository.get_evaluation_batch(batch.id)
         runs_before = self.repository.list_evaluation_runs_for_batch(batch.id)
 
-        response = self.client.delete(
-            f"/api/admin/evaluations/cases/{protected_case.id}"
-        )
+        response = self.client.delete(f"/api/admin/evaluations/cases/{protected_case.id}")
 
         self.assertEqual(response.status_code, 409)
         self.assertIn("评测批次", str(response.json()))

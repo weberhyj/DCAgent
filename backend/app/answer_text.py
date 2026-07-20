@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 
-
 _INLINE_CITATION_MARKER = re.compile(r"[ \t]*\[(?:[1-9]\d*)\]")
 _SPACE_BEFORE_PUNCTUATION = re.compile(r"[ \t]+([，。；：！？、,.!?;:])")
 
@@ -53,9 +52,7 @@ def _normalize_line(line: str) -> str:
 
     matches = list(_BOLD_SPAN.finditer(line))
     matched_positions = [
-        position
-        for match in matches
-        for position in (match.start(), match.end() - 2)
+        position for match in matches for position in (match.start(), match.end() - 2)
     ]
     # Every detected delimiter must belong to a validated span before editing.
     if delimiter_positions != matched_positions:
@@ -80,9 +77,7 @@ def _normalize_formatting(text: str) -> str:
         pieces.append(protected.group())
         cursor = protected.end()
 
-    pieces.extend(
-        _normalize_line(line) for line in text[cursor:].splitlines(keepends=True)
-    )
+    pieces.extend(_normalize_line(line) for line in text[cursor:].splitlines(keepends=True))
     return "".join(pieces)
 
 

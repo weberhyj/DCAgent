@@ -15,7 +15,9 @@ class KnowledgeUploadTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         repository = InMemoryChatRepository(build_seed_state())
-        self.client = TestClient(create_app(repository=repository, upload_dir=Path(self.temp_dir.name)))
+        self.client = TestClient(
+            create_app(repository=repository, upload_dir=Path(self.temp_dir.name))
+        )
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()

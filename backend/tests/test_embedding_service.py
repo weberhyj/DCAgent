@@ -135,9 +135,7 @@ class EmbeddingContractsTest(unittest.TestCase):
         )
 
         with self.assertRaises(ValidationError):
-            EmbeddingRequest.model_validate(
-                {"texts": ["valid", "   "], "purpose": "query"}
-            )
+            EmbeddingRequest.model_validate({"texts": ["valid", "   "], "purpose": "query"})
         with self.assertRaises(ValidationError):
             EmbeddingResponse.model_validate(
                 {
@@ -161,9 +159,7 @@ class EmbeddingServiceTest(unittest.TestCase):
         backend = FakeEmbeddingBackend(dimensions=4)
         app = create_embedding_app(
             backend=backend,
-            metadata=EmbeddingModelMetadata(
-                "bge-test", "1", "a" * 64, 4, True, "e" * 64, "1"
-            ),
+            metadata=EmbeddingModelMetadata("bge-test", "1", "a" * 64, 4, True, "e" * 64, "1"),
         )
         response = TestClient(app).post(
             "/v1/embeddings",
@@ -179,9 +175,7 @@ class EmbeddingServiceTest(unittest.TestCase):
         self.assertEqual(backend.calls, [(["one", "two"], "document")])
 
     def test_accepts_simple_backend_fakes_without_a_purpose_keyword(self) -> None:
-        app = create_embedding_app(
-            backend=LegacyEmbeddingBackend(), metadata=metadata()
-        )
+        app = create_embedding_app(backend=LegacyEmbeddingBackend(), metadata=metadata())
 
         response = TestClient(app).post(
             "/v1/embeddings",
@@ -192,9 +186,7 @@ class EmbeddingServiceTest(unittest.TestCase):
         self.assertEqual(len(response.json()["vectors"]), 1)
 
     def test_ready_and_metadata_endpoints_expose_pinned_identity(self) -> None:
-        app = create_embedding_app(
-            backend=FakeEmbeddingBackend(), metadata=metadata()
-        )
+        app = create_embedding_app(backend=FakeEmbeddingBackend(), metadata=metadata())
         client = TestClient(app)
 
         ready = client.get("/readyz")
@@ -208,9 +200,7 @@ class EmbeddingServiceTest(unittest.TestCase):
         self.assertEqual(response.json()["dimensions"], 4)
 
     def test_rejects_invalid_requests_and_bounded_limits(self) -> None:
-        app = create_embedding_app(
-            backend=FakeEmbeddingBackend(), metadata=metadata()
-        )
+        app = create_embedding_app(backend=FakeEmbeddingBackend(), metadata=metadata())
         client = TestClient(app)
         cases = (
             ({"texts": [], "purpose": "query"}, 422),
@@ -233,9 +223,7 @@ class EmbeddingServiceTest(unittest.TestCase):
         self.assertEqual(response.status_code, 413)
 
     def test_rejects_backend_vector_count_and_dimension_mismatches(self) -> None:
-        count_app = create_embedding_app(
-            backend=WrongVectorCountBackend(), metadata=metadata()
-        )
+        count_app = create_embedding_app(backend=WrongVectorCountBackend(), metadata=metadata())
         dimension_app = create_embedding_app(
             backend=FakeEmbeddingBackend(dimensions=3), metadata=metadata()
         )
@@ -269,9 +257,7 @@ class EmbeddingServiceTest(unittest.TestCase):
                 loader_calls.append((model_root, model_metadata))
                 return backend
 
-            app = create_production_app(
-                environ=environ, backend_loader=load_backend
-            )
+            app = create_production_app(environ=environ, backend_loader=load_backend)
             self.assertEqual(loader_calls, [])
 
             with TestClient(app) as client:
@@ -282,9 +268,7 @@ class EmbeddingServiceTest(unittest.TestCase):
                     [purpose for _, purpose in backend.calls],
                     ["query", "document"],
                 )
-                self.assertTrue(
-                    all(len(texts) == 1 for texts, _ in backend.calls)
-                )
+                self.assertTrue(all(len(texts) == 1 for texts, _ in backend.calls))
                 for text in ("first", "second"):
                     response = client.post(
                         "/v1/embeddings",
@@ -317,9 +301,7 @@ class EmbeddingServiceTest(unittest.TestCase):
                 backend_loader=lambda model_root, model_metadata: backend,
             )
 
-            with self.assertRaisesRegex(
-                RuntimeError, "embedding backend startup self-test failed"
-            ):
+            with self.assertRaisesRegex(RuntimeError, "embedding backend startup self-test failed"):
                 with TestClient(app):
                     pass
 
@@ -420,16 +402,19 @@ class EmbeddingServiceTest(unittest.TestCase):
                 return fake_module
             return original_import(name, globals, locals, fromlist, level)
 
-        with patch.dict(
-            os.environ,
-            {
-                "HF_HUB_OFFLINE": "wrong",
-                "TRANSFORMERS_OFFLINE": "wrong",
-                "HF_HUB_DISABLE_TELEMETRY": "wrong",
-                "TOKENIZERS_PARALLELISM": "wrong",
-            },
-            clear=False,
-        ), patch("builtins.__import__", side_effect=import_with_observation):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HF_HUB_OFFLINE": "wrong",
+                    "TRANSFORMERS_OFFLINE": "wrong",
+                    "HF_HUB_DISABLE_TELEMETRY": "wrong",
+                    "TOKENIZERS_PARALLELISM": "wrong",
+                },
+                clear=False,
+            ),
+            patch("builtins.__import__", side_effect=import_with_observation),
+        ):
             load_flag_embedding_backend(model_root, metadata(normalized=False))
 
         self.assertEqual(
@@ -503,9 +488,7 @@ class EmbeddingRequestStreamingTest(unittest.IsolatedAsyncioTestCase):
                 )
 
                 response_start = next(
-                    message
-                    for message in sent
-                    if message["type"] == "http.response.start"
+                    message for message in sent if message["type"] == "http.response.start"
                 )
                 self.assertEqual(response_start["status"], 413)
                 self.assertEqual(receive_calls, 3)
