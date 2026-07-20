@@ -111,6 +111,150 @@ class PhysocSseTests(unittest.TestCase):
                         expected_model="physoc-v1",
                     )
 
+    def test_rejects_oversized_event_metadata(self) -> None:
+        lines = [
+            'data: {"response":"ok","done":true,"extra":"' + ("x" * 128) + '"}\n',
+            "\n",
+        ]
+
+        with self.assertRaisesRegex(PhysocStreamError, "Physoc event size exceeded"):
+            collect_physoc_response(
+                lines,
+                expected_model="physoc-v1",
+                max_event_chars=64,
+            )
+
+    def test_rejects_event_limit_exceeded_across_data_lines(self) -> None:
+        first_data = '{"response":"ok",'
+        second_data = '"done":true}'
+        lines = [f"data: {first_data}\n", f"data: {second_data}\n", "\n"]
+
+        with self.assertRaisesRegex(PhysocStreamError, "Physoc event size exceeded"):
+            collect_physoc_response(
+                lines,
+                expected_model="physoc-v1",
+                max_event_chars=len(first_data) + len(second_data),
+            )
+
+    def test_event_limit_resets_after_each_record(self) -> None:
+        lines = [
+            'data: {"response":"a","done":false}\n',
+            "\n",
+            'data: {"response":"b","done":true}\n',
+            "\n",
+        ]
+
+        self.assertEqual(
+            collect_physoc_response(
+                lines,
+                expected_model="physoc-v1",
+                max_event_chars=34,
+            ),
+            "ab",
+        )
+
+    def test_rejects_oversized_single_response_before_accumulation(self) -> None:
+        response = "x" * 128
+
+        with self.assertRaisesRegex(PhysocStreamError, "response size"):
+            collect_physoc_response(
+                [f'data: {{"response":"{response}","done":true}}\n', "\n"],
+                expected_model="physoc-v1",
+                max_event_chars=256,
+                max_response_chars=64,
+            )
+
+    def test_response_limit_accepts_exact_size_and_rejects_one_more(self) -> None:
+        exact_lines = [
+            'data: {"response":"ab","done":false}\n',
+            "\n",
+            'data: {"response":"cd","done":true}\n',
+            "\n",
+        ]
+        oversized_lines = [
+            'data: {"response":"ab","done":false}\n',
+            "\n",
+            'data: {"response":"cde","done":true}\n',
+            "\n",
+        ]
+
+        self.assertEqual(
+            collect_physoc_response(
+                exact_lines,
+                expected_model="physoc-v1",
+                max_response_chars=4,
+            ),
+            "abcd",
+        )
+        with self.assertRaisesRegex(PhysocStreamError, "response size"):
+            collect_physoc_response(
+                oversized_lines,
+                expected_model="physoc-v1",
+                max_response_chars=4,
+            )
+
+    def test_done_response_does_not_consume_more_input(self) -> None:
+        def lines():
+            yield 'data: {"response":"ok","done":true}\n'
+            yield "\n"
+            raise AssertionError("input consumed after done")
+
+        self.assertEqual(
+            collect_physoc_response(
+                lines(),
+                expected_model="physoc-v1",
+                max_event_chars=64,
+            ),
+            "ok",
+        )
+
+    def test_strips_one_bom_only_from_the_first_line(self) -> None:
+        self.assertEqual(
+            collect_physoc_response(
+                [
+                    '\ufeffdata: {"response":"ok","done":true}\n',
+                    "\n",
+                ],
+                expected_model="physoc-v1",
+            ),
+            "ok",
+        )
+
+        invalid_bom_streams = [
+            [
+                '\ufeff\ufeffdata: {"response":"bad","done":true}\n',
+                "\n",
+            ],
+            [
+                ": first line\n",
+                '\ufeffdata: {"response":"bad","done":true}\n',
+                "\n",
+            ],
+        ]
+        for lines in invalid_bom_streams:
+            with self.subTest(lines=lines):
+                with self.assertRaises(PhysocStreamError):
+                    collect_physoc_response(lines, expected_model="physoc-v1")
+
+    def test_rejects_invalid_event_and_response_limits(self) -> None:
+        invalid_limits = (0, -1, True, 1.5, "10")
+
+        def unreadable_lines():
+            raise AssertionError("invalid limits must be rejected before input is consumed")
+            yield ""
+
+        for limit in invalid_limits:
+            with self.subTest(kind="event", limit=limit):
+                with self.assertRaises(PhysocStreamError):
+                    list(iter_message_data(unreadable_lines(), max_event_chars=limit))
+            with self.subTest(kind="response", limit=limit):
+                with self.assertRaises(PhysocStreamError):
+                    collect_physoc_response(
+                        unreadable_lines(),
+                        expected_model="physoc-v1",
+                        max_response_chars=limit,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
