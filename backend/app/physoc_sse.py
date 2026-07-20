@@ -8,6 +8,17 @@ class PhysocStreamError(ValueError):
     """Raised when a Physoc response stream violates its contract."""
 
 
+def _reject_json_constant(constant: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {constant}")
+
+
+def _decode_payload(data: str) -> object:
+    try:
+        return json.loads(data, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise PhysocStreamError("invalid Physoc JSON") from exc
+
+
 def iter_message_data(lines: Iterable[str]) -> Iterator[str]:
     """Yield joined data fields from message SSE records."""
     event = "message"
@@ -36,7 +47,7 @@ def iter_message_data(lines: Iterable[str]) -> Iterator[str]:
             value = value[1:]
 
         if field == "event":
-            event = value
+            event = value or "message"
         elif field == "data":
             data_lines.append(value)
 
@@ -56,10 +67,7 @@ def collect_physoc_response(
     response_chars = 0
 
     for data in iter_message_data(lines):
-        try:
-            payload = json.loads(data)
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise PhysocStreamError("invalid Physoc JSON") from exc
+        payload = _decode_payload(data)
 
         if not isinstance(payload, dict):
             raise PhysocStreamError("Physoc payload must be an object")

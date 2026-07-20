@@ -41,6 +41,21 @@ class PhysocSseTests(unittest.TestCase):
             "hello world",
         )
 
+    def test_empty_event_fields_fall_back_to_message(self) -> None:
+        for event_line in ("event:\r\n", "event\r\n"):
+            with self.subTest(event_line=event_line):
+                self.assertEqual(
+                    collect_physoc_response(
+                        [
+                            event_line,
+                            'data: {"response":"ok","done":true}\r\n',
+                            "\r\n",
+                        ],
+                        expected_model="physoc-v1",
+                    ),
+                    "ok",
+                )
+
     def test_rejects_incomplete_or_invalid_message_payloads(self) -> None:
         invalid_streams = {
             "invalid JSON": ["data: not-json\n", "\n"],
@@ -83,6 +98,18 @@ class PhysocSseTests(unittest.TestCase):
                 expected_model="physoc-v1",
                 max_response_chars=4,
             )
+
+    def test_rejects_nonstandard_json_constants(self) -> None:
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                with self.assertRaises(PhysocStreamError):
+                    collect_physoc_response(
+                        [
+                            f'data: {{"response":"ok","done":true,"extra":{constant}}}\n',
+                            "\n",
+                        ],
+                        expected_model="physoc-v1",
+                    )
 
 
 if __name__ == "__main__":
