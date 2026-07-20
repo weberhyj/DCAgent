@@ -12,41 +12,22 @@
 
 ## 2. 离线依赖与 Python 3.12
 
-在目标主机准备 Python 3.12 virtualenv，并从已审核的内部 wheelhouse 生成带 hash 的锁文件。锁文件必须在与目标主机相同的 Python 3.12 环境中生成，不能把未审核的公共索引地址写入仓库。
+`backend/uv.lock` 是仓库唯一的依赖锁。先在可审核的解析环境中从仓库根目录为 Python 3.12 更新该锁；再把仓库与锁文件带到目标 Linux 主机，只使用已审核的内部 wheelhouse 执行冻结同步：
 
 ```powershell
-python3.12 -m venv .venv
-& ./.venv/bin/python -m pip install --no-index --find-links artifacts/wheels pip-tools
-$env:PIP_NO_INDEX = "1"
-& ./.venv/bin/pip-compile `
-  --no-index `
-  --generate-hashes `
-  --no-emit-index-url `
-  --no-emit-trusted-host `
-  --find-links artifacts/wheels `
-  --output-file backend/requirements-offline.txt `
-  backend/requirements-offline.in
-& ./.venv/bin/pip-compile `
-  --no-index `
-  --generate-hashes `
-  --no-emit-index-url `
-  --no-emit-trusted-host `
-  --find-links artifacts/wheels `
-  --output-file backend/requirements-benchmark.txt `
-  backend/requirements-benchmark.in
-& ./.venv/bin/python -m pip install `
-  --no-index --find-links artifacts/wheels --require-hashes `
-  -r backend/requirements-offline.txt `
-  -r backend/requirements-benchmark.txt
+uv lock --project backend --python 3.12
+$env:UV_PYTHON_DOWNLOADS = "never"
+uv sync --project backend --frozen --group offline --no-dev --no-index --find-links artifacts/wheels
+uv sync --project backend --frozen --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
 ```
 
 提交或部署前检查：
 
-1. 两个 lock 文件中的每个发行版都有 hash，且所有 wheel 来自内部 wheelhouse。
-2. `pip install` 使用 `--no-index --find-links ... --require-hashes`，不允许 fallback 到网络。
-3. `backend/requirements-offline.txt` 和 `backend/requirements-benchmark.txt` 的生成日志、Python 版本、wheelhouse 清单和 wheel SHA-256 一起归档。
+1. wheelhouse 必须包含 `backend/uv.lock` 对目标 Linux 平台和 Python 3.12 所需的全部发行制品，并归档制品清单与校验结果。
+2. 离线主机必须设置 `UV_PYTHON_DOWNLOADS=never`，禁止 uv 下载或自动安装 Python。
+3. 两次冻结同步都必须使用 `--no-index` 和 `--find-links artifacts/wheels`，不得 fallback 到公共索引。
 
-当前仓库只保留 `.in` 输入文件；上述 lock 文件尚未在本开发机生成，不能把“可安装”写成已验证事实。
+当前开发机没有完整的目标 wheelhouse，也没有 Docker。因此真实 offline sync、三份离线镜像构建、Compose 渲染和 Compose smoke 仍是目标主机 gate，不能在本机写成已验证通过。
 
 ## 3. Artifact manifest 与许可证审核
 

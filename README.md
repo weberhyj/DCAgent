@@ -67,9 +67,10 @@ LLM_MODEL=your-model-name
 后端：
 
 ```powershell
-cd backend
-py -m pip install -r requirements.txt
-py -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+uv sync --project backend --group dev
+Set-Location backend
+uv run --project . --group dev python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+Set-Location ..
 ```
 
 用户检索端：
@@ -104,8 +105,15 @@ npm.cmd run dev
 后端测试：
 
 ```powershell
-cd backend
-py -m unittest discover -s tests -p "test_*.py" -v
+uv run --project backend --group dev python -m unittest discover -s backend/tests -p "test_*.py" -v
+```
+
+后端代码质量：
+
+```powershell
+uv run --project backend --group dev ruff check backend
+uv run --project backend --group dev ruff format --check backend
+uv run --project backend --group dev ruff format backend
 ```
 
 用户检索端：

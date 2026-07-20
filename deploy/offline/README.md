@@ -30,9 +30,18 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 
 ## Current development gates
 
-The hashed `backend/requirements-offline.txt` and `backend/requirements-benchmark.txt` files are intentionally absent until the target Linux Python 3.12 environment and internal wheel mirror are fixed. Dockerfiles already enforce the final contract with `--no-index`, the local wheel directory, and `--require-hashes`; do not fabricate lock files locally.
+`backend/uv.lock` is the only dependency lock. From the repository root, resolve it for Python 3.12, then verify both offline groups only against the reviewed wheelhouse:
 
-Docker is not installed on the current development machine, so Compose rendering cannot be verified here. Validate `& tools/invoke_offline_compose.ps1 config --quiet` on a host with Docker before deployment.
+```powershell
+uv lock --project backend --python 3.12
+$env:UV_PYTHON_DOWNLOADS = "never"
+uv sync --project backend --frozen --group offline --no-dev --no-index --find-links artifacts/wheels
+uv sync --project backend --frozen --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
+```
+
+The wheelhouse must contain every distribution required by `backend/uv.lock` for the target Linux platform and Python 3.12, together with approved checksum evidence. Offline hosts must set `UV_PYTHON_DOWNLOADS=never`; neither sync command may fall back to a public package index.
+
+This development machine has neither Docker nor a complete target wheelhouse. Real offline sync, all three image builds, Compose rendering, and Compose smoke therefore remain target-host gates. Validate them on the approved Linux host before deployment.
 
 ## Offline Compose smoke check
 

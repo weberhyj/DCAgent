@@ -9,6 +9,10 @@ BACKEND_ROOT = REPOSITORY_ROOT / "backend"
 
 
 class BackendUvContractTest(unittest.TestCase):
+    def normalize_command_text(self, text: str) -> str:
+        without_powershell_continuations = re.sub(r"`[ \t]*\r?\n[ \t]*", " ", text)
+        return re.sub(r"\s+", " ", without_powershell_continuations).strip()
+
     def assert_exact_requirements(self, requirements: list[object], expected: set[str]) -> None:
         self.assertTrue(all(isinstance(requirement, str) for requirement in requirements))
         self.assertEqual(len(requirements), len(expected))
@@ -234,23 +238,81 @@ class BackendUvContractTest(unittest.TestCase):
         self.assertEqual(ruff["extend-exclude"], ["uploads"])
         self.assertEqual(ruff["lint"]["select"], ["E4", "E7", "E9", "F", "I", "UP"])
 
-    def test_documentation_does_not_reference_removed_requirements_files(self) -> None:
-        for path in (
+    def test_active_documentation_uses_only_uv_dependency_workflows(self) -> None:
+        documentation_paths = (
             REPOSITORY_ROOT / "README.md",
+            REPOSITORY_ROOT / "deploy" / "offline" / "README.md",
+            REPOSITORY_ROOT / "docs" / "offline-platform-runbook.md",
+        )
+        forbidden_tokens = (
+            "requirements.txt",
+            "requirements-offline.in",
+            "requirements-offline.txt",
+            "requirements-benchmark.in",
+            "requirements-benchmark.txt",
+            "pip install",
+            "pip-compile",
+            "pip-tools",
+        )
+
+        for path in documentation_paths:
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                normalized = self.normalize_command_text(text).lower()
+                for token in forbidden_tokens:
+                    with self.subTest(token=token):
+                        self.assertNotIn(token, normalized)
+
+    def test_readme_documents_uv_and_ruff_development_commands(self) -> None:
+        text = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        normalized = self.normalize_command_text(text)
+
+        self.assertIn("uv sync --project backend --group dev", normalized)
+        self.assertIn(
+            "uv run --project . --group dev python -m uvicorn app.main:app "
+            "--host 127.0.0.1 --port 8000",
+            normalized,
+        )
+        self.assertIn("uv run --project backend --group dev ruff check backend", normalized)
+        self.assertIn("uv run --project backend --group dev ruff format backend", normalized)
+
+    def test_offline_documentation_uses_the_frozen_lock_and_wheelhouse(self) -> None:
+        for path in (
             REPOSITORY_ROOT / "deploy" / "offline" / "README.md",
             REPOSITORY_ROOT / "docs" / "offline-platform-runbook.md",
         ):
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                for filename in (
-                    "requirements.txt",
-                    "requirements-offline.in",
-                    "requirements-offline.txt",
-                    "requirements-benchmark.in",
-                    "requirements-benchmark.txt",
-                ):
-                    with self.subTest(filename=filename):
-                        self.assertNotIn(filename, text)
+                normalized = self.normalize_command_text(text)
+                self.assertIn("backend/uv.lock", text)
+                self.assertRegex(normalized, r"UV_PYTHON_DOWNLOADS\s*=\s*[\"']?never\b")
+                self.assertIn(
+                    "uv sync --project backend --frozen --group offline --no-dev "
+                    "--no-index --find-links artifacts/wheels",
+                    normalized,
+                )
+                self.assertIn(
+                    "uv sync --project backend --frozen --no-default-groups --group benchmark "
+                    "--no-index --find-links artifacts/wheels",
+                    normalized,
+                )
+
+    def test_smoke_backend_uses_uv_from_the_backend_project(self) -> None:
+        path = REPOSITORY_ROOT / "tools" / "start_smoke_backend.cmd"
+        text = path.read_text(encoding="utf-8")
+        normalized = self.normalize_command_text(text)
+        lower_normalized = normalized.lower()
+
+        self.assertIn('cd /d "%~dp0..\\backend"', lower_normalized)
+        self.assertIn("set database_url=sqlite+pysqlite:///:memory:", lower_normalized)
+        self.assertIn("set llm_provider=template", lower_normalized)
+        self.assertIn(
+            "uv run --project . --group dev python -m uvicorn app.main:app "
+            "--host 127.0.0.1 --port 8015",
+            lower_normalized,
+        )
+        self.assertNotIn("py -m uvicorn", lower_normalized)
+        self.assertNotRegex(lower_normalized, r"\b(?:pip3?|uv\s+pip|python\s+-m\s+pip)\s+install\b")
 
 
 if __name__ == "__main__":
