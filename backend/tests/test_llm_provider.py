@@ -568,7 +568,9 @@ class LLMProviderTest(unittest.TestCase):
         self.assertEqual(response.exit_count, 1)
         self.assertEqual(client.exit_count, 1)
 
-    def test_physoc_provider_wraps_malformed_stream_as_safe_error_and_closes_resources(self) -> None:
+    def test_physoc_provider_wraps_malformed_stream_as_safe_error_and_closes_resources(
+        self,
+    ) -> None:
         sensitive_payload = "secret payload from http://127.0.0.1:11434/private-stream"
         response = FakePhysocResponse([f"data: {sensitive_payload}", ""])
         client = RecordingPhysocClient(response)
@@ -695,6 +697,27 @@ class LLMProviderTest(unittest.TestCase):
             "/api/physoc/custom/stream",
         )
 
+    def test_physoc_api_base_validator_accepts_private_base_path(self) -> None:
+        self.assertEqual(
+            llm_module._validate_physoc_api_base("  http://10.0.0.8:8080/root/  "),
+            "http://10.0.0.8:8080/root",
+        )
+
+    def test_physoc_api_base_validator_rejects_unsafe_urls(self) -> None:
+        invalid_bases = (
+            "http://127.0.0.1:8080/root?secret=payload",
+            "http://127.0.0.1:8080/root#fragment",
+            "http://user:password@127.0.0.1:8080/root",
+            "ftp://127.0.0.1:8080/root",
+            "http:///root",
+            "http://127.0.0.1:99999/root",
+        )
+
+        for api_base in invalid_bases:
+            with self.subTest(api_base=api_base):
+                with self.assertRaisesRegex(ValueError, "LLM_API_BASE"):
+                    llm_module._validate_physoc_api_base(api_base)
+
     def test_physoc_stream_path_validator_rejects_unsafe_paths(self) -> None:
         invalid_paths = (
             "",
@@ -703,6 +726,8 @@ class LLMProviderTest(unittest.TestCase):
             "https://127.0.0.1/api/physoc/stream",
             "/api/physoc/stream?secret=payload",
             "/api/physoc/stream#fragment",
+            "/api/../stream",
+            "/./stream",
         )
 
         for path in invalid_paths:
@@ -736,7 +761,7 @@ class LLMProviderTest(unittest.TestCase):
         provider = create_llm_provider(
             {
                 "LLM_PROVIDER": "physoc_deepseek",
-                "LLM_API_BASE": "http://10.0.0.8:8080/root/",
+                "LLM_API_BASE": "  http://10.0.0.8:8080/root/  ",
                 "LLM_API_KEY": "ignored-secret",
                 "LLM_MODEL": "deepseek-r1",
                 "LLM_STREAM_PATH": "  /custom/stream  ",
@@ -746,6 +771,27 @@ class LLMProviderTest(unittest.TestCase):
         self.assertIsInstance(provider, PhysocDeepSeekLLMProvider)
         self.assertEqual(provider.stream_path, "/custom/stream")
         self.assertEqual(provider.stream_url, "http://10.0.0.8:8080/root/custom/stream")
+
+    def test_llm_provider_factory_rejects_unsafe_physoc_api_bases(self) -> None:
+        invalid_bases = (
+            "http://127.0.0.1:8080/root?secret=payload",
+            "http://127.0.0.1:8080/root#fragment",
+            "http://user:password@127.0.0.1:8080/root",
+            "ftp://127.0.0.1:8080/root",
+            "http:///root",
+            "http://127.0.0.1:99999/root",
+        )
+
+        for api_base in invalid_bases:
+            with self.subTest(api_base=api_base):
+                with self.assertRaisesRegex(ValueError, "LLM_API_BASE"):
+                    create_llm_provider(
+                        {
+                            "LLM_PROVIDER": "physoc_deepseek",
+                            "LLM_API_BASE": api_base,
+                            "LLM_MODEL": "deepseek-r1",
+                        }
+                    )
 
     def test_llm_provider_factory_requires_physoc_base_and_model(self) -> None:
         missing_values = (

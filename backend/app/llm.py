@@ -194,9 +194,35 @@ def _validate_physoc_stream_path(path: str) -> str:
         or parsed.fragment
         or "?" in candidate
         or "#" in candidate
+        or any(segment in {".", ".."} for segment in parsed.path.split("/"))
     ):
-        raise ValueError("LLM_STREAM_PATH must be an absolute path without a URL, query, or fragment")
+        raise ValueError(
+            "LLM_STREAM_PATH must be an absolute path without a URL, query, or fragment"
+        )
     return candidate
+
+
+def _validate_physoc_api_base(api_base: str) -> str:
+    candidate = api_base.strip()
+    parsed = urlsplit(candidate)
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("LLM_API_BASE must contain a valid port") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "?" in candidate
+        or "#" in candidate
+    ):
+        raise ValueError(
+            "LLM_API_BASE must be an HTTP(S) URL without credentials, query, or fragment"
+        )
+    return candidate.rstrip("/")
 
 
 def create_llm_provider(environ: Mapping[str, str] | None = None) -> LLMProvider:
@@ -224,10 +250,12 @@ def create_llm_provider(environ: Mapping[str, str] | None = None) -> LLMProvider
             raise ValueError("LLM_API_BASE is required")
         if not model:
             raise ValueError("LLM_MODEL is required")
+        api_base = _validate_physoc_api_base(api_base)
         stream_path = _validate_physoc_stream_path(
             source.get("LLM_STREAM_PATH", DEFAULT_PHYSOC_STREAM_PATH)
         )
-        require_private_url(api_base.rstrip("/") + stream_path, "LLM_API_BASE")
+        stream_url = api_base + stream_path
+        require_private_url(stream_url, "LLM_API_BASE")
         return PhysocDeepSeekLLMProvider(
             api_base=api_base,
             stream_path=stream_path,
