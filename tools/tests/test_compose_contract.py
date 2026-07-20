@@ -1566,6 +1566,11 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn('case "$DCAGENT_GID"', text)
             self.assertIn("id -u dcagent", text)
             self.assertIn("id -g dcagent", text)
+            writable_directory_command = (
+                "install -d -o dcagent -g dcagent /app/uploads/knowledge"
+            )
+            self.assertIn(writable_directory_command, text)
+            self.assertNotRegex(text, r"\bchown\s+-R\b[^\n]*\s/app(?:\s|$)")
             sync_command = (
                 "RUN uv --version && uv sync --frozen --no-install-project --no-dev "
                 "--group offline --find-links=/wheels"
@@ -1587,7 +1592,9 @@ class ComposeContractTest(unittest.TestCase):
                 text.index('ENV PATH="/app/.venv/bin:$PATH"'),
             )
             self.assertLess(text.index("USER root"), text.index("useradd --uid"))
+            self.assertLess(text.index("useradd --uid"), text.index(writable_directory_command))
             self.assertLess(text.index("useradd --uid"), text.rindex("USER dcagent"))
+            self.assertLess(text.index(writable_directory_command), text.rindex("USER dcagent"))
             commands.add(next(line for line in text.splitlines() if line.startswith("CMD ")))
         self.assertEqual(3, len(commands))
 

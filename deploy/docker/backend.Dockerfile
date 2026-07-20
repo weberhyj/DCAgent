@@ -30,7 +30,7 @@ RUN case "$DCAGENT_UID" in ''|*[!0-9]*) exit 1 ;; esac \
     && useradd --uid "$DCAGENT_UID" --gid "$DCAGENT_GID" --create-home --shell /usr/sbin/nologin dcagent \
     && test "$(id -u dcagent)" = "$DCAGENT_UID" \
     && test "$(id -g dcagent)" = "$DCAGENT_GID" \
-    && chown -R dcagent:dcagent /app
+    && install -d -o dcagent -g dcagent /app/uploads/knowledge
 USER dcagent
 
 CMD ["python", "-m", "uvicorn", "app.main:create_production_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
