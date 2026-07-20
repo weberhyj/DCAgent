@@ -60,14 +60,14 @@ The new provider is selected with:
 
 ```text
 LLM_PROVIDER=physoc_deepseek
-LLM_API_BASE=http://physoc.internal
+LLM_API_BASE=http://127.0.0.1:8090
 LLM_STREAM_PATH=/api/physoc/deepseek/stream
 LLM_MODEL=my_deepseek_r1_7b
 ```
 
 `LLM_STREAM_PATH` defaults to `/api/physoc/deepseek/stream`. `LLM_API_KEY` is not required for this provider.
 
-When `OFFLINE_MODE` is enabled, the combined Physoc URL must pass the existing private-or-loopback URL validation. The configured path must be absolute, must not contain a scheme, host, query, or fragment, and is joined to `LLM_API_BASE` without accepting an arbitrary external URL.
+The combined Physoc URL must always pass the existing private-or-loopback URL validation, even when `OFFLINE_MODE` is disabled, because this provider is exclusively for the internal Physoc service. The configured path must be absolute, must not contain a scheme, host, query, or fragment, and is joined to `LLM_API_BASE` without accepting an arbitrary external URL.
 
 The existing `template` and `openai_compatible` providers remain supported.
 
