@@ -58,6 +58,25 @@ LLM_API_KEY=replace-with-your-api-key
 LLM_MODEL=your-model-name
 ```
 
+### Physoc DeepSeek 模式
+
+Physoc DeepSeek 流式接口可以按以下方式配置，示例使用本机 loopback 地址：
+
+```text
+LLM_PROVIDER=physoc_deepseek
+LLM_API_BASE=http://127.0.0.1:8090
+LLM_STREAM_PATH=/api/physoc/deepseek/stream
+LLM_MODEL=my_deepseek_r1_7b
+```
+
+Physoc 模式无需 LLM_API_KEY。后端向 `LLM_API_BASE` 与 `LLM_STREAM_PATH` 组成的地址发送 `POST` 请求，请求 JSON 包含 `"query"` 和 `"model"`：
+
+```json
+{"query":"用户问题","model":"my_deepseek_r1_7b"}
+```
+
+响应类型为 `text/event-stream`。后端读取 SSE `message` 事件中的 `"response"` 内容，直到收到 `"done": true`。现阶段后端会缓冲完整结果后再返回；前端对话 API 保持不变，模拟逐字显示保持不变。真实私有 IP 应在部署环境中设置，不要把实际地址或凭据写入示例文件。
+
 当知识库没有命中资料时，DCAgent 会返回“未检索到足够依据”，不会调用真实模型编造答案。
 
 两个前端项目都支持通过 `VITE_API_PROXY_TARGET` 覆盖本地 API 代理目标，默认代理到 `http://127.0.0.1:8000`。
