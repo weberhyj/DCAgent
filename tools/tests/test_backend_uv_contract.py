@@ -113,7 +113,7 @@ class BackendUvContractTest(unittest.TestCase):
                 )
                 self.assertRegex(
                     active_normalized,
-                    r"\bCOPY\s+artifacts/wheels\s+/wheels\b",
+                    r"(?<!\S)COPY\s+artifacts/wheels\s+/wheels(?=\s|$)",
                 )
                 self.assertRegex(environment, r"\bUV_NO_INDEX=1(?:\s|$)")
                 self.assertRegex(environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
@@ -121,12 +121,12 @@ class BackendUvContractTest(unittest.TestCase):
                 self.assertRegex(environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
                 self.assertRegex(
                     active_commands,
-                    r"(?m)^RUN\b[^\n]*?\buv\s+sync"
-                    r"(?=[^\n]*\s--frozen(?:\s|$))"
-                    r"(?=[^\n]*\s--no-install-project(?:\s|$))"
-                    r"(?=[^\n]*\s--no-dev(?:\s|$))"
-                    r"(?=[^\n]*\s--group\s+offline(?:\s|$))"
-                    r"(?=[^\n]*\s--find-links=/wheels(?:\s|$))[^\n]*$",
+                    r"(?m)^RUN\s+(?:uv\s+--version\s+&&\s+)?uv\s+sync\s+"
+                    r"(?=[^\n]*(?<!\S)--frozen(?:\s|$))"
+                    r"(?=[^\n]*(?<!\S)--no-install-project(?:\s|$))"
+                    r"(?=[^\n]*(?<!\S)--no-dev(?:\s|$))"
+                    r"(?=[^\n]*(?<!\S)--group\s+offline(?:\s|$))"
+                    r"(?=[^\n]*(?<!\S)--find-links=/wheels(?:\s|$))[^\n]*$",
                 )
                 self.assertNotRegex(
                     active_normalized,
