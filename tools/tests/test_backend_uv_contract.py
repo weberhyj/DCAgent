@@ -122,13 +122,13 @@ class BackendUvContractTest(unittest.TestCase):
                 before_sync_environment = "\n".join(
                     re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands[:sync_match.start()])
                 )
-                all_environment = "\n".join(
-                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands)
+                after_sync_environment = "\n".join(
+                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands[sync_match.end():])
                 )
                 self.assertRegex(before_sync_environment, r"\bUV_NO_INDEX=1(?:\s|$)")
                 self.assertRegex(before_sync_environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
                 self.assertRegex(before_sync_environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
-                self.assertRegex(all_environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
+                self.assertRegex(after_sync_environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
                 sync_args = sync_match["args"]
                 self.assertRegex(sync_args, r"(?<!\S)--frozen(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--no-install-project(?!\S)")
