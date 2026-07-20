@@ -190,6 +190,10 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
 
 def _validate_physoc_stream_path(path: str) -> str:
     candidate = path.strip()
+    if any(ord(character) < 32 or ord(character) == 127 for character in candidate):
+        raise ValueError("LLM_STREAM_PATH must not contain control characters")
+    if any(character.isspace() for character in candidate):
+        raise ValueError("LLM_STREAM_PATH must not contain internal whitespace")
     parsed = urlsplit(candidate)
     if (
         not candidate

@@ -809,6 +809,12 @@ class LLMProviderTest(unittest.TestCase):
             "/api/%5cstream",
             "/api/%255cstream",
             "/api/%25stream",
+            "/api/\nstream",
+            "/api/\rstream",
+            "/api/\tstream",
+            "/api/\x00stream",
+            "/api/stream path",
+            "/api/stream\u00a0path",
         )
 
         for path in invalid_paths:
