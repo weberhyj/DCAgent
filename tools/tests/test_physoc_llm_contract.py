@@ -17,14 +17,18 @@ PHYSOC_SETTINGS = (
     "LLM_STREAM_PATH=/api/physoc/deepseek/stream",
     "LLM_MODEL=my_deepseek_r1_7b",
 )
+PHYSOC_BEGIN = "# BEGIN PHYSOC DEEPSEEK EXAMPLE"
+PHYSOC_END = "# END PHYSOC DEEPSEEK EXAMPLE"
+SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?im)^\s*#?\s*[A-Z0-9_]*(?:TOKEN|COOKIE|PASSWORD|SECRET|AUTHORIZATION|API_KEY)[A-Z0-9_]*\s*=\s*\S+"
+)
 
 
 def physoc_env_block(text: str) -> str:
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        if line.startswith("# Physoc DeepSeek example."):
-            return "\n".join(lines[index : index + 6])
-    return ""
+    match = re.search(
+        rf"(?ms)^{re.escape(PHYSOC_BEGIN)}.*?^{re.escape(PHYSOC_END)}\s*$", text
+    )
+    return "" if match is None else match.group(0)
 
 
 def physoc_readme_section(text: str) -> str:
@@ -39,14 +43,35 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         for path in ENV_EXAMPLES:
             text = path.read_text(encoding="utf-8")
             with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertEqual(1, text.count(PHYSOC_BEGIN))
+                self.assertEqual(1, text.count(PHYSOC_END))
                 for setting in PHYSOC_SETTINGS:
-                    self.assertRegex(text, rf"(?m)^\s*#\s*{re.escape(setting)}\s*$")
-                self.assertIn("Physoc 模式无需 LLM_API_KEY。", text)
+                    self.assertRegex(
+                        physoc_env_block(text), rf"(?m)^\s*#\s*{re.escape(setting)}\s*$"
+                    )
+                self.assertIn("Physoc 模式无需 LLM_API_KEY。", physoc_env_block(text))
+
+        offline = physoc_env_block(ENV_EXAMPLES[-1].read_text(encoding="utf-8"))
+        for required_text in (
+            "当前 offline Compose 拓扑不可直接启用",
+            "请勿直接取消注释",
+            "Compose 未透传 LLM_STREAM_PATH",
+            "仍要求 LLM_API_KEY",
+            "接入同一隔离网络",
+            "容器可达的批准 private IP",
+            "补齐 Compose 接线",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, offline)
+        self.assertNotIn("取消注释即可", offline)
+        self.assertNotIn("当前可用", offline)
 
     def test_env_examples_keep_template_as_the_active_default(self) -> None:
         for path in ENV_EXAMPLES:
             text = path.read_text(encoding="utf-8")
-            active_providers = re.findall(r"(?m)^\s*LLM_PROVIDER\s*=\s*([^#\s]+)\s*$", text)
+            active_providers = re.findall(
+                r"(?m)^\s*LLM_PROVIDER\s*=\s*([^#\s]+)\s*$", text
+            )
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertEqual(["template"], active_providers)
 
@@ -54,14 +79,17 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         for path in (*ENV_EXAMPLES, REPO_ROOT / "README.md"):
             text = path.read_text(encoding="utf-8")
             physoc_lines = (
-                physoc_readme_section(text) if path.name == "README.md" else physoc_env_block(text)
+                physoc_readme_section(text)
+                if path.name == "README.md"
+                else physoc_env_block(text)
             )
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertTrue(physoc_lines)
                 self.assertNotIn("physoc.internal", physoc_lines.lower())
-                self.assertNotRegex(physoc_lines, r"https?://(?!127\.0\.0\.1(?::|/|$))[^\s`]+")
-                self.assertNotRegex(physoc_lines, r"(?im)^\s*#?\s*[^#\n]*(?:TOKEN|COOKIE)\s*=")
-                self.assertNotRegex(physoc_lines, r"(?im)^\s*#?\s*LLM_API_KEY\s*=")
+                self.assertNotRegex(
+                    physoc_lines, r"https?://(?!127\.0\.0\.1(?::|/|$))[^\s`]+"
+                )
+                self.assertIsNone(SENSITIVE_ASSIGNMENT.search(physoc_lines))
 
     def test_readme_documents_the_physoc_streaming_contract(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -75,6 +103,8 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "POST",
             '"query"',
             '"model"',
+            "完整 RAG 提示词（系统约束、检索证据、Agent 摘要和近期会话）",
+            "不是原始用户问题",
             "text/event-stream",
             "`message` 事件",
             '"response"',

@@ -69,10 +69,12 @@ LLM_STREAM_PATH=/api/physoc/deepseek/stream
 LLM_MODEL=my_deepseek_r1_7b
 ```
 
-Physoc 模式无需 LLM_API_KEY。后端向 `LLM_API_BASE` 与 `LLM_STREAM_PATH` 组成的地址发送 `POST` 请求，请求 JSON 包含 `"query"` 和 `"model"`：
+该 loopback 示例适用于后端直接运行在同一主机的开发场景，不表示当前 offline Compose 拓扑可以直接启用 Physoc。Compose 内的 `127.0.0.1` 指向 API 容器自身，部署前必须完成隔离网络和变量接线审核。
+
+Physoc 模式无需 LLM_API_KEY。后端向 `LLM_API_BASE` 与 `LLM_STREAM_PATH` 组成的地址发送 `POST` 请求，请求 JSON 包含 `"query"` 和 `"model"`。其中 `query` 是完整 RAG 提示词，不是原始用户问题：
 
 ```json
-{"query":"用户问题","model":"my_deepseek_r1_7b"}
+{"query":"完整 RAG 提示词（系统约束、检索证据、Agent 摘要和近期会话）","model":"my_deepseek_r1_7b"}
 ```
 
 响应类型为 `text/event-stream`。后端读取 SSE `message` 事件中的 `"response"` 内容，直到收到 `"done": true`。现阶段后端会缓冲完整结果后再返回；前端对话 API 保持不变，模拟逐字显示保持不变。真实私有 IP 应在部署环境中设置，不要把实际地址或凭据写入示例文件。
