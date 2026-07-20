@@ -20,10 +20,45 @@ class BackendUvContractTest(unittest.TestCase):
         with path.open("rb") as file:
             return tomllib.load(file)
 
+    def load_uv_lock(self) -> dict[str, object]:
+        path = BACKEND_ROOT / "uv.lock"
+        self.assertTrue(path.is_file(), f"Missing backend lock file: {path}")
+        with path.open("rb") as file:
+            return tomllib.load(file)
+
+    def requirement_name_and_specifier(self, requirement: str) -> tuple[str, str]:
+        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^]]+])?(.*)", requirement)
+        self.assertIsNotNone(match, f"Unsupported requirement format: {requirement}")
+        assert match is not None
+        return (match.group(1).lower().replace("_", "-"), match.group(2))
+
+    def expand_dependency_group(
+        self, dependency_groups: dict[str, list[object]], group: str
+    ) -> list[str]:
+        expanded = []
+        for dependency in dependency_groups[group]:
+            if isinstance(dependency, str):
+                expanded.append(dependency)
+            else:
+                self.assertEqual(set(dependency), {"include-group"})
+                expanded.extend(self.expand_dependency_group(dependency_groups, dependency["include-group"]))
+        return expanded
+
+    def assert_lock_requirements_match(
+        self, lock_requirements: list[dict[str, str]], expected_requirements: list[str]
+    ) -> None:
+        actual = sorted((requirement["name"], requirement["specifier"]) for requirement in lock_requirements)
+        expected = sorted(
+            self.requirement_name_and_specifier(requirement) for requirement in expected_requirements
+        )
+        self.assertEqual(actual, expected)
+
     def test_project_metadata_and_dependency_groups_match_the_migration_contract(self) -> None:
         pyproject = self.load_pyproject()
         project = pyproject["project"]
         self.assertEqual(project["requires-python"], ">=3.12,<3.13")
+        self.assertIs(pyproject["tool"]["uv"]["package"], False)
+        self.assertEqual(pyproject["tool"]["uv"]["default-groups"], ["dev"])
 
         self.assert_exact_requirements(
             project["dependencies"],
@@ -80,6 +115,37 @@ class BackendUvContractTest(unittest.TestCase):
             dependency_groups["dev"],
             {"alembic>=1.16,<2", "ruff==0.15.22"},
         )
+
+    def test_uv_lock_matches_project_dependency_metadata(self) -> None:
+        pyproject = self.load_pyproject()
+        lock = self.load_uv_lock()
+        self.assertEqual(lock["version"], 1)
+        self.assertEqual(lock["revision"], 3)
+        self.assertEqual(lock["requires-python"], "==3.12.*")
+
+        root_package = next(
+            (package for package in lock["package"] if package["name"] == "dc-agent-backend"),
+            None,
+        )
+        self.assertIsNotNone(root_package, "The backend package is missing from uv.lock")
+        assert root_package is not None
+        self.assertEqual(root_package["source"], {"virtual": "."})
+
+        dependency_groups = pyproject["dependency-groups"]
+        expected_group_requirements = {
+            group: self.expand_dependency_group(dependency_groups, group)
+            for group in ("offline", "benchmark", "dev")
+        }
+        self.assertEqual(set(root_package["dev-dependencies"]), set(expected_group_requirements))
+
+        self.assert_lock_requirements_match(
+            root_package["metadata"]["requires-dist"], pyproject["project"]["dependencies"]
+        )
+        lock_dev_requirements = root_package["metadata"]["requires-dev"]
+        self.assertEqual(set(lock_dev_requirements), set(expected_group_requirements))
+        for group, expected_requirements in expected_group_requirements.items():
+            with self.subTest(group=group):
+                self.assert_lock_requirements_match(lock_dev_requirements[group], expected_requirements)
 
     def test_legacy_requirements_inputs_are_removed(self) -> None:
         for filename in (
