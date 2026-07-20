@@ -8,14 +8,12 @@ REPOSITORY_ROOT = Path(__file__).parents[2]
 BACKEND_ROOT = REPOSITORY_ROOT / "backend"
 
 
-def normalized_package_name(requirement: str) -> str:
-    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
-    if match is None:
-        raise AssertionError(f"Unable to parse package name from {requirement!r}")
-    return re.sub(r"[._-]+", "-", match.group(1)).lower()
-
-
 class BackendUvContractTest(unittest.TestCase):
+    def assert_exact_requirements(self, requirements: list[object], expected: set[str]) -> None:
+        self.assertTrue(all(isinstance(requirement, str) for requirement in requirements))
+        self.assertEqual(len(requirements), len(expected))
+        self.assertEqual(set(requirements), expected)
+
     def load_pyproject(self) -> dict[str, object]:
         path = BACKEND_ROOT / "pyproject.toml"
         self.assertTrue(path.is_file(), f"Missing backend project file: {path}")
@@ -27,49 +25,44 @@ class BackendUvContractTest(unittest.TestCase):
         project = pyproject["project"]
         self.assertEqual(project["requires-python"], ">=3.12,<3.13")
 
-        expected_base_dependencies = {
-            "fastapi",
-            "httpx",
-            "langgraph",
-            "openpyxl",
-            "psycopg",
-            "pypdf",
-            "python-docx",
-            "python-multipart",
-            "sqlalchemy",
-            "uvicorn",
-        }
-        self.assertEqual(
-            {normalized_package_name(dependency) for dependency in project["dependencies"]},
-            expected_base_dependencies,
+        self.assert_exact_requirements(
+            project["dependencies"],
+            {
+                "fastapi>=0.116.0",
+                "httpx>=0.28.0",
+                "langgraph>=0.2.0,<2.0.0",
+                "openpyxl>=3.1.0",
+                "psycopg[binary]>=3.2.0",
+                "pypdf>=5.0.0",
+                "python-docx>=1.1.0",
+                "python-multipart>=0.0.20",
+                "sqlalchemy>=2.0.0",
+                "uvicorn[standard]>=0.35.0",
+            },
         )
 
         dependency_groups = pyproject["dependency-groups"]
         self.assertEqual(set(dependency_groups), {"offline", "benchmark", "dev"})
 
-        offline_group = dependency_groups["offline"]
-        self.assertTrue(all(isinstance(dependency, str) for dependency in offline_group))
-        self.assertEqual(len(offline_group), 15)
-        self.assertEqual(
-            {normalized_package_name(dependency) for dependency in offline_group},
+        self.assert_exact_requirements(
+            dependency_groups["offline"],
             {
-                "alembic",
-                "clickhouse-connect",
-                "qdrant-client",
-                "redis",
-                "polars",
-                "pyarrow",
-                "pyxlsb",
-                "docling",
-                "paddlepaddle",
-                "paddleocr",
-                "jieba",
-                "sqlglot",
-                "flagembedding",
-                "onnxruntime",
-                "psutil",
+                "alembic>=1.16,<2",
+                "clickhouse-connect>=0.8,<1",
+                "qdrant-client>=1.14,<2",
+                "redis>=5,<7",
+                "polars>=1.30,<2",
+                "pyarrow>=19,<22",
+                "pyxlsb>=1.0,<2",
+                "docling>=2.40,<3",
+                "paddlepaddle>=3,<4",
+                "paddleocr>=3,<4",
+                "jieba>=0.42,<1",
+                "sqlglot>=27,<30",
+                "FlagEmbedding>=1.3,<2",
+                "onnxruntime>=1.22,<2",
+                "psutil>=7,<8",
             },
-            "The offline dependency group must exactly match the non-recursive requirements-offline.in packages",
         )
 
         benchmark_dependencies = dependency_groups["benchmark"]
@@ -78,15 +71,15 @@ class BackendUvContractTest(unittest.TestCase):
             [dependency for dependency in benchmark_dependencies if isinstance(dependency, dict)],
             [{"include-group": "offline"}],
         )
-        self.assertEqual(
-            {normalized_package_name(dependency) for dependency in benchmark_dependencies if isinstance(dependency, str)},
-            {"locust"},
-        )
+        benchmark_strings = [
+            dependency for dependency in benchmark_dependencies if isinstance(dependency, str)
+        ]
+        self.assertEqual(benchmark_strings, ["locust>=2.37,<3"])
 
-        dev_group = dependency_groups["dev"]
-        self.assertTrue(all(isinstance(dependency, str) for dependency in dev_group))
-        self.assertEqual(len(dev_group), 2)
-        self.assertEqual({normalized_package_name(dependency) for dependency in dev_group}, {"alembic", "ruff"})
+        self.assert_exact_requirements(
+            dependency_groups["dev"],
+            {"alembic>=1.16,<2", "ruff==0.15.22"},
+        )
 
     def test_legacy_requirements_inputs_are_removed(self) -> None:
         for filename in (
@@ -106,11 +99,21 @@ class BackendUvContractTest(unittest.TestCase):
             with self.subTest(filename=filename):
                 dockerfile = REPOSITORY_ROOT / "deploy" / "docker" / filename
                 text = dockerfile.read_text(encoding="utf-8")
+                active_text = "\n".join(
+                    line for line in text.splitlines() if not line.lstrip().startswith("#")
+                )
+                normalized_commands = re.sub(r"\\\s*\n\s*", " ", active_text)
                 self.assertIn("pyproject.toml", text)
                 self.assertIn("uv.lock", text)
-                self.assertIn("uv sync --frozen", text)
-                self.assertNotIn("requirements.txt", text)
-                self.assertNotIn("pip install", text)
+                self.assertRegex(
+                    normalized_commands,
+                    r"(?m)^RUN\s+uv\s+sync(?:\s+\S+)*\s+--frozen(?:\s|$)",
+                )
+                self.assertNotRegex(
+                    active_text,
+                    r"\brequirements[^\s/]*\.(?:txt|in)\b",
+                )
+                self.assertNotIn("pip install", active_text)
 
         dockerignore = (REPOSITORY_ROOT / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("!backend/pyproject.toml", dockerignore)
@@ -130,6 +133,7 @@ class BackendUvContractTest(unittest.TestCase):
         ruff = pyproject["tool"]["ruff"]
         self.assertEqual(ruff["target-version"], "py312")
         self.assertEqual(ruff["line-length"], 100)
+        self.assertEqual(ruff["extend-exclude"], ["uploads"])
         self.assertEqual(ruff["lint"]["select"], ["E4", "E7", "E9", "F", "I", "UP"])
 
     def test_documentation_does_not_reference_removed_requirements_files(self) -> None:
