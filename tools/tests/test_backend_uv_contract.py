@@ -250,10 +250,13 @@ class BackendUvContractTest(unittest.TestCase):
             "requirements-offline.txt",
             "requirements-benchmark.in",
             "requirements-benchmark.txt",
-            "pip install",
-            "pip-compile",
-            "pip-tools",
         )
+        forbidden_workflow_patterns = {
+            "hashed requirements": r"\bhashed\s+requirements\b",
+            "pip installer": r"\b(?:pip3?\s+install|python\s+-m\s+pip\s+install)\b",
+            "pip-compile": r"\bpip-compile\b",
+            "pip-tools": r"\bpip-tools\b",
+        }
 
         for path in documentation_paths:
             with self.subTest(path=path):
@@ -262,29 +265,64 @@ class BackendUvContractTest(unittest.TestCase):
                 for token in forbidden_tokens:
                     with self.subTest(token=token):
                         self.assertNotIn(token, normalized)
+                for workflow, pattern in forbidden_workflow_patterns.items():
+                    with self.subTest(workflow=workflow):
+                        self.assertNotRegex(normalized, pattern)
 
     def test_readme_documents_uv_and_ruff_development_commands(self) -> None:
         text = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         normalized = self.normalize_command_text(text)
 
-        self.assertIn("uv sync --project backend --group dev", normalized)
-        self.assertIn(
+        sync_command = "uv sync --project backend --group dev"
+        run_command = (
             "uv run --project . --group dev python -m uvicorn app.main:app "
-            "--host 127.0.0.1 --port 8000",
-            normalized,
+            "--host 127.0.0.1 --port 8000"
         )
+        sync_index = normalized.index(sync_command)
+        backend_index = normalized.index("Set-Location backend", sync_index)
+        run_index = normalized.index(run_command, backend_index)
+        repository_index = normalized.index("Set-Location ..", run_index)
+        self.assertLess(sync_index, backend_index)
+        self.assertLess(backend_index, run_index)
+        self.assertLess(run_index, repository_index)
         self.assertIn("uv run --project backend --group dev ruff check backend", normalized)
         self.assertIn("uv run --project backend --group dev ruff format backend", normalized)
 
     def test_offline_documentation_uses_the_frozen_lock_and_wheelhouse(self) -> None:
-        for path in (
-            REPOSITORY_ROOT / "deploy" / "offline" / "README.md",
-            REPOSITORY_ROOT / "docs" / "offline-platform-runbook.md",
-        ):
+        documentation_contracts = (
+            (
+                REPOSITORY_ROOT / "deploy" / "offline" / "README.md",
+                r"`backend/uv\.lock` is the only dependency lock\b",
+                (
+                    r"The wheelhouse must contain all wheels and other artifacts required by "
+                    r"`backend/uv\.lock` for the target Linux platform and Python 3\.12\b"
+                ),
+                (
+                    r"Real offline sync, all three image builds, Compose rendering, and Compose "
+                    r"smoke therefore remain target-host gates\b"
+                ),
+            ),
+            (
+                REPOSITORY_ROOT / "docs" / "offline-platform-runbook.md",
+                r"`backend/uv\.lock` 是仓库唯一的依赖锁",
+                (
+                    r"wheelhouse 必须包含 `backend/uv\.lock` 对目标 Linux 平台和 Python 3\.12 "
+                    r"所需的全部发行制品"
+                ),
+                (
+                    r"真实 offline sync、三份离线镜像构建、Compose 渲染和 Compose smoke "
+                    r"仍是目标主机 gate"
+                ),
+            ),
+        )
+        for path, lock_pattern, wheelhouse_pattern, gate_pattern in documentation_contracts:
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
                 normalized = self.normalize_command_text(text)
-                self.assertIn("backend/uv.lock", text)
+                self.assertIn("uv lock --project backend --python 3.12", normalized)
+                self.assertRegex(normalized, lock_pattern)
+                self.assertRegex(normalized, wheelhouse_pattern)
+                self.assertRegex(normalized, gate_pattern)
                 self.assertRegex(normalized, r"UV_PYTHON_DOWNLOADS\s*=\s*[\"']?never\b")
                 self.assertIn(
                     "uv sync --project backend --frozen --group offline --no-dev "
@@ -306,11 +344,13 @@ class BackendUvContractTest(unittest.TestCase):
         self.assertIn('cd /d "%~dp0..\\backend"', lower_normalized)
         self.assertIn("set database_url=sqlite+pysqlite:///:memory:", lower_normalized)
         self.assertIn("set llm_provider=template", lower_normalized)
-        self.assertIn(
+        run_command = (
             "uv run --project . --group dev python -m uvicorn app.main:app "
-            "--host 127.0.0.1 --port 8015",
-            lower_normalized,
+            "--host 127.0.0.1 --port 8015"
         )
+        backend_index = lower_normalized.index('cd /d "%~dp0..\\backend"')
+        run_index = lower_normalized.index(run_command, backend_index)
+        self.assertLess(backend_index, run_index)
         self.assertNotIn("py -m uvicorn", lower_normalized)
         self.assertNotRegex(lower_normalized, r"\b(?:pip3?|uv\s+pip|python\s+-m\s+pip)\s+install\b")
 

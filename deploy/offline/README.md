@@ -39,7 +39,7 @@ uv sync --project backend --frozen --group offline --no-dev --no-index --find-li
 uv sync --project backend --frozen --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
 ```
 
-The wheelhouse must contain every distribution required by `backend/uv.lock` for the target Linux platform and Python 3.12, together with approved checksum evidence. Offline hosts must set `UV_PYTHON_DOWNLOADS=never`; neither sync command may fall back to a public package index.
+The wheelhouse must contain all wheels and other artifacts required by `backend/uv.lock` for the target Linux platform and Python 3.12, together with approved checksum evidence. Offline hosts must set `UV_PYTHON_DOWNLOADS=never`; neither sync command may fall back to a public package index.
 
 This development machine has neither Docker nor a complete target wheelhouse. Real offline sync, all three image builds, Compose rendering, and Compose smoke therefore remain target-host gates. Validate them on the approved Linux host before deployment.
 
