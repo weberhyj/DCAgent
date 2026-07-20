@@ -104,21 +104,14 @@ class BackendUvContractTest(unittest.TestCase):
                 )
                 active_commands = re.sub(r"\\\s*\n\s*", " ", active_text)
                 active_normalized = re.sub(r"\s+", " ", active_commands)
-                environment = "\n".join(
-                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands)
-                )
                 self.assertRegex(
-                    active_normalized,
-                    r"\bCOPY\s+backend/pyproject\.toml\s+backend/uv\.lock\s+\./",
+                    active_commands,
+                    r"(?m)^COPY\s+backend/pyproject\.toml\s+backend/uv\.lock\s+\./\s*$",
                 )
                 self.assertRegex(
                     active_commands,
                     r"(?m)^COPY\s+artifacts/wheels\s+/wheels\s*$",
                 )
-                self.assertRegex(environment, r"\bUV_NO_INDEX=1(?:\s|$)")
-                self.assertRegex(environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
-                self.assertRegex(environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
-                self.assertRegex(environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
                 sync_match = re.search(
                     r"(?m)^RUN\s+(?:uv\s+--version\s+&&\s+)?uv\s+sync\s+"
                     r"(?P<args>.*?)(?:[ \t]*(?:&&|\|\||;)[ \t]*|$)",
@@ -126,6 +119,16 @@ class BackendUvContractTest(unittest.TestCase):
                 )
                 if sync_match is None:
                     self.fail("Missing the required offline uv sync command")
+                before_sync_environment = "\n".join(
+                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands[:sync_match.start()])
+                )
+                all_environment = "\n".join(
+                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands)
+                )
+                self.assertRegex(before_sync_environment, r"\bUV_NO_INDEX=1(?:\s|$)")
+                self.assertRegex(before_sync_environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
+                self.assertRegex(before_sync_environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
+                self.assertRegex(all_environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
                 sync_args = sync_match["args"]
                 self.assertRegex(sync_args, r"(?<!\S)--frozen(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--no-install-project(?!\S)")
