@@ -128,7 +128,10 @@ class BackendUvContractTest(unittest.TestCase):
                 self.assertRegex(before_sync_environment, r"\bUV_NO_INDEX=1(?:\s|$)")
                 self.assertRegex(before_sync_environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
                 self.assertRegex(before_sync_environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
-                self.assertRegex(after_sync_environment, r"\bPATH=(?:['\"])?[^\s]*/app/\.venv/bin")
+                self.assertRegex(
+                    after_sync_environment,
+                    r"\bPATH=(?:['\"])?/app/\.venv/bin(?=[:'\"\s]|$)",
+                )
                 sync_args = sync_match["args"]
                 self.assertRegex(sync_args, r"(?<!\S)--frozen(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--no-install-project(?!\S)")
