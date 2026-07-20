@@ -1570,9 +1570,12 @@ class ComposeContractTest(unittest.TestCase):
                 "install -d -o dcagent -g dcagent /app/uploads/knowledge"
             )
             self.assertIn(writable_directory_command, text)
+            self.assertEqual(text.count("install -d -o dcagent -g dcagent"), 1)
+            self.assertNotIn("COPY --chown", text)
+            self.assertNotRegex(text, r"\bchown\b")
             self.assertNotRegex(text, r"\bchown\s+-R\b[^\n]*\s/app(?:\s|$)")
             sync_command = (
-                "RUN uv --version && uv sync --frozen --no-install-project --no-dev "
+                "RUN uv --version && uv sync --frozen --offline --no-install-project --no-dev "
                 "--group offline --find-links=/wheels"
             )
             self.assertIn("UV_NO_INDEX=1", text)
@@ -1592,9 +1595,17 @@ class ComposeContractTest(unittest.TestCase):
                 text.index('ENV PATH="/app/.venv/bin:$PATH"'),
             )
             self.assertLess(text.index("USER root"), text.index("useradd --uid"))
+            useradd_command = (
+                'useradd --uid "$DCAGENT_UID" --gid "$DCAGENT_GID" '
+                "--home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin dcagent"
+            )
+            self.assertIn(useradd_command, text)
+            self.assertNotRegex(text, r"(?<!no-)--create-home\b")
+            self.assertIn("ENV HOME=/nonexistent", text)
             self.assertLess(text.index("useradd --uid"), text.index(writable_directory_command))
             self.assertLess(text.index("useradd --uid"), text.rindex("USER dcagent"))
             self.assertLess(text.index(writable_directory_command), text.rindex("USER dcagent"))
+            self.assertLess(text.index("ENV HOME=/nonexistent"), text.rindex("USER dcagent"))
             commands.add(next(line for line in text.splitlines() if line.startswith("CMD ")))
         self.assertEqual(3, len(commands))
 

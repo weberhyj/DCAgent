@@ -2,6 +2,7 @@ import re
 import tomllib
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -112,6 +113,7 @@ class BackendUvContractTest(unittest.TestCase):
                 "sqlglot>=27,<30",
                 "FlagEmbedding>=1.3,<2",
                 "onnxruntime>=1.22,<2",
+                "psycopg[binary]>=3.2,<4",
                 "psutil>=7,<8",
             },
         )
@@ -216,6 +218,7 @@ class BackendUvContractTest(unittest.TestCase):
                 )
                 sync_args = sync_match["args"]
                 self.assertRegex(sync_args, r"(?<!\S)--frozen(?!\S)")
+                self.assertRegex(sync_args, r"(?<!\S)--offline(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--no-install-project(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--no-dev(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--group\s+offline(?!\S)")
@@ -241,6 +244,39 @@ class BackendUvContractTest(unittest.TestCase):
             ),
             "The Docker build context must not allowlist any requirements file",
         )
+
+    def test_uv_lock_uses_only_approved_hashed_registry_artifacts(self) -> None:
+        packages = self.load_uv_lock()["package"]
+        root_packages = [package for package in packages if package["name"] == "dc-agent-backend"]
+        self.assertEqual(len(root_packages), 1)
+
+        approved_registry = "https://pypi.org/simple"
+        hash_pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
+        for package in packages:
+            package_name = package["name"]
+            source = package.get("source")
+            with self.subTest(package=package_name, source=source):
+                if package_name == "dc-agent-backend":
+                    self.assertEqual(source, {"virtual": "."})
+                    continue
+
+                self.assertEqual(source, {"registry": approved_registry})
+                registry_url = urlsplit(source["registry"])
+                self.assertEqual(registry_url.scheme, "https")
+                self.assertIsNone(registry_url.username)
+                self.assertIsNone(registry_url.password)
+
+                artifacts = []
+                if "sdist" in package:
+                    artifacts.append(package["sdist"])
+                artifacts.extend(package.get("wheels", []))
+                self.assertTrue(artifacts, "Registry packages must have an sdist or wheel")
+                for artifact in artifacts:
+                    artifact_url = urlsplit(artifact["url"])
+                    self.assertEqual(artifact_url.scheme, "https")
+                    self.assertIsNone(artifact_url.username)
+                    self.assertIsNone(artifact_url.password)
+                    self.assertRegex(artifact.get("hash", ""), hash_pattern)
 
     def test_ruff_is_configured_for_python_312(self) -> None:
         pyproject = self.load_pyproject()
@@ -287,6 +323,14 @@ class BackendUvContractTest(unittest.TestCase):
     def test_readme_documents_uv_and_ruff_development_commands(self) -> None:
         text = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         normalized = self.normalize_command_text(text)
+
+        self.assertIn("Python 3.12.x（不支持 3.13）", text)
+        self.assertNotIn("Python 3.12 或更高版本", text)
+        self.assertRegex(
+            normalized,
+            r"UI smoke[^.。]*Playwright/Pillow[^.。]*QA Python 环境"
+            r"[^.。]*不由 backend UV dependency groups 管理",
+        )
 
         sync_command = "uv sync --project backend --group dev"
         server_command = (
