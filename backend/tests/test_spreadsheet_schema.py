@@ -309,6 +309,61 @@ class SpreadsheetSchemaInferenceTest(unittest.TestCase):
         self.assertEqual(preview.datasets, ())
         self.assertTrue(any(item.code == "unsupported_encoding" for item in preview.diagnostics))
 
+    def test_rejects_csv_record_larger_than_the_raw_record_limit(self) -> None:
+        max_record_bytes = 1024 * 1024
+        path = self.temp_dir / "huge-record.csv"
+        path.write_text(
+            "value\n" + ("x" * (max_record_bytes + 1)) + "\n",
+            encoding="utf-8",
+        )
+
+        preview = infer_spreadsheet_schema(path, source_id="kb-huge-record")
+
+        self.assertEqual(preview.datasets, ())
+        self.assertTrue(
+            any(item.code == "csv_record_limit_exceeded" for item in preview.diagnostics)
+        )
+
+    def test_caps_blank_csv_records_scanned_after_the_header(self) -> None:
+        path = self.temp_dir / "blank-records.csv"
+        path.write_text("value\n\n\n\n10\n", encoding="utf-8")
+
+        with patch.object(schema_module, "MAX_SCANNED_ROWS", 3, create=True):
+            preview = infer_spreadsheet_schema(path, source_id="kb-blank-records")
+
+        self.assertEqual(preview.datasets[0].sampled_rows, 0)
+        self.assertTrue(
+            any(item.code == "scanned_row_limit_exceeded" for item in preview.diagnostics)
+        )
+
+    def test_retries_gb18030_when_ascii_prefix_looks_like_utf8(self) -> None:
+        path = self.temp_dir / "late-gb18030.csv"
+        path.write_bytes(b"value\r\n" + (b"\r\n" * 33_000) + "中国\r\n".encode("gb18030"))
+
+        preview = infer_spreadsheet_schema(path, source_id="kb-late-gb18030")
+
+        self.assertEqual(len(preview.datasets), 1)
+        self.assertEqual(preview.datasets[0].sampled_rows, 1)
+        self.assertEqual(preview.datasets[0].columns[0].examples, ("中国",))
+        self.assertFalse(any(item.code == "unsupported_encoding" for item in preview.diagnostics))
+
+    def test_ignores_far_right_formatting_when_inferring_xlsx_width(self) -> None:
+        from openpyxl.styles import PatternFill
+
+        path = self.temp_dir / "styled-width.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["amount", "region"])
+        sheet.append([10, "east"])
+        sheet.cell(row=1, column=300).fill = PatternFill(fill_type="solid", fgColor="FFFF00")
+        workbook.save(path)
+        workbook.close()
+
+        preview = infer_spreadsheet_schema(path, source_id="kb-styled-width")
+
+        self.assertEqual(len(preview.datasets[0].columns), 2)
+        self.assertFalse(any(item.code == "column_limit_exceeded" for item in preview.diagnostics))
+
     def test_sheet_read_error_preserves_an_already_valid_sheet(self) -> None:
         class Cell:
             def __init__(self, value):

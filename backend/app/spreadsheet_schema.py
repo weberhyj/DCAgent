@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -34,6 +35,9 @@ MAX_COLUMNS_PER_DATASET = 256
 MAX_LEADING_EMPTY_ROWS = 1_000
 MAX_DIAGNOSTICS = 128
 ENCODING_PROBE_BYTES = 64 * 1024
+MAX_CSV_RECORD_BYTES = 1024 * 1024
+MAX_CSV_FIELD_CHARS = 256 * 1024
+MAX_SCANNED_ROWS = 50_000
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030")
 EXPECTED_WORKBOOK_ERRORS = (
     BadZipFile,
@@ -47,6 +51,37 @@ EXPECTED_WORKBOOK_ERRORS = (
 _INTEGER_RE = re.compile(r"^[+-]?\d+$")
 _DECIMAL_RE = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$")
 _PHYSICAL_RE = re.compile(r"[^a-z0-9_]+")
+
+
+class _CsvRecordLimitExceeded(Exception):
+    pass
+
+
+class _BoundedCsvLines:
+    def __init__(self, handle: Any, encoding: str) -> None:
+        self.handle = handle
+        self.encoding = encoding
+        self.record_bytes = 0
+        self.in_quotes = False
+
+    def __iter__(self) -> _BoundedCsvLines:
+        return self
+
+    def __next__(self) -> str:
+        remaining = MAX_CSV_RECORD_BYTES - self.record_bytes
+        if remaining <= 0:
+            raise _CsvRecordLimitExceeded
+        line = self.handle.readline(remaining + 1)
+        if not line:
+            raise StopIteration
+        line_bytes = len(line.encode(self.encoding))
+        if line_bytes > remaining:
+            raise _CsvRecordLimitExceeded
+        self.record_bytes += line_bytes
+        self.in_quotes = _updated_quote_state(line, self.in_quotes)
+        if not self.in_quotes:
+            self.record_bytes = 0
+        return line
 
 
 @dataclass(slots=True)
@@ -116,8 +151,8 @@ def infer_spreadsheet_schema(path: Path, source_id: str) -> SpreadsheetPreview:
     datasets: list[StructuredDatasetPreview] = []
     if suffix == ".csv":
         worksheet_name = path.stem
-        encoding = _detect_csv_encoding(path)
-        if encoding is None:
+        encodings = _candidate_csv_encodings(path)
+        if not encodings:
             _add_diagnostic(
                 diagnostics,
                 StructuredDiagnostic(
@@ -129,38 +164,79 @@ def infer_spreadsheet_schema(path: Path, source_id: str) -> SpreadsheetPreview:
             return SpreadsheetPreview(
                 source_id=source_id, datasets=(), diagnostics=tuple(diagnostics)
             )
-        try:
-            with path.open("r", encoding=encoding, newline="") as handle:
-                rows = (
-                    (row_number, tuple(row), ())
-                    for row_number, row in enumerate(csv.reader(handle), 1)
+        for encoding in encodings:
+            attempt_diagnostics: list[StructuredDiagnostic] = []
+            try:
+                with path.open("r", encoding=encoding, newline="") as handle:
+                    bounded_lines = _BoundedCsvLines(handle, encoding)
+                    with _bounded_csv_field_size():
+                        rows = (
+                            (row_number, tuple(row), ())
+                            for row_number, row in enumerate(csv.reader(bounded_lines), 1)
+                        )
+                        dataset = _infer_dataset(
+                            source_id, worksheet_name, rows, attempt_diagnostics
+                        )
+            except UnicodeDecodeError:
+                continue
+            except _CsvRecordLimitExceeded:
+                _add_diagnostic(
+                    diagnostics,
+                    StructuredDiagnostic(
+                        code="csv_record_limit_exceeded",
+                        message=f"CSV record exceeded {MAX_CSV_RECORD_BYTES} bytes.",
+                        worksheet_name=worksheet_name,
+                    ),
                 )
-                dataset = _infer_dataset(source_id, worksheet_name, rows, diagnostics)
-        except UnicodeDecodeError:
-            _add_diagnostic(
-                diagnostics,
-                StructuredDiagnostic(
-                    code="unsupported_encoding",
-                    message="CSV decoding failed while sampling rows.",
-                    worksheet_name=worksheet_name,
-                ),
+                return SpreadsheetPreview(
+                    source_id=source_id, datasets=(), diagnostics=tuple(diagnostics)
+                )
+            except csv.Error as exc:
+                code = (
+                    "csv_record_limit_exceeded"
+                    if "field larger than field limit" in str(exc).lower()
+                    else "csv_read_error"
+                )
+                _add_diagnostic(
+                    diagnostics,
+                    StructuredDiagnostic(
+                        code=code,
+                        message=f"CSV could not be read: {exc}",
+                        worksheet_name=worksheet_name,
+                    ),
+                )
+                return SpreadsheetPreview(
+                    source_id=source_id, datasets=(), diagnostics=tuple(diagnostics)
+                )
+            except OSError as exc:
+                _add_diagnostic(
+                    diagnostics,
+                    StructuredDiagnostic(
+                        code="csv_read_error",
+                        message=f"CSV could not be read: {exc}",
+                        worksheet_name=worksheet_name,
+                    ),
+                )
+                return SpreadsheetPreview(
+                    source_id=source_id, datasets=(), diagnostics=tuple(diagnostics)
+                )
+            _merge_diagnostics(diagnostics, attempt_diagnostics)
+            if dataset is not None:
+                datasets.append(dataset)
+            return SpreadsheetPreview(
+                source_id=source_id,
+                datasets=tuple(datasets),
+                diagnostics=tuple(diagnostics),
             )
-            dataset = None
-        except (OSError, csv.Error) as exc:
-            _add_diagnostic(
-                diagnostics,
-                StructuredDiagnostic(
-                    code="empty_sheet",
-                    message=f"CSV could not be read: {exc}",
-                    worksheet_name=worksheet_name,
-                ),
-            )
-            dataset = None
-        if dataset is not None:
-            datasets.append(dataset)
-        return SpreadsheetPreview(
-            source_id=source_id, datasets=tuple(datasets), diagnostics=tuple(diagnostics)
+        _add_diagnostic(
+            diagnostics,
+            StructuredDiagnostic(
+                code="unsupported_encoding",
+                message="CSV decoding failed for every supported encoding.",
+                worksheet_name=worksheet_name,
+            ),
         )
+        return SpreadsheetPreview(source_id=source_id, datasets=(), diagnostics=tuple(diagnostics))
 
     cached_workbook = formula_workbook = None
     try:
@@ -198,7 +274,7 @@ def infer_spreadsheet_schema(path: Path, source_id: str) -> SpreadsheetPreview:
                 formula_sheet = formula_sheets.get(sheet.title)
                 cached_rows = (_xlsx_cached_values(row) for row in sheet.iter_rows())
                 formula_rows = (
-                    (tuple(cell.value for cell in row) for row in formula_sheet.iter_rows())
+                    (_xlsx_formula_values(row) for row in formula_sheet.iter_rows())
                     if formula_sheet
                     else iter(())
                 )
@@ -302,11 +378,23 @@ def _infer_dataset(
                 ),
             )
     sampled_rows = 0
+    scanned_rows = 0
     while sampled_rows < MAX_SAMPLED_ROWS:
+        if scanned_rows >= MAX_SCANNED_ROWS:
+            _add_diagnostic(
+                diagnostics,
+                StructuredDiagnostic(
+                    code="scanned_row_limit_exceeded",
+                    message=f"Sampling stopped after scanning {MAX_SCANNED_ROWS} data rows.",
+                    worksheet_name=worksheet_name,
+                ),
+            )
+            break
         try:
             row_number, values, formulas = next(iterator)
         except StopIteration:
             break
+        scanned_rows += 1
         if not _row_has_value(values, formulas):
             continue
         row_width = max(len(values), len(formulas))
@@ -458,24 +546,40 @@ def _append_missing_columns(
 
 
 def _detect_csv_encoding(path: Path) -> str | None:
+    candidates = _candidate_csv_encodings(path)
+    return candidates[0] if candidates else None
+
+
+def _candidate_csv_encodings(path: Path) -> tuple[str, ...]:
     try:
         with path.open("rb") as handle:
             probe = handle.read(ENCODING_PROBE_BYTES)
     except OSError:
-        return None
+        return ()
 
     if probe.startswith((b"\xff\xfe", b"\xfe\xff", b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
-        return None
+        return ()
     if b"\x00" in probe:
-        return None
+        return ()
+    candidates: list[str] = []
     for encoding in CSV_ENCODINGS:
         decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
         try:
             decoder.decode(probe, final=False)
         except (LookupError, UnicodeDecodeError):
             continue
-        return encoding
-    return None
+        candidates.append(encoding)
+    return tuple(candidates)
+
+
+@contextmanager
+def _bounded_csv_field_size():
+    previous_limit = csv.field_size_limit()
+    csv.field_size_limit(MAX_CSV_FIELD_CHARS)
+    try:
+        yield
+    finally:
+        csv.field_size_limit(previous_limit)
 
 
 def _add_diagnostic(
@@ -493,6 +597,13 @@ def _add_diagnostic(
         )
         return
     diagnostics.append(diagnostic)
+
+
+def _merge_diagnostics(
+    target: list[StructuredDiagnostic], source: Sequence[StructuredDiagnostic]
+) -> None:
+    for diagnostic in source:
+        _add_diagnostic(target, diagnostic)
 
 
 def _normalize_physical_name(original: str, index: int) -> str:
@@ -604,4 +715,30 @@ def _xlsx_cached_values(row: Sequence[Any]) -> tuple[Any, ...]:
         if isinstance(value, datetime) and classify_datetime_format(cell.number_format) == "date":
             value = value.date()
         values.append(value)
-    return tuple(values)
+    return _trim_trailing_empty(values)
+
+
+def _xlsx_formula_values(row: Sequence[Any]) -> tuple[Any, ...]:
+    return _trim_trailing_empty([cell.value for cell in row])
+
+
+def _trim_trailing_empty(values: Sequence[Any]) -> tuple[Any, ...]:
+    last_meaningful = 0
+    for index, value in enumerate(values, 1):
+        if not _is_null(value) or _is_formula(value):
+            last_meaningful = index
+    return tuple(values[:last_meaningful])
+
+
+def _updated_quote_state(line: str, in_quotes: bool) -> bool:
+    index = 0
+    while index < len(line):
+        if line[index] != '"':
+            index += 1
+            continue
+        if in_quotes and index + 1 < len(line) and line[index + 1] == '"':
+            index += 2
+            continue
+        in_quotes = not in_quotes
+        index += 1
+    return in_quotes
