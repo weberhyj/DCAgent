@@ -3,11 +3,15 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 from openpyxl import Workbook
+from sqlalchemy import event, insert
+from sqlalchemy.orm import Session
 
-from app.database import Database
+from app.database import Database, StructuredDatasetRecord, StructuredPreviewRecord
 from app.spreadsheet_schema import infer_spreadsheet_schema
 from app.sql_repository import SqlChatRepository
 from app.structured_models import (
@@ -17,6 +21,7 @@ from app.structured_models import (
 )
 from app.structured_repository import (
     StructuredColumnConfirmation,
+    StructuredConflictError,
     StructuredDatasetConfirmation,
     StructuredRepository,
     StructuredValidationError,
@@ -118,6 +123,112 @@ class StructuredRepositoryTest(unittest.TestCase):
 
         self.assertEqual(reloaded, preview)
 
+    def test_confirmation_rejects_a_stale_preview(self) -> None:
+        class StalePreviewRepository(StructuredRepository):
+            def get_preview(self, source_id: str) -> SpreadsheetPreview:
+                preview = super().get_preview(source_id)
+                dataset = preview.datasets[0]
+                changed_column = replace(
+                    dataset.columns[0], display_name="Changed after validation"
+                )
+                changed_dataset = replace(dataset, columns=(changed_column, *dataset.columns[1:]))
+                StructuredRepository.save_preview(
+                    self, replace(preview, datasets=(changed_dataset,))
+                )
+                return preview
+
+        repository = StalePreviewRepository(self.database)
+        repository.save_preview(self.preview)
+
+        with self.assertRaisesRegex(StructuredConflictError, "preview"):
+            repository.confirm_schema(self.source_id, self.confirmation())
+
+    def test_confirmation_maps_schema_version_race_to_conflict(self) -> None:
+        self.repository.save_preview(self.preview)
+        self.repository.confirm_schema(self.source_id, self.confirmation())
+        triggered = False
+
+        def insert_competing_version(
+            session: Session, _flush_context: object, _instances: object
+        ) -> None:
+            nonlocal triggered
+            if triggered:
+                return
+            if any(
+                isinstance(item, StructuredDatasetRecord)
+                and item.status == "confirmed"
+                and item.schema_version == 2
+                for item in session.new
+            ):
+                triggered = True
+                session.execute(
+                    insert(StructuredDatasetRecord).values(
+                        dataset_id=self.preview.datasets[0].dataset_id,
+                        source_id=self.source_id,
+                        worksheet_name=self.preview.datasets[0].worksheet_name,
+                        schema_version=2,
+                        schema_hash="b" * 64,
+                        status="confirmed",
+                    )
+                )
+
+        event.listen(Session, "before_flush", insert_competing_version)
+        try:
+            with self.assertRaisesRegex(StructuredConflictError, "version"):
+                self.repository.confirm_schema(self.source_id, self.confirmation())
+        finally:
+            event.remove(Session, "before_flush", insert_competing_version)
+
+    def test_corrupt_preview_payload_always_raises_conflict(self) -> None:
+        corruptions = {
+            "source id": lambda payload: payload.update({"source_id": "other-source"}),
+            "dataset source id": lambda payload: payload["datasets"][0].update(
+                {"source_id": "other-source"}
+            ),
+            "datasets type": lambda payload: payload.update({"datasets": "invalid"}),
+            "dataset object": lambda payload: payload.update({"datasets": [None]}),
+            "columns object": lambda payload: payload["datasets"][0].update({"columns": [None]}),
+            "enum": lambda payload: payload["datasets"][0]["columns"][0].update(
+                {"data_type": "invalid"}
+            ),
+            "examples type": lambda payload: payload["datasets"][0]["columns"][0].update(
+                {"examples": "invalid"}
+            ),
+            "sampled rows": lambda payload: payload["datasets"][0].update({"sampled_rows": []}),
+            "column sampled rows": lambda payload: payload["datasets"][0]["columns"][0].update(
+                {"sampled_rows": []}
+            ),
+            "null count": lambda payload: payload["datasets"][0]["columns"][0].update(
+                {"null_count": []}
+            ),
+            "diagnostic object": lambda payload: payload.update({"diagnostics": [None]}),
+            "diagnostic row number": lambda payload: payload.update(
+                {
+                    "diagnostics": [
+                        {
+                            "code": "mixed_type",
+                            "message": "Mixed values",
+                            "worksheet_name": "Sales",
+                            "column_name": "amount",
+                            "row_number": [],
+                        }
+                    ]
+                }
+            ),
+        }
+        for name, corrupt in corruptions.items():
+            with self.subTest(corruption=name):
+                self.repository.save_preview(self.preview)
+                with self.database.session() as session:
+                    record = session.get(StructuredPreviewRecord, self.source_id)
+                    assert record is not None
+                    payload = deepcopy(record.payload)
+                    corrupt(payload)
+                    record.payload = payload
+
+                with self.assertRaises(StructuredConflictError):
+                    self.repository.get_preview(self.source_id)
+
     def test_reconfirmation_creates_an_immutable_new_schema_version(self) -> None:
         self.repository.save_preview(self.preview)
 
@@ -168,6 +279,15 @@ class StructuredRepositoryTest(unittest.TestCase):
             self.repository.confirm_schema(self.source_id, (missing_column,))
         with self.assertRaisesRegex(StructuredValidationError, "aggregate"):
             self.repository.confirm_schema(self.source_id, (invalid_aggregate,))
+
+    def test_confirmation_rejects_overlong_display_name(self) -> None:
+        self.repository.save_preview(self.preview)
+
+        with self.assertRaisesRegex(StructuredValidationError, "display name"):
+            self.repository.confirm_schema(
+                self.source_id,
+                self.confirmation(amount_display_name="x" * 241),
+            )
 
     def test_confirmation_rejects_blank_alias_and_generated_header_display_name(self) -> None:
         blank_path = Path(self.temp_dir.name) / "blank-header.xlsx"

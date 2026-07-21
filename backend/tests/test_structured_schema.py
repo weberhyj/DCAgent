@@ -26,6 +26,7 @@ from app.structured_models import (
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 BASE_REVISION = "20260715_00"
 STRUCTURED_REVISION = "20260721_01"
+PREVIEW_REVISION = "20260721_02"
 
 
 def make_alembic_config(database_url: str) -> Config:
@@ -330,6 +331,50 @@ class StructuredSchemaContractTest(unittest.TestCase):
                     self.assertEqual(
                         connection.scalar(text("SELECT version_num FROM alembic_version")),
                         BASE_REVISION,
+                    )
+            finally:
+                engine.dispose()
+
+    def test_alembic_preview_revision_round_trips_source_cascade(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "preview-migration.db"
+            database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+            config = make_alembic_config(database_url)
+            command.upgrade(config, PREVIEW_REVISION)
+
+            engine = create_engine(database_url)
+            try:
+                inspector = inspect(engine)
+                self.assertIn("structured_previews", inspector.get_table_names())
+                self.assertEqual(
+                    inspector.get_pk_constraint("structured_previews")["constrained_columns"],
+                    ["source_id"],
+                )
+                self.assertEqual(
+                    [
+                        (
+                            foreign_key["constrained_columns"],
+                            foreign_key["referred_table"],
+                            foreign_key["referred_columns"],
+                            foreign_key["options"].get("ondelete"),
+                        )
+                        for foreign_key in inspector.get_foreign_keys("structured_previews")
+                    ],
+                    [(["source_id"], "knowledge_sources", ["id"], "CASCADE")],
+                )
+            finally:
+                engine.dispose()
+
+            command.downgrade(config, STRUCTURED_REVISION)
+            engine = create_engine(database_url)
+            try:
+                inspector = inspect(engine)
+                self.assertNotIn("structured_previews", inspector.get_table_names())
+                self.assertIn("structured_datasets", inspector.get_table_names())
+                with engine.connect() as connection:
+                    self.assertEqual(
+                        connection.scalar(text("SELECT version_num FROM alembic_version")),
+                        STRUCTURED_REVISION,
                     )
             finally:
                 engine.dispose()
