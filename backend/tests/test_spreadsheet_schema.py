@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime
 from io import BytesIO
@@ -299,6 +300,40 @@ class SpreadsheetSchemaInferenceTest(unittest.TestCase):
 
         self.assertEqual(encoding, "utf-8-sig")
         self.assertLessEqual(path.bytes_read, 64 * 1024)
+
+    def test_csv_field_limit_context_serializes_and_restores_global_limit(self) -> None:
+        original_limit = schema_module.csv.field_size_limit()
+        first_entered = threading.Event()
+        second_attempting = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+
+        def first_user() -> None:
+            with schema_module._bounded_csv_field_size():
+                first_entered.set()
+                release_first.wait(timeout=2)
+
+        def second_user() -> None:
+            first_entered.wait(timeout=2)
+            second_attempting.set()
+            with schema_module._bounded_csv_field_size():
+                second_entered.set()
+
+        first = threading.Thread(target=first_user)
+        second = threading.Thread(target=second_user)
+        first.start()
+        second.start()
+        self.assertTrue(first_entered.wait(timeout=2))
+        self.assertTrue(second_attempting.wait(timeout=2))
+        self.assertFalse(second_entered.wait(timeout=0.1))
+        release_first.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(schema_module.csv.field_size_limit(), original_limit)
 
     def test_rejects_nul_prefixed_csv_as_unsupported_encoding(self) -> None:
         path = self.temp_dir / "utf16.csv"

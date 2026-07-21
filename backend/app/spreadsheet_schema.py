@@ -12,6 +12,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from itertools import zip_longest
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
@@ -51,6 +52,7 @@ EXPECTED_WORKBOOK_ERRORS = (
 _INTEGER_RE = re.compile(r"^[+-]?\d+$")
 _DECIMAL_RE = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$")
 _PHYSICAL_RE = re.compile(r"[^a-z0-9_]+")
+_CSV_FIELD_LIMIT_LOCK = RLock()
 
 
 class _CsvRecordLimitExceeded(Exception):
@@ -574,12 +576,13 @@ def _candidate_csv_encodings(path: Path) -> tuple[str, ...]:
 
 @contextmanager
 def _bounded_csv_field_size():
-    previous_limit = csv.field_size_limit()
-    csv.field_size_limit(MAX_CSV_FIELD_CHARS)
-    try:
-        yield
-    finally:
-        csv.field_size_limit(previous_limit)
+    with _CSV_FIELD_LIMIT_LOCK:
+        previous_limit = csv.field_size_limit()
+        csv.field_size_limit(MAX_CSV_FIELD_CHARS)
+        try:
+            yield
+        finally:
+            csv.field_size_limit(previous_limit)
 
 
 def _add_diagnostic(
