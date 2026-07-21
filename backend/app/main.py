@@ -30,6 +30,7 @@ from .routes import router
 from .runtime_env import load_runtime_environment
 from .sql_repository import SqlChatRepository
 from .storage import KnowledgeFileStorage
+from .structured_repository import StructuredRepository
 
 
 def create_default_repository(llm_provider: LLMProvider | None = None) -> ChatRepository:
@@ -44,13 +45,19 @@ def create_app(
     repository: ChatRepository | None = None,
     upload_dir: Path | None = None,
     ingestion_queue: KnowledgeIngestionQueue | None = None,
+    structured_repository: StructuredRepository | None = None,
+    structured_query_enabled: bool = False,
     llm_provider: LLMProvider | None = None,
     health_registry: DependencyHealthRegistry | None = None,
 ) -> FastAPI:
     app = _build_app()
     app.state.repository = repository or create_default_repository(llm_provider)
+    app.state.structured_repository = structured_repository
+    app.state.structured_query_enabled = structured_query_enabled
     app.state.knowledge_ingestion_queue = ingestion_queue or KnowledgeIngestionQueue(
-        app.state.repository
+        app.state.repository,
+        structured_repository=structured_repository,
+        structured_query_enabled=structured_query_enabled,
     )
     app.state.knowledge_file_storage = KnowledgeFileStorage(
         upload_dir or Path(__file__).resolve().parents[1] / "uploads" / "knowledge"
@@ -192,8 +199,17 @@ def create_production_app(
                 repository = repository_factory()
             own(repository)
 
-            queue_builder = ingestion_queue_factory or KnowledgeIngestionQueue
-            ingestion_queue = own(queue_builder(repository))
+            structured_repository = StructuredRepository(database)  # type: ignore[arg-type]
+            if ingestion_queue_factory is None:
+                ingestion_queue = own(
+                    KnowledgeIngestionQueue(
+                        repository,
+                        structured_repository=structured_repository,
+                        structured_query_enabled=settings.structured_query_enabled,
+                    )
+                )
+            else:
+                ingestion_queue = own(ingestion_queue_factory(repository))
 
             storage_builder = storage_factory or KnowledgeFileStorage
             storage_root = (
@@ -254,6 +270,8 @@ def create_production_app(
             application.state.llm_provider = llm_provider
             application.state.database = database
             application.state.repository = repository
+            application.state.structured_repository = structured_repository
+            application.state.structured_query_enabled = settings.structured_query_enabled
             application.state.knowledge_ingestion_queue = ingestion_queue
             application.state.knowledge_file_storage = storage
             application.state.evaluation_import_service = evaluation_service

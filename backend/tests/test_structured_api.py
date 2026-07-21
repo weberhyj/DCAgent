@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from sqlalchemy import event, insert, select
 from sqlalchemy.dialects import postgresql
@@ -22,6 +23,12 @@ from app.database import (
     StructuredDatasetRecord,
     StructuredPreviewRecord,
 )
+from app.infra.health import DependencyHealthRegistry
+from app.llm import TemplateLLMProvider
+from app.main import create_app, create_production_app
+from app.offline_settings import OfflineSettings
+from app.repository import InMemoryChatRepository
+from app.seed import build_seed_state
 from app.spreadsheet_schema import infer_spreadsheet_schema
 from app.sql_repository import SqlChatRepository
 from app.structured_models import (
@@ -38,6 +45,9 @@ from app.structured_repository import (
 )
 
 WAITING_FOR_SCHEMA = "\u5f85\u786e\u8ba4\u8868\u7ed3\u6784"
+INDEXING = "\u89e3\u6790\u4e2d"
+INDEXED = "\u5df2\u7d22\u5f15"
+FAILED = "\u89e3\u6790\u5931\u8d25"
 
 
 def workbook_bytes(rows: list[list[object]]) -> bytes:
@@ -50,6 +60,284 @@ def workbook_bytes(rows: list[list[object]]) -> bytes:
     workbook.save(buffer)
     workbook.close()
     return buffer.getvalue()
+
+
+class StructuredApiTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.database = Database("sqlite+pysqlite:///:memory:")
+        self.database.create_schema()
+        self.chat_repository = SqlChatRepository(self.database)
+        self.structured_repository = StructuredRepository(self.database)
+
+    def tearDown(self) -> None:
+        self.database.engine.dispose()
+        self.temp_dir.cleanup()
+
+    def build_client(self, *, structured_query_enabled: bool = True) -> TestClient:
+        return TestClient(
+            create_app(
+                repository=self.chat_repository,
+                structured_repository=self.structured_repository,
+                structured_query_enabled=structured_query_enabled,
+                upload_dir=Path(self.temp_dir.name),
+            )
+        )
+
+    def upload(
+        self,
+        client: TestClient,
+        name: str,
+        content: bytes,
+        content_type: str,
+    ) -> str:
+        response = client.post(
+            "/api/knowledge/uploads",
+            files={"files": (name, content, content_type)},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        uploaded = response.json()[0]
+        self.assertEqual(uploaded["status"], INDEXING)
+        return uploaded["id"]
+
+    def upload_xlsx(self, client: TestClient) -> str:
+        return self.upload(
+            client,
+            "sales.xlsx",
+            workbook_bytes([["amount", "region"], ["12.5", "East"], ["7", "West"]]),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    def confirmation_payload(self, preview: dict[str, Any]) -> dict[str, Any]:
+        datasets = []
+        for dataset in preview["datasets"]:
+            columns = []
+            for column in dataset["columns"]:
+                columns.append(
+                    {
+                        "physicalName": column["physicalName"],
+                        "displayName": column["displayName"],
+                        "dataType": column["dataType"],
+                        "aliases": column["aliases"],
+                        "allowAggregate": column["dataType"] in {"integer", "decimal"},
+                        "allowFilter": True,
+                        "nullPolicy": "ignore",
+                    }
+                )
+            datasets.append({"datasetId": dataset["datasetId"], "columns": columns})
+        return {"datasets": datasets}
+
+    def test_enabled_xlsx_upload_exposes_camel_case_preview_without_chunks(self) -> None:
+        client = self.build_client()
+        source_id = self.upload_xlsx(client)
+
+        sources = client.get("/api/knowledge/sources")
+        source = next(item for item in sources.json() if item["id"] == source_id)
+        self.assertEqual(source["status"], WAITING_FOR_SCHEMA)
+        preview = client.get(f"/api/knowledge/sources/{source_id}/structured-preview")
+
+        self.assertEqual(preview.status_code, 200, preview.text)
+        body = preview.json()
+        self.assertEqual(body["sourceId"], source_id)
+        self.assertEqual(body["datasets"][0]["worksheetName"], "Sales")
+        self.assertEqual(body["datasets"][0]["columns"][0]["dataType"], "decimal")
+        self.assertIn("sampledRows", body["datasets"][0])
+        self.assertIn("nullCount", body["datasets"][0]["columns"][0])
+        chunks = client.get(f"/api/knowledge/sources/{source_id}/chunks")
+        self.assertEqual(chunks.status_code, 200)
+        self.assertEqual(chunks.json(), [])
+
+    def test_enabled_csv_upload_enters_preview_state(self) -> None:
+        client = self.build_client()
+        source_id = self.upload(
+            client,
+            "sales.csv",
+            b"amount,region\n12.5,East\n7,West\n",
+            "text/csv",
+        )
+
+        sources = client.get("/api/knowledge/sources").json()
+        source = next(item for item in sources if item["id"] == source_id)
+        preview = client.get(f"/api/knowledge/sources/{source_id}/structured-preview")
+        self.assertEqual(source["status"], WAITING_FOR_SCHEMA)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["datasets"][0]["columns"][0]["dataType"], "decimal")
+
+    def test_confirmation_succeeds_and_reconfirmation_increments_version(self) -> None:
+        client = self.build_client()
+        source_id = self.upload_xlsx(client)
+        client.get("/api/knowledge/sources")
+        preview = client.get(f"/api/knowledge/sources/{source_id}/structured-preview").json()
+        payload = self.confirmation_payload(preview)
+
+        first = client.put(f"/api/knowledge/sources/{source_id}/structured-schema", json=payload)
+        second = client.put(f"/api/knowledge/sources/{source_id}/structured-schema", json=payload)
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["status"], "confirmed")
+        self.assertEqual(first.json()["datasets"][0]["schemaVersion"], 1)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["datasets"][0]["schemaVersion"], 2)
+        self.assertEqual(first.json()["datasets"][0]["columns"][0]["allowAggregate"], True)
+
+    def test_confirmation_rejects_missing_column_and_string_aggregate(self) -> None:
+        client = self.build_client()
+        source_id = self.upload_xlsx(client)
+        client.get("/api/knowledge/sources")
+        preview = client.get(f"/api/knowledge/sources/{source_id}/structured-preview").json()
+        missing = self.confirmation_payload(preview)
+        missing["datasets"][0]["columns"] = missing["datasets"][0]["columns"][:1]
+        aggregate = self.confirmation_payload(preview)
+        aggregate["datasets"][0]["columns"][1]["allowAggregate"] = True
+        unknown = self.confirmation_payload(preview)
+        unknown["datasets"][0]["columns"][0]["physicalName"] = "unknown_amount"
+
+        missing_response = client.put(
+            f"/api/knowledge/sources/{source_id}/structured-schema", json=missing
+        )
+        aggregate_response = client.put(
+            f"/api/knowledge/sources/{source_id}/structured-schema", json=aggregate
+        )
+        unknown_response = client.put(
+            f"/api/knowledge/sources/{source_id}/structured-schema", json=unknown
+        )
+
+        self.assertEqual(missing_response.status_code, 400, missing_response.text)
+        self.assertEqual(aggregate_response.status_code, 400, aggregate_response.text)
+        self.assertEqual(unknown_response.status_code, 400, unknown_response.text)
+        self.assertIn("aggregate", aggregate_response.json()["detail"].lower())
+
+    def test_confirmation_requires_explicit_capability_booleans(self) -> None:
+        client = self.build_client()
+        source_id = self.upload_xlsx(client)
+        client.get("/api/knowledge/sources")
+        preview = client.get(f"/api/knowledge/sources/{source_id}/structured-preview").json()
+        payload = self.confirmation_payload(preview)
+        del payload["datasets"][0]["columns"][0]["allowAggregate"]
+
+        response = client.put(f"/api/knowledge/sources/{source_id}/structured-schema", json=payload)
+
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_missing_and_conflicting_previews_map_to_404_and_409(self) -> None:
+        client = self.build_client()
+        missing = client.get("/api/knowledge/sources/missing/structured-preview")
+        source_id = self.upload_xlsx(client)
+        client.get("/api/knowledge/sources")
+        with self.database.session() as session:
+            preview_record = session.get(StructuredPreviewRecord, source_id)
+            assert preview_record is not None
+            preview_record.payload = {"invalid": True}
+        conflict = client.get(f"/api/knowledge/sources/{source_id}/structured-preview")
+
+        self.assertEqual(missing.status_code, 404, missing.text)
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+
+    def test_disabled_spreadsheets_and_enabled_non_table_files_use_legacy_chunks(self) -> None:
+        disabled_client = self.build_client(structured_query_enabled=False)
+        xlsx_source_id = self.upload_xlsx(disabled_client)
+        xlsx_sources = disabled_client.get("/api/knowledge/sources").json()
+        xlsx_source = next(item for item in xlsx_sources if item["id"] == xlsx_source_id)
+        self.assertEqual(xlsx_source["status"], INDEXED)
+        self.assertGreater(
+            len(disabled_client.get(f"/api/knowledge/sources/{xlsx_source_id}/chunks").json()),
+            0,
+        )
+        csv_source_id = self.upload(
+            disabled_client,
+            "legacy.csv",
+            b"amount,region\n12.5,East\n",
+            "text/csv",
+        )
+        csv_sources = disabled_client.get("/api/knowledge/sources").json()
+        csv_source = next(item for item in csv_sources if item["id"] == csv_source_id)
+        self.assertEqual(csv_source["status"], INDEXED)
+        self.assertGreater(
+            len(disabled_client.get(f"/api/knowledge/sources/{csv_source_id}/chunks").json()),
+            0,
+        )
+
+        enabled_client = self.build_client(structured_query_enabled=True)
+        text_source_id = self.upload(
+            enabled_client,
+            "policy.txt",
+            b"travel policy approval flow " * 40,
+            "text/plain",
+        )
+        text_sources = enabled_client.get("/api/knowledge/sources").json()
+        text_source = next(item for item in text_sources if item["id"] == text_source_id)
+        self.assertEqual(text_source["status"], INDEXED)
+        self.assertGreater(
+            len(enabled_client.get(f"/api/knowledge/sources/{text_source_id}/chunks").json()),
+            0,
+        )
+
+    def test_disabled_feature_returns_stable_not_found_for_preview_route(self) -> None:
+        client = self.build_client(structured_query_enabled=False)
+        source_id = self.upload_xlsx(client)
+        client.get("/api/knowledge/sources")
+
+        response = client.get(f"/api/knowledge/sources/{source_id}/structured-preview")
+
+        self.assertEqual(response.status_code, 404, response.text)
+
+    def test_enabled_feature_without_repository_returns_stable_unavailable_response(self) -> None:
+        client = TestClient(
+            create_app(
+                repository=self.chat_repository,
+                structured_query_enabled=True,
+                upload_dir=Path(self.temp_dir.name),
+            )
+        )
+
+        source_id = self.upload_xlsx(client)
+        sources = client.get("/api/knowledge/sources").json()
+        source = next(item for item in sources if item["id"] == source_id)
+        response = client.get(f"/api/knowledge/sources/{source_id}/structured-preview")
+
+        self.assertEqual(source["status"], FAILED)
+        self.assertEqual(client.get(f"/api/knowledge/sources/{source_id}/chunks").json(), [])
+        self.assertEqual(response.status_code, 503, response.text)
+
+
+class StructuredWiringTest(unittest.TestCase):
+    def test_offline_settings_parse_structured_query_flag_defaulting_false(self) -> None:
+        self.assertFalse(OfflineSettings.from_environ({}).structured_query_enabled)
+        self.assertTrue(
+            OfflineSettings.from_environ(
+                {"STRUCTURED_QUERY_ENABLED": "true"}
+            ).structured_query_enabled
+        )
+
+    def test_production_app_injects_flag_without_breaking_legacy_queue_factory(self) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        custom_queue = SimpleNamespace(close=lambda: None)
+        production = create_production_app(
+            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "true"},
+            repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
+            database_factory=lambda _url: database,
+            llm_provider_factory=lambda _environment: TemplateLLMProvider(),
+            health_registry_factory=DependencyHealthRegistry,
+            ingestion_queue_factory=lambda _repository: custom_queue,
+        )
+        with TestClient(production) as client:
+            self.assertIs(client.app.state.knowledge_ingestion_queue, custom_queue)
+            self.assertTrue(client.app.state.structured_query_enabled)
+            self.assertIsInstance(client.app.state.structured_repository, StructuredRepository)
+
+    def test_production_app_passes_flag_and_repository_to_default_queue(self) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        production = create_production_app(
+            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "true"},
+            repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
+            database_factory=lambda _url: database,
+            llm_provider_factory=lambda _environment: TemplateLLMProvider(),
+            health_registry_factory=DependencyHealthRegistry,
+        )
+        with TestClient(production) as client:
+            queue = client.app.state.knowledge_ingestion_queue
+            self.assertTrue(queue._structured_query_enabled)
+            self.assertIs(queue._structured_repository, client.app.state.structured_repository)
 
 
 class StructuredRepositoryTest(unittest.TestCase):

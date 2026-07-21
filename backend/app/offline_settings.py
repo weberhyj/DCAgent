@@ -60,6 +60,7 @@ def require_private_url(value: str, field: str) -> str:
 @dataclass(frozen=True, slots=True)
 class OfflineSettings:
     offline_mode: bool
+    structured_query_enabled: bool
     database_url: str
     clickhouse_url: str
     qdrant_url: str
@@ -96,6 +97,9 @@ class OfflineSettings:
 
         return cls(
             offline_mode=offline_mode,
+            structured_query_enabled=parse_bool(
+                environ.get("STRUCTURED_QUERY_ENABLED"), default=False
+            ),
             clamav_host=environ.get("CLAMAV_HOST", "127.0.0.1"),
             raw_data_root=Path(environ.get("RAW_DATA_ROOT", "./data/raw")),
             parquet_root=Path(environ.get("PARQUET_ROOT", "./data/parquet")),

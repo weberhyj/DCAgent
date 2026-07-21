@@ -55,8 +55,19 @@ from .schemas import (
     KnowledgeSource,
     KnowledgeSourceRequest,
     SendMessageRequest,
+    SpreadsheetPreview,
+    StructuredSchemaConfirmationRequest,
+    StructuredSchemaConfirmationResponse,
 )
 from .storage import KnowledgeFileStorage
+from .structured_repository import (
+    StructuredColumnConfirmation,
+    StructuredConflictError,
+    StructuredDatasetConfirmation,
+    StructuredNotFoundError,
+    StructuredRepository,
+    StructuredValidationError,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -71,6 +82,15 @@ def get_storage(request: Request) -> KnowledgeFileStorage:
 
 def get_ingestion_queue(request: Request) -> KnowledgeIngestionQueue:
     return request.app.state.knowledge_ingestion_queue
+
+
+def get_structured_repository(request: Request) -> StructuredRepository:
+    if not getattr(request.app.state, "structured_query_enabled", False):
+        raise HTTPException(status_code=404, detail="Structured query feature is disabled")
+    repository = getattr(request.app.state, "structured_repository", None)
+    if repository is None:
+        raise HTTPException(status_code=503, detail="Structured repository is unavailable")
+    return repository
 
 
 def get_evaluation_import_service(request: Request) -> EvaluationImportService:
@@ -493,6 +513,61 @@ async def upload_knowledge_file(
         ingestion_queue.enqueue(stored.source_id, stored.path, stored.source_type)
 
     return [KnowledgeSource.from_model(source) for source in sources]
+
+
+@router.get(
+    "/knowledge/sources/{source_id}/structured-preview",
+    response_model=SpreadsheetPreview,
+)
+def get_structured_preview(
+    source_id: str,
+    structured_repository: StructuredRepository = Depends(get_structured_repository),
+) -> SpreadsheetPreview:
+    try:
+        preview = structured_repository.get_preview(source_id)
+    except StructuredNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except StructuredConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return SpreadsheetPreview.from_model(preview)
+
+
+@router.put(
+    "/knowledge/sources/{source_id}/structured-schema",
+    response_model=StructuredSchemaConfirmationResponse,
+)
+def confirm_structured_schema(
+    source_id: str,
+    request: StructuredSchemaConfirmationRequest,
+    structured_repository: StructuredRepository = Depends(get_structured_repository),
+) -> StructuredSchemaConfirmationResponse:
+    submissions = tuple(
+        StructuredDatasetConfirmation(
+            dataset_id=dataset.dataset_id,
+            columns=tuple(
+                StructuredColumnConfirmation(
+                    physical_name=column.physical_name,
+                    display_name=column.display_name,
+                    data_type=column.data_type,
+                    aliases=tuple(column.aliases),
+                    allow_aggregate=column.allow_aggregate,
+                    allow_filter=column.allow_filter,
+                    null_policy=column.null_policy,
+                )
+                for column in dataset.columns
+            ),
+        )
+        for dataset in request.datasets
+    )
+    try:
+        result = structured_repository.confirm_schema(source_id, submissions)
+    except StructuredNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except StructuredValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except StructuredConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return StructuredSchemaConfirmationResponse.from_model(result)
 
 
 @router.get("/knowledge/sources/{source_id}/chunks", response_model=list[KnowledgeChunk])

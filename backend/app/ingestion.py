@@ -5,6 +5,8 @@ from pathlib import Path
 from threading import Lock
 
 from .repository import ChatRepository
+from .spreadsheet_schema import infer_spreadsheet_schema
+from .structured_repository import StructuredRepository
 from .text_parser import parse_knowledge_file
 
 
@@ -16,8 +18,15 @@ class KnowledgeIngestionJob:
 
 
 class KnowledgeIngestionQueue:
-    def __init__(self, repository: ChatRepository) -> None:
+    def __init__(
+        self,
+        repository: ChatRepository,
+        structured_repository: StructuredRepository | None = None,
+        structured_query_enabled: bool = False,
+    ) -> None:
         self._repository = repository
+        self._structured_repository = structured_repository
+        self._structured_query_enabled = structured_query_enabled
         self._pending: list[KnowledgeIngestionJob] = []
         self._lock = Lock()
 
@@ -44,6 +53,12 @@ class KnowledgeIngestionQueue:
 
     def _process(self, job: KnowledgeIngestionJob) -> None:
         try:
+            if self._should_infer_structured_preview(job):
+                if self._structured_repository is None:
+                    raise RuntimeError("Structured repository is unavailable")
+                preview = infer_spreadsheet_schema(job.file_path, job.source_id)
+                self._structured_repository.save_preview(preview)
+                return
             chunks = parse_knowledge_file(job.file_path, job.source_id, job.source_type)
             self._repository.complete_knowledge_source_indexing(job.source_id, chunks)
         except Exception as exc:
@@ -52,3 +67,6 @@ class KnowledgeIngestionQueue:
                 self._repository.fail_knowledge_source_indexing(job.source_id, message)
             except Exception:
                 return
+
+    def _should_infer_structured_preview(self, job: KnowledgeIngestionJob) -> bool:
+        return self._structured_query_enabled and job.file_path.suffix.lower() in {".xlsx", ".csv"}
