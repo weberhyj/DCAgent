@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
-from sqlalchemy import inspect
+from alembic.config import Config
+from sqlalchemy import create_engine, inspect, text
 
+from alembic import command
 from app.database import (
     Database,
     StructuredColumnRecord,
@@ -18,6 +22,17 @@ from app.structured_models import (
     StructuredColumnType,
     StructuredDatasetSchema,
 )
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+BASE_REVISION = "20260715_00"
+STRUCTURED_REVISION = "20260721_01"
+
+
+def make_alembic_config(database_url: str) -> Config:
+    config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+    return config
 
 
 class StructuredSchemaContractTest(unittest.TestCase):
@@ -175,7 +190,6 @@ class StructuredSchemaContractTest(unittest.TestCase):
                     source_id="kb-sales",
                     dataset_id="ds-sales",
                     schema_version=2,
-                    publication_id="pub-v2",
                     status="queued",
                     checkpoint_row=0,
                     attempt=0,
@@ -209,6 +223,116 @@ class StructuredSchemaContractTest(unittest.TestCase):
             self.assertEqual(version_two.ingestion_jobs[0].dataset.schema_version, 2)
             self.assertEqual(version_one.publications[0].schema_version, 1)
             self.assertEqual(version_one.publications[0].dataset.schema_version, 1)
+
+    def test_alembic_structured_revision_round_trips_references_and_indexes(self) -> None:
+        structured_tables = {
+            "structured_datasets",
+            "structured_columns",
+            "structured_ingestion_jobs",
+            "structured_publications",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "structured-migration.db"
+            database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+            config = make_alembic_config(database_url)
+            command.upgrade(config, BASE_REVISION)
+            command.upgrade(config, STRUCTURED_REVISION)
+
+            engine = create_engine(database_url)
+            try:
+                inspector = inspect(engine)
+                self.assertTrue(structured_tables.issubset(inspector.get_table_names()))
+                self.assertEqual(
+                    tuple(
+                        inspector.get_pk_constraint("structured_datasets")["constrained_columns"]
+                    ),
+                    ("dataset_id", "schema_version"),
+                )
+                expected_foreign_keys = {
+                    "structured_datasets": {
+                        (("source_id",), "knowledge_sources", ("id",), "CASCADE"),
+                    },
+                    "structured_columns": {
+                        (
+                            ("dataset_id", "schema_version"),
+                            "structured_datasets",
+                            ("dataset_id", "schema_version"),
+                            "CASCADE",
+                        ),
+                    },
+                    "structured_ingestion_jobs": {
+                        (("source_id",), "knowledge_sources", ("id",), "CASCADE"),
+                        (
+                            ("dataset_id", "schema_version"),
+                            "structured_datasets",
+                            ("dataset_id", "schema_version"),
+                            "CASCADE",
+                        ),
+                        (
+                            ("publication_id",),
+                            "structured_publications",
+                            ("publication_id",),
+                            "SET NULL",
+                        ),
+                    },
+                    "structured_publications": {
+                        (
+                            ("dataset_id", "schema_version"),
+                            "structured_datasets",
+                            ("dataset_id", "schema_version"),
+                            "CASCADE",
+                        ),
+                    },
+                }
+                expected_indexes = {
+                    "structured_datasets": {
+                        "ix_structured_datasets_source_id",
+                        "ix_structured_datasets_status",
+                    },
+                    "structured_columns": {"ix_structured_columns_dataset_id"},
+                    "structured_ingestion_jobs": {
+                        "ix_structured_ingestion_jobs_source_id",
+                        "ix_structured_ingestion_jobs_dataset_id",
+                        "ix_structured_ingestion_jobs_status",
+                    },
+                    "structured_publications": {
+                        "ix_structured_publications_dataset_id",
+                        "ix_structured_publications_status",
+                    },
+                }
+                for table_name in structured_tables:
+                    with self.subTest(table=table_name):
+                        actual_foreign_keys = {
+                            (
+                                tuple(foreign_key["constrained_columns"]),
+                                foreign_key["referred_table"],
+                                tuple(foreign_key["referred_columns"]),
+                                foreign_key["options"].get("ondelete"),
+                            )
+                            for foreign_key in inspector.get_foreign_keys(table_name)
+                        }
+                        self.assertEqual(expected_foreign_keys[table_name], actual_foreign_keys)
+                        self.assertEqual(
+                            expected_indexes[table_name],
+                            {index["name"] for index in inspector.get_indexes(table_name)},
+                        )
+            finally:
+                engine.dispose()
+
+            command.downgrade(config, BASE_REVISION)
+            engine = create_engine(database_url)
+            try:
+                inspector = inspect(engine)
+                tables_after_downgrade = set(inspector.get_table_names())
+                self.assertTrue(structured_tables.isdisjoint(tables_after_downgrade))
+                self.assertIn("knowledge_sources", tables_after_downgrade)
+                with engine.connect() as connection:
+                    self.assertEqual(
+                        connection.scalar(text("SELECT version_num FROM alembic_version")),
+                        BASE_REVISION,
+                    )
+            finally:
+                engine.dispose()
 
 
 if __name__ == "__main__":

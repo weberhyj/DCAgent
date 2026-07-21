@@ -315,7 +315,11 @@ class StructuredDatasetRecord(Base):
     )
 
     dataset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    source_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     worksheet_name: Mapped[str] = mapped_column(String(240), nullable=False)
     schema_version: Mapped[int] = mapped_column(Integer, primary_key=True)
     schema_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -379,10 +383,16 @@ class StructuredIngestionJobRecord(Base):
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    source_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    publication_id: Mapped[str | None] = mapped_column(String(64))
+    publication_id: Mapped[str | None] = mapped_column(
+        ForeignKey("structured_publications.publication_id", ondelete="SET NULL")
+    )
     status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     lease_token: Mapped[str | None] = mapped_column(String(128))
     lease_expires_at: Mapped[str | None] = mapped_column(String(40))

@@ -24,6 +24,11 @@ def upgrade() -> None:
         sa.Column("schema_version", sa.Integer(), nullable=False),
         sa.Column("schema_hash", sa.String(length=64), nullable=False),
         sa.Column("status", sa.String(length=40), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["source_id"],
+            ["knowledge_sources.id"],
+            ondelete="CASCADE",
+        ),
         sa.PrimaryKeyConstraint("dataset_id", "schema_version"),
         sa.UniqueConstraint(
             "source_id",
@@ -60,6 +65,22 @@ def upgrade() -> None:
         ),
     )
     op.create_table(
+        "structured_publications",
+        sa.Column("publication_id", sa.String(length=64), nullable=False),
+        sa.Column("dataset_id", sa.String(length=128), nullable=False),
+        sa.Column("schema_version", sa.Integer(), nullable=False),
+        sa.Column("physical_table_name", sa.String(length=240), nullable=False),
+        sa.Column("row_count", sa.BigInteger(), nullable=False),
+        sa.Column("content_hash", sa.String(length=64), nullable=False),
+        sa.Column("status", sa.String(length=40), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["dataset_id", "schema_version"],
+            ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("publication_id"),
+    )
+    op.create_table(
         "structured_ingestion_jobs",
         sa.Column("id", sa.String(length=64), nullable=False),
         sa.Column("source_id", sa.String(length=64), nullable=False),
@@ -78,23 +99,17 @@ def upgrade() -> None:
             ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
             ondelete="CASCADE",
         ),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_table(
-        "structured_publications",
-        sa.Column("publication_id", sa.String(length=64), nullable=False),
-        sa.Column("dataset_id", sa.String(length=128), nullable=False),
-        sa.Column("schema_version", sa.Integer(), nullable=False),
-        sa.Column("physical_table_name", sa.String(length=240), nullable=False),
-        sa.Column("row_count", sa.BigInteger(), nullable=False),
-        sa.Column("content_hash", sa.String(length=64), nullable=False),
-        sa.Column("status", sa.String(length=40), nullable=False),
         sa.ForeignKeyConstraint(
-            ["dataset_id", "schema_version"],
-            ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
+            ["publication_id"],
+            ["structured_publications.publication_id"],
+            ondelete="SET NULL",
+        ),
+        sa.ForeignKeyConstraint(
+            ["source_id"],
+            ["knowledge_sources.id"],
             ondelete="CASCADE",
         ),
-        sa.PrimaryKeyConstraint("publication_id"),
+        sa.PrimaryKeyConstraint("id"),
     )
 
     op.create_index(
@@ -148,15 +163,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_structured_publications_status", table_name="structured_publications")
-    op.drop_index("ix_structured_publications_dataset_id", table_name="structured_publications")
     op.drop_index("ix_structured_ingestion_jobs_status", table_name="structured_ingestion_jobs")
     op.drop_index("ix_structured_ingestion_jobs_dataset_id", table_name="structured_ingestion_jobs")
     op.drop_index("ix_structured_ingestion_jobs_source_id", table_name="structured_ingestion_jobs")
+    op.drop_index("ix_structured_publications_status", table_name="structured_publications")
+    op.drop_index("ix_structured_publications_dataset_id", table_name="structured_publications")
     op.drop_index("ix_structured_columns_dataset_id", table_name="structured_columns")
     op.drop_index("ix_structured_datasets_status", table_name="structured_datasets")
     op.drop_index("ix_structured_datasets_source_id", table_name="structured_datasets")
-    op.drop_table("structured_publications")
     op.drop_table("structured_ingestion_jobs")
+    op.drop_table("structured_publications")
     op.drop_table("structured_columns")
     op.drop_table("structured_datasets")
