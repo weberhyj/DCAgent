@@ -192,6 +192,8 @@ function submit() {
 }
 
 .tool-button {
+  grid-column: 1;
+  grid-row: 1;
   width: 34px;
   height: 34px;
   border: 1px solid transparent;
@@ -206,6 +208,8 @@ function submit() {
 }
 
 .composer-input {
+  grid-column: 2;
+  grid-row: 1;
   height: 36px;
 }
 
@@ -259,6 +263,8 @@ function submit() {
 }
 
 .send-button {
+  grid-column: 3;
+  grid-row: 1;
   width: 38px;
   height: 38px;
   border-radius: 14px;
@@ -302,7 +308,16 @@ function submit() {
   }
 
   .composer-loading-label {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
   }
 }
 </style>
