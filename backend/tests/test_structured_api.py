@@ -3,15 +3,25 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from openpyxl import Workbook
-from sqlalchemy import event, insert
+from sqlalchemy import event, insert, select
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.database import Database, StructuredDatasetRecord, StructuredPreviewRecord
+from app.database import (
+    Database,
+    KnowledgeSourceRecord,
+    StructuredDatasetRecord,
+    StructuredPreviewRecord,
+)
 from app.spreadsheet_schema import infer_spreadsheet_schema
 from app.sql_repository import SqlChatRepository
 from app.structured_models import (
@@ -178,6 +188,116 @@ class StructuredRepositoryTest(unittest.TestCase):
                 self.repository.confirm_schema(self.source_id, self.confirmation())
         finally:
             event.remove(Session, "before_flush", insert_competing_version)
+
+    def test_postgres_writes_lock_source_before_preview_and_datasets(self) -> None:
+        self.repository.save_preview(self.preview)
+        with self.database.session() as session:
+            source = session.get(KnowledgeSourceRecord, self.source_id)
+            preview_record = session.get(StructuredPreviewRecord, self.source_id)
+            records = session.scalars(
+                select(StructuredDatasetRecord).where(
+                    StructuredDatasetRecord.source_id == self.source_id,
+                    StructuredDatasetRecord.schema_version == 0,
+                )
+            ).all()
+            for record in records:
+                tuple(record.columns)
+        assert source is not None
+        assert preview_record is not None
+
+        class ScalarRows:
+            def __init__(self, rows: list[StructuredDatasetRecord]) -> None:
+                self._rows = rows
+
+            def all(self) -> list[StructuredDatasetRecord]:
+                return self._rows
+
+        class RecordingSession:
+            def __init__(self, *, include_preview: bool, rows: list[Any]) -> None:
+                self.operations: list[str] = []
+                self.include_preview = include_preview
+                self.rows = rows
+
+            def get_bind(self) -> object:
+                return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+            def get(self, record_type: type[object], _key: object) -> object | None:
+                self.operations.append(f"GET {record_type.__tablename__}")
+                return source
+
+            def scalar(self, statement: object) -> object | None:
+                sql = str(statement.compile(dialect=postgresql.dialect()))
+                self.operations.append(sql)
+                if "FROM knowledge_sources" in sql:
+                    return source
+                if "FROM structured_previews" in sql:
+                    return preview_record if self.include_preview else None
+                if "max(structured_datasets.schema_version)" in sql:
+                    return 0
+                raise AssertionError(f"Unexpected scalar SQL: {sql}")
+
+            def scalars(self, statement: object) -> ScalarRows:
+                sql = str(statement.compile(dialect=postgresql.dialect()))
+                self.operations.append(sql)
+                return ScalarRows(self.rows)
+
+            def add(self, _record: object) -> None:
+                return None
+
+            def delete(self, _record: object) -> None:
+                return None
+
+            def flush(self) -> None:
+                return None
+
+        class RecordingDatabase:
+            def __init__(self, session: RecordingSession) -> None:
+                self._session = session
+
+            @contextmanager
+            def session(self):
+                yield self._session
+
+        def assert_lock_order(test_case: unittest.TestCase, operations: list[str]) -> None:
+            test_case.assertIn("FROM knowledge_sources", operations[0])
+            test_case.assertIn("FOR UPDATE", operations[0])
+            test_case.assertIn("FROM structured_previews", operations[1])
+            test_case.assertIn("FOR UPDATE", operations[1])
+            test_case.assertIn("FROM structured_datasets", operations[2])
+            test_case.assertIn("FOR UPDATE", operations[2])
+
+        save_session = RecordingSession(include_preview=False, rows=[])
+        StructuredRepository(RecordingDatabase(save_session)).save_preview(self.preview)  # type: ignore[arg-type]
+        assert_lock_order(self, save_session.operations)
+
+        class CachedPreviewRepository(StructuredRepository):
+            def get_preview(self, _source_id: str) -> SpreadsheetPreview:
+                return self_preview
+
+        self_preview = self.preview
+        confirm_session = RecordingSession(include_preview=True, rows=records)
+        CachedPreviewRepository(RecordingDatabase(confirm_session)).confirm_schema(  # type: ignore[arg-type]
+            self.source_id, self.confirmation()
+        )
+        assert_lock_order(self, confirm_session.operations)
+
+    def test_non_version_integrity_error_uses_generic_conflict_message(self) -> None:
+        self.repository.save_preview(self.preview)
+
+        def raise_foreign_key_error(
+            _session: Session, _flush_context: object, _instances: object
+        ) -> None:
+            raise IntegrityError("INSERT", {}, Exception("FOREIGN KEY constraint failed"))
+
+        event.listen(Session, "before_flush", raise_foreign_key_error)
+        try:
+            with self.assertRaises(StructuredConflictError) as caught:
+                self.repository.confirm_schema(self.source_id, self.confirmation())
+        finally:
+            event.remove(Session, "before_flush", raise_foreign_key_error)
+
+        self.assertNotIn("version", str(caught.exception).lower())
+        self.assertIn("database state", str(caught.exception).lower())
 
     def test_corrupt_preview_payload_always_raises_conflict(self) -> None:
         corruptions = {

@@ -362,6 +362,38 @@ class StructuredSchemaContractTest(unittest.TestCase):
                     ],
                     [(["source_id"], "knowledge_sources", ["id"], "CASCADE")],
                 )
+                with engine.connect() as connection:
+                    connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                    connection.execute(
+                        text(
+                            "INSERT INTO knowledge_sources ("
+                            "id, name, source_type, records, status, updated_at, "
+                            "classification, sort_order"
+                            ") VALUES ("
+                            "'cascade-source', 'Cascade source', 'XLSX', 0, 'ready', "
+                            "'2026-07-22T00:00:00Z', 'internal', 0"
+                            ")"
+                        )
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO structured_previews (source_id, payload) "
+                            "VALUES ('cascade-source', '{}')"
+                        )
+                    )
+                    connection.execute(
+                        text("DELETE FROM knowledge_sources WHERE id = 'cascade-source'")
+                    )
+                    self.assertEqual(
+                        connection.scalar(
+                            text(
+                                "SELECT COUNT(*) FROM structured_previews "
+                                "WHERE source_id = 'cascade-source'"
+                            )
+                        ),
+                        0,
+                    )
+                    connection.commit()
             finally:
                 engine.dispose()
 

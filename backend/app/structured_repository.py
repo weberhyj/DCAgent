@@ -97,7 +97,7 @@ class StructuredRepository:
     def save_preview(self, preview: SpreadsheetPreview) -> SpreadsheetPreview:
         with self._database.session() as session:
             _begin_sqlite_write(session)
-            source = session.get(KnowledgeSourceRecord, preview.source_id)
+            source = _lock_source(session, preview.source_id)
             if source is None:
                 raise StructuredNotFoundError("Knowledge source not found")
 
@@ -108,10 +108,12 @@ class StructuredRepository:
             )
 
             previous_previews = session.scalars(
-                select(StructuredDatasetRecord).where(
+                select(StructuredDatasetRecord)
+                .where(
                     StructuredDatasetRecord.source_id == preview.source_id,
                     StructuredDatasetRecord.schema_version == PREVIEW_SCHEMA_VERSION,
                 )
+                .with_for_update()
             ).all()
             for record in previous_previews:
                 session.delete(record)
@@ -215,7 +217,7 @@ class StructuredRepository:
         try:
             with self._database.session() as session:
                 _begin_sqlite_write(session)
-                if session.get(KnowledgeSourceRecord, source_id) is None:
+                if _lock_source(session, source_id) is None:
                     raise StructuredNotFoundError("Knowledge source not found")
                 preview_record = session.scalar(
                     select(StructuredPreviewRecord)
@@ -305,9 +307,11 @@ class StructuredRepository:
                     )
                 session.flush()
         except IntegrityError as error:
-            raise StructuredConflictError(
-                "Structured schema version was created concurrently"
-            ) from error
+            if _is_schema_version_conflict(error):
+                message = "Structured schema version was created concurrently"
+            else:
+                message = "Structured schema confirmation conflicted with database state"
+            raise StructuredConflictError(message) from error
 
         return StructuredConfirmationResult(status="confirmed", datasets=tuple(confirmed))
 
@@ -414,6 +418,35 @@ def _column_record_id(dataset_id: str, schema_version: int, index: int) -> str:
 def _begin_sqlite_write(session: Session) -> None:
     if session.get_bind().dialect.name == "sqlite":
         session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+
+def _lock_source(session: Session, source_id: str) -> KnowledgeSourceRecord | None:
+    return session.scalar(
+        select(KnowledgeSourceRecord).where(KnowledgeSourceRecord.id == source_id).with_for_update()
+    )
+
+
+def _is_schema_version_conflict(error: IntegrityError) -> bool:
+    original = error.orig
+    diagnostic = getattr(original, "diag", None)
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    sql_state = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    if sql_state == "23505" and constraint_name in {
+        "structured_datasets_pkey",
+        "uq_structured_datasets_source_worksheet_version",
+    }:
+        return True
+
+    message = str(original).casefold()
+    return any(
+        signature in message
+        for signature in (
+            "unique constraint failed: structured_datasets.dataset_id, "
+            "structured_datasets.schema_version",
+            "unique constraint failed: structured_datasets.source_id, "
+            "structured_datasets.worksheet_name, structured_datasets.schema_version",
+        )
+    )
 
 
 def _preview_payload(preview: SpreadsheetPreview) -> dict[str, object]:
