@@ -29,6 +29,22 @@ describe('ComposerBar', () => {
     expect(wrapper.text()).not.toContain('全库检索')
   })
 
+  it('hides the attachment entry by default while preserving its implementation', () => {
+    const wrapper = mount(ComposerBar, {
+      props: {
+        sending: false,
+      },
+    })
+
+    expect(wrapper.find('.tool-button').exists()).toBe(false)
+    expect(wrapper.find('button[aria-label="添加附件"]').exists()).toBe(false)
+    expect(wrapper.find('input').exists()).toBe(true)
+    expect(wrapper.find('button[type="submit"]').exists()).toBe(true)
+    expect(composerBarSource).toContain('const isAttachmentEntryVisible = false')
+    expect(composerBarSource).toContain('v-if="isAttachmentEntryVisible"')
+    expect(composerBarSource).toContain('<Paperclip :size="21" />')
+  })
+
   it('submits trimmed content with the fixed deep mode and clears the input', async () => {
     const wrapper = mount(ComposerBar, {
       props: {
@@ -61,21 +77,18 @@ describe('ComposerBar', () => {
     expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined()
   })
 
-  it('keeps composer controls in their three-column layout while searching', () => {
+  it('keeps visible composer controls in a two-column layout while searching', () => {
     const composerRule = getStyleRule(composerBarSource, '.composer')
-    const toolRule = getStyleRule(composerBarSource, '.tool-button')
     const inputRule = getStyleRule(composerBarSource, '.composer-input')
     const loadingRule = getStyleRule(composerBarSource, '.composer-loading')
     const sendRule = getStyleRule(composerBarSource, '.send-button')
 
-    expect(composerRule).toContain('grid-template-columns: auto minmax(0, 1fr) 42px')
-    expect(toolRule).toContain('grid-column: 1')
-    expect(toolRule).toContain('grid-row: 1')
-    expect(inputRule).toContain('grid-column: 2')
+    expect(composerRule).toContain('grid-template-columns: minmax(0, 1fr) 42px')
+    expect(inputRule).toContain('grid-column: 1')
     expect(inputRule).toContain('grid-row: 1')
-    expect(loadingRule).toContain('grid-column: 2')
+    expect(loadingRule).toContain('grid-column: 1')
     expect(loadingRule).toContain('grid-row: 1')
-    expect(sendRule).toContain('grid-column: 3')
+    expect(sendRule).toContain('grid-column: 2')
     expect(sendRule).toContain('grid-row: 1')
   })
 
