@@ -3,7 +3,15 @@ from __future__ import annotations
 import math
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from .agent import AgentRunAudit as AgentRunAuditModel
 from .agent import AgentStep as AgentStepModel
@@ -44,6 +52,13 @@ from .models import (
     TableArtifactModel,
     VideoArtifactModel,
 )
+from .spreadsheet_schema import MAX_COLUMNS_PER_DATASET, MAX_WORKSHEETS
+from .structured_models import (
+    MAX_STRUCTURED_ALIAS_LENGTH,
+    MAX_STRUCTURED_ALIASES_PER_COLUMN,
+    StructuredColumnType,
+    StructuredConfirmationResult,
+)
 from .structured_models import (
     SpreadsheetPreview as SpreadsheetPreviewModel,
 )
@@ -53,7 +68,6 @@ from .structured_models import (
 from .structured_models import (
     StructuredColumnSchema as StructuredColumnSchemaModel,
 )
-from .structured_models import StructuredColumnType
 from .structured_models import (
     StructuredDatasetPreview as StructuredDatasetPreviewModel,
 )
@@ -61,8 +75,16 @@ from .structured_models import (
     StructuredDatasetSchema as StructuredDatasetSchemaModel,
 )
 from .structured_models import StructuredDiagnostic as StructuredDiagnosticModel
-from .structured_repository import StructuredConfirmationResult
 from .time_utils import normalize_display_timestamp
+
+StructuredAlias = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_STRUCTURED_ALIAS_LENGTH,
+    ),
+]
 
 
 class ApiModel(BaseModel):
@@ -422,7 +444,7 @@ class StructuredColumnConfirmationRequest(ApiModel):
     physical_name: str = Field(alias="physicalName", min_length=1, max_length=160)
     display_name: str = Field(alias="displayName", max_length=240)
     data_type: StructuredColumnType = Field(alias="dataType")
-    aliases: list[str] = Field(max_length=20)
+    aliases: list[StructuredAlias] = Field(max_length=MAX_STRUCTURED_ALIASES_PER_COLUMN)
     allow_aggregate: StrictBool = Field(alias="allowAggregate")
     allow_filter: StrictBool = Field(alias="allowFilter")
     null_policy: str = Field(alias="nullPolicy", min_length=1, max_length=40)
@@ -430,11 +452,17 @@ class StructuredColumnConfirmationRequest(ApiModel):
 
 class StructuredDatasetConfirmationRequest(ApiModel):
     dataset_id: str = Field(alias="datasetId", min_length=1, max_length=128)
-    columns: list[StructuredColumnConfirmationRequest]
+    columns: list[StructuredColumnConfirmationRequest] = Field(
+        min_length=1,
+        max_length=MAX_COLUMNS_PER_DATASET,
+    )
 
 
 class StructuredSchemaConfirmationRequest(ApiModel):
-    datasets: list[StructuredDatasetConfirmationRequest]
+    datasets: list[StructuredDatasetConfirmationRequest] = Field(
+        min_length=1,
+        max_length=MAX_WORKSHEETS,
+    )
 
 
 class StructuredColumnSchema(ApiModel):

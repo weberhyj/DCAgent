@@ -4,6 +4,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
+MAX_STRUCTURED_ALIASES_PER_COLUMN = 20
+MAX_STRUCTURED_ALIAS_LENGTH = 80
+
 
 class StructuredColumnType(StrEnum):
     STRING = "string"
@@ -80,6 +83,12 @@ class StructuredDatasetSchema:
     schema_version: int
     columns: tuple[StructuredColumnSchema, ...]
     schema_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredConfirmationResult:
+    status: str
+    datasets: tuple[StructuredDatasetSchema, ...]
 
 
 @dataclass(frozen=True, slots=True)

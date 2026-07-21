@@ -149,7 +149,7 @@ def create_production_app(
     health_registry_factory: Callable[[], DependencyHealthRegistry] | None = None,
     database_factory: Callable[[str], object] | None = None,
     llm_provider_factory: Callable[[Mapping[str, str]], LLMProvider] | None = None,
-    ingestion_queue_factory: Callable[[ChatRepository], object] | None = None,
+    ingestion_queue_factory: Callable[..., object] | None = None,
     storage_factory: Callable[[Path], object] | None = None,
     evaluation_import_service_factory: Callable[[], object] | None = None,
     health_http_client_factory: Callable[..., object] | None = None,
@@ -209,7 +209,14 @@ def create_production_app(
                     )
                 )
             else:
-                ingestion_queue = own(ingestion_queue_factory(repository))
+                ingestion_queue = own(
+                    _create_custom_ingestion_queue(
+                        ingestion_queue_factory,
+                        repository,
+                        structured_repository,
+                        settings.structured_query_enabled,
+                    )
+                )
 
             storage_builder = storage_factory or KnowledgeFileStorage
             storage_root = (
@@ -284,6 +291,44 @@ def create_production_app(
                 await _close_owned_resource(resource)
 
     return _build_app(lifespan=lifespan)
+
+
+def _create_custom_ingestion_queue(
+    factory: Callable[..., object],
+    repository: ChatRepository,
+    structured_repository: StructuredRepository,
+    structured_query_enabled: bool,
+) -> object:
+    if not structured_query_enabled:
+        return factory(repository)
+
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "When STRUCTURED_QUERY_ENABLED=true, ingestion_queue_factory must be "
+            "structured-aware and expose an inspectable three-argument signature"
+        ) from error
+
+    keyword_arguments = {
+        "repository": repository,
+        "structured_repository": structured_repository,
+        "structured_query_enabled": True,
+    }
+    try:
+        signature.bind(**keyword_arguments)
+    except TypeError:
+        positional_arguments = (repository, structured_repository, True)
+        try:
+            signature.bind(*positional_arguments)
+        except TypeError as error:
+            raise TypeError(
+                "When STRUCTURED_QUERY_ENABLED=true, ingestion_queue_factory must be "
+                "structured-aware and accept repository, structured_repository, and "
+                "structured_query_enabled"
+            ) from error
+        return factory(*positional_arguments)
+    return factory(**keyword_arguments)
 
 
 # Legacy development commands still import ``app.main:app``.  This construction

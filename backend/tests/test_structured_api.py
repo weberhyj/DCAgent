@@ -29,7 +29,11 @@ from app.main import create_app, create_production_app
 from app.offline_settings import OfflineSettings
 from app.repository import InMemoryChatRepository
 from app.seed import build_seed_state
-from app.spreadsheet_schema import infer_spreadsheet_schema
+from app.spreadsheet_schema import (
+    MAX_COLUMNS_PER_DATASET,
+    MAX_WORKSHEETS,
+    infer_spreadsheet_schema,
+)
 from app.sql_repository import SqlChatRepository
 from app.structured_models import (
     SpreadsheetPreview,
@@ -219,6 +223,50 @@ class StructuredApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422, response.text)
 
+    def test_confirmation_request_rejects_empty_and_over_limit_collections(self) -> None:
+        client = self.build_client()
+        source_id = self.upload_xlsx(client)
+        client.get("/api/knowledge/sources")
+        column = {
+            "physicalName": "amount",
+            "displayName": "Amount",
+            "dataType": "decimal",
+            "aliases": ["amount"],
+            "allowAggregate": True,
+            "allowFilter": True,
+            "nullPolicy": "ignore",
+        }
+        dataset = {"datasetId": "ds-sales", "columns": [column]}
+        payloads = (
+            {"datasets": []},
+            {"datasets": [{"datasetId": "ds-sales", "columns": []}]},
+            {"datasets": [dataset] * (MAX_WORKSHEETS + 1)},
+            {
+                "datasets": [
+                    {
+                        "datasetId": "ds-sales",
+                        "columns": [column] * (MAX_COLUMNS_PER_DATASET + 1),
+                    }
+                ]
+            },
+            {
+                "datasets": [
+                    {
+                        "datasetId": "ds-sales",
+                        "columns": [{**column, "aliases": ["a" * 81]}],
+                    }
+                ]
+            },
+        )
+
+        for payload in payloads:
+            with self.subTest(payload_shape=str(payload)[:80]):
+                response = client.put(
+                    f"/api/knowledge/sources/{source_id}/structured-schema",
+                    json=payload,
+                )
+                self.assertEqual(response.status_code, 422, response.text)
+
     def test_missing_and_conflicting_previews_map_to_404_and_409(self) -> None:
         client = self.build_client()
         missing = client.get("/api/knowledge/sources/missing/structured-preview")
@@ -313,7 +361,7 @@ class StructuredWiringTest(unittest.TestCase):
         database = Database("sqlite+pysqlite:///:memory:")
         custom_queue = SimpleNamespace(close=lambda: None)
         production = create_production_app(
-            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "true"},
+            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "false"},
             repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
             database_factory=lambda _url: database,
             llm_provider_factory=lambda _environment: TemplateLLMProvider(),
@@ -322,8 +370,55 @@ class StructuredWiringTest(unittest.TestCase):
         )
         with TestClient(production) as client:
             self.assertIs(client.app.state.knowledge_ingestion_queue, custom_queue)
-            self.assertTrue(client.app.state.structured_query_enabled)
+            self.assertFalse(client.app.state.structured_query_enabled)
             self.assertIsInstance(client.app.state.structured_repository, StructuredRepository)
+
+    def test_enabled_production_app_rejects_legacy_one_argument_queue_factory(self) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        production = create_production_app(
+            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "true"},
+            repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
+            database_factory=lambda _url: database,
+            llm_provider_factory=lambda _environment: TemplateLLMProvider(),
+            health_registry_factory=DependencyHealthRegistry,
+            ingestion_queue_factory=lambda _repository: SimpleNamespace(close=lambda: None),
+        )
+
+        with self.assertRaisesRegex(TypeError, "structured-aware|structured_repository"):
+            with TestClient(production):
+                pass
+
+    def test_enabled_production_app_passes_context_to_structured_aware_factory(self) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        captured: dict[str, object] = {}
+        custom_queue = SimpleNamespace(close=lambda: None)
+
+        def build_queue(
+            repository: object,
+            structured_repository: object,
+            structured_query_enabled: bool,
+        ) -> object:
+            captured.update(
+                repository=repository,
+                structured_repository=structured_repository,
+                structured_query_enabled=structured_query_enabled,
+            )
+            return custom_queue
+
+        production = create_production_app(
+            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "true"},
+            repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
+            database_factory=lambda _url: database,
+            llm_provider_factory=lambda _environment: TemplateLLMProvider(),
+            health_registry_factory=DependencyHealthRegistry,
+            ingestion_queue_factory=build_queue,
+        )
+
+        with TestClient(production) as client:
+            self.assertIs(client.app.state.knowledge_ingestion_queue, custom_queue)
+            self.assertIs(captured["repository"], client.app.state.repository)
+            self.assertIs(captured["structured_repository"], client.app.state.structured_repository)
+            self.assertIs(captured["structured_query_enabled"], True)
 
     def test_production_app_passes_flag_and_repository_to_default_queue(self) -> None:
         database = Database("sqlite+pysqlite:///:memory:")

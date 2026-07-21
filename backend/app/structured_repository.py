@@ -17,10 +17,13 @@ from .database import (
     StructuredPreviewRecord,
 )
 from .structured_models import (
+    MAX_STRUCTURED_ALIAS_LENGTH,
+    MAX_STRUCTURED_ALIASES_PER_COLUMN,
     SpreadsheetPreview,
     StructuredColumnPreview,
     StructuredColumnSchema,
     StructuredColumnType,
+    StructuredConfirmationResult,
     StructuredDatasetPreview,
     StructuredDatasetSchema,
     StructuredDiagnostic,
@@ -28,8 +31,6 @@ from .structured_models import (
 
 STATUS_AWAITING_SCHEMA = "\u5f85\u786e\u8ba4\u8868\u7ed3\u6784"
 PREVIEW_SCHEMA_VERSION = 0
-MAX_ALIASES_PER_COLUMN = 20
-MAX_ALIAS_LENGTH = 80
 MAX_DISPLAY_NAME_LENGTH = 240
 ALLOWED_NULL_POLICIES = frozenset({"ignore", "zero", "reject"})
 NUMERIC_TYPES = frozenset({StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL})
@@ -80,12 +81,6 @@ class StructuredColumnConfirmation:
 class StructuredDatasetConfirmation:
     dataset_id: str
     columns: tuple[StructuredColumnConfirmation, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class StructuredConfirmationResult:
-    status: str
-    datasets: tuple[StructuredDatasetSchema, ...]
 
 
 class StructuredRepository:
@@ -377,7 +372,7 @@ class StructuredRepository:
                 raise StructuredValidationError(
                     f"Column {column.physical_name} cannot use zero null policy"
                 )
-            if len(column.aliases) > MAX_ALIASES_PER_COLUMN:
+            if len(column.aliases) > MAX_STRUCTURED_ALIASES_PER_COLUMN:
                 raise StructuredValidationError(
                     f"Column {column.physical_name} has too many aliases"
                 )
@@ -386,7 +381,7 @@ class StructuredRepository:
                 if not isinstance(raw_alias, str):
                     raise StructuredValidationError("Aliases must be strings")
                 alias = raw_alias.strip()
-                if not alias or len(alias) > MAX_ALIAS_LENGTH:
+                if not alias or len(alias) > MAX_STRUCTURED_ALIAS_LENGTH:
                     raise StructuredValidationError(
                         f"Column {column.physical_name} has an invalid alias"
                     )
