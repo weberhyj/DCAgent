@@ -82,6 +82,9 @@ describe('ComposerBar', () => {
     const inputRule = getStyleRule(composerBarSource, '.composer-input')
     const loadingRule = getStyleRule(composerBarSource, '.composer-loading')
     const sendRule = getStyleRule(composerBarSource, '.send-button')
+    const mobileStyles = composerBarSource.split('@media (max-width: 720px)')[1] ?? ''
+    const mobileComposerRule = getStyleRule(mobileStyles, '.composer')
+    const mobileVisibleComposerRule = getStyleRule(mobileStyles, '.composer.attachments-visible')
 
     expect(composerRule).toContain('grid-template-columns: minmax(0, 1fr) 42px')
     expect(inputRule).toContain('grid-column: 1')
@@ -90,6 +93,8 @@ describe('ComposerBar', () => {
     expect(loadingRule).toContain('grid-row: 1')
     expect(sendRule).toContain('grid-column: 2')
     expect(sendRule).toContain('grid-row: 1')
+    expect(mobileComposerRule).toContain('grid-template-columns: minmax(0, 1fr) 45px')
+    expect(mobileVisibleComposerRule).toContain('grid-template-columns: auto minmax(0, 1fr) 45px')
   })
 
   it('visually hides the mobile loading label without removing accessible text', () => {
