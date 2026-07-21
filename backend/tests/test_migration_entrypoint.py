@@ -6,14 +6,17 @@ from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import sqlalchemy as sa
+from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.dialects import postgresql
 
+from alembic import command
 from app import migration_entrypoint
 from app.database import Database
 from app.migration_entrypoint import BaselineSchemaMismatch, run_migrations
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
+CURRENT_REVISION = "20260721_02"
 
 
 def sqlite_url(path: Path) -> str:
@@ -24,6 +27,20 @@ def prepare_current_schema(database_url: str) -> None:
     database = Database(database_url)
     database.create_schema()
     database.engine.dispose()
+
+
+def prepare_unversioned_baseline_schema(database_url: str) -> None:
+    config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+    command.upgrade(config, migration_entrypoint.BASELINE_REVISION)
+
+    engine = create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE alembic_version"))
+    finally:
+        engine.dispose()
 
 
 def table_names(database_url: str) -> list[str]:
@@ -1136,7 +1153,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_existing_current_database_is_stamped_and_rerun_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "existing.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
 
             run_migrations(database_url=database_url, config_path=BACKEND_ROOT / "alembic.ini")
             first_tables = table_names(database_url)
@@ -1146,9 +1163,26 @@ class MigrationEntrypointTest(unittest.TestCase):
             run_migrations(database_url=database_url, config_path=BACKEND_ROOT / "alembic.ini")
             second_tables = table_names(database_url)
             second_revision = current_revision(database_url)
-            self.assertEqual(first_revision, "20260715_00")
+            self.assertEqual(first_revision, CURRENT_REVISION)
             self.assertEqual(second_revision, first_revision)
             self.assertEqual(first_tables, second_tables)
+            self.assertIn("structured_previews", second_tables)
+
+    def test_unversioned_current_orm_schema_refuses_to_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = sqlite_url(Path(temp_dir) / "unversioned-current.db")
+            prepare_current_schema(database_url)
+
+            with self.assertRaisesRegex(
+                BaselineSchemaMismatch,
+                r"extra tables: structured_columns",
+            ):
+                run_migrations(
+                    database_url=database_url,
+                    config_path=BACKEND_ROOT / "alembic.ini",
+                )
+
+            self.assertNotIn("alembic_version", table_names(database_url))
 
     def test_baseline_version_without_application_schema_refuses_to_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1168,7 +1202,7 @@ class MigrationEntrypointTest(unittest.TestCase):
         for variant in variants:
             with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temp_dir:
                 database_url = sqlite_url(Path(temp_dir) / "malformed-version.db")
-                prepare_current_schema(database_url)
+                prepare_unversioned_baseline_schema(database_url)
                 self._create_version_table(
                     database_url,
                     ["20260715_00"],
@@ -1184,7 +1218,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_managed_baseline_missing_schema_refuses_to_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "managed-missing.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE conversations DROP COLUMN context_summary"))
@@ -1197,7 +1231,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_managed_baseline_extra_schema_refuses_to_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "managed-extra.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE conversations ADD COLUMN unexpected TEXT"))
@@ -1210,7 +1244,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_empty_managed_version_row_refuses_to_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "empty-version.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             self._create_version_table(database_url, [])
 
             with self.assertRaises(migration_entrypoint.ManagedRevisionStateError):
@@ -1219,7 +1253,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_multiple_managed_version_rows_refuse_to_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "multiple-version.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             self._create_version_table(
                 database_url,
                 ["20260715_00", "20260715_00"],
@@ -1232,7 +1266,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_unknown_managed_version_refuses_to_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "unknown-version.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             self._create_version_table(database_url, ["future_revision"])
 
             with self.assertRaises(migration_entrypoint.ManagedRevisionStateError):
@@ -1242,7 +1276,7 @@ class MigrationEntrypointTest(unittest.TestCase):
         for revision in ("head", "base", "20260715"):
             with self.subTest(revision=revision), tempfile.TemporaryDirectory() as temp_dir:
                 database_url = sqlite_url(Path(temp_dir) / "symbolic-version.db")
-                prepare_current_schema(database_url)
+                prepare_unversioned_baseline_schema(database_url)
                 self._create_version_table(database_url, [revision])
 
                 with self.assertRaises(migration_entrypoint.ManagedRevisionStateError):
@@ -1454,7 +1488,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_missing_column_refuses_to_stamp_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "missing-column.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE conversations DROP COLUMN context_summary"))
@@ -1472,7 +1506,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_extra_column_refuses_to_stamp_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "extra-column.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE conversations ADD COLUMN unexpected TEXT"))
@@ -1490,7 +1524,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_extra_table_refuses_to_stamp_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "extra-table.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("CREATE TABLE unexpected_table (id INTEGER PRIMARY KEY)"))
@@ -1504,7 +1538,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_extra_index_refuses_to_stamp_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "extra-index.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(
@@ -1524,7 +1558,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_extra_expression_index_refuses_to_stamp_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "extra-expression-index.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(
@@ -1552,7 +1586,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_non_unique_replacement_for_unique_index_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "wrong-unique-index.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP INDEX ix_evaluation_runs_sequence"))
@@ -1568,7 +1602,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_partial_unique_index_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "partial-unique-index.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP INDEX ix_evaluation_runs_sequence"))
@@ -1587,7 +1621,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_descending_index_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "descending-index.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP INDEX ix_conversations_sort_order"))
@@ -1606,7 +1640,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_wrong_column_type_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "wrong-type.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP TABLE evaluation_counters"))
@@ -1631,7 +1665,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_char_replacement_for_varchar_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "wrong-char-type.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP TABLE evaluation_counters"))
@@ -1656,7 +1690,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_generated_column_drift_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "generated-column.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP TABLE evaluation_counters"))
@@ -1683,7 +1717,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_missing_foreign_key_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "missing-foreign-key.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP TABLE messages"))
@@ -1710,7 +1744,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_foreign_key_update_and_deferrable_drift_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "foreign-key-options.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP TABLE messages"))
@@ -1740,7 +1774,7 @@ class MigrationEntrypointTest(unittest.TestCase):
     def test_composite_foreign_key_drift_refuses_to_stamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = sqlite_url(Path(temp_dir) / "composite-foreign-key.db")
-            prepare_current_schema(database_url)
+            prepare_unversioned_baseline_schema(database_url)
             engine = create_engine(database_url)
             with engine.begin() as connection:
                 connection.execute(text("DROP TABLE messages"))
