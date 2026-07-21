@@ -12,6 +12,7 @@ from sqlalchemy import (
     Boolean,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -316,7 +317,7 @@ class StructuredDatasetRecord(Base):
     dataset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     source_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     worksheet_name: Mapped[str] = mapped_column(String(240), nullable=False)
-    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, primary_key=True)
     schema_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
 
@@ -338,19 +339,22 @@ class StructuredDatasetRecord(Base):
 class StructuredColumnRecord(Base):
     __tablename__ = "structured_columns"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["dataset_id", "schema_version"],
+            ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
+            ondelete="CASCADE",
+        ),
         UniqueConstraint(
             "dataset_id",
+            "schema_version",
             "physical_name",
             name="uq_structured_columns_dataset_physical_name",
         ),
     )
 
     id: Mapped[str] = mapped_column(String(160), primary_key=True)
-    dataset_id: Mapped[str] = mapped_column(
-        ForeignKey("structured_datasets.dataset_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     physical_name: Mapped[str] = mapped_column(String(160), nullable=False)
     original_name: Mapped[str] = mapped_column(String(240), nullable=False)
     display_name: Mapped[str] = mapped_column(String(240), nullable=False)
@@ -366,14 +370,18 @@ class StructuredColumnRecord(Base):
 
 class StructuredIngestionJobRecord(Base):
     __tablename__ = "structured_ingestion_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["dataset_id", "schema_version"],
+            ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
+            ondelete="CASCADE",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    dataset_id: Mapped[str] = mapped_column(
-        ForeignKey("structured_datasets.dataset_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     publication_id: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     lease_token: Mapped[str | None] = mapped_column(String(128))
@@ -388,13 +396,16 @@ class StructuredIngestionJobRecord(Base):
 
 class StructuredPublicationRecord(Base):
     __tablename__ = "structured_publications"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["dataset_id", "schema_version"],
+            ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
+            ondelete="CASCADE",
+        ),
+    )
 
     publication_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    dataset_id: Mapped[str] = mapped_column(
-        ForeignKey("structured_datasets.dataset_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     physical_table_name: Mapped[str] = mapped_column(String(240), nullable=False)
     row_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
