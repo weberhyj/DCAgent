@@ -24,6 +24,7 @@ const content = shallowRef('')
 const DEFAULT_COMPOSER_MODE: ComposerMode = 'deep'
 const composerHintText = 'DCAgent 会基于资料库线索生成结论，请结合专业判断复核。'
 const attachmentLabel = '添加附件'
+const isAttachmentEntryVisible = false
 const inputPlaceholder = '输入搜查问题，或追加检索条件'
 const inputLabel = '输入搜查问题'
 const searchingLabel = '资料库搜查中'
@@ -42,10 +43,10 @@ function submit() {
 
 <template>
   <footer class="composer-wrap" :class="[props.variant, { searching: props.searching, closing: props.closing }]" data-ignore-quantum-pulse>
-    <form class="composer" @submit.prevent="submit">
+    <form class="composer" :class="{ 'attachments-visible': isAttachmentEntryVisible }" @submit.prevent="submit">
       <span v-if="props.variant === 'center'" class="composer-shutter composer-shutter--left" aria-hidden="true" />
       <span v-if="props.variant === 'center'" class="composer-shutter composer-shutter--right" aria-hidden="true" />
-      <BaseButton type="button" class="tool-button" variant="ghost" size="icon" :disabled="isInputDisabled" :aria-label="attachmentLabel">
+      <BaseButton v-if="isAttachmentEntryVisible" type="button" class="tool-button" variant="ghost" size="icon" :disabled="isInputDisabled" :aria-label="attachmentLabel">
         <Paperclip :size="21" />
       </BaseButton>
       <BaseInput
@@ -85,7 +86,7 @@ function submit() {
 .composer {
   position: relative;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) 42px;
+  grid-template-columns: minmax(0, 1fr) 42px;
   align-items: center;
   gap: 10px;
   max-width: 900px;
@@ -208,13 +209,13 @@ function submit() {
 }
 
 .composer-input {
-  grid-column: 2;
+  grid-column: 1;
   grid-row: 1;
   height: 36px;
 }
 
 .composer-loading {
-  grid-column: 2;
+  grid-column: 1;
   grid-row: 1;
   justify-self: end;
   display: inline-flex;
@@ -263,11 +264,28 @@ function submit() {
 }
 
 .send-button {
-  grid-column: 3;
+  grid-column: 2;
   grid-row: 1;
   width: 38px;
   height: 38px;
   border-radius: 14px;
+}
+
+.composer.attachments-visible {
+  grid-template-columns: auto minmax(0, 1fr) 42px;
+}
+
+.composer.attachments-visible .tool-button {
+  grid-column: 1;
+}
+
+.composer.attachments-visible .composer-input,
+.composer.attachments-visible .composer-loading {
+  grid-column: 2;
+}
+
+.composer.attachments-visible .send-button {
+  grid-column: 3;
 }
 
 .send-button:disabled {
@@ -299,8 +317,12 @@ function submit() {
   }
 
   .composer {
-    grid-template-columns: auto minmax(0, 1fr) 45px;
+    grid-template-columns: minmax(0, 1fr) 45px;
     min-height: 58px;
+  }
+
+  .composer.attachments-visible {
+    grid-template-columns: auto minmax(0, 1fr) 45px;
   }
 
   .composer-wrap.searching .composer-input {
