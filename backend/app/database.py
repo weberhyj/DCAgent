@@ -303,6 +303,16 @@ class KnowledgeChunkRecord(Base):
     source: Mapped[KnowledgeSourceRecord] = relationship(back_populates="chunks")
 
 
+class StructuredPreviewRecord(Base):
+    __tablename__ = "structured_previews"
+
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+
+
 class StructuredDatasetRecord(Base):
     __tablename__ = "structured_datasets"
     __table_args__ = (
