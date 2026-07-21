@@ -3,7 +3,6 @@ import { Paperclip, SendHorizontal } from 'lucide-vue-next'
 import { computed, shallowRef } from 'vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
-import BaseSelect from '@/components/ui/BaseSelect.vue'
 import type { ComposerMode } from '@/types/chat'
 
 const props = withDefaults(defineProps<{
@@ -22,28 +21,13 @@ const emit = defineEmits<{
 }>()
 
 const content = shallowRef('')
-const mode = shallowRef<ComposerMode>('deep')
-const modeOptions = [
-  { label: '快速检索', value: 'quick' },
-  { label: '深度分析', value: 'deep' },
-  { label: '全库检索', value: 'source' },
-]
+const DEFAULT_COMPOSER_MODE: ComposerMode = 'deep'
 const composerHintText = 'DCAgent 会基于资料库线索生成结论，请结合专业判断复核。'
 const attachmentLabel = '添加附件'
 const inputPlaceholder = '输入搜查问题，或追加检索条件'
 const inputLabel = '输入搜查问题'
 const searchingLabel = '资料库搜查中'
-const modeSelectLabel = '搜查模式'
 const sendLabel = '发起搜查'
-
-const modeModel = computed({
-  get: () => mode.value,
-  set: (value: string) => {
-    if (value === 'quick' || value === 'deep' || value === 'source') {
-      mode.value = value
-    }
-  },
-})
 
 const isInputDisabled = computed(() => props.sending || props.searching || props.closing)
 const isSubmitDisabled = computed(() => isInputDisabled.value || !content.value.trim())
@@ -51,7 +35,7 @@ const isSubmitDisabled = computed(() => isInputDisabled.value || !content.value.
 function submit() {
   const trimmed = content.value.trim()
   if (!trimmed) return
-  emit('send', { content: trimmed, mode: mode.value })
+  emit('send', { content: trimmed, mode: DEFAULT_COMPOSER_MODE })
   content.value = ''
 }
 </script>
@@ -74,15 +58,8 @@ function submit() {
       />
       <div v-if="props.searching" class="composer-loading" data-testid="composer-loading" aria-live="polite">
         <span class="loading-ring" aria-hidden="true" />
-        <span>{{ searchingLabel }}</span>
+        <span class="composer-loading-label">{{ searchingLabel }}</span>
       </div>
-      <BaseSelect
-        v-else
-        v-model="modeModel"
-        class="mode-select"
-        :options="modeOptions"
-        :aria-label="modeSelectLabel"
-      />
       <BaseButton class="send-button" variant="primary" size="icon" type="submit" :disabled="isSubmitDisabled" :aria-label="sendLabel">
         <SendHorizontal :size="20" />
       </BaseButton>
@@ -108,7 +85,7 @@ function submit() {
 .composer {
   position: relative;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) 132px 42px;
+  grid-template-columns: auto minmax(0, 1fr) 42px;
   align-items: center;
   gap: 10px;
   max-width: 900px;
@@ -228,12 +205,14 @@ function submit() {
   background: rgba(103, 216, 255, 0.07);
 }
 
-.composer-input,
-.mode-select {
+.composer-input {
   height: 36px;
 }
 
 .composer-loading {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -244,6 +223,7 @@ function submit() {
   color: #b8f2ff;
   font-size: 13px;
   white-space: nowrap;
+  pointer-events: none;
 }
 
 .loading-ring {
@@ -265,6 +245,10 @@ function submit() {
     inset 0 1px 0 rgba(255, 255, 255, 0.13);
 }
 
+.composer-wrap.searching .composer-input {
+  padding-right: 150px;
+}
+
 .composer-input {
   border: 0;
   border-radius: 12px;
@@ -272,25 +256,6 @@ function submit() {
   color: var(--color-text);
   background: transparent;
   box-shadow: none;
-}
-
-.mode-select :deep(.base-select-trigger) {
-  justify-content: center;
-  gap: 8px;
-  padding: 0 8px;
-  border-color: transparent;
-  border-radius: 12px;
-  background: transparent;
-  box-shadow: none;
-  transform: none;
-}
-
-.mode-select :deep(.base-select-trigger:hover),
-.mode-select :deep(.base-select-trigger[data-state="open"]) {
-  border-color: transparent;
-  background: transparent;
-  box-shadow: none;
-  transform: none;
 }
 
 .send-button {
@@ -332,7 +297,11 @@ function submit() {
     min-height: 58px;
   }
 
-  .mode-select {
+  .composer-wrap.searching .composer-input {
+    padding-right: 42px;
+  }
+
+  .composer-loading-label {
     display: none;
   }
 }

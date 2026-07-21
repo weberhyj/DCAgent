@@ -7,17 +7,34 @@ describe('ComposerBar', () => {
     document.body.innerHTML = ''
   })
 
-  it('uses user-safe search mode copy instead of source tracing copy', async () => {
+  it('hides unfinished search mode choices', () => {
     const wrapper = mount(ComposerBar, {
       props: {
         sending: false,
       },
     })
 
-    await wrapper.get('[data-testid="base-select-trigger"]').trigger('click')
+    expect(wrapper.find('[data-testid="base-select-trigger"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('快速检索')
+    expect(wrapper.text()).not.toContain('深度分析')
+    expect(wrapper.text()).not.toContain('全库检索')
+  })
 
-    expect(document.body.textContent).toContain('全库检索')
-    expect(document.body.textContent).not.toContain('溯源')
+  it('submits trimmed content with the fixed deep mode and clears the input', async () => {
+    const wrapper = mount(ComposerBar, {
+      props: {
+        sending: false,
+      },
+    })
+
+    const input = wrapper.get('input')
+    await input.setValue('  分析现金流风险  ')
+    await wrapper.get('form').trigger('submit')
+
+    expect(wrapper.emitted('send')).toEqual([[
+      { content: '分析现金流风险', mode: 'deep' },
+    ]])
+    expect(input.element.value).toBe('')
   })
 
   it('shows a search loading state while the centered composer is submitting', () => {
