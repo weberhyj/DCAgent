@@ -184,12 +184,21 @@ In the existing mobile media query, replace the obsolete `.mode-select { display
   padding-right: 42px;
 }
 
-.composer-loading span:last-child {
-  display: none;
+.composer-loading-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 ```
 
-This keeps the loading ring visible on narrow screens without covering most of the input.
+This keeps the loading ring visible on narrow screens without covering most of the input, while visually hiding the label and retaining its `aria-live` text for screen readers.
 
 - [ ] **Step 5: Run the focused test and verify GREEN**
 
