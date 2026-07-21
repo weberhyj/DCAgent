@@ -1,20 +1,39 @@
 import { readonly, shallowRef } from 'vue'
 import {
+  confirmStructuredSchema as confirmStructuredSchemaApi,
   deleteKnowledgeSource,
   fetchAgentRuns,
   fetchKnowledgeChunks,
   fetchKnowledgeSources,
+  fetchStructuredPreview,
   reindexKnowledgeSource as reindexKnowledgeSourceApi,
   uploadKnowledgeFiles,
 } from '@/services/api'
-import type { AgentRunAudit, KnowledgeChunk, KnowledgeSource } from '@/types/chat'
+import type {
+  AgentRunAudit,
+  KnowledgeChunk,
+  KnowledgeSource,
+  StructuredPreview,
+  StructuredSchemaSubmission,
+} from '@/types/chat'
 
 const KNOWLEDGE_INDEXING_STATUS: KnowledgeSource['status'] = '解析中'
 const KNOWLEDGE_POLL_INTERVAL_MS = 800
 const KNOWLEDGE_POLL_ATTEMPTS = 5
+const STRUCTURED_SOURCE_TYPES = new Set(['csv', 'xlsx'])
+const STRUCTURED_SOURCE_STATUSES = new Set([
+  '\u5f85\u786e\u8ba4\u8868\u7ed3\u6784',
+  '\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d',
+])
 
 function hasIndexingSource(sources: readonly KnowledgeSource[]) {
   return sources.some((source) => source.status === KNOWLEDGE_INDEXING_STATUS)
+}
+
+function isStructuredKnowledgeSource(source: KnowledgeSource | undefined) {
+  if (!source) return false
+  return STRUCTURED_SOURCE_TYPES.has(source.sourceType.trim().toLowerCase())
+    || STRUCTURED_SOURCE_STATUSES.has(source.status)
 }
 
 function delay(milliseconds: number) {
@@ -26,6 +45,7 @@ function delay(milliseconds: number) {
 export function useChatKnowledgeManagement() {
   const knowledgeSources = shallowRef<KnowledgeSource[]>([])
   const knowledgeChunks = shallowRef<KnowledgeChunk[]>([])
+  const structuredPreview = shallowRef<StructuredPreview | null>(null)
   const agentRuns = shallowRef<AgentRunAudit[]>([])
   const activeKnowledgeSourceId = shallowRef<string | null>(null)
   const knowledgeSourcesLoading = shallowRef(false)
@@ -34,6 +54,8 @@ export function useChatKnowledgeManagement() {
   const knowledgeBatchRemoving = shallowRef(false)
   const knowledgeReindexingSourceId = shallowRef<string | null>(null)
   const knowledgeChunksLoading = shallowRef(false)
+  const structuredPreviewLoading = shallowRef(false)
+  const structuredSchemaConfirming = shallowRef(false)
   const agentRunsLoading = shallowRef(false)
   const error = shallowRef<string | null>(null)
 
@@ -153,9 +175,50 @@ export function useChatKnowledgeManagement() {
     }
   }
 
+  async function loadStructuredPreview(sourceId: string) {
+    if (structuredPreviewLoading.value) return
+    structuredPreviewLoading.value = true
+    error.value = null
+    try {
+      structuredPreview.value = await fetchStructuredPreview(sourceId)
+    } catch {
+      structuredPreview.value = null
+      error.value = 'Structured schema preview could not be loaded.'
+    } finally {
+      structuredPreviewLoading.value = false
+    }
+  }
+
+  async function confirmStructuredSchema(
+    sourceId: string,
+    submission: StructuredSchemaSubmission,
+  ) {
+    if (structuredSchemaConfirming.value) return null
+    structuredSchemaConfirming.value = true
+    error.value = null
+    try {
+      return await confirmStructuredSchemaApi(sourceId, submission)
+    } catch {
+      error.value = 'Structured schema could not be confirmed.'
+      return null
+    } finally {
+      structuredSchemaConfirming.value = false
+    }
+  }
+
   async function inspectKnowledgeSource(sourceId: string) {
+    const source = knowledgeSources.value.find((item) => item.id === sourceId)
+    if (isStructuredKnowledgeSource(source)) {
+      activeKnowledgeSourceId.value = sourceId
+      knowledgeChunks.value = []
+      knowledgeChunksLoading.value = false
+      await loadStructuredPreview(sourceId)
+      return
+    }
+
     if (knowledgeChunksLoading.value && activeKnowledgeSourceId.value === sourceId) return
     activeKnowledgeSourceId.value = sourceId
+    structuredPreview.value = null
     knowledgeChunksLoading.value = true
     error.value = null
     try {
@@ -171,6 +234,7 @@ export function useChatKnowledgeManagement() {
   return {
     knowledgeSources: readonly(knowledgeSources),
     knowledgeChunks: readonly(knowledgeChunks),
+    structuredPreview: readonly(structuredPreview),
     agentRuns: readonly(agentRuns),
     activeKnowledgeSourceId: readonly(activeKnowledgeSourceId),
     knowledgeSourcesLoading: readonly(knowledgeSourcesLoading),
@@ -179,6 +243,8 @@ export function useChatKnowledgeManagement() {
     knowledgeBatchRemoving: readonly(knowledgeBatchRemoving),
     knowledgeReindexingSourceId: readonly(knowledgeReindexingSourceId),
     knowledgeChunksLoading: readonly(knowledgeChunksLoading),
+    structuredPreviewLoading: readonly(structuredPreviewLoading),
+    structuredSchemaConfirming: readonly(structuredSchemaConfirming),
     agentRunsLoading: readonly(agentRunsLoading),
     error: readonly(error),
     loadKnowledgeSources,
@@ -188,5 +254,7 @@ export function useChatKnowledgeManagement() {
     removeKnowledgeSources,
     reindexKnowledgeSource,
     inspectKnowledgeSource,
+    loadStructuredPreview,
+    confirmStructuredSchema,
   }
 }

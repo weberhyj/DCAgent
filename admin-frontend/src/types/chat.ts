@@ -1,9 +1,17 @@
+export type KnowledgeSourceStatus =
+  | '已索引'
+  | '解析中'
+  | '待复核'
+  | '解析失败'
+  | '待确认表结构'
+  | '结构化导入中'
+
 export interface KnowledgeSource {
   id: string
   name: string
   sourceType: string
   records: number
-  status: '已索引' | '解析中' | '待复核' | '解析失败'
+  status: KnowledgeSourceStatus
   updatedAt: string
   classification: string
   fileSize?: number | null
@@ -17,6 +25,87 @@ export interface KnowledgeChunk {
   chunkIndex: number
   text: string
   tokenCount: number
+}
+
+export type StructuredColumnType =
+  | 'string'
+  | 'integer'
+  | 'decimal'
+  | 'date'
+  | 'datetime'
+  | 'boolean'
+
+export type StructuredNullPolicy = 'ignore' | 'zero' | 'reject'
+
+export interface StructuredDiagnostic {
+  code: string
+  message: string
+  worksheetName: string
+  columnName: string | null
+  rowNumber: number | null
+}
+
+export interface StructuredColumnPreview {
+  physicalName: string
+  originalName: string
+  displayName: string
+  dataType: StructuredColumnType
+  aliases: string[]
+  examples: string[]
+  sampledRows: number
+  nullCount: number
+}
+
+export interface StructuredDatasetPreview {
+  datasetId: string
+  sourceId: string
+  worksheetName: string
+  columns: StructuredColumnPreview[]
+  sampledRows: number
+  schemaHash: string
+}
+
+export interface StructuredPreview {
+  sourceId: string
+  datasets: StructuredDatasetPreview[]
+  diagnostics: StructuredDiagnostic[]
+}
+
+export interface StructuredColumnSubmission {
+  physicalName: string
+  displayName: string
+  dataType: StructuredColumnType
+  aliases: string[]
+  allowAggregate: boolean
+  allowFilter: boolean
+  nullPolicy: StructuredNullPolicy
+}
+
+export interface StructuredDatasetSubmission {
+  datasetId: string
+  columns: StructuredColumnSubmission[]
+}
+
+export interface StructuredSchemaSubmission {
+  datasets: StructuredDatasetSubmission[]
+}
+
+export interface StructuredColumnSchema extends StructuredColumnSubmission {
+  originalName: string
+}
+
+export interface StructuredDatasetSchema {
+  datasetId: string
+  sourceId: string
+  worksheetName: string
+  schemaVersion: number
+  columns: StructuredColumnSchema[]
+  schemaHash: string
+}
+
+export interface StructuredSchemaConfirmationResponse {
+  status: string
+  datasets: StructuredDatasetSchema[]
 }
 
 export interface AgentStepAudit {
