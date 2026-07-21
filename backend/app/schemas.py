@@ -276,7 +276,14 @@ class KnowledgeSource(ApiModel):
     name: str
     source_type: str = Field(alias="sourceType")
     records: int
-    status: Literal["已索引", "解析中", "待复核", "解析失败"]
+    status: Literal[
+        "已索引",
+        "解析中",
+        "待复核",
+        "解析失败",
+        "待确认表结构",
+        "结构化导入中",
+    ]
     updated_at: str = Field(alias="updatedAt")
     classification: str
     file_size: int | None = Field(default=None, alias="fileSize")

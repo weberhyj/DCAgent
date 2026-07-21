@@ -219,7 +219,7 @@ class AlembicBaselineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "baseline.db"
             database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
-            command.upgrade(make_config(database_url), "head")
+            command.upgrade(make_config(database_url), REVISION)
 
             engine = create_engine(database_url)
             inspector = inspect(engine)

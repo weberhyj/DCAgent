@@ -5,7 +5,14 @@ from typing import Literal
 
 ComposerMode = Literal["quick", "deep", "source"]
 MessageRole = Literal["user", "assistant"]
-KnowledgeStatus = Literal["已索引", "解析中", "待复核", "解析失败"]
+KnowledgeStatus = Literal[
+    "已索引",
+    "解析中",
+    "待复核",
+    "解析失败",
+    "待确认表结构",
+    "结构化导入中",
+]
 AssetKey = Literal["city", "analysis"]
 
 
