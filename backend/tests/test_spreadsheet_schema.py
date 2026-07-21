@@ -3,10 +3,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 from datetime import date, datetime
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import Workbook
 
+import app.spreadsheet_schema as schema_module
 from app.spreadsheet_schema import _infer_dataset, infer_spreadsheet_schema
 from app.structured_models import StructuredColumnType
 from tests.support.structured_fakes import write_csv, write_formula_xlsx, write_xlsx
@@ -239,6 +242,115 @@ class SpreadsheetSchemaInferenceTest(unittest.TestCase):
         self.assertEqual(dataset.sampled_rows, 10_000)
         self.assertEqual(dataset.columns[0].sampled_rows, 10_000)
         self.assertEqual(dataset.columns[0].examples, ("0", "1", "2", "3", "4"))
+
+    def test_caps_wide_rows_and_reports_column_truncation(self) -> None:
+        max_columns = 256
+        width = max_columns + 10
+        path = write_csv(
+            self.temp_dir / "wide.csv",
+            [[f"column_{index}" for index in range(width)], list(range(width))],
+        )
+
+        preview = infer_spreadsheet_schema(path, source_id="kb-wide")
+
+        self.assertEqual(len(preview.datasets[0].columns), max_columns)
+        self.assertTrue(any(item.code == "column_limit_exceeded" for item in preview.diagnostics))
+
+    def test_caps_diagnostics_and_reports_truncation(self) -> None:
+        max_columns = 256
+        max_diagnostics = 128
+        header = tuple("amount" for _ in range(max_columns))
+        diagnostics = []
+
+        dataset = _infer_dataset("kb-diagnostics", "Sheet1", [(1, header, ())], diagnostics)
+
+        self.assertIsNotNone(dataset)
+        self.assertEqual(len(diagnostics), max_diagnostics)
+        self.assertEqual(diagnostics[-1].code, "diagnostics_truncated")
+
+    def test_csv_encoding_probe_reads_only_a_bounded_prefix(self) -> None:
+        payload = b"header\n" + (b"value\n" * 100_000)
+
+        class CountingPath:
+            def __init__(self) -> None:
+                self.bytes_read = 0
+
+            def open(self, mode: str):
+                self.assert_binary_mode(mode)
+
+                owner = self
+
+                class CountingStream(BytesIO):
+                    def read(self, size: int = -1):
+                        chunk = super().read(size)
+                        owner.bytes_read += len(chunk)
+                        return chunk
+
+                return CountingStream(payload)
+
+            @staticmethod
+            def assert_binary_mode(mode: str) -> None:
+                if mode != "rb":
+                    raise AssertionError(mode)
+
+        path = CountingPath()
+
+        encoding = schema_module._detect_csv_encoding(path)
+
+        self.assertEqual(encoding, "utf-8-sig")
+        self.assertLessEqual(path.bytes_read, 64 * 1024)
+
+    def test_rejects_nul_prefixed_csv_as_unsupported_encoding(self) -> None:
+        path = self.temp_dir / "utf16.csv"
+        path.write_bytes("amount,region\n10,east\n".encode("utf-16-le"))
+
+        preview = infer_spreadsheet_schema(path, source_id="kb-utf16")
+
+        self.assertEqual(preview.datasets, ())
+        self.assertTrue(any(item.code == "unsupported_encoding" for item in preview.diagnostics))
+
+    def test_sheet_read_error_preserves_an_already_valid_sheet(self) -> None:
+        class Cell:
+            def __init__(self, value):
+                self.value = value
+                self.number_format = "General"
+
+        class Sheet:
+            def __init__(self, title, rows=(), error=None):
+                self.title = title
+                self.rows = rows
+                self.error = error
+
+            def iter_rows(self):
+                if self.error is not None:
+                    raise self.error
+                return iter(tuple(tuple(Cell(value) for value in row) for row in self.rows))
+
+        class WorkbookStub:
+            def __init__(self, sheets):
+                self.worksheets = sheets
+
+            def close(self):
+                return None
+
+        cached = WorkbookStub(
+            [
+                Sheet("Good", (("amount",), (10,))),
+                Sheet("Bad", error=OSError("broken sheet stream")),
+            ]
+        )
+        formulas = WorkbookStub([Sheet("Good", (("amount",), (10,))), Sheet("Bad", (("amount",),))])
+
+        with patch.object(schema_module, "load_workbook", side_effect=(cached, formulas)):
+            preview = infer_spreadsheet_schema(self.temp_dir / "book.xlsx", "kb-book")
+
+        self.assertEqual([dataset.worksheet_name for dataset in preview.datasets], ["Good"])
+        self.assertTrue(
+            any(
+                item.code == "sheet_read_error" and item.worksheet_name == "Bad"
+                for item in preview.diagnostics
+            )
+        )
 
     def test_infers_dates_datetimes_booleans_and_null_counts(self) -> None:
         path = write_xlsx(

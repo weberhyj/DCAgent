@@ -12,9 +12,12 @@ from decimal import Decimal, InvalidOperation
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile
 
 from openpyxl import load_workbook
 from openpyxl.styles.numbers import is_datetime as classify_datetime_format
+from openpyxl.utils.exceptions import InvalidFileException
 
 from .structured_models import (
     SpreadsheetPreview,
@@ -26,7 +29,21 @@ from .structured_models import (
 
 MAX_SAMPLED_ROWS = 10_000
 MAX_EXAMPLES = 5
+MAX_WORKSHEETS = 64
+MAX_COLUMNS_PER_DATASET = 256
+MAX_LEADING_EMPTY_ROWS = 1_000
+MAX_DIAGNOSTICS = 128
+ENCODING_PROBE_BYTES = 64 * 1024
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030")
+EXPECTED_WORKBOOK_ERRORS = (
+    BadZipFile,
+    EOFError,
+    InvalidFileException,
+    KeyError,
+    OSError,
+    ParseError,
+    ValueError,
+)
 _INTEGER_RE = re.compile(r"^[+-]?\d+$")
 _DECIMAL_RE = re.compile(r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$")
 _PHYSICAL_RE = re.compile(r"[^a-z0-9_]+")
@@ -58,7 +75,8 @@ class _ColumnAccumulator:
         self.observed_types.add(value_type)
         if not _types_are_compatible(self.observed_types) and not self.mixed_reported:
             self.mixed_reported = True
-            diagnostics.append(
+            _add_diagnostic(
+                diagnostics,
                 StructuredDiagnostic(
                     code="mixed_type",
                     message=(
@@ -68,7 +86,7 @@ class _ColumnAccumulator:
                     worksheet_name=worksheet_name,
                     column_name=self.display_name,
                     row_number=row_number,
-                )
+                ),
             )
         rendered = _render_value(value)
         if rendered not in self.examples and len(self.examples) < MAX_EXAMPLES:
@@ -100,12 +118,13 @@ def infer_spreadsheet_schema(path: Path, source_id: str) -> SpreadsheetPreview:
         worksheet_name = path.stem
         encoding = _detect_csv_encoding(path)
         if encoding is None:
-            diagnostics.append(
+            _add_diagnostic(
+                diagnostics,
                 StructuredDiagnostic(
                     code="unsupported_encoding",
                     message="CSV could not be decoded with a supported encoding.",
                     worksheet_name=worksheet_name,
-                )
+                ),
             )
             return SpreadsheetPreview(
                 source_id=source_id, datasets=(), diagnostics=tuple(diagnostics)
@@ -117,13 +136,24 @@ def infer_spreadsheet_schema(path: Path, source_id: str) -> SpreadsheetPreview:
                     for row_number, row in enumerate(csv.reader(handle), 1)
                 )
                 dataset = _infer_dataset(source_id, worksheet_name, rows, diagnostics)
+        except UnicodeDecodeError:
+            _add_diagnostic(
+                diagnostics,
+                StructuredDiagnostic(
+                    code="unsupported_encoding",
+                    message="CSV decoding failed while sampling rows.",
+                    worksheet_name=worksheet_name,
+                ),
+            )
+            dataset = None
         except (OSError, csv.Error) as exc:
-            diagnostics.append(
+            _add_diagnostic(
+                diagnostics,
                 StructuredDiagnostic(
                     code="empty_sheet",
                     message=f"CSV could not be read: {exc}",
                     worksheet_name=worksheet_name,
-                )
+                ),
             )
             dataset = None
         if dataset is not None:
@@ -134,35 +164,63 @@ def infer_spreadsheet_schema(path: Path, source_id: str) -> SpreadsheetPreview:
 
     cached_workbook = formula_workbook = None
     try:
-        cached_workbook = load_workbook(path, read_only=True, data_only=True)
-        formula_workbook = load_workbook(path, read_only=True, data_only=False)
-        formula_sheets = {sheet.title: sheet for sheet in formula_workbook.worksheets}
-        for sheet in cached_workbook.worksheets:
-            formula_sheet = formula_sheets.get(sheet.title)
-            cached_rows = (_xlsx_cached_values(row) for row in sheet.iter_rows())
-            formula_rows = (
-                (tuple(cell.value for cell in row) for row in formula_sheet.iter_rows())
-                if formula_sheet
-                else iter(())
+        try:
+            cached_workbook = load_workbook(path, read_only=True, data_only=True)
+            formula_workbook = load_workbook(path, read_only=True, data_only=False)
+        except EXPECTED_WORKBOOK_ERRORS as exc:
+            _add_diagnostic(
+                diagnostics,
+                StructuredDiagnostic(
+                    code="workbook_read_error",
+                    message=f"Workbook could not be opened: {exc}",
+                    worksheet_name=path.stem,
+                ),
             )
-            paired_rows = (
-                (row_number, tuple(cached or ()), tuple(formulas or ()))
-                for row_number, (cached, formulas) in enumerate(
-                    zip_longest(cached_rows, formula_rows, fillvalue=()), 1
+            return SpreadsheetPreview(
+                source_id=source_id, datasets=(), diagnostics=tuple(diagnostics)
+            )
+
+        cached_sheets = cached_workbook.worksheets
+        formula_sheets = {
+            sheet.title: sheet for sheet in formula_workbook.worksheets[:MAX_WORKSHEETS]
+        }
+        if len(cached_sheets) > MAX_WORKSHEETS:
+            _add_diagnostic(
+                diagnostics,
+                StructuredDiagnostic(
+                    code="worksheet_limit_exceeded",
+                    message=f"Only the first {MAX_WORKSHEETS} worksheets were sampled.",
+                    worksheet_name=path.stem,
+                ),
+            )
+        for sheet in cached_sheets[:MAX_WORKSHEETS]:
+            try:
+                formula_sheet = formula_sheets.get(sheet.title)
+                cached_rows = (_xlsx_cached_values(row) for row in sheet.iter_rows())
+                formula_rows = (
+                    (tuple(cell.value for cell in row) for row in formula_sheet.iter_rows())
+                    if formula_sheet
+                    else iter(())
                 )
-            )
-            dataset = _infer_dataset(source_id, sheet.title, paired_rows, diagnostics)
+                paired_rows = (
+                    (row_number, tuple(cached or ()), tuple(formulas or ()))
+                    for row_number, (cached, formulas) in enumerate(
+                        zip_longest(cached_rows, formula_rows, fillvalue=()), 1
+                    )
+                )
+                dataset = _infer_dataset(source_id, sheet.title, paired_rows, diagnostics)
+            except EXPECTED_WORKBOOK_ERRORS as exc:
+                _add_diagnostic(
+                    diagnostics,
+                    StructuredDiagnostic(
+                        code="sheet_read_error",
+                        message=f"Worksheet could not be sampled: {exc}",
+                        worksheet_name=sheet.title,
+                    ),
+                )
+                continue
             if dataset is not None:
                 datasets.append(dataset)
-    except Exception as exc:
-        diagnostics.append(
-            StructuredDiagnostic(
-                code="empty_sheet",
-                message=f"Workbook could not be read: {exc}",
-                worksheet_name=path.stem,
-            )
-        )
-        datasets.clear()
     finally:
         if formula_workbook is not None:
             formula_workbook.close()
@@ -183,23 +241,49 @@ def _infer_dataset(
     header_row_number: int | None = None
     header_values: tuple[Any, ...] = ()
     header_formulas: tuple[Any, ...] = ()
+    leading_empty_rows = 0
     for row_number, values, formulas in iterator:
         if _row_has_value(values, formulas):
             header_row_number = row_number
             header_values = values
             header_formulas = formulas
             break
+        leading_empty_rows += 1
+        if leading_empty_rows > MAX_LEADING_EMPTY_ROWS:
+            _add_diagnostic(
+                diagnostics,
+                StructuredDiagnostic(
+                    code="leading_empty_rows_exceeded",
+                    message=f"Header was not found within {MAX_LEADING_EMPTY_ROWS} empty rows.",
+                    worksheet_name=worksheet_name,
+                    row_number=row_number,
+                ),
+            )
+            return None
     if header_row_number is None:
-        diagnostics.append(
+        _add_diagnostic(
+            diagnostics,
             StructuredDiagnostic(
                 code="empty_sheet",
                 message="Worksheet has no non-empty header row.",
                 worksheet_name=worksheet_name,
-            )
+            ),
         )
         return None
 
-    width = max(len(header_values), len(header_formulas))
+    raw_width = max(len(header_values), len(header_formulas))
+    columns_truncated = raw_width > MAX_COLUMNS_PER_DATASET
+    if columns_truncated:
+        _add_diagnostic(
+            diagnostics,
+            StructuredDiagnostic(
+                code="column_limit_exceeded",
+                message=f"Only the first {MAX_COLUMNS_PER_DATASET} columns were sampled.",
+                worksheet_name=worksheet_name,
+                row_number=header_row_number,
+            ),
+        )
+    width = min(raw_width, MAX_COLUMNS_PER_DATASET)
     accumulators = _build_columns(
         header_values, header_formulas, width, worksheet_name, header_row_number, diagnostics
     )
@@ -207,14 +291,15 @@ def _infer_dataset(
         cached_value = header_values[index] if index < len(header_values) else None
         formula = header_formulas[index] if index < len(header_formulas) else None
         if _is_formula(formula) and _is_null(cached_value):
-            diagnostics.append(
+            _add_diagnostic(
+                diagnostics,
                 StructuredDiagnostic(
                     code="formula_cache_missing",
                     message="Formula has no cached result; it was not evaluated.",
                     worksheet_name=worksheet_name,
                     column_name=accumulator.display_name,
                     row_number=header_row_number,
-                )
+                ),
             )
     sampled_rows = 0
     while sampled_rows < MAX_SAMPLED_ROWS:
@@ -225,10 +310,22 @@ def _infer_dataset(
         if not _row_has_value(values, formulas):
             continue
         row_width = max(len(values), len(formulas))
-        if row_width > len(accumulators):
+        if row_width > MAX_COLUMNS_PER_DATASET and not columns_truncated:
+            columns_truncated = True
+            _add_diagnostic(
+                diagnostics,
+                StructuredDiagnostic(
+                    code="column_limit_exceeded",
+                    message=f"Only the first {MAX_COLUMNS_PER_DATASET} columns were sampled.",
+                    worksheet_name=worksheet_name,
+                    row_number=row_number,
+                ),
+            )
+        target_width = min(row_width, MAX_COLUMNS_PER_DATASET)
+        if target_width > len(accumulators):
             _append_missing_columns(
                 accumulators,
-                row_width - len(accumulators),
+                target_width - len(accumulators),
                 worksheet_name,
                 header_row_number,
                 diagnostics,
@@ -239,14 +336,15 @@ def _infer_dataset(
             value = values[index] if index < len(values) else None
             formula = formulas[index] if index < len(formulas) else None
             if _is_formula(formula) and _is_null(value):
-                diagnostics.append(
+                _add_diagnostic(
+                    diagnostics,
                     StructuredDiagnostic(
                         code="formula_cache_missing",
                         message="Formula has no cached result; it was not evaluated.",
                         worksheet_name=worksheet_name,
                         column_name=accumulator.display_name,
                         row_number=row_number,
-                    )
+                    ),
                 )
             accumulator.observe(value, row_number, worksheet_name, diagnostics)
 
@@ -286,24 +384,26 @@ def _build_columns(
             while f"{base}_{suffix}" in used_names:
                 suffix += 1
             physical = f"{base}_{suffix}"
-            diagnostics.append(
+            _add_diagnostic(
+                diagnostics,
                 StructuredDiagnostic(
                     code="duplicate_header",
                     message=f"Duplicate header {original or base!r} received a stable suffix.",
                     worksheet_name=worksheet_name,
                     column_name=original or base,
                     row_number=row_number,
-                )
+                ),
             )
         elif not original:
-            diagnostics.append(
+            _add_diagnostic(
+                diagnostics,
                 StructuredDiagnostic(
                     code="missing_header",
                     message=f"Blank header received generated name {physical!r}.",
                     worksheet_name=worksheet_name,
                     column_name=physical,
                     row_number=row_number,
-                )
+                ),
             )
         used_names.add(physical)
         accumulators.append(
@@ -336,14 +436,15 @@ def _append_missing_columns(
             physical = f"{base}_{suffix}"
             suffix += 1
         used_names.add(physical)
-        diagnostics.append(
+        _add_diagnostic(
+            diagnostics,
             StructuredDiagnostic(
                 code="missing_header",
                 message=f"Missing header received generated name {physical!r}.",
                 worksheet_name=worksheet_name,
                 column_name=physical,
                 row_number=row_number,
-            )
+            ),
         )
         accumulators.append(
             _ColumnAccumulator(
@@ -357,17 +458,41 @@ def _append_missing_columns(
 
 
 def _detect_csv_encoding(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            probe = handle.read(ENCODING_PROBE_BYTES)
+    except OSError:
+        return None
+
+    if probe.startswith((b"\xff\xfe", b"\xfe\xff", b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return None
+    if b"\x00" in probe:
+        return None
     for encoding in CSV_ENCODINGS:
         decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
         try:
-            with path.open("rb") as handle:
-                while chunk := handle.read(64 * 1024):
-                    decoder.decode(chunk, final=False)
-                decoder.decode(b"", final=True)
-        except (LookupError, UnicodeDecodeError, OSError):
+            decoder.decode(probe, final=False)
+        except (LookupError, UnicodeDecodeError):
             continue
         return encoding
     return None
+
+
+def _add_diagnostic(
+    diagnostics: list[StructuredDiagnostic], diagnostic: StructuredDiagnostic
+) -> None:
+    if diagnostics and diagnostics[-1].code == "diagnostics_truncated":
+        return
+    if len(diagnostics) >= MAX_DIAGNOSTICS - 1:
+        diagnostics.append(
+            StructuredDiagnostic(
+                code="diagnostics_truncated",
+                message=f"Diagnostics were truncated at {MAX_DIAGNOSTICS} entries.",
+                worksheet_name=diagnostic.worksheet_name,
+            )
+        )
+        return
+    diagnostics.append(diagnostic)
 
 
 def _normalize_physical_name(original: str, index: int) -> str:
