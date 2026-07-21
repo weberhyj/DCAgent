@@ -65,7 +65,7 @@ function createManagement(sourceType: string) {
     knowledgeChunksLoading: shallowRef(false),
     structuredPreviewLoading: shallowRef(false),
     structuredSchemaConfirming: shallowRef(false),
-    error: shallowRef(null),
+    error: shallowRef<string | null>(null),
     loadKnowledgeSources: vi.fn().mockResolvedValue(undefined),
     inspectKnowledgeSource: vi.fn().mockResolvedValue(undefined),
     loadStructuredPreview: vi.fn().mockResolvedValue(undefined),
@@ -134,5 +134,37 @@ describe('KnowledgeSourceDetailPage structured schema', () => {
         }],
       }],
     })
+  })
+
+  it('shows the loading state while a structured preview is loading', async () => {
+    const management = createManagement('XLSX')
+    management.structuredPreviewLoading.value = true
+    useManagement.mockReturnValue(management)
+
+    const wrapper = mount(KnowledgeSourceDetailPage, {
+      global: { stubs: { RouterLink: RouterLinkStub } },
+    })
+    await flushPromises()
+
+    expect(wrapper.get('.module-state').text()).toContain('正在读取')
+    expect(wrapper.find('[data-testid="structured-schema-panel"]').exists()).toBe(false)
+    expect(wrapper.find('.chunk-panel').exists()).toBe(false)
+  })
+
+  it('shows structured errors without falling through to the legacy empty state', async () => {
+    const management = createManagement('CSV')
+    management.error.value = 'Structured preview failed'
+    useManagement.mockReturnValue(management)
+
+    const wrapper = mount(KnowledgeSourceDetailPage, {
+      global: { stubs: { RouterLink: RouterLinkStub } },
+    })
+    await flushPromises()
+
+    expect(wrapper.findAll('.module-state')).toHaveLength(1)
+    expect(wrapper.get('.module-state').text()).toBe('Structured preview failed')
+    expect(wrapper.text()).not.toContain('暂无可预览片段')
+    expect(wrapper.find('[data-testid="structured-schema-panel"]').exists()).toBe(false)
+    expect(wrapper.find('.chunk-panel').exists()).toBe(false)
   })
 })
