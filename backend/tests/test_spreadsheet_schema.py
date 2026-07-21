@@ -5,7 +5,9 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 
-from app.spreadsheet_schema import infer_spreadsheet_schema
+from openpyxl import Workbook
+
+from app.spreadsheet_schema import _infer_dataset, infer_spreadsheet_schema
 from app.structured_models import StructuredColumnType
 from tests.support.structured_fakes import write_csv, write_formula_xlsx, write_xlsx
 
@@ -72,12 +74,71 @@ class SpreadsheetSchemaInferenceTest(unittest.TestCase):
         preview = infer_spreadsheet_schema(path, source_id="kb-formula")
 
         self.assertEqual(len(preview.datasets), 1)
-        diagnostic = next(
-            item for item in preview.diagnostics if item.code == "formula_cache_missing"
-        )
+        matching = [item for item in preview.diagnostics if item.code == "formula_cache_missing"]
+        self.assertEqual(len(matching), 1)
+        diagnostic = matching[0]
         self.assertEqual(diagnostic.worksheet_name, "Sheet1")
         self.assertEqual(diagnostic.column_name, "合计")
         self.assertEqual(diagnostic.row_number, 2)
+
+    def test_formula_without_cached_header_value_is_reported(self) -> None:
+        path = self.temp_dir / "formula-header.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Sheet1"
+        sheet.append(["=A1"])
+        sheet.append(["value"])
+        workbook.save(path)
+        workbook.close()
+
+        preview = infer_spreadsheet_schema(path, source_id="kb-formula-header")
+
+        matching = [item for item in preview.diagnostics if item.code == "formula_cache_missing"]
+        self.assertEqual(len(matching), 1)
+        diagnostic = matching[0]
+        self.assertEqual(diagnostic.worksheet_name, "Sheet1")
+        self.assertEqual(diagnostic.column_name, "column_1")
+        self.assertEqual(diagnostic.row_number, 1)
+
+    def test_sampling_cap_does_not_consume_an_extra_data_row(self) -> None:
+        consumed: list[int] = []
+
+        def rows():
+            consumed.append(1)
+            yield (1, ("value",), ())
+            for row_number in range(2, 10_002):
+                consumed.append(row_number)
+                yield (row_number, (str(row_number),), ())
+            consumed.append(10_002)
+            yield (10_002, ("must-not-be-read",), ())
+
+        diagnostics = []
+        dataset = _infer_dataset("kb-cap", "Sheet1", rows(), diagnostics)
+
+        self.assertIsNotNone(dataset)
+        assert dataset is not None
+        self.assertEqual(dataset.sampled_rows, 10_000)
+        self.assertEqual(len(consumed), 10_001)
+        self.assertNotIn(10_002, consumed)
+
+    def test_excel_number_format_distinguishes_date_from_midnight_datetime(self) -> None:
+        path = self.temp_dir / "midnight.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Types"
+        sheet.append(["day", "timestamp"])
+        sheet.append([date(2026, 1, 1), datetime(2026, 1, 1, 0, 0, 0)])
+        sheet["A2"].number_format = "yyyy-mm-dd"
+        sheet["B2"].number_format = "yyyy-mm-dd h:mm:ss"
+        workbook.save(path)
+        workbook.close()
+
+        preview = infer_spreadsheet_schema(path, source_id="kb-midnight")
+
+        self.assertEqual(
+            [column.data_type for column in preview.datasets[0].columns],
+            [StructuredColumnType.DATE, StructuredColumnType.DATETIME],
+        )
 
     def test_empty_sheet_is_blocking(self) -> None:
         path = write_xlsx(self.temp_dir / "empty.xlsx", "Sheet1", [])

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.styles.numbers import is_datetime as classify_datetime_format
 
 from .structured_models import (
     SpreadsheetPreview,
@@ -138,8 +139,12 @@ def infer_spreadsheet_schema(path: Path, source_id: str) -> SpreadsheetPreview:
         formula_sheets = {sheet.title: sheet for sheet in formula_workbook.worksheets}
         for sheet in cached_workbook.worksheets:
             formula_sheet = formula_sheets.get(sheet.title)
-            cached_rows = sheet.iter_rows(values_only=True)
-            formula_rows = formula_sheet.iter_rows(values_only=True) if formula_sheet else iter(())
+            cached_rows = (_xlsx_cached_values(row) for row in sheet.iter_rows())
+            formula_rows = (
+                (tuple(cell.value for cell in row) for row in formula_sheet.iter_rows())
+                if formula_sheet
+                else iter(())
+            )
             paired_rows = (
                 (row_number, tuple(cached or ()), tuple(formulas or ()))
                 for row_number, (cached, formulas) in enumerate(
@@ -198,9 +203,24 @@ def _infer_dataset(
     accumulators = _build_columns(
         header_values, header_formulas, width, worksheet_name, header_row_number, diagnostics
     )
+    for index, accumulator in enumerate(accumulators):
+        cached_value = header_values[index] if index < len(header_values) else None
+        formula = header_formulas[index] if index < len(header_formulas) else None
+        if _is_formula(formula) and _is_null(cached_value):
+            diagnostics.append(
+                StructuredDiagnostic(
+                    code="formula_cache_missing",
+                    message="Formula has no cached result; it was not evaluated.",
+                    worksheet_name=worksheet_name,
+                    column_name=accumulator.display_name,
+                    row_number=header_row_number,
+                )
+            )
     sampled_rows = 0
-    for row_number, values, formulas in iterator:
-        if sampled_rows >= MAX_SAMPLED_ROWS:
+    while sampled_rows < MAX_SAMPLED_ROWS:
+        try:
+            row_number, values, formulas = next(iterator)
+        except StopIteration:
             break
         if not _row_has_value(values, formulas):
             continue
@@ -361,10 +381,6 @@ def _classify_value(value: Any) -> StructuredColumnType:
     if isinstance(value, bool):
         return StructuredColumnType.BOOLEAN
     if isinstance(value, datetime):
-        # openpyxl materializes date-only cells as midnight datetimes in some
-        # workbooks; treat those as dates while retaining actual time values.
-        if value.time() == datetime.min.time():
-            return StructuredColumnType.DATE
         return StructuredColumnType.DATETIME
     if isinstance(value, date):
         return StructuredColumnType.DATE
@@ -454,3 +470,13 @@ def _row_has_value(values: Sequence[Any], formulas: Sequence[Any]) -> bool:
     return any(not _is_null(value) for value in values) or any(
         _is_formula(value) for value in formulas
     )
+
+
+def _xlsx_cached_values(row: Sequence[Any]) -> tuple[Any, ...]:
+    values: list[Any] = []
+    for cell in row:
+        value = cell.value
+        if isinstance(value, datetime) and classify_datetime_format(cell.number_format) == "date":
+            value = value.date()
+        values.append(value)
+    return tuple(values)
