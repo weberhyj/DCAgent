@@ -985,6 +985,73 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
         self.assertEqual(gateway.calls, [])
 
+    def test_filter_field_name_inside_equality_value_does_not_fake_an_aggregate(
+        self,
+    ) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        level = replace(
+            dataset.schema.columns[1],
+            physical_name="level",
+            original_name="等级",
+            display_name="等级",
+            aliases=(),
+        )
+        standard = replace(
+            dataset.schema.columns[2],
+            physical_name="standard",
+            original_name="标准",
+            display_name="标准",
+            aliases=(),
+        )
+        filter_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(dataset.schema.columns[0], level, standard),
+                    ),
+                ),
+            ),
+        )
+
+        for question in ("等级为最高标准", "等级为最高标准的记录", "等级为标准最高"):
+            with self.subTest(question=question):
+                provider = RecordingLLMProvider()
+                gateway = RecordingClickHouseGateway()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(lambda: filter_catalog, gateway),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(provider.calls, 1)
+                self.assertEqual(gateway.calls, [])
+
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: filter_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(
+            conversation_id,
+            "等级为最高标准的订单金额平均值",
+            "source",
+        )
+
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(len(gateway.calls), 1)
+        self.assertEqual(gateway.calls[0][1]["filter_0"], "最高标准")
+
     def test_ambiguous_cross_dataset_equality_with_real_aggregate_stays_structured(
         self,
     ) -> None:

@@ -213,9 +213,21 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
         for column in dataset.schema.columns
         if column.allow_filter
     )
-    normalized = _normalize(
-        _mask_aggregate_equality_values(question, filter_columns, catalog_names)
-    )
+    metric_names = {
+        normalized
+        for dataset in catalog.datasets
+        for column in dataset.schema.columns
+        if column.allow_aggregate
+        for value in (
+            column.physical_name,
+            column.original_name,
+            column.display_name,
+            *column.aliases,
+        )
+        for normalized in (_normalize(value),)
+        if normalized
+    }
+    normalized = _normalize(_mask_aggregate_equality_values(question, filter_columns, metric_names))
     return _has_catalog_span_with_independent_aggregate(normalized, catalog_names)
 
 
@@ -275,7 +287,7 @@ def _has_catalog_span_with_independent_aggregate(
 def _mask_aggregate_equality_values(
     question: str,
     filter_columns: tuple[StructuredColumnSchema, ...],
-    catalog_names: set[str],
+    metric_names: set[str],
 ) -> str:
     masked = list(question)
     spans = {
@@ -285,11 +297,53 @@ def _mask_aggregate_equality_values(
     }
     for value_start, value_end in spans:
         value = question[value_start:value_end]
-        if _has_aggregate_language(value) and not _has_catalog_span_with_independent_aggregate(
-            _normalize(value), catalog_names
-        ):
+        if not _has_aggregate_language(value):
+            continue
+        normalized_value = _normalize(value)
+        preserve_offset = _metric_aggregate_start(normalized_value, metric_names)
+        if preserve_offset is None:
             masked[value_start:value_end] = "_" * (value_end - value_start)
+            continue
+        raw_offset = _raw_offset_for_normalized_offset(value, preserve_offset)
+        masked[value_start : value_start + raw_offset] = "_" * raw_offset
     return "".join(masked)
+
+
+def _metric_aggregate_start(normalized_value: str, metric_names: set[str]) -> int | None:
+    spans: set[tuple[int, int]] = set()
+    for name in metric_names:
+        start = normalized_value.find(name)
+        while start >= 0:
+            spans.add((start, start + len(name)))
+            start = normalized_value.find(name, start + 1)
+    maximal_spans = (
+        span
+        for span in spans
+        if not any(
+            other_start <= span[0]
+            and span[1] <= other_end
+            and other_end - other_start > span[1] - span[0]
+            for other_start, other_end in spans
+        )
+    )
+    candidates: list[tuple[int, int]] = []
+    for start, end in maximal_spans:
+        suffix = normalized_value[end:]
+        if suffix.startswith("的"):
+            suffix = suffix[1:]
+        suffix = _strip_natural_aggregate_tail(suffix)
+        if _matching_aggregate_suffix(suffix) == suffix:
+            candidates.append((start, end))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda span: (span[0], span[1] - span[0]))[0]
+
+
+def _raw_offset_for_normalized_offset(value: str, normalized_offset: int) -> int:
+    for index in range(len(value) + 1):
+        if len(_normalize(value[:index])) >= normalized_offset:
+            return index
+    return len(value)
 
 
 def _is_implicit_row_count(question: str) -> bool:
