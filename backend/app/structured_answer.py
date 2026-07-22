@@ -278,13 +278,17 @@ def _mask_aggregate_equality_values(
     catalog_names: set[str],
 ) -> str:
     masked = list(question)
-    for value_start, value_end in _explicit_equality_value_spans(question, filter_columns):
+    spans = {
+        span
+        for column in filter_columns
+        for span in _explicit_equality_value_spans(question, (column,))
+    }
+    for value_start, value_end in spans:
         value = question[value_start:value_end]
-        if not _has_aggregate_language(value):
-            continue
-        if _has_catalog_span_with_independent_aggregate(_normalize(value), catalog_names):
-            continue
-        masked[value_start:value_end] = "_" * (value_end - value_start)
+        if _has_aggregate_language(value) and not _has_catalog_span_with_independent_aggregate(
+            _normalize(value), catalog_names
+        ):
+            masked[value_start:value_end] = "_" * (value_end - value_start)
     return "".join(masked)
 
 

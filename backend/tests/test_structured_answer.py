@@ -889,6 +889,172 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             ["最高", "最高标准"],
         )
 
+    def test_ambiguous_cross_dataset_equality_values_keep_legacy_agent_path(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        level = replace(
+            dataset.schema.columns[1],
+            physical_name="level",
+            original_name="等级",
+            display_name="等级",
+            aliases=(),
+        )
+        first = replace(
+            dataset,
+            schema=replace(
+                dataset.schema,
+                columns=(
+                    dataset.schema.columns[0],
+                    level,
+                    dataset.schema.columns[2],
+                ),
+            ),
+        )
+        second_level = replace(level, physical_name="grade_level")
+        second = replace(
+            first,
+            schema=replace(
+                first.schema,
+                dataset_id="ds-sales-2",
+                source_id="kb-sales-2",
+                columns=(
+                    first.schema.columns[0],
+                    second_level,
+                    first.schema.columns[2],
+                ),
+            ),
+            source_name="sales-2.xlsx",
+            active_publication=replace(
+                first.active_publication,
+                publication_id="pub-sales-2",
+                dataset_id="ds-sales-2",
+                physical_table_name="structured_ds_sales_2_v1",
+            ),
+        )
+        ambiguous_catalog = replace(catalog, datasets=(first, second))
+
+        for question in ("等级为最高", "等级为最高的记录", "sales.xlsx的等级为最高"):
+            with self.subTest(question=question):
+                provider = RecordingLLMProvider()
+                gateway = RecordingClickHouseGateway()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(
+                        lambda: ambiguous_catalog,
+                        gateway,
+                    ),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(provider.calls, 1)
+                self.assertEqual(gateway.calls, [])
+
+    def test_ambiguous_same_dataset_alias_equality_value_keeps_legacy_agent_path(
+        self,
+    ) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        region = replace(dataset.schema.columns[1], aliases=("等级",))
+        order_date = replace(dataset.schema.columns[2], aliases=("等级",))
+        ambiguous_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(dataset.schema.columns[0], region, order_date),
+                    ),
+                ),
+            ),
+        )
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: ambiguous_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "等级为最高", "source")
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(gateway.calls, [])
+
+    def test_ambiguous_cross_dataset_equality_with_real_aggregate_stays_structured(
+        self,
+    ) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        level = replace(
+            dataset.schema.columns[1],
+            physical_name="level",
+            original_name="等级",
+            display_name="等级",
+            aliases=(),
+        )
+        first = replace(
+            dataset,
+            schema=replace(
+                dataset.schema,
+                columns=(
+                    dataset.schema.columns[0],
+                    level,
+                    dataset.schema.columns[2],
+                ),
+            ),
+        )
+        second_level = replace(level, physical_name="grade_level")
+        second = replace(
+            first,
+            schema=replace(
+                first.schema,
+                dataset_id="ds-sales-2",
+                source_id="kb-sales-2",
+                columns=(
+                    first.schema.columns[0],
+                    second_level,
+                    first.schema.columns[2],
+                ),
+            ),
+            source_name="sales-2.xlsx",
+            active_publication=replace(
+                first.active_publication,
+                publication_id="pub-sales-2",
+                dataset_id="ds-sales-2",
+                physical_table_name="structured_ds_sales_2_v1",
+            ),
+        )
+        ambiguous_catalog = replace(catalog, datasets=(first, second))
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: ambiguous_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "等级为最高的订单金额平均值",
+            "source",
+        )
+        repository.send_message(
+            conversation_id,
+            "sales.xlsx的等级为最高的订单金额平均值",
+            "source",
+        )
+
+        self.assertEqual(provider.calls, 0)
+        self.assertIn("澄清", messages[-1].paragraphs[0].text)
+        self.assertEqual(len(gateway.calls), 1)
+        self.assertEqual(gateway.calls[0][1]["filter_0"], "最高")
+
     def test_equality_filter_and_aggregate_orderings_remain_structured_candidates(
         self,
     ) -> None:
