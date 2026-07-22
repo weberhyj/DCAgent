@@ -13,6 +13,7 @@ from .structured_models import (
     StructuredAggregateResult,
     StructuredCatalog,
     StructuredClarification,
+    StructuredColumnSchema,
     StructuredDatasetCatalog,
     StructuredFilter,
     StructuredIntent,
@@ -22,6 +23,7 @@ from .structured_query import (
     StructuredQueryExecutor,
     StructuredQueryPlanner,
     UnsafeStructuredQueryError,
+    _explicit_equality_value_spans,
     resolve_structured_intent,
 )
 from .time_utils import display_datetime_label
@@ -91,10 +93,6 @@ _AGGREGATE_CONCEPT_TERMS = tuple(
 )
 _NATURAL_AGGREGATE_TAILS = ("是多少", "有多少", "多少", "呢", "吗")
 _EQUALITY_FIELD_DELIMITERS = ("，", ",", "。", "；", ";", "且", "或")
-_EQUALITY_AGGREGATE_VALUE_RE = re.compile(
-    rf"\s*(?P<value>{'|'.join(re.escape(term) for term in sorted(_CHINESE_AGGREGATE_TERMS, key=len, reverse=True))})"
-    r"(?=$|[\s，,。？?的且或；;吗呢])"
-)
 
 
 class StructuredAnswerService:
@@ -209,20 +207,15 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     catalog_names = {
         name for dataset in catalog.datasets for name in _dataset_names(dataset) if name
     }
-    filter_names = {
-        _normalize(value)
+    filter_columns = tuple(
+        column
         for dataset in catalog.datasets
         for column in dataset.schema.columns
         if column.allow_filter
-        for value in (
-            column.physical_name,
-            column.original_name,
-            column.display_name,
-            *column.aliases,
-        )
-        if value
-    }
-    normalized = _normalize(_mask_aggregate_equality_values(question, filter_names))
+    )
+    normalized = _normalize(
+        _mask_aggregate_equality_values(question, filter_columns, catalog_names)
+    )
     return _has_catalog_span_with_independent_aggregate(normalized, catalog_names)
 
 
@@ -279,25 +272,18 @@ def _has_catalog_span_with_independent_aggregate(
     return False
 
 
-def _mask_aggregate_equality_values(question: str, filter_names: set[str]) -> str:
+def _mask_aggregate_equality_values(
+    question: str,
+    filter_columns: tuple[StructuredColumnSchema, ...],
+    catalog_names: set[str],
+) -> str:
     masked = list(question)
-    for operator in re.finditer(r"为|=", question):
-        context = _normalize(question[max(0, operator.start() - 2) : operator.end()])
-        if any(context.endswith(item) for item in _COPULA_FRAGMENTS):
+    for value_start, value_end in _explicit_equality_value_spans(question, filter_columns):
+        value = question[value_start:value_end]
+        if not _has_aggregate_language(value):
             continue
-        prefix = question[: operator.start()]
-        field_start = max(
-            (prefix.rfind(delimiter) + 1 for delimiter in _EQUALITY_FIELD_DELIMITERS),
-            default=0,
-        )
-        field = _normalize(question[field_start : operator.start()])
-        if not any(field.endswith(name) for name in filter_names):
+        if _has_catalog_span_with_independent_aggregate(_normalize(value), catalog_names):
             continue
-        value_match = _EQUALITY_AGGREGATE_VALUE_RE.match(question[operator.end() :])
-        if value_match is None:
-            continue
-        value_start = operator.end() + value_match.start("value")
-        value_end = operator.end() + value_match.end("value")
         masked[value_start:value_end] = "_" * (value_end - value_start)
     return "".join(masked)
 

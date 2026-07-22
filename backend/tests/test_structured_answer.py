@@ -796,6 +796,13 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         questions = (
             "等级为最高",
             "等级为最高的记录",
+            "等级为最高.",
+            "等级为最高！",
+            "等级为最高!",
+            "等级为最高吧",
+            "等级为最高呀",
+            "等级为最高吧！",
+            "等级为最高标准",
             *(
                 f"等级为{value}{tail}"
                 for value in ("最高", "最低", "平均值", "总和")
@@ -819,7 +826,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 self.assertEqual(gateway.calls, [])
 
     def test_real_aggregate_natural_tails_remain_structured_candidates(self) -> None:
-        for question in ("订单金额最高吗", "订单金额平均值呢"):
+        for question in ("订单金额最高吗", "订单金额平均值呢", "订单金额最高吧！"):
             with self.subTest(question=question):
                 provider = RecordingLLMProvider()
                 gateway = RecordingClickHouseGateway()
@@ -872,11 +879,15 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         )
         _, conversation_id, _ = repository.create_conversation()
 
-        repository.send_message(conversation_id, "等级为最高的订单金额平均值", "source")
+        for question in ("等级为最高的订单金额平均值", "等级为最高标准的订单金额平均值"):
+            repository.send_message(conversation_id, question, "source")
 
         self.assertEqual(provider.calls, 0)
-        self.assertEqual(len(gateway.calls), 1)
-        self.assertEqual(gateway.calls[0][1]["filter_0"], "最高")
+        self.assertEqual(len(gateway.calls), 2)
+        self.assertEqual(
+            [parameters["filter_0"] for _, parameters in gateway.calls],
+            ["最高", "最高标准"],
+        )
 
     def test_equality_filter_and_aggregate_orderings_remain_structured_candidates(
         self,

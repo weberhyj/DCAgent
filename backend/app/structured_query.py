@@ -711,6 +711,20 @@ def _parse_explicit_filter_clauses(
     )
 
 
+def _explicit_equality_value_spans(
+    question: str,
+    columns: tuple[StructuredColumnSchema, ...],
+) -> tuple[tuple[int, int], ...]:
+    parsed = _parse_explicit_filter_clauses(question, columns)
+    if parsed.issue is not None:
+        return ()
+    return tuple(
+        (match.span.end - len(match.item.value), match.span.end)
+        for match in parsed.value or ()
+        if match.item.operator == "eq"
+    )
+
+
 def _resolve_operator_field(
     segment: str,
     columns: tuple[StructuredColumnSchema, ...],
