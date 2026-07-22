@@ -3,8 +3,10 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 from decimal import Decimal
+from threading import Event, Lock, Thread
 from unittest.mock import patch
 
+from app.clickhouse_gateway import StructuredStorageError
 from app.database import (
     Database,
     KnowledgeSourceRecord,
@@ -13,7 +15,12 @@ from app.database import (
     StructuredPublicationRecord,
 )
 from app.infra.health import DependencyHealthRegistry
-from app.main import create_default_repository, create_production_app
+from app.main import (
+    _LazyStructuredQueryGateway,
+    create_app,
+    create_default_repository,
+    create_production_app,
+)
 from app.models import ChatMessageModel, ChatState, ResponseParagraphModel
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
@@ -54,6 +61,22 @@ class RecordingClickHouseGateway:
         return self.result
 
 
+class LifecycleClickHouseClient:
+    def __init__(self, query_handler=None) -> None:
+        self.close_calls = 0
+        self.query_calls = 0
+        self.query_handler = query_handler
+
+    def query(self, *args: object, **kwargs: object) -> object:
+        self.query_calls += 1
+        if self.query_handler is not None:
+            return self.query_handler(*args, **kwargs)
+        return {"value": 1}
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 class CountingStructuredService:
     def __init__(self, service: StructuredAnswerService) -> None:
         self.service = service
@@ -69,6 +92,168 @@ def empty_state() -> ChatState:
 
 
 class StructuredAnswerServiceTest(unittest.TestCase):
+    def test_lazy_gateway_closes_same_client_when_gateway_rejects_identity_reuse(self) -> None:
+        client = LifecycleClickHouseClient()
+        gateway = _LazyStructuredQueryGateway(lambda **_kwargs: client, "http://clickhouse")
+
+        with self.assertRaises(StructuredStorageError):
+            gateway.query("SELECT 1", {})
+
+        self.assertEqual(client.close_calls, 1)
+        self.assertIsNone(gateway._clients)
+
+    def test_lazy_gateway_constructor_failure_closes_clients_and_allows_clean_retry(self) -> None:
+        clients: list[LifecycleClickHouseClient] = []
+
+        def build_client(**_kwargs: object) -> LifecycleClickHouseClient:
+            client = LifecycleClickHouseClient()
+            clients.append(client)
+            return client
+
+        gateway = _LazyStructuredQueryGateway(build_client, "http://clickhouse")
+        with patch("app.main.ClickHouseGateway", side_effect=RuntimeError("constructor failed")):
+            with self.assertRaisesRegex(RuntimeError, "constructor failed"):
+                gateway.query("SELECT 1", {})
+
+        self.assertEqual([client.close_calls for client in clients], [1, 1])
+        self.assertIsNone(gateway._clients)
+        self.assertEqual(gateway.query("SELECT 1", {}), {"value": 1})
+        self.assertEqual(len(clients), 4)
+
+    def test_lazy_gateway_close_is_permanent_and_idempotent(self) -> None:
+        clients: list[LifecycleClickHouseClient] = []
+
+        def build_client(**_kwargs: object) -> LifecycleClickHouseClient:
+            client = LifecycleClickHouseClient()
+            clients.append(client)
+            return client
+
+        gateway = _LazyStructuredQueryGateway(build_client, "http://clickhouse")
+        gateway.query("SELECT 1", {})
+
+        gateway.close()
+        gateway.close()
+
+        self.assertEqual([client.close_calls for client in clients], [1, 1])
+        with self.assertRaisesRegex(StructuredStorageError, "closed"):
+            gateway.query("SELECT 1", {})
+        self.assertEqual(len(clients), 2)
+
+    def test_lazy_gateway_close_waits_for_inflight_query_and_blocks_new_queries(self) -> None:
+        query_started = Event()
+        release_query = Event()
+        close_returned = Event()
+        clients: list[LifecycleClickHouseClient] = []
+
+        def query_handler(*_args: object, **_kwargs: object) -> object:
+            query_started.set()
+            self.assertTrue(release_query.wait(2))
+            return {"value": 1}
+
+        def build_client(**_kwargs: object) -> LifecycleClickHouseClient:
+            handler = query_handler if len(clients) == 1 else None
+            client = LifecycleClickHouseClient(handler)
+            clients.append(client)
+            return client
+
+        gateway = _LazyStructuredQueryGateway(build_client, "http://clickhouse")
+        query_thread = Thread(target=lambda: gateway.query("SELECT 1", {}))
+        query_thread.start()
+        self.assertTrue(query_started.wait(2))
+        close_thread = Thread(target=lambda: (gateway.close(), close_returned.set()))
+        close_thread.start()
+
+        self.assertFalse(close_returned.wait(0.1))
+        with self.assertRaisesRegex(StructuredStorageError, "closed"):
+            gateway.query("SELECT 2", {})
+        self.assertEqual([client.close_calls for client in clients], [0, 0])
+
+        release_query.set()
+        query_thread.join(2)
+        close_thread.join(2)
+        self.assertFalse(query_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual([client.close_calls for client in clients], [1, 1])
+
+    def test_lazy_gateway_allows_fifteen_queries_to_run_concurrently(self) -> None:
+        entered = 0
+        entered_lock = Lock()
+        all_entered = Event()
+        release = Event()
+        errors: list[Exception] = []
+        clients: list[LifecycleClickHouseClient] = []
+
+        def query_handler(*_args: object, **_kwargs: object) -> object:
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+                if entered == 15:
+                    all_entered.set()
+            release.wait(2)
+            return {"value": 1}
+
+        def build_client(**_kwargs: object) -> LifecycleClickHouseClient:
+            handler = query_handler if len(clients) == 1 else None
+            client = LifecycleClickHouseClient(handler)
+            clients.append(client)
+            return client
+
+        gateway = _LazyStructuredQueryGateway(build_client, "http://clickhouse")
+
+        def run_query() -> None:
+            try:
+                gateway.query("SELECT 1", {})
+            except Exception as error:
+                errors.append(error)
+
+        threads = [Thread(target=run_query) for _ in range(15)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(all_entered.wait(2))
+        release.set()
+        for thread in threads:
+            thread.join(2)
+        self.assertEqual(errors, [])
+
+    def test_default_repository_close_releases_lazy_clickhouse_clients_once(self) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        clients: list[LifecycleClickHouseClient] = []
+
+        def build_client(**_kwargs: object) -> LifecycleClickHouseClient:
+            client = LifecycleClickHouseClient()
+            clients.append(client)
+            return client
+
+        repository = create_default_repository(
+            environ={"OFFLINE_MODE": "true", "STRUCTURED_QUERY_ENABLED": "true"},
+            database_factory=lambda _url: database,
+            clickhouse_client_factory=build_client,
+        )
+        repository._structured_service._clickhouse_gateway.query("SELECT 1", {})
+
+        repository.close()
+        repository.close()
+
+        self.assertEqual([client.close_calls for client in clients], [1, 1])
+
+    def test_create_app_closes_owned_default_repository(self) -> None:
+        from fastapi.testclient import TestClient
+
+        class Repository:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        repository = Repository()
+        with patch("app.main.create_default_repository", return_value=repository):
+            application = create_app()
+            with TestClient(application):
+                pass
+
+        self.assertEqual(repository.close_calls, 1)
+
     def test_default_repository_does_not_construct_clickhouse_when_disabled(self) -> None:
         database = Database("sqlite+pysqlite:///:memory:")
         client_calls: list[object] = []
@@ -275,6 +460,25 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertEqual([step.tool_name for step in runs[0].steps], ["query_structured_data"])
 
+    def test_structured_decimal_value_uses_deterministic_thousands_separator(self) -> None:
+        gateway = RecordingClickHouseGateway(
+            result={
+                "aggregate_value": Decimal("12345.67"),
+                "total_count": 1,
+                "valid_count": 1,
+                "null_count": 0,
+            }
+        )
+        repository = InMemoryChatRepository(
+            empty_state(),
+            structured_service=StructuredAnswerService(lambda: sample_catalog(), gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(conversation_id, "订单金额总和", "source")
+
+        self.assertIn("value=12,345.67", messages[-1].paragraphs[0].text)
+
     def test_non_structured_query_keeps_legacy_agent_path(self) -> None:
         provider = RecordingLLMProvider()
         gateway = RecordingClickHouseGateway()
@@ -342,6 +546,78 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
         self.assertEqual(gateway.calls, [])
         self.assertEqual(messages[-1].paragraphs[0].text, "legacy Physoc answer")
+
+    def test_english_average_query_keeps_legacy_agent_path(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        structured = CountingStructuredService(
+            StructuredAnswerService(lambda: sample_catalog(), gateway)
+        )
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=structured,
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "average sales amount", "source")
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(gateway.calls, [])
+
+    def test_anchored_implicit_row_count_uses_single_published_dataset(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: sample_catalog(), gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(conversation_id, "总共有多少条", "source")
+
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(len(gateway.calls), 1)
+        self.assertIn("count() AS aggregate_value", gateway.calls[0][0])
+        self.assertIn("aggregate=count", messages[-1].paragraphs[0].text)
+
+    def test_catalog_failure_only_marks_strong_structured_shape_unavailable(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+
+        def failing_catalog():
+            raise RuntimeError("catalog down")
+
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(failing_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(conversation_id, "订单金额的平均值", "source")
+
+        self.assertEqual(provider.calls, 0)
+        self.assertIn("不可用", messages[-1].paragraphs[0].text)
+
+    def test_catalog_failure_keeps_weak_document_count_question_on_legacy_path(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+
+        def failing_catalog():
+            raise RuntimeError("catalog down")
+
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(failing_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "合同有多少条付款条款", "source")
+
+        self.assertEqual(provider.calls, 1)
 
     def test_ambiguous_structured_query_clarifies_without_clickhouse_or_llm(self) -> None:
         provider = RecordingLLMProvider()

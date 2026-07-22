@@ -6,14 +6,14 @@ import os
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from threading import Lock
+from threading import Condition
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.engine import make_url
 
-from .clickhouse_gateway import ClickHouseGateway
+from .clickhouse_gateway import ClickHouseGateway, StructuredStorageError
 from .database import Database, resolve_database_url
 from .evaluation_import import EvaluationImportService
 from .infra.health import (
@@ -88,12 +88,23 @@ def create_app(
     llm_provider: LLMProvider | None = None,
     health_registry: DependencyHealthRegistry | None = None,
 ) -> FastAPI:
-    app = _build_app()
+    owns_repository = repository is None
     if repository is None:
+        # The create_app flag is authoritative so ambient env values cannot change legacy defaults.
         repository = create_default_repository(
             llm_provider,
             structured_query_enabled=structured_query_enabled,
         )
+
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI):
+        try:
+            yield
+        finally:
+            if owns_repository:
+                await _close_owned_resource(repository)
+
+    app = _build_app(lifespan=lifespan if owns_repository else None)
     app.state.repository = repository
     app.state.structured_repository = structured_repository
     app.state.structured_query_enabled = structured_query_enabled
@@ -375,42 +386,97 @@ class _LazyStructuredQueryGateway:
     def __init__(self, client_factory: Callable[..., object], dsn: str) -> None:
         self._client_factory = client_factory
         self._dsn = dsn
-        self._lock = Lock()
+        self._condition = Condition()
+        self._closed = False
+        self._initializing = False
+        self._active_queries = 0
         self._gateway: ClickHouseGateway | None = None
         self._clients: tuple[object, object] | None = None
 
     def query(self, statement: str, parameters: Mapping[str, object] | None = None) -> object:
-        return self._get_gateway().query(statement, parameters)
+        gateway = self._acquire_gateway_for_query()
+        try:
+            return gateway.query(statement, parameters)
+        finally:
+            with self._condition:
+                self._active_queries -= 1
+                self._condition.notify_all()
 
     def close(self) -> None:
-        with self._lock:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+            while self._initializing or self._active_queries:
+                self._condition.wait()
             clients = self._clients or ()
             self._clients = None
             self._gateway = None
-        for client in reversed(clients):
-            close = getattr(client, "close", None)
-            if callable(close):
-                with suppress(Exception):
-                    close()
+        _close_clickhouse_clients(clients)
 
-    def _get_gateway(self) -> ClickHouseGateway:
-        if self._gateway is not None:
-            return self._gateway
-        with self._lock:
-            if self._gateway is not None:
-                return self._gateway
-            ingest_client = self._client_factory(dsn=self._dsn)
+    def _acquire_gateway_for_query(self) -> ClickHouseGateway:
+        with self._condition:
+            while True:
+                if self._closed:
+                    raise StructuredStorageError("ClickHouse structured query gateway is closed")
+                if self._gateway is not None:
+                    self._active_queries += 1
+                    return self._gateway
+                if not self._initializing:
+                    self._initializing = True
+                    break
+                self._condition.wait()
+
+        try:
+            gateway, clients = self._build_gateway()
+        except Exception:
+            with self._condition:
+                self._initializing = False
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
+            if not self._closed:
+                self._gateway = gateway
+                self._clients = clients
+                self._active_queries += 1
+                self._initializing = False
+                self._condition.notify_all()
+                return gateway
+
+        _close_clickhouse_clients(clients)
+        with self._condition:
+            self._initializing = False
+            self._condition.notify_all()
+        raise StructuredStorageError("ClickHouse structured query gateway is closed")
+
+    def _build_gateway(self) -> tuple[ClickHouseGateway, tuple[object, object]]:
+        ingest_client = self._client_factory(dsn=self._dsn)
+        try:
+            query_client = self._client_factory(dsn=self._dsn)
+        except Exception:
+            _close_clickhouse_clients((ingest_client,))
+            raise
+        clients = (ingest_client, query_client)
+        try:
+            gateway = ClickHouseGateway(ingest_client, query_client=query_client)
+        except Exception:
+            _close_clickhouse_clients(clients)
+            raise
+        return gateway, clients
+
+
+def _close_clickhouse_clients(clients: tuple[object, ...]) -> None:
+    closed_ids: set[int] = set()
+    for client in reversed(clients):
+        if id(client) in closed_ids:
+            continue
+        closed_ids.add(id(client))
+        close = getattr(client, "close", None)
+        if callable(close):
             try:
-                query_client = self._client_factory(dsn=self._dsn)
+                close()
             except Exception:
-                close = getattr(ingest_client, "close", None)
-                if callable(close):
-                    with suppress(Exception):
-                        close()
-                raise
-            self._clients = (ingest_client, query_client)
-            self._gateway = ClickHouseGateway(ingest_client, query_client=query_client)
-            return self._gateway
+                pass
 
 
 def _create_custom_ingestion_queue(

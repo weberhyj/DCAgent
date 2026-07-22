@@ -413,6 +413,11 @@ class SqlChatRepository:
             llm_provider=self._llm_provider,
         )
 
+    def close(self) -> None:
+        close = getattr(self._structured_service, "close", None)
+        if callable(close):
+            close()
+
     def seed_if_empty(self, state: ChatState) -> None:
         with self._database.session() as session:
             if has_seed_data(session):

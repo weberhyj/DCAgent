@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
+from decimal import Decimal
 from pathlib import PurePath
 from uuid import uuid4
 
@@ -41,9 +42,15 @@ _CHINESE_AGGREGATE_TERMS = (
     "最小",
     "最低",
 )
-_ENGLISH_AGGREGATE_RE = re.compile(
-    r"(?<![a-z0-9_])(?:average|avg|mean|sum|count|maximum|minimum|max|min)(?![a-z0-9_])",
-    re.IGNORECASE,
+_IMPLICIT_ROW_COUNT_RE = re.compile(
+    r"^(?:(?:总共|一共|共有)有?)?多少条(?:记录|数据|明细|行)?[？?。.]?$"
+)
+_STRONG_AGGREGATE_SUFFIX_RE = re.compile(
+    r"(?:的)?(?:平均值|平均|均值|总和|合计|求和|计数|最大值|最大|最高|最小值|最小|最低)"
+    r"[？?。.]?$"
+)
+_STRUCTURED_FILTER_RE = re.compile(
+    r"(?:大于|不少于|小于|不超过)|(?:\d{4}-\d{2}-\d{2}\s*至\s*\d{4}-\d{2}-\d{2})"
 )
 
 
@@ -55,6 +62,11 @@ class StructuredAnswerService:
     ) -> None:
         self._catalog_provider = catalog_provider
         self._clickhouse_gateway = clickhouse_gateway
+
+    def close(self) -> None:
+        close = getattr(self._clickhouse_gateway, "close", None)
+        if callable(close):
+            close()
 
     def try_answer(
         self,
@@ -71,6 +83,8 @@ class StructuredAnswerService:
         try:
             catalog = self._catalog_provider()
         except Exception:
+            if not _is_strong_structured_shape(question):
+                return None
             return _structured_run(
                 conversation_id,
                 question,
@@ -143,10 +157,17 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     normalized = _normalize(question)
     if not _has_aggregate_language(question):
         return False
-    return any(
+    has_catalog_reference = any(
         name and name in normalized
         for dataset in catalog.datasets
         for name in _dataset_names(dataset)
+    )
+    if has_catalog_reference:
+        return True
+    return (
+        _is_implicit_row_count(question)
+        and len([dataset for dataset in catalog.datasets if dataset.active_publication is not None])
+        == 1
     )
 
 
@@ -172,8 +193,21 @@ def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:
 
 def _has_aggregate_language(question: str) -> bool:
     normalized = _normalize(question)
-    return any(_normalize(term) in normalized for term in _CHINESE_AGGREGATE_TERMS) or bool(
-        _ENGLISH_AGGREGATE_RE.search(question)
+    return any(_normalize(term) in normalized for term in _CHINESE_AGGREGATE_TERMS)
+
+
+def _is_implicit_row_count(question: str) -> bool:
+    return _IMPLICIT_ROW_COUNT_RE.fullmatch(question.strip()) is not None
+
+
+def _is_strong_structured_shape(question: str) -> bool:
+    stripped = question.strip()
+    return (
+        _is_implicit_row_count(stripped)
+        or _STRONG_AGGREGATE_SUFFIX_RE.search(stripped) is not None
+        or (
+            _has_aggregate_language(stripped) and _STRUCTURED_FILTER_RE.search(stripped) is not None
+        )
     )
 
 
@@ -192,7 +226,7 @@ def _active_publication(catalog: StructuredCatalog, intent: StructuredIntent):
 
 def _format_result(result: StructuredAggregateResult) -> str:
     metric = result.metric_display_name or result.metric_physical_name or "all_rows"
-    value = "null" if result.value is None else str(result.value)
+    value = _format_numeric_value(result.value)
     return (
         "结构化查询结果："
         f"source_file={result.source_name}; "
@@ -210,6 +244,12 @@ def _format_result(result: StructuredAggregateResult) -> str:
         f"elapsed_ms={result.elapsed_ms:.3f}; "
         f"audit_id={result.audit_id}"
     )
+
+
+def _format_numeric_value(value: Decimal | int | None) -> str:
+    if value is None:
+        return "null"
+    return format(value, ",")
 
 
 def _format_filters(filters: tuple[StructuredFilter, ...]) -> str:

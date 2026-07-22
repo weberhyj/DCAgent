@@ -444,6 +444,11 @@ class InMemoryChatRepository:
             llm_provider=self._llm_provider,
         )
 
+    def close(self) -> None:
+        close = getattr(self._structured_service, "close", None)
+        if callable(close):
+            close()
+
     def list_conversations(self) -> list[ConversationModel]:
         with self._lock:
             return deepcopy(self._state.conversations)
