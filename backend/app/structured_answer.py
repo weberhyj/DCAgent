@@ -23,7 +23,7 @@ from .structured_query import (
     StructuredQueryExecutor,
     StructuredQueryPlanner,
     UnsafeStructuredQueryError,
-    _explicit_equality_value_spans,
+    _candidate_equality_value_spans,
     resolve_structured_intent,
 )
 from .time_utils import display_datetime_label
@@ -88,8 +88,15 @@ _CONCEPT_TERM_SUFFIXES = (
     "定义",
 )
 _COPULA_FRAGMENTS = frozenset(("因为", "作为", "称为", "成为", "认为", "何为"))
+_NAMED_AVERAGE_CONCEPT_TERMS = (
+    "算术平均值",
+    "加权平均值",
+    "移动平均值",
+    "几何平均值",
+    "调和平均值",
+)
 _AGGREGATE_CONCEPT_TERMS = tuple(
-    sorted(("算术平均值", *_CHINESE_AGGREGATE_TERMS), key=len, reverse=True)
+    sorted((*_NAMED_AVERAGE_CONCEPT_TERMS, *_CHINESE_AGGREGATE_TERMS), key=len, reverse=True)
 )
 _NATURAL_AGGREGATE_TAILS = ("是多少", "有多少", "多少", "呢", "吗")
 _EQUALITY_FIELD_DELIMITERS = ("，", ",", "。", "；", ";", "且", "或")
@@ -293,7 +300,7 @@ def _mask_aggregate_equality_values(
     spans = {
         span
         for column in filter_columns
-        for span in _explicit_equality_value_spans(question, (column,))
+        for span in _candidate_equality_value_spans(question, (column,))
     }
     for value_start, value_end in spans:
         value = question[value_start:value_end]
@@ -357,6 +364,8 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
         return "weak"
     if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(stripped):
         return "strong"
+    if _is_exact_aggregate_concept_shape(normalized):
+        return "concept"
     if _has_metric_qualified_concept_shape(normalized):
         return "strong"
     if _is_aggregate_concept_question(normalized):
@@ -364,6 +373,19 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
     if _is_implicit_row_count(stripped) or _has_field_aggregate_suffix(normalized):
         return "strong"
     return "weak"
+
+
+def _is_exact_aggregate_concept_shape(normalized: str) -> bool:
+    return any(
+        normalized
+        in {
+            f"什么是{term}",
+            f"什么叫{term}",
+            f"何为{term}",
+            *(f"{term}{suffix}" for suffix in _CONCEPT_TERM_SUFFIXES),
+        }
+        for term in _AGGREGATE_CONCEPT_TERMS
+    )
 
 
 def _has_metric_qualified_concept_shape(normalized: str) -> bool:

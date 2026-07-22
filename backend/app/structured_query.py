@@ -711,18 +711,37 @@ def _parse_explicit_filter_clauses(
     )
 
 
-def _explicit_equality_value_spans(
+def _candidate_equality_value_spans(
     question: str,
     columns: tuple[StructuredColumnSchema, ...],
 ) -> tuple[tuple[int, int], ...]:
-    parsed = _parse_explicit_filter_clauses(question, columns)
-    if parsed.issue is not None:
-        return ()
-    return tuple(
-        (match.span.end - len(match.item.value), match.span.end)
-        for match in parsed.value or ()
-        if match.item.operator == "eq"
-    )
+    spans: list[tuple[int, int]] = []
+    for operator in re.finditer(r"为|=", question):
+        prefix = question[: operator.start()]
+        segment_start = max(
+            (prefix.rfind(delimiter) + 1 for delimiter in ("且", "或", "，", ",", "。", "；", ";")),
+            default=0,
+        )
+        resolved = _resolve_operator_field(
+            question[segment_start : operator.start()],
+            columns,
+            segment_start,
+        )
+        if not isinstance(resolved, tuple):
+            continue
+        value_match = re.match(
+            r"\s*(?P<value>[^\s，,。的且或；;]+)",
+            question[operator.end() :],
+        )
+        if value_match is None:
+            continue
+        spans.append(
+            (
+                operator.end() + value_match.start("value"),
+                operator.end() + value_match.end("value"),
+            )
+        )
+    return tuple(spans)
 
 
 def _resolve_operator_field(

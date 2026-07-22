@@ -766,6 +766,20 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             with self.subTest(question=question):
                 self._assert_catalog_failure_is_strong_candidate(question)
 
+    def test_catalog_failure_named_average_concepts_keep_legacy_agent_path(self) -> None:
+        questions = (
+            "什么是算术平均值",
+            "算术平均值是什么",
+            "什么是加权平均值",
+            "什么是移动平均值",
+            "什么是几何平均值",
+            "什么是调和平均值",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_uses_legacy_path(question)
+
     def test_aggregate_looking_equality_values_keep_legacy_agent_path(self) -> None:
         catalog = sample_catalog()
         dataset = catalog.datasets[0]
@@ -1051,6 +1065,81 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(provider.calls, 0)
         self.assertEqual(len(gateway.calls), 1)
         self.assertEqual(gateway.calls[0][1]["filter_0"], "最高标准")
+
+    def test_multiple_equality_only_filters_keep_legacy_agent_path(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        level = replace(
+            dataset.schema.columns[1],
+            physical_name="level",
+            original_name="等级",
+            display_name="等级",
+            aliases=(),
+        )
+        standard = replace(
+            dataset.schema.columns[1],
+            physical_name="standard",
+            original_name="标准",
+            display_name="标准",
+            aliases=(),
+        )
+        filter_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(
+                            dataset.schema.columns[0],
+                            level,
+                            dataset.schema.columns[2],
+                            standard,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        equality_only_questions = (
+            "等级为最高且订单日期为最低",
+            "等级为最高，订单日期为2026-01-01",
+            "等级为最高且订单日期为最低且标准为平均值",
+        )
+        for question in equality_only_questions:
+            with self.subTest(question=question):
+                provider = RecordingLLMProvider()
+                gateway = RecordingClickHouseGateway()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(lambda: filter_catalog, gateway),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(provider.calls, 1)
+                self.assertEqual(gateway.calls, [])
+
+        aggregate_questions = (
+            "等级为最高且订单日期为最低的订单金额平均值",
+            "等级为最高，订单日期为2026-01-01，订单金额平均值",
+            "等级为最高且订单日期为最低且标准为平均值的订单金额平均值",
+        )
+        for question in aggregate_questions:
+            with self.subTest(question=question):
+                provider = RecordingLLMProvider()
+                gateway = RecordingClickHouseGateway()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(lambda: filter_catalog, gateway),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(provider.calls, 0)
 
     def test_ambiguous_cross_dataset_equality_with_real_aggregate_stays_structured(
         self,
