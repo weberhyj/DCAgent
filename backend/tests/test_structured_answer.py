@@ -793,13 +793,16 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             ),
         )
 
-        for question in (
+        questions = (
             "等级为最高",
             "等级为最高的记录",
-            "等级为最低",
-            "等级为平均值",
-            "等级为总和",
-        ):
+            *(
+                f"等级为{value}{tail}"
+                for value in ("最高", "最低", "平均值", "总和")
+                for tail in ("？", "?", "吗", "呢")
+            ),
+        )
+        for question in questions:
             with self.subTest(question=question):
                 provider = RecordingLLMProvider()
                 gateway = RecordingClickHouseGateway()
@@ -814,6 +817,23 @@ class StructuredAnswerServiceTest(unittest.TestCase):
 
                 self.assertEqual(provider.calls, 1)
                 self.assertEqual(gateway.calls, [])
+
+    def test_real_aggregate_natural_tails_remain_structured_candidates(self) -> None:
+        for question in ("订单金额最高吗", "订单金额平均值呢"):
+            with self.subTest(question=question):
+                provider = RecordingLLMProvider()
+                gateway = RecordingClickHouseGateway()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(lambda: sample_catalog(), gateway),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(provider.calls, 0)
+                self.assertEqual(len(gateway.calls), 1)
 
     def test_aggregate_looking_equality_value_allows_separate_aggregate_clause(
         self,

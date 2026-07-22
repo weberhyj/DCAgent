@@ -93,7 +93,7 @@ _NATURAL_AGGREGATE_TAILS = ("是多少", "有多少", "多少", "呢", "吗")
 _EQUALITY_FIELD_DELIMITERS = ("，", ",", "。", "；", ";", "且", "或")
 _EQUALITY_AGGREGATE_VALUE_RE = re.compile(
     rf"\s*(?P<value>{'|'.join(re.escape(term) for term in sorted(_CHINESE_AGGREGATE_TERMS, key=len, reverse=True))})"
-    r"(?=$|[\s，,。的且或；;])"
+    r"(?=$|[\s，,。？?的且或；;吗呢])"
 )
 
 
