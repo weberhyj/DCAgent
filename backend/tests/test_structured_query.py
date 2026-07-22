@@ -200,6 +200,24 @@ class StructuredIntentParserTest(unittest.TestCase):
         self.assertIn("count() AS aggregate_value", all_rows_plan.sql)
         self.assertIn("count(order_date) AS aggregate_value", field_count_plan.sql)
 
+    def test_row_count_word_keeps_explicit_numeric_metric(self) -> None:
+        result = parse_structured_intent(
+            "订单金额非空值有多少条",
+            sample_catalog(),
+        )
+
+        self.assertEqual(result.aggregate, "count")
+        self.assertEqual(result.metric_physical_name, "order_amount")
+
+    def test_row_count_word_keeps_explicit_string_metric(self) -> None:
+        result = parse_structured_intent(
+            "地区多少条",
+            sample_catalog(),
+        )
+
+        self.assertEqual(result.aggregate, "count")
+        self.assertEqual(result.metric_physical_name, "region")
+
     def test_multiple_and_date_ranges_are_rejected(self) -> None:
         result = parse_structured_intent(
             "2026-01-01至2026-01-07且2026-02-01至2026-02-07的订单金额总和",

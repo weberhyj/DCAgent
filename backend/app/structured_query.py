@@ -476,8 +476,6 @@ def _parse_metric_clause(
     count_all_hint: bool,
     excluded_spans: tuple[_TextSpan, ...],
 ) -> _ClauseParseResult[StructuredColumnSchema | None]:
-    if aggregate == "count" and count_all_hint:
-        return _ClauseParseResult(value=None)
     available = _mask_spans(question, excluded_spans)
     aggregate_columns = (
         columns
@@ -494,6 +492,8 @@ def _parse_metric_clause(
             consumed_spans=_column_name_spans(available, (metric,)),
         )
     if aggregate == "count":
+        if count_all_hint:
+            return _ClauseParseResult(value=None)
         reusable = tuple(dict.fromkeys(shared_columns))
         if len(reusable) == 1:
             return _ClauseParseResult(value=reusable[0])
