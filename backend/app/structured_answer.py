@@ -4,6 +4,7 @@ import re
 from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import PurePath
+from typing import Literal
 from uuid import uuid4
 
 from .agent import AgentRunResult, AgentStep
@@ -45,26 +46,59 @@ _CHINESE_AGGREGATE_TERMS = (
 _IMPLICIT_ROW_COUNT_RE = re.compile(
     r"^(?:(?:总共|一共|共有)有?)?多少条(?:记录|数据|明细|行)?[？?。.]?$"
 )
-_STRONG_AGGREGATE_SUFFIX_RE = re.compile(
-    r"(?:的)?(?:平均值|平均|均值|总和|合计|求和|计数|最大值|最大|最高|最小值|最小|最低)"
-    r"[？?。.]?$"
+_STRONG_AGGREGATE_SUFFIXES = tuple(
+    sorted(
+        (
+            "平均值",
+            "平均",
+            "均值",
+            "总和",
+            "合计",
+            "求和",
+            "计数",
+            "最大值",
+            "最大",
+            "最高",
+            "最小值",
+            "最小",
+            "最低",
+        ),
+        key=len,
+        reverse=True,
+    )
 )
-_STRUCTURED_FILTER_RE = re.compile(
-    r"(?:大于|不少于|小于|不超过|(?<!何)为(?!什么)|=)"
+_HAS_EXPLICIT_FILTER_RE = re.compile(
+    r"(?:(?:大于|不少于|小于|不超过|[<>]=?)\s*-?\d+(?:\.\d+)?)|="
     r"|(?:\d{4}-\d{2}-\d{2}\s*至\s*\d{4}-\d{2}-\d{2})"
 )
-_AGGREGATE_CONCEPT_MARKERS = (
-    "什么是",
-    "什么叫",
-    "何为",
+_CATALOG_FAILURE_POLITE_PREFIXES = (
+    "请告诉我",
+    "请问",
+    "能否",
+    "可否",
+    "可以",
+    "麻烦",
+    "烦请",
+    "劳烦",
+    "请",
+)
+_CONCEPT_OPENERS = ("什么是", "什么叫", "何为")
+_CONCEPT_VERBS = ("解释", "说明", "介绍", "定义")
+_CONCEPT_TERM_SUFFIXES = (
     "是什么",
     "是什么意思",
     "怎么理解",
     "如何理解",
-    "解释",
-    "说明",
-    "介绍",
+    "的含义",
+    "含义",
+    "的概念",
+    "概念",
+    "的定义",
     "定义",
+)
+_COPULA_FRAGMENTS = frozenset(("因为", "作为", "称为", "成为", "认为", "何为"))
+_AGGREGATE_CONCEPT_TERMS = tuple(
+    sorted(("算术平均值", *_CHINESE_AGGREGATE_TERMS), key=len, reverse=True)
 )
 
 
@@ -97,7 +131,7 @@ class StructuredAnswerService:
         try:
             catalog = self._catalog_provider()
         except Exception:
-            if not _is_strong_structured_shape(question):
+            if _classify_without_catalog(question) != "strong":
                 return None
             return _structured_run(
                 conversation_id,
@@ -241,21 +275,111 @@ def _is_implicit_row_count(question: str) -> bool:
     return _IMPLICIT_ROW_COUNT_RE.fullmatch(question.strip()) is not None
 
 
-def _is_strong_structured_shape(question: str) -> bool:
+def _classify_without_catalog(question: str) -> Literal["weak", "strong", "concept"]:
     stripped = question.strip()
-    has_structured_filter = _STRUCTURED_FILTER_RE.search(stripped) is not None
-    if _is_aggregate_concept_question(stripped) and not has_structured_filter:
+    normalized = _normalize(stripped)
+    if not _has_aggregate_language(normalized):
+        return "weak"
+    if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(normalized):
+        return "strong"
+    if _is_aggregate_concept_question(normalized):
+        return "concept"
+    if _is_implicit_row_count(stripped) or _has_field_aggregate_suffix(normalized):
+        return "strong"
+    return "weak"
+
+
+def _has_chinese_equality_filter(normalized: str) -> bool:
+    for index, character in enumerate(normalized):
+        if character != "为" or normalized[max(0, index - 1) : index + 1] in _COPULA_FRAGMENTS:
+            continue
+        field_start = max(normalized.rfind("且", 0, index), normalized.rfind("或", 0, index)) + 1
+        field = normalized[field_start:index]
+        value = normalized[index + 1 :]
+        if not field or not value:
+            continue
+        remaining = normalized[:field_start] + "_" * len(field) + normalized[index:]
+        if _has_aggregate_language(remaining):
+            return True
+    return False
+
+
+def _has_field_aggregate_suffix(normalized: str) -> bool:
+    suffix = _matching_aggregate_suffix(normalized)
+    if suffix is None:
         return False
-    return (
-        _is_implicit_row_count(stripped)
-        or _STRONG_AGGREGATE_SUFFIX_RE.search(stripped) is not None
-        or (_has_aggregate_language(stripped) and has_structured_filter)
-    )
+    prefix = normalized[: -len(suffix)]
+    if prefix.endswith("的"):
+        prefix = prefix[:-1]
+    return bool(prefix)
 
 
-def _is_aggregate_concept_question(question: str) -> bool:
-    normalized = _normalize(question)
-    return any(marker in normalized for marker in _AGGREGATE_CONCEPT_MARKERS)
+def _matching_aggregate_suffix(normalized: str) -> str | None:
+    return next((term for term in _STRONG_AGGREGATE_SUFFIXES if normalized.endswith(term)), None)
+
+
+def _is_aggregate_concept_question(normalized: str) -> bool:
+    body = _strip_polite_prefixes(normalized)
+    if not _has_aggregate_language(body):
+        return False
+    if any(
+        body.startswith(opener)
+        and _matches_concept_term_phrase(body[len(opener) :], allow_bare=True)
+        for opener in _CONCEPT_OPENERS
+    ):
+        return True
+    for verb in _CONCEPT_VERBS:
+        if not body.startswith(verb):
+            continue
+        remainder = body[len(verb) :]
+        if remainder.startswith("一下"):
+            remainder = remainder[2:]
+        if any(
+            remainder.startswith(opener)
+            and _matches_concept_term_phrase(remainder[len(opener) :], allow_bare=True)
+            for opener in _CONCEPT_OPENERS
+        ):
+            return True
+        if _matches_concept_term_phrase(remainder, allow_bare=True):
+            return True
+        if (
+            remainder.startswith("因为")
+            and _contains_aggregate_concept_term(remainder)
+            and remainder.endswith(("影响", "原因", "后果", "结果"))
+        ):
+            return True
+        if (
+            remainder.startswith("被称为")
+            and _contains_aggregate_concept_term(remainder)
+            and remainder.endswith(("概念", "含义", "定义"))
+        ):
+            return True
+    return _matches_concept_term_phrase(body, allow_bare=False)
+
+
+def _strip_polite_prefixes(normalized: str) -> str:
+    remaining = normalized
+    while True:
+        prefix = next(
+            (item for item in _CATALOG_FAILURE_POLITE_PREFIXES if remaining.startswith(item)),
+            None,
+        )
+        if prefix is None:
+            return remaining
+        remaining = remaining[len(prefix) :]
+
+
+def _matches_concept_term_phrase(value: str, *, allow_bare: bool) -> bool:
+    for term in _AGGREGATE_CONCEPT_TERMS:
+        if not value.startswith(term):
+            continue
+        remainder = value[len(term) :]
+        return (allow_bare and not remainder) or remainder in _CONCEPT_TERM_SUFFIXES
+    return False
+
+
+def _contains_aggregate_concept_term(value: str) -> bool:
+    return any(term in value for term in _AGGREGATE_CONCEPT_TERMS)
 
 
 def _normalize(value: str) -> str:

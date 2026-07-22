@@ -681,6 +681,72 @@ class StructuredAnswerServiceTest(unittest.TestCase):
 
         self.assertEqual(provider.calls, 1)
 
+    def _assert_catalog_failure_is_strong_candidate(self, question: str) -> None:
+        def failing_catalog():
+            raise RuntimeError("catalog down")
+
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                failing_catalog,
+                RecordingClickHouseGateway(),
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(conversation_id, question, "source")
+
+        self.assertEqual(provider.calls, 0)
+        self.assertIn("不可用", messages[-1].paragraphs[0].text)
+
+    def test_catalog_failure_concept_grammar_handles_full_explanatory_sentences(self) -> None:
+        questions = (
+            "请说明因为平均值过高会有什么影响",
+            "请介绍被称为算术平均值的概念",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_uses_legacy_path(question)
+
+    def test_catalog_failure_field_prefixes_can_contain_concept_words(self) -> None:
+        questions = (
+            "产品说明平均值",
+            "商品说明订单金额平均值",
+            "介绍费总和",
+            "定义值总和",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_is_strong_candidate(question)
+
+    def test_catalog_failure_copula_fragments_remain_on_legacy_path(self) -> None:
+        questions = (
+            "平均值为常用统计指标",
+            "平均值作为统计指标",
+            "因为平均值过高会有什么影响",
+            "被称为算术平均值的概念",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_uses_legacy_path(question)
+
+    def test_catalog_failure_explicit_filter_grammars_are_strong_candidates(self) -> None:
+        questions = (
+            "订单金额大于10的平均值",
+            "订单日期2026-01-01至2026-01-31订单金额平均值",
+            "地区=华东订单金额平均值",
+            "地区为华东订单金额平均值",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_is_strong_candidate(question)
+
     def test_catalog_failure_keeps_arbitrary_prefix_what_is_question_on_legacy_path(
         self,
     ) -> None:
