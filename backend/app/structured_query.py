@@ -273,21 +273,40 @@ def parse_structured_intent(
 def resolve_structured_intent(
     question: str, catalog: StructuredCatalog
 ) -> StructuredIntentResolution:
-    aggregate = _resolve_aggregate(question)
-    if isinstance(aggregate, StructuredClarification):
-        return aggregate
-    if aggregate is None:
+    if not _contains_aggregate_word(question):
         return StructuredUnavailable("未识别到受支持的聚合意图")
 
     dataset = _resolve_dataset(question, catalog)
     if not isinstance(dataset, StructuredDatasetCatalog):
         return dataset
 
+    aggregate = _resolve_aggregate(question, dataset.schema.columns)
+    if isinstance(aggregate, StructuredClarification):
+        return aggregate
+    if aggregate is None:
+        return StructuredUnavailable("未识别到受支持的聚合意图")
+
     filters = _resolve_filters(question, dataset.schema.columns)
     if isinstance(filters, (StructuredClarification, StructuredUnavailable)):
         return filters
 
-    metric = _resolve_metric(question, dataset.schema.columns, aggregate)
+    metric_question = _mask_filter_clauses(question, filters, dataset.schema.columns)
+    metric = _resolve_metric(metric_question, dataset.schema.columns, aggregate)
+    if isinstance(metric, StructuredUnavailable) and aggregate != "count":
+        columns_by_name = {column.physical_name: column for column in dataset.schema.columns}
+        aggregate_filter_columns = {
+            column
+            for item in filters
+            if (column := columns_by_name.get(item.physical_name)) is not None
+            and column.allow_aggregate
+        }
+        if len(aggregate_filter_columns) == 1:
+            metric = next(iter(aggregate_filter_columns))
+        elif len(aggregate_filter_columns) > 1:
+            metric = StructuredClarification(
+                "多个筛选字段都可作为聚合指标，请明确指标字段",
+                tuple(sorted(column.physical_name for column in aggregate_filter_columns)),
+            )
     if isinstance(metric, StructuredClarification):
         return metric
     if isinstance(metric, StructuredUnavailable):
@@ -301,13 +320,44 @@ def resolve_structured_intent(
     )
 
 
-def _resolve_aggregate(question: str) -> str | StructuredClarification | None:
+def _contains_aggregate_word(question: str) -> bool:
     normalized = _normalize(question)
-    aggregates = {
-        aggregate
-        for aggregate, words in _AGGREGATE_WORDS
-        if any(_normalize(word) in normalized for word in words)
-    }
+    return any(_normalize(word) in normalized for _, words in _AGGREGATE_WORDS for word in words)
+
+
+def _resolve_aggregate(
+    question: str,
+    columns: tuple[StructuredColumnSchema, ...],
+) -> str | StructuredClarification | None:
+    normalized = _normalize(question)
+    field_spans = _column_name_spans(question, columns)
+    aggregates: set[str] = set()
+    for aggregate, words in _AGGREGATE_WORDS:
+        for word in words:
+            normalized_word = _normalize(word)
+            start = normalized.find(normalized_word)
+            while start >= 0:
+                end = start + len(normalized_word)
+                contained_in_field = any(
+                    field_start <= start
+                    and end <= field_end
+                    and (
+                        field_end - field_start > len(normalized_word)
+                        or any(
+                            normalized[end:].startswith(_normalize(operator_word))
+                            for operator_word in _COMPARISON_OPERATORS
+                        )
+                        or any(
+                            _normalize(other_word) in normalized[end:]
+                            for _, other_words in _AGGREGATE_WORDS
+                            for other_word in other_words
+                        )
+                    )
+                    for field_start, field_end in field_spans
+                )
+                if not contained_in_field:
+                    aggregates.add(aggregate)
+                start = normalized.find(normalized_word, start + 1)
     if len(aggregates) > 1:
         return StructuredClarification(
             "问题包含多个不同的聚合意图，请选择一个",
@@ -319,7 +369,7 @@ def _resolve_aggregate(question: str) -> str | StructuredClarification | None:
 def _resolve_dataset(
     question: str, catalog: StructuredCatalog
 ) -> StructuredDatasetCatalog | StructuredClarification | StructuredUnavailable:
-    normalized = _normalize(question)
+    normalized, positions = _normalize_with_positions(question)
     matches: list[tuple[int, int, int, int, StructuredDatasetCatalog]] = []
     for dataset in catalog.datasets:
         names = (
@@ -335,7 +385,13 @@ def _resolve_dataset(
             start = normalized.find(normalized_name)
             while start >= 0:
                 end = start + len(normalized_name)
-                matches.append((priority, len(normalized_name), start, end, dataset))
+                if _is_natural_dataset_mention(
+                    question,
+                    positions,
+                    start,
+                    end,
+                ):
+                    matches.append((priority, len(normalized_name), start, end, dataset))
                 start = normalized.find(normalized_name, start + 1)
 
     if matches:
@@ -396,12 +452,13 @@ def _resolve_filters(
     explicit = _resolve_explicit_filters(question, filter_columns)
     if isinstance(explicit, (StructuredClarification, StructuredUnavailable)):
         return explicit
-    if explicit and "或" in question:
+    date_ranges = tuple(_DATE_RANGE_RE.finditer(question))
+    if "或" in question and (explicit or date_ranges):
         return StructuredUnavailable("结构化筛选暂不支持 OR 条件")
     filters = list(explicit)
 
-    date_range = _DATE_RANGE_RE.search(question)
-    if date_range:
+    if date_ranges:
+        date_range = date_ranges[0]
         date_columns = tuple(
             column
             for column in filter_columns
@@ -440,9 +497,61 @@ def _resolve_filters(
     )
     if isinstance(implicit, StructuredClarification):
         return implicit
+    if implicit and "或" in question:
+        return StructuredUnavailable("结构化筛选暂不支持 OR 条件")
     filters.extend(implicit)
 
     return tuple(filters)
+
+
+def _mask_filter_clauses(
+    question: str,
+    filters: tuple[StructuredFilter, ...],
+    columns: tuple[StructuredColumnSchema, ...],
+) -> str:
+    masked = list(question)
+    columns_by_name = {column.physical_name: column for column in columns}
+    for item in filters:
+        if item.operator == "between" and item.upper_value is not None:
+            pattern = re.compile(rf"{re.escape(item.value)}\s*至\s*{re.escape(item.upper_value)}")
+            _mask_matches(masked, question, pattern)
+            continue
+        column = columns_by_name.get(item.physical_name)
+        if column is None:
+            continue
+        for priority, name in _resolution_names(column):
+            field_pattern = _field_pattern(name, normalized=priority == 0)
+            if item.operator == "eq":
+                explicit = re.compile(
+                    rf"{field_pattern}\s*(?:为|=)\s*{re.escape(item.value)}",
+                    re.IGNORECASE,
+                )
+                implicit = re.compile(
+                    rf"{re.escape(item.value)}\s*{field_pattern}",
+                    re.IGNORECASE,
+                )
+                _mask_matches(masked, question, explicit)
+                _mask_matches(masked, question, implicit)
+                continue
+            operator_word = {
+                "gt": "大于",
+                "gte": "不少于",
+                "lt": "小于",
+                "lte": "不超过",
+            }.get(item.operator)
+            if operator_word is None:
+                continue
+            comparison = re.compile(
+                rf"{field_pattern}\s*{operator_word}\s*{re.escape(item.value)}",
+                re.IGNORECASE,
+            )
+            _mask_matches(masked, question, comparison)
+    return "".join(masked)
+
+
+def _mask_matches(masked: list[str], question: str, pattern: re.Pattern[str]) -> None:
+    for match in pattern.finditer(question):
+        masked[match.start() : match.end()] = " " * (match.end() - match.start())
 
 
 def _resolve_explicit_filters(
@@ -516,6 +625,10 @@ def _validate_filter_field_phrases(
                 is None
             ):
                 return StructuredUnavailable("数值比较值格式无效")
+        elif not resolved and not _contains_aggregate_word(
+            question[segment_start : operator.start()]
+        ):
+            return StructuredUnavailable("等值筛选必须指定已确认的字段")
     return None
 
 
@@ -614,6 +727,24 @@ def _resolve_columns(
     return _unique_or_clarification(selected)
 
 
+def _column_name_spans(
+    question: str,
+    columns: Iterable[StructuredColumnSchema],
+) -> tuple[tuple[int, int], ...]:
+    normalized_question = _normalize(question)
+    spans: set[tuple[int, int]] = set()
+    for column in columns:
+        for _, name in _resolution_names(column):
+            normalized_name = _normalize(name)
+            if not normalized_name:
+                continue
+            start = normalized_question.find(normalized_name)
+            while start >= 0:
+                spans.add((start, start + len(normalized_name)))
+                start = normalized_question.find(normalized_name, start + 1)
+    return tuple(spans)
+
+
 def _unique_or_clarification(
     matches: set[StructuredColumnSchema],
 ) -> tuple[StructuredColumnSchema, ...] | StructuredClarification:
@@ -656,6 +787,51 @@ def _field_pattern(name: str, *, normalized: bool) -> str:
 
 def _normalize(value: str) -> str:
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.casefold())
+
+
+def _normalize_with_positions(value: str) -> tuple[str, tuple[int, ...]]:
+    characters: list[str] = []
+    positions: list[int] = []
+    for index, character in enumerate(value.casefold()):
+        if re.fullmatch(r"[0-9a-z\u4e00-\u9fff]", character):
+            characters.append(character)
+            positions.append(index)
+    return "".join(characters), tuple(positions)
+
+
+def _is_natural_dataset_mention(
+    question: str,
+    positions: tuple[int, ...],
+    start: int,
+    end: int,
+) -> bool:
+    original_start = positions[start]
+    original_end = positions[end - 1] + 1
+    previous = question[original_start - 1] if original_start > 0 else None
+    following = question[original_end] if original_end < len(question) else None
+    boundary_characters = frozenset("和与及或的在中里、，,。；;：:()（）[]【】")
+
+    start_is_boundary = (
+        previous is None
+        or previous.isspace()
+        or previous in boundary_characters
+        or _different_scripts(previous, question[original_start])
+    )
+    end_is_boundary = (
+        following is None
+        or following.isspace()
+        or following in boundary_characters
+        or _different_scripts(question[original_end - 1], following)
+    )
+    return start_is_boundary and end_is_boundary
+
+
+def _different_scripts(left: str, right: str) -> bool:
+    left_ascii = left.isascii() and left.isalnum()
+    right_ascii = right.isascii() and right.isalnum()
+    left_chinese = "\u4e00" <= left <= "\u9fff"
+    right_chinese = "\u4e00" <= right <= "\u9fff"
+    return (left_ascii and right_chinese) or (left_chinese and right_ascii)
 
 
 def _require_identifier(value: str) -> str:

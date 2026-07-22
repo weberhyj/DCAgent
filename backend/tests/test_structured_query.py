@@ -146,6 +146,104 @@ class StructuredIntentParserTest(unittest.TestCase):
 
         self.assertEqual(result.aggregate, "max")
 
+    def test_aggregate_words_inside_metric_name_are_not_count_intents(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        sales_quantity = replace(
+            base.schema.columns[0],
+            physical_name="sales_quantity",
+            original_name="销售数量",
+            display_name="销售数量",
+            aliases=("销量",),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(replace(base, schema=replace(base.schema, columns=(sales_quantity,))),),
+        )
+
+        average = parse_structured_intent("销售数量平均值", catalog)
+        total = parse_structured_intent("销售数量总和", catalog)
+
+        self.assertEqual(
+            (average.aggregate, average.metric_physical_name), ("avg", "sales_quantity")
+        )
+        self.assertEqual((total.aggregate, total.metric_physical_name), ("sum", "sales_quantity"))
+
+    def test_count_suffix_remains_valid_when_quantity_is_inside_metric_name(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        order_quantity = replace(
+            base.schema.columns[0],
+            physical_name="order_quantity",
+            original_name="订单数量",
+            display_name="订单数量",
+            aliases=("订单数",),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(replace(base, schema=replace(base.schema, columns=(order_quantity,))),),
+        )
+
+        result = parse_structured_intent("订单数量计数", catalog)
+
+        self.assertEqual(
+            (result.aggregate, result.metric_physical_name), ("count", "order_quantity")
+        )
+
+    def test_metric_resolution_excludes_consumed_explicit_filter_field(self) -> None:
+        result = parse_structured_intent(
+            "地区=华东的订单金额计数",
+            sample_catalog(),
+        )
+
+        self.assertEqual(result.aggregate, "count")
+        self.assertEqual(result.metric_physical_name, "order_amount")
+        self.assertEqual(result.filters, (StructuredFilter("region", "eq", "华东"),))
+
+    def test_non_count_metric_ignores_distinct_numeric_filter_field(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        quantity = replace(
+            base.schema.columns[0],
+            physical_name="quantity",
+            original_name="数量",
+            display_name="数量",
+            aliases=("件数",),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    base,
+                    schema=replace(
+                        base.schema,
+                        columns=(base.schema.columns[0], quantity, *base.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+
+        result = parse_structured_intent(
+            "数量大于100的订单金额总和",
+            catalog,
+        )
+
+        self.assertEqual(result.aggregate, "sum")
+        self.assertEqual(result.metric_physical_name, "order_amount")
+        self.assertIn(StructuredFilter("quantity", "gt", "100"), result.filters)
+
+    def test_non_count_uses_single_aggregate_filter_field_when_no_other_metric_exists(self) -> None:
+        result = parse_structured_intent(
+            "订单金额大于100的总和",
+            sample_catalog(),
+        )
+
+        self.assertEqual(result.metric_physical_name, "order_amount")
+        self.assertEqual(
+            result.filters,
+            (StructuredFilter("order_amount", "gt", "100"),),
+        )
+
     def test_count_resolves_confirmed_non_aggregate_field(self) -> None:
         result = parse_structured_intent("地区计数", sample_catalog())
 
@@ -223,6 +321,34 @@ class StructuredIntentParserTest(unittest.TestCase):
         )
 
         self.assertIsInstance(result, (StructuredClarification, StructuredUnavailable))
+
+    def test_or_implicit_filters_are_rejected(self) -> None:
+        result = parse_structured_intent(
+            "华东地区或华南地区的订单金额总和",
+            sample_catalog(),
+        )
+
+        self.assertIsInstance(result, (StructuredClarification, StructuredUnavailable))
+
+    def test_or_date_ranges_are_rejected(self) -> None:
+        result = parse_structured_intent(
+            "2026-01-01至2026-01-07或2026-02-01至2026-02-07订单金额总和",
+            sample_catalog(),
+        )
+
+        self.assertIsInstance(result, (StructuredClarification, StructuredUnavailable))
+
+    def test_unknown_explicit_equality_field_is_never_dropped(self) -> None:
+        for question in (
+            "省份=浙江的订单金额总和",
+            "省份为浙江的订单金额总和",
+        ):
+            with self.subTest(question=question):
+                result = parse_structured_intent(question, sample_catalog())
+                self.assertIsInstance(
+                    result,
+                    (StructuredClarification, StructuredUnavailable),
+                )
 
     def test_equality_stops_at_chinese_comma_and_de_boundary(self) -> None:
         comma = parse_structured_intent(
@@ -545,6 +671,33 @@ class StructuredIntentParserTest(unittest.TestCase):
 
         self.assertIsInstance(result, StructuredClarification)
         self.assertEqual(result.candidates, ("ds-sales", "ds-sales-2"))
+
+    def test_dataset_worksheet_substring_inside_metric_is_not_a_mention(self) -> None:
+        catalog = sample_catalog()
+        sales = catalog.datasets[0]
+        other_publication = replace(
+            sample_publication(),
+            publication_id="pub-other",
+            dataset_id="ds-other",
+            physical_table_name="structured_ds_other_v1",
+        )
+        other = replace(
+            sales,
+            schema=replace(
+                sales.schema,
+                dataset_id="ds-other",
+                worksheet_name="订单",
+            ),
+            source_name="other.xlsx",
+            active_publication=other_publication,
+        )
+
+        result = parse_structured_intent(
+            "sales订单金额平均值",
+            replace(catalog, datasets=(sales, other)),
+        )
+
+        self.assertEqual(result.dataset_id, "ds-sales")
 
     def test_display_name_tie_returns_all_candidates(self) -> None:
         catalog = sample_catalog()
