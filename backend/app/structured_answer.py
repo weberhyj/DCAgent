@@ -91,6 +91,10 @@ _AGGREGATE_CONCEPT_TERMS = tuple(
 )
 _NATURAL_AGGREGATE_TAILS = ("是多少", "有多少", "多少", "呢", "吗")
 _EQUALITY_FIELD_DELIMITERS = ("，", ",", "。", "；", ";", "且", "或")
+_EQUALITY_AGGREGATE_VALUE_RE = re.compile(
+    rf"\s*(?P<value>{'|'.join(re.escape(term) for term in sorted(_CHINESE_AGGREGATE_TERMS, key=len, reverse=True))})"
+    r"(?=$|[\s，,。的且或；;])"
+)
 
 
 class StructuredAnswerService:
@@ -193,7 +197,6 @@ class StructuredAnswerService:
 
 
 def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
-    normalized = _normalize(question)
     if not _has_aggregate_language(question):
         return False
     if (
@@ -206,6 +209,20 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     catalog_names = {
         name for dataset in catalog.datasets for name in _dataset_names(dataset) if name
     }
+    filter_names = {
+        _normalize(value)
+        for dataset in catalog.datasets
+        for column in dataset.schema.columns
+        if column.allow_filter
+        for value in (
+            column.physical_name,
+            column.original_name,
+            column.display_name,
+            *column.aliases,
+        )
+        if value
+    }
+    normalized = _normalize(_mask_aggregate_equality_values(question, filter_names))
     return _has_catalog_span_with_independent_aggregate(normalized, catalog_names)
 
 
@@ -262,6 +279,29 @@ def _has_catalog_span_with_independent_aggregate(
     return False
 
 
+def _mask_aggregate_equality_values(question: str, filter_names: set[str]) -> str:
+    masked = list(question)
+    for operator in re.finditer(r"为|=", question):
+        context = _normalize(question[max(0, operator.start() - 2) : operator.end()])
+        if any(context.endswith(item) for item in _COPULA_FRAGMENTS):
+            continue
+        prefix = question[: operator.start()]
+        field_start = max(
+            (prefix.rfind(delimiter) + 1 for delimiter in _EQUALITY_FIELD_DELIMITERS),
+            default=0,
+        )
+        field = _normalize(question[field_start : operator.start()])
+        if not any(field.endswith(name) for name in filter_names):
+            continue
+        value_match = _EQUALITY_AGGREGATE_VALUE_RE.match(question[operator.end() :])
+        if value_match is None:
+            continue
+        value_start = operator.end() + value_match.start("value")
+        value_end = operator.end() + value_match.end("value")
+        masked[value_start:value_end] = "_" * (value_end - value_start)
+    return "".join(masked)
+
+
 def _is_implicit_row_count(question: str) -> bool:
     return _IMPLICIT_ROW_COUNT_RE.fullmatch(question.strip()) is not None
 
@@ -273,11 +313,25 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
         return "weak"
     if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(stripped):
         return "strong"
+    if _has_metric_qualified_concept_shape(normalized):
+        return "strong"
     if _is_aggregate_concept_question(normalized):
         return "concept"
     if _is_implicit_row_count(stripped) or _has_field_aggregate_suffix(normalized):
         return "strong"
     return "weak"
+
+
+def _has_metric_qualified_concept_shape(normalized: str) -> bool:
+    for phrase in _CONCEPT_ANYWHERE_PHRASES:
+        start = normalized.find(phrase)
+        while start >= 0:
+            if _has_field_aggregate_suffix(normalized[start + len(phrase) :]):
+                return True
+            start = normalized.find(phrase, start + 1)
+    if normalized.endswith("是什么"):
+        return _has_field_aggregate_suffix(normalized[: -len("是什么")])
+    return False
 
 
 def _has_chinese_equality_filter(question: str) -> bool:
