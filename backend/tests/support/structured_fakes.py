@@ -165,16 +165,27 @@ def sample_catalog(*, ambiguous: bool = False) -> StructuredCatalog:
 
 class RecordingParquetSink:
     def __init__(self, root: Path | None = None) -> None:
-        self.root = root
+        self.root = root or Path(".")
         self.batch_rows: list[int] = []
         self.output_paths: list[Path] = []
+        self.batches: list[Any] = []
 
     def write_batch(self, rows: Sequence[Any], output_path: Path) -> None:
         self.batch_rows.append(len(rows))
         self.output_paths.append(Path(output_path))
+        self.batches.append(rows)
 
     def write(self, rows: Sequence[Any], output_path: Path) -> None:
         self.write_batch(rows, output_path)
+
+    def iter_batches(self, paths: Sequence[Path]):
+        expected = [Path(path) for path in paths]
+        selected = [
+            batch
+            for path, batch in zip(self.output_paths, self.batches, strict=True)
+            if path in expected
+        ]
+        return iter(selected)
 
 
 class FakeClickHouse:

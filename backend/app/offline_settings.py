@@ -70,6 +70,7 @@ class OfflineSettings:
     llama_server_url: str
     raw_data_root: Path
     parquet_root: Path
+    structured_ingest_batch_rows: int
     model_root: Path
     model_slots: int
     dependency_timeout_seconds: float
@@ -95,6 +96,15 @@ class OfflineSettings:
         if model_slots not in {1, 2, 3, 4}:
             raise OfflineSettingsError("MODEL_SLOTS must be between 1 and 4")
 
+        try:
+            structured_ingest_batch_rows = int(environ.get("STRUCTURED_INGEST_BATCH_ROWS", "50000"))
+        except ValueError as error:
+            raise OfflineSettingsError(
+                "STRUCTURED_INGEST_BATCH_ROWS must be between 1 and 50000"
+            ) from error
+        if not 1 <= structured_ingest_batch_rows <= 50_000:
+            raise OfflineSettingsError("STRUCTURED_INGEST_BATCH_ROWS must be between 1 and 50000")
+
         return cls(
             offline_mode=offline_mode,
             structured_query_enabled=parse_bool(
@@ -103,6 +113,7 @@ class OfflineSettings:
             clamav_host=environ.get("CLAMAV_HOST", "127.0.0.1"),
             raw_data_root=Path(environ.get("RAW_DATA_ROOT", "./data/raw")),
             parquet_root=Path(environ.get("PARQUET_ROOT", "./data/parquet")),
+            structured_ingest_batch_rows=structured_ingest_batch_rows,
             model_root=Path(environ.get("MODEL_ROOT", "./models")),
             model_slots=model_slots,
             dependency_timeout_seconds=float(environ.get("DEPENDENCY_TIMEOUT_SECONDS", "2.0")),

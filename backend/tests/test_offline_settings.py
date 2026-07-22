@@ -131,6 +131,22 @@ class OfflineSettingsTest(unittest.TestCase):
                 with self.assertRaisesRegex(OfflineSettingsError, "between 1 and 4"):
                     OfflineSettings.from_environ({"MODEL_SLOTS": model_slots})
 
+    def test_structured_ingest_batch_rows_is_bounded_and_configurable(self) -> None:
+        self.assertEqual(OfflineSettings.from_environ({}).structured_ingest_batch_rows, 50_000)
+        self.assertEqual(
+            OfflineSettings.from_environ(
+                {"STRUCTURED_INGEST_BATCH_ROWS": "2048"}
+            ).structured_ingest_batch_rows,
+            2048,
+        )
+
+        for value in ("0", "50001", "many"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    OfflineSettingsError, "STRUCTURED_INGEST_BATCH_ROWS.*1.*50000"
+                ):
+                    OfflineSettings.from_environ({"STRUCTURED_INGEST_BATCH_ROWS": value})
+
     def test_existing_llm_provider_rejects_public_api_in_offline_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "private or loopback"):
             create_llm_provider(
