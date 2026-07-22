@@ -41,12 +41,16 @@ const structuredPreview = {
   diagnostics: [],
 }
 
-function createManagement(sourceType: string) {
-  const structured = sourceType === 'XLSX' || sourceType === 'CSV'
-  return {
+function createManagement(sourceType: string, name?: string) {
+  const sourceName = name ?? (sourceType === 'PDF' ? 'notes.pdf' : 'sales.xlsx')
+  const structured = sourceType === 'XLSX'
+    || sourceType === 'CSV'
+    || sourceType === '\u8868\u683c'
+    || /\.(xlsx|csv)$/i.test(sourceName)
+  const management = {
     knowledgeSources: shallowRef([{
       id: 'source-1',
-      name: structured ? 'sales.xlsx' : 'notes.pdf',
+      name: sourceName,
       sourceType,
       records: structured ? 0 : 1,
       status: structured ? '\u5f85\u786e\u8ba4\u8868\u7ed3\u6784' : '\u5df2\u7d22\u5f15',
@@ -65,12 +69,14 @@ function createManagement(sourceType: string) {
     knowledgeChunksLoading: shallowRef(false),
     structuredPreviewLoading: shallowRef(false),
     structuredSchemaConfirming: shallowRef(false),
+    structuredSchemaConfirmation: shallowRef<{ status: string, datasets: never[] } | null>(null),
     error: shallowRef<string | null>(null),
     loadKnowledgeSources: vi.fn().mockResolvedValue(undefined),
     inspectKnowledgeSource: vi.fn().mockResolvedValue(undefined),
     loadStructuredPreview: vi.fn().mockResolvedValue(undefined),
     confirmStructuredSchema: vi.fn().mockResolvedValue({ status: 'confirmed', datasets: [] }),
   }
+  return management
 }
 
 describe('KnowledgeSourceDetailPage structured schema', () => {
@@ -107,6 +113,23 @@ describe('KnowledgeSourceDetailPage structured schema', () => {
     expect(management.loadStructuredPreview).not.toHaveBeenCalled()
     expect(wrapper.get('.chunk-panel').text()).toContain('Legacy chunk text')
     expect(wrapper.find('[data-testid="structured-schema-panel"]').exists()).toBe(false)
+  })
+
+  it.each([
+    { sourceType: '\u8868\u683c', name: 'sales.data' },
+    { sourceType: 'uploaded file', name: 'sales.xlsx' },
+    { sourceType: 'uploaded file', name: 'sales.csv' },
+  ])('uses structured preview for real backend table identity: $sourceType $name', async ({ sourceType, name }) => {
+    const management = createManagement(sourceType, name)
+    useManagement.mockReturnValue(management)
+
+    mount(KnowledgeSourceDetailPage, {
+      global: { stubs: { RouterLink: RouterLinkStub } },
+    })
+    await flushPromises()
+
+    expect(management.loadStructuredPreview).toHaveBeenCalledWith('source-1')
+    expect(management.inspectKnowledgeSource).not.toHaveBeenCalled()
   })
 
   it('passes the complete panel submission to the composable', async () => {
@@ -166,5 +189,28 @@ describe('KnowledgeSourceDetailPage structured schema', () => {
     expect(wrapper.text()).not.toContain('暂无可预览片段')
     expect(wrapper.find('[data-testid="structured-schema-panel"]').exists()).toBe(false)
     expect(wrapper.find('.chunk-panel').exists()).toBe(false)
+  })
+
+  it('shows confirmation success and prevents duplicate schema confirmation', async () => {
+    const management = createManagement('CSV')
+    management.confirmStructuredSchema.mockImplementation(async () => {
+      const response = { status: 'confirmed', datasets: [] as never[] }
+      management.structuredSchemaConfirmation.value = response
+      return response
+    })
+    useManagement.mockReturnValue(management)
+    const wrapper = mount(KnowledgeSourceDetailPage, {
+      global: { stubs: { RouterLink: RouterLinkStub } },
+    })
+    await flushPromises()
+
+    const confirm = wrapper.get('[data-testid="structured-confirm-button"]')
+    await confirm.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('\u8868\u7ed3\u6784\u5df2\u786e\u8ba4')
+    expect(confirm.attributes('disabled')).toBeDefined()
+    await confirm.trigger('click')
+    expect(management.confirmStructuredSchema).toHaveBeenCalledTimes(1)
   })
 })

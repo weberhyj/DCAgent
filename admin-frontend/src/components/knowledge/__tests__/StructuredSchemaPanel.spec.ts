@@ -201,4 +201,98 @@ describe('StructuredSchemaPanel', () => {
     await crossColumn.get('[data-testid="aliases-amount"]').setValue('area')
     expect(crossColumn.get('[data-testid="structured-confirm-button"]').attributes('disabled')).toBeDefined()
   })
+
+  it('allows the same alias in different worksheets', () => {
+    const wrapper = mountPanel({
+      datasets: [
+        {
+          ...preview.datasets[0],
+          datasetId: 'dataset-1',
+          worksheetName: 'Sheet1',
+          columns: [{ ...preview.datasets[0].columns[0], aliases: ['revenue'] }],
+        },
+        {
+          ...preview.datasets[0],
+          datasetId: 'dataset-2',
+          worksheetName: 'Sheet2',
+          columns: [{
+            ...preview.datasets[0].columns[0],
+            physicalName: 'total',
+            originalName: 'Total',
+            displayName: 'Total',
+            aliases: ['revenue'],
+          }],
+        },
+      ],
+    })
+
+    expect(wrapper.get('[data-testid="structured-confirm-button"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('preserves dirty edits for an equivalent schema and resets for a changed schema key', async () => {
+    const wrapper = mountPanel()
+    const displayName = wrapper.get('[data-testid="display-name-amount"]')
+    await displayName.setValue('My edited amount')
+
+    await wrapper.setProps({
+      preview: {
+        ...preview,
+        datasets: preview.datasets.map((dataset) => ({
+          ...dataset,
+          columns: dataset.columns.map((column) => ({ ...column, displayName: `Server ${column.displayName}` })),
+        })),
+      },
+    })
+    expect(displayName.element).toHaveProperty('value', 'My edited amount')
+
+    await wrapper.setProps({
+      preview: {
+        ...preview,
+        datasets: preview.datasets.map((dataset) => ({
+          ...dataset,
+          schemaHash: 'hash-2',
+          columns: dataset.columns.map((column) => ({ ...column, displayName: `New ${column.displayName}` })),
+        })),
+      },
+    })
+    expect(wrapper.get<HTMLInputElement>('[data-testid="display-name-amount"]').element.value).toBe('New Amount')
+  })
+
+  it('shows confirmed success and disables the form against duplicate confirmation', async () => {
+    const wrapper = mount(StructuredSchemaPanel, {
+      props: { preview, confirmed: true, confirmationStatus: 'confirmed' },
+    })
+
+    expect(wrapper.text()).toContain('\u8868\u7ed3\u6784\u5df2\u786e\u8ba4')
+    expect(wrapper.get('[data-testid="structured-confirm-button"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="display-name-amount"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="structured-confirm-button"]').trigger('click')
+    expect(wrapper.emitted('confirm')).toBeUndefined()
+  })
+
+  it('enforces backend length/count limits and exposes visible validation messages', async () => {
+    const wrapper = mountPanel()
+    const displayName = wrapper.get('[data-testid="display-name-amount"]')
+    const aliases = wrapper.get('[data-testid="aliases-amount"]')
+
+    expect(displayName.attributes('maxlength')).toBe('240')
+    expect(displayName.attributes('aria-label')).toContain('Sheet1')
+    expect(displayName.attributes('aria-label')).toContain('amount')
+    expect(aliases.attributes('aria-label')).toContain('aliases')
+    expect(wrapper.get('[data-testid="type-amount"]').attributes('aria-label')).toContain('type')
+    expect(wrapper.get('[data-testid="aggregate-amount"]').attributes('aria-label')).toContain('aggregate')
+    expect(wrapper.get('[data-testid="filter-amount"]').attributes('aria-label')).toContain('filter')
+    expect(wrapper.get('[data-testid="null-policy-amount"]').attributes('aria-label')).toContain('null policy')
+
+    await displayName.setValue('x'.repeat(241))
+    expect(wrapper.get('[data-testid="structured-confirm-button"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="structured-validation-summary"]').text()).toContain('240')
+
+    await displayName.setValue('Amount')
+    await aliases.setValue(Array.from({ length: 21 }, (_, index) => `alias${index}`).join(','))
+    expect(wrapper.get('[data-testid="structured-validation-summary"]').text()).toContain('20')
+
+    await aliases.setValue('a'.repeat(81))
+    expect(wrapper.get('[data-testid="structured-validation-summary"]').text()).toContain('80')
+  })
 })

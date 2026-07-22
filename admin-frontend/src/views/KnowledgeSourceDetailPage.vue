@@ -6,12 +6,14 @@ import AdminPageHeader from '@/components/layout/AdminPageHeader.vue'
 import StructuredSchemaPanel from '@/components/knowledge/StructuredSchemaPanel.vue'
 import { useChatKnowledgeManagement } from '@/composables/useChatKnowledgeManagement'
 import type { StructuredSchemaSubmission } from '@/types/chat'
+import { isStructuredKnowledgeSource } from '@/utils/knowledgeSources'
 
 const route = useRoute()
 const {
   knowledgeSources,
   knowledgeChunks,
   structuredPreview,
+  structuredSchemaConfirmation,
   knowledgeSourcesLoading,
   knowledgeChunksLoading,
   structuredPreviewLoading,
@@ -25,15 +27,9 @@ const {
 
 const sourceId = computed(() => String(route.params.sourceId ?? ''))
 const activeSource = computed(() => knowledgeSources.value.find((source) => source.id === sourceId.value) ?? null)
-const structuredSource = computed(() => {
-  const source = activeSource.value
-  if (!source) return false
-  const sourceType = source.sourceType.trim().toLowerCase()
-  return sourceType === 'xlsx'
-    || sourceType === 'csv'
-    || source.status === '\u5f85\u786e\u8ba4\u8868\u7ed3\u6784'
-    || source.status === '\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d'
-})
+const structuredSource = computed(() => isStructuredKnowledgeSource(activeSource.value ?? undefined))
+const structuredConfirmationStatus = computed(() => structuredSchemaConfirmation.value?.status ?? null)
+const structuredConfirmed = computed(() => structuredConfirmationStatus.value === 'confirmed')
 const loading = computed(() => knowledgeSourcesLoading.value
   || (structuredSource.value ? structuredPreviewLoading.value : knowledgeChunksLoading.value))
 
@@ -88,6 +84,8 @@ async function handleStructuredConfirm(submission: StructuredSchemaSubmission) {
       v-else-if="structuredSource && structuredPreview"
       :preview="structuredPreview"
       :confirming="structuredSchemaConfirming"
+      :confirmed="structuredConfirmed"
+      :confirmation-status="structuredConfirmationStatus"
       @confirm="handleStructuredConfirm"
     />
     <div v-else-if="structuredSource" class="module-state">

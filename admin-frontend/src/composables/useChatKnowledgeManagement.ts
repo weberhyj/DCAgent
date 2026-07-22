@@ -14,26 +14,17 @@ import type {
   KnowledgeChunk,
   KnowledgeSource,
   StructuredPreview,
+  StructuredSchemaConfirmationResponse,
   StructuredSchemaSubmission,
 } from '@/types/chat'
+import { isStructuredKnowledgeSource } from '@/utils/knowledgeSources'
 
 const KNOWLEDGE_INDEXING_STATUS: KnowledgeSource['status'] = '解析中'
 const KNOWLEDGE_POLL_INTERVAL_MS = 800
 const KNOWLEDGE_POLL_ATTEMPTS = 5
-const STRUCTURED_SOURCE_TYPES = new Set(['csv', 'xlsx'])
-const STRUCTURED_SOURCE_STATUSES = new Set([
-  '\u5f85\u786e\u8ba4\u8868\u7ed3\u6784',
-  '\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d',
-])
 
 function hasIndexingSource(sources: readonly KnowledgeSource[]) {
   return sources.some((source) => source.status === KNOWLEDGE_INDEXING_STATUS)
-}
-
-function isStructuredKnowledgeSource(source: KnowledgeSource | undefined) {
-  if (!source) return false
-  return STRUCTURED_SOURCE_TYPES.has(source.sourceType.trim().toLowerCase())
-    || STRUCTURED_SOURCE_STATUSES.has(source.status)
 }
 
 function delay(milliseconds: number) {
@@ -46,6 +37,7 @@ export function useChatKnowledgeManagement() {
   const knowledgeSources = shallowRef<KnowledgeSource[]>([])
   const knowledgeChunks = shallowRef<KnowledgeChunk[]>([])
   const structuredPreview = shallowRef<StructuredPreview | null>(null)
+  const structuredSchemaConfirmation = shallowRef<StructuredSchemaConfirmationResponse | null>(null)
   const agentRuns = shallowRef<AgentRunAudit[]>([])
   const activeKnowledgeSourceId = shallowRef<string | null>(null)
   const knowledgeSourcesLoading = shallowRef(false)
@@ -58,6 +50,8 @@ export function useChatKnowledgeManagement() {
   const structuredSchemaConfirming = shallowRef(false)
   const agentRunsLoading = shallowRef(false)
   const error = shallowRef<string | null>(null)
+  let structuredPreviewRequestToken = 0
+  let structuredConfirmationRequestToken = 0
 
   async function loadKnowledgeSources() {
     knowledgeSourcesLoading.value = true
@@ -176,16 +170,27 @@ export function useChatKnowledgeManagement() {
   }
 
   async function loadStructuredPreview(sourceId: string) {
-    if (structuredPreviewLoading.value) return
+    const requestToken = ++structuredPreviewRequestToken
+    structuredConfirmationRequestToken += 1
     structuredPreviewLoading.value = true
+    structuredSchemaConfirming.value = false
+    structuredPreview.value = null
+    structuredSchemaConfirmation.value = null
     error.value = null
     try {
-      structuredPreview.value = await fetchStructuredPreview(sourceId)
+      const preview = await fetchStructuredPreview(sourceId)
+      if (requestToken === structuredPreviewRequestToken) {
+        structuredPreview.value = preview
+      }
     } catch {
-      structuredPreview.value = null
-      error.value = 'Structured schema preview could not be loaded.'
+      if (requestToken === structuredPreviewRequestToken) {
+        structuredPreview.value = null
+        error.value = 'Structured schema preview could not be loaded.'
+      }
     } finally {
-      structuredPreviewLoading.value = false
+      if (requestToken === structuredPreviewRequestToken) {
+        structuredPreviewLoading.value = false
+      }
     }
   }
 
@@ -194,15 +199,24 @@ export function useChatKnowledgeManagement() {
     submission: StructuredSchemaSubmission,
   ) {
     if (structuredSchemaConfirming.value) return null
+    const requestToken = ++structuredConfirmationRequestToken
     structuredSchemaConfirming.value = true
     error.value = null
     try {
-      return await confirmStructuredSchemaApi(sourceId, submission)
+      const confirmation = await confirmStructuredSchemaApi(sourceId, submission)
+      if (requestToken === structuredConfirmationRequestToken) {
+        structuredSchemaConfirmation.value = confirmation
+      }
+      return confirmation
     } catch {
-      error.value = 'Structured schema could not be confirmed.'
+      if (requestToken === structuredConfirmationRequestToken) {
+        error.value = 'Structured schema could not be confirmed.'
+      }
       return null
     } finally {
-      structuredSchemaConfirming.value = false
+      if (requestToken === structuredConfirmationRequestToken) {
+        structuredSchemaConfirming.value = false
+      }
     }
   }
 
@@ -216,9 +230,14 @@ export function useChatKnowledgeManagement() {
       return
     }
 
+    structuredPreviewRequestToken += 1
+    structuredConfirmationRequestToken += 1
+    structuredPreview.value = null
+    structuredSchemaConfirmation.value = null
+    structuredPreviewLoading.value = false
+    structuredSchemaConfirming.value = false
     if (knowledgeChunksLoading.value && activeKnowledgeSourceId.value === sourceId) return
     activeKnowledgeSourceId.value = sourceId
-    structuredPreview.value = null
     knowledgeChunksLoading.value = true
     error.value = null
     try {
@@ -235,6 +254,7 @@ export function useChatKnowledgeManagement() {
     knowledgeSources: readonly(knowledgeSources),
     knowledgeChunks: readonly(knowledgeChunks),
     structuredPreview: readonly(structuredPreview),
+    structuredSchemaConfirmation: readonly(structuredSchemaConfirmation),
     agentRuns: readonly(agentRuns),
     activeKnowledgeSourceId: readonly(activeKnowledgeSourceId),
     knowledgeSourcesLoading: readonly(knowledgeSourcesLoading),

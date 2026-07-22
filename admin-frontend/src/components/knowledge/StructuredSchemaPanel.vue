@@ -88,8 +88,12 @@ const COLUMN_TYPES: StructuredColumnType[] = [
 const props = withDefaults(defineProps<{
   preview: DeepReadonly<StructuredPreview>
   confirming?: boolean
+  confirmed?: boolean
+  confirmationStatus?: string | null
 }>(), {
   confirming: false,
+  confirmed: false,
+  confirmationStatus: null,
 })
 
 const emit = defineEmits<{
@@ -117,8 +121,15 @@ function createDrafts(preview: DeepReadonly<StructuredPreview>) {
 
 const datasets = reactive(createDrafts(props.preview))
 
-watch(() => props.preview, (preview) => {
-  datasets.splice(0, datasets.length, ...createDrafts(preview))
+function previewSchemaKey(preview: DeepReadonly<StructuredPreview>) {
+  const datasetsKey = preview.datasets
+    .map((dataset) => `${dataset.datasetId}:${dataset.schemaHash}`)
+    .join('|')
+  return `${preview.sourceId}:${datasetsKey}`
+}
+
+watch(() => previewSchemaKey(props.preview), () => {
+  datasets.splice(0, datasets.length, ...createDrafts(props.preview))
 })
 
 function isNumeric(type: StructuredColumnType) {
@@ -140,40 +151,60 @@ const hasBlockingDiagnostic = computed(() => props.preview.diagnostics.some(
   (diagnostic) => BLOCKING_DIAGNOSTIC_CODES.has(diagnostic.code),
 ))
 
-const schemaValid = computed(() => {
-  if (!datasets.length) return false
+const validationErrors = computed(() => {
+  const errors: string[] = []
+  if (!datasets.length) return ['At least one worksheet is required.']
 
-  const aliasOwners = new Map<string, string>()
   for (const dataset of datasets) {
-    if (!dataset.datasetId.trim() || !dataset.columns.length) return false
+    if (!dataset.datasetId.trim()) errors.push('Every worksheet requires a dataset id.')
+    if (!dataset.columns.length) {
+      errors.push(`${dataset.worksheetName} requires at least one column.`)
+      continue
+    }
+
+    const aliasOwners = new Map<string, string>()
 
     for (const column of dataset.columns) {
-      const columnOwner = `${dataset.datasetId}:${column.physicalName}`
       const displayName = column.displayName.trim()
-      if (!displayName) return false
-      if (!column.originalName.trim() && displayName === column.physicalName) return false
-      if (column.allowAggregate && !isNumeric(column.dataType)) return false
-      if (column.nullPolicy === 'zero' && !isNumeric(column.dataType)) return false
+      if (!displayName) errors.push(`${column.physicalName} requires a display name.`)
+      if (displayName.length > 240) errors.push(`${column.physicalName} display name must be 240 characters or fewer.`)
+      if (!column.originalName.trim() && displayName === column.physicalName) {
+        errors.push(`${column.physicalName} requires a readable display name.`)
+      }
+      if (column.allowAggregate && !isNumeric(column.dataType)) {
+        errors.push(`${column.physicalName} cannot aggregate a non-numeric type.`)
+      }
+      if (column.nullPolicy === 'zero' && !isNumeric(column.dataType)) {
+        errors.push(`${column.physicalName} cannot use zero for a non-numeric type.`)
+      }
 
       const aliases = parseAliases(column.aliasesText)
+      if (aliases.length > 20) errors.push(`${column.physicalName} supports at most 20 aliases.`)
       const localAliases = new Set<string>()
       for (const alias of aliases) {
-        if (!alias || alias.length > 80) return false
+        if (!alias) {
+          errors.push(`${column.physicalName} aliases cannot be blank.`)
+          continue
+        }
+        if (alias.length > 80) errors.push(`${column.physicalName} aliases must be 80 characters or fewer.`)
         const normalized = alias.toLocaleLowerCase()
-        if (localAliases.has(normalized)) return false
+        if (localAliases.has(normalized)) errors.push(`${column.physicalName} has duplicate aliases.`)
         const owner = aliasOwners.get(normalized)
-        if (owner && owner !== columnOwner) return false
+        if (owner && owner !== column.physicalName) errors.push(`${alias} is assigned to multiple columns.`)
         localAliases.add(normalized)
-        aliasOwners.set(normalized, columnOwner)
+        aliasOwners.set(normalized, column.physicalName)
       }
     }
   }
 
-  return true
+  return errors
 })
 
+const schemaValid = computed(() => validationErrors.value.length === 0)
+const confirmationLocked = computed(() => props.confirmed || props.confirmationStatus === 'confirmed')
+
 const confirmationDisabled = computed(() => (
-  props.confirming || hasBlockingDiagnostic.value || !schemaValid.value
+  props.confirming || confirmationLocked.value || hasBlockingDiagnostic.value || !schemaValid.value
 ))
 
 function confirmSchema() {
@@ -198,12 +229,26 @@ function confirmSchema() {
 
 <template>
   <section class="structured-schema-panel" data-testid="structured-schema-panel">
+    <p v-if="confirmationLocked" class="structured-schema-panel__success">
+      {{ '\u8868\u7ed3\u6784\u5df2\u786e\u8ba4' }}
+    </p>
+
     <ul v-if="preview.diagnostics.length" class="structured-schema-panel__diagnostics">
       <li
         v-for="diagnostic in preview.diagnostics"
         :key="`${diagnostic.code}:${diagnostic.worksheetName ?? ''}:${diagnostic.message}`"
       >
         {{ diagnostic.message }}
+      </li>
+    </ul>
+
+    <ul
+      v-if="validationErrors.length"
+      class="structured-schema-panel__validation"
+      data-testid="structured-validation-summary"
+    >
+      <li v-for="validationError in validationErrors" :key="validationError">
+        {{ validationError }}
       </li>
     </ul>
 
@@ -246,21 +291,28 @@ function confirmSchema() {
                 <input
                   v-model="column.displayName"
                   :data-testid="`display-name-${column.physicalName}`"
+                  :aria-label="`${dataset.worksheetName} ${column.physicalName} display name`"
                   type="text"
+                  maxlength="240"
+                  :disabled="confirmationLocked"
                 >
               </td>
               <td>
                 <input
                   v-model="column.aliasesText"
                   :data-testid="`aliases-${column.physicalName}`"
+                  :aria-label="`${dataset.worksheetName} ${column.physicalName} aliases`"
                   type="text"
                   placeholder="comma, separated"
+                  :disabled="confirmationLocked"
                 >
               </td>
               <td>
                 <select
                   v-model="column.dataType"
                   :data-testid="`type-${column.physicalName}`"
+                  :aria-label="`${dataset.worksheetName} ${column.physicalName} type`"
+                  :disabled="confirmationLocked"
                   @change="normalizeCapabilities(column)"
                 >
                   <option v-for="type in COLUMN_TYPES" :key="type" :value="type">
@@ -273,8 +325,9 @@ function confirmSchema() {
                   <input
                     v-model="column.allowAggregate"
                     :data-testid="`aggregate-${column.physicalName}`"
+                    :aria-label="`${dataset.worksheetName} ${column.physicalName} aggregate`"
                     type="checkbox"
-                    :disabled="!isNumeric(column.dataType)"
+                    :disabled="confirmationLocked || !isNumeric(column.dataType)"
                   >
                   Aggregate
                 </label>
@@ -282,7 +335,9 @@ function confirmSchema() {
                   <input
                     v-model="column.allowFilter"
                     :data-testid="`filter-${column.physicalName}`"
+                    :aria-label="`${dataset.worksheetName} ${column.physicalName} filter`"
                     type="checkbox"
+                    :disabled="confirmationLocked"
                   >
                   Filter
                 </label>
@@ -291,6 +346,8 @@ function confirmSchema() {
                 <select
                   v-model="column.nullPolicy"
                   :data-testid="`null-policy-${column.physicalName}`"
+                  :aria-label="`${dataset.worksheetName} ${column.physicalName} null policy`"
+                  :disabled="confirmationLocked"
                 >
                   <option value="ignore">ignore</option>
                   <option value="zero" :disabled="!isNumeric(column.dataType)">zero</option>
@@ -309,7 +366,7 @@ function confirmSchema() {
       :disabled="confirmationDisabled"
       @click="confirmSchema"
     >
-      {{ confirming ? 'Confirming...' : 'Confirm structure' }}
+      {{ confirming ? 'Confirming...' : confirmationLocked ? 'Confirmed' : 'Confirm structure' }}
     </button>
   </section>
 </template>
@@ -362,5 +419,16 @@ select {
 .structured-schema-panel__diagnostics {
   margin: 0;
   color: #b42318;
+}
+
+.structured-schema-panel__validation {
+  margin: 0;
+  color: #b42318;
+}
+
+.structured-schema-panel__success {
+  margin: 0;
+  color: #067647;
+  font-weight: 600;
 }
 </style>
