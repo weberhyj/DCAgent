@@ -767,6 +767,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "订单金额平均值是什么",
             "什么是订单金额加权平均值",
             "订单金额加权平均值是什么",
+            "什么是订单金额加权平均值呢",
         ):
             with self.subTest(question=question):
                 self._assert_catalog_failure_is_strong_candidate(question)
@@ -782,6 +783,11 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "我想了解什么是加权平均值",
             "能帮我讲讲什么是移动平均值",
             "请问调和平均值是什么",
+            "什么是加权平均值呢",
+            "我想了解什么是移动平均值吗",
+            "能帮我说说加权平均值是什么",
+            "麻烦告诉我调和平均值是什么",
+            "请介绍加权平均值是什么",
         )
 
         for question in questions:
@@ -789,7 +795,11 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 self._assert_catalog_failure_uses_legacy_path(question)
 
     def test_named_average_metric_phrases_route_to_structured_query(self) -> None:
-        for question in ("什么是订单金额加权平均值", "订单金额加权平均值是什么"):
+        for question in (
+            "什么是订单金额加权平均值",
+            "订单金额加权平均值是什么",
+            "什么是订单金额加权平均值呢",
+        ):
             with self.subTest(question=question):
                 provider = RecordingLLMProvider()
                 gateway = RecordingClickHouseGateway()

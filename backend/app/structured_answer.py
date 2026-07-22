@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import PurePath
@@ -75,12 +76,6 @@ _HAS_EXPLICIT_FILTER_RE = re.compile(
 )
 _CONCEPT_ANYWHERE_PHRASES = ("什么是", "什么叫", "何为", "是什么意思")
 _CONCEPT_TERM_INTRODUCERS = ("解释一下", "讲讲", "介绍一下", "说明一下")
-_CONCEPT_QUESTION_LEADIN_SUFFIXES = (
-    "请问",
-    "想了解",
-    "想知道",
-    *_CONCEPT_TERM_INTRODUCERS,
-)
 _CONCEPT_TERM_SUFFIXES = (
     "是什么",
     "是什么意思",
@@ -101,6 +96,34 @@ _NAMED_AVERAGE_CONCEPT_TERMS = (
     "几何平均值",
     "调和平均值",
 )
+_CONVERSATIONAL_CUE_ATOMS = tuple(
+    sorted(
+        (
+            "麻烦",
+            "告诉",
+            "介绍",
+            "解释",
+            "说明",
+            "了解",
+            "知道",
+            "一下",
+            "可以",
+            "请",
+            "问",
+            "能",
+            "帮",
+            "我",
+            "你",
+            "您",
+            "想",
+            "说",
+            "讲",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_NATURAL_QUESTION_PARTICLES = ("呢", "吗", "吧", "呀", "啊")
 _AGGREGATE_CONCEPT_TERMS = tuple(
     sorted((*_NAMED_AVERAGE_CONCEPT_TERMS, *_CHINESE_AGGREGATE_TERMS), key=len, reverse=True)
 )
@@ -370,9 +393,8 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
         return "weak"
     if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(stripped):
         return "strong"
-    if _is_exact_aggregate_concept_shape(normalized):
-        return "concept"
-    if _is_named_average_concept_shape(normalized):
+    concept_body = _normalize(_strip_concept_question_tail(stripped))
+    if _is_priority_aggregate_concept_shape(concept_body):
         return "concept"
     if _has_metric_qualified_concept_shape(normalized):
         return "strong"
@@ -383,37 +405,54 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
     return "weak"
 
 
-def _is_exact_aggregate_concept_shape(normalized: str) -> bool:
-    return any(
-        normalized
-        in {
-            f"什么是{term}",
-            f"什么叫{term}",
-            f"何为{term}",
-            *(f"{term}{suffix}" for suffix in _CONCEPT_TERM_SUFFIXES),
-        }
-        for term in _AGGREGATE_CONCEPT_TERMS
-    )
-
-
-def _is_named_average_concept_shape(normalized: str) -> bool:
+def _is_priority_aggregate_concept_shape(normalized: str) -> bool:
     for opener in ("什么是", "什么叫", "何为"):
         start = normalized.find(opener)
         while start >= 0:
-            if normalized[start + len(opener) :] in _NAMED_AVERAGE_CONCEPT_TERMS:
+            remainder = normalized[start + len(opener) :]
+            if remainder in _NAMED_AVERAGE_CONCEPT_TERMS:
+                return True
+            if start == 0 and remainder in _AGGREGATE_CONCEPT_TERMS:
                 return True
             start = normalized.find(opener, start + 1)
-    for term in _NAMED_AVERAGE_CONCEPT_TERMS:
+    for term in _AGGREGATE_CONCEPT_TERMS:
         for suffix in _CONCEPT_TERM_SUFFIXES:
             phrase = f"{term}{suffix}"
             if not normalized.endswith(phrase):
                 continue
             leadin = normalized[: -len(phrase)]
-            if not leadin or any(
-                leadin.endswith(marker) for marker in _CONCEPT_QUESTION_LEADIN_SUFFIXES
-            ):
+            if not leadin:
+                return True
+            if term in _NAMED_AVERAGE_CONCEPT_TERMS and _is_conversational_leadin(leadin):
                 return True
     return False
+
+
+def _strip_concept_question_tail(value: str) -> str:
+    remaining = value.rstrip()
+    while remaining:
+        previous = remaining
+        while remaining and unicodedata.category(remaining[-1]).startswith("P"):
+            remaining = remaining[:-1].rstrip()
+        particle = next(
+            (item for item in _NATURAL_QUESTION_PARTICLES if remaining.endswith(item)),
+            None,
+        )
+        if particle is not None:
+            remaining = remaining[: -len(particle)].rstrip()
+        if remaining == previous:
+            return remaining
+    return remaining
+
+
+def _is_conversational_leadin(value: str) -> bool:
+    remaining = value
+    while remaining:
+        cue = next((item for item in _CONVERSATIONAL_CUE_ATOMS if remaining.startswith(item)), None)
+        if cue is None:
+            return False
+        remaining = remaining[len(cue) :]
+    return True
 
 
 def _has_metric_qualified_concept_shape(normalized: str) -> bool:
