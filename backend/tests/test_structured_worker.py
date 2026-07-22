@@ -33,11 +33,22 @@ class RecordingPublisher:
         self.result = result
         self.calls: list[tuple[Path, object, str]] = []
         self.staging_tokens: list[str | None] = []
+        self.staging_generations: list[int | None] = []
         self.lease_checks = 0
 
-    def publish(self, path, schema, publication_id, *, lease_guard=None, staging_token=None):
+    def publish(
+        self,
+        path,
+        schema,
+        publication_id,
+        *,
+        lease_guard=None,
+        staging_token=None,
+        staging_generation=None,
+    ):
         self.calls.append((Path(path), schema, publication_id))
         self.staging_tokens.append(staging_token)
+        self.staging_generations.append(staging_generation)
         if lease_guard is not None:
             lease_guard()
             self.lease_checks += 1
@@ -50,7 +61,16 @@ class RecordingPublisher:
 
 
 class FailOncePublisher(RecordingPublisher):
-    def publish(self, path, schema, publication_id, *, lease_guard=None, staging_token=None):
+    def publish(
+        self,
+        path,
+        schema,
+        publication_id,
+        *,
+        lease_guard=None,
+        staging_token=None,
+        staging_generation=None,
+    ):
         if self.calls:
             return super().publish(
                 path,
@@ -58,9 +78,11 @@ class FailOncePublisher(RecordingPublisher):
                 publication_id,
                 lease_guard=lease_guard,
                 staging_token=staging_token,
+                staging_generation=staging_generation,
             )
         self.calls.append((Path(path), schema, publication_id))
         self.staging_tokens.append(staging_token)
+        self.staging_generations.append(staging_generation)
         raise RuntimeError("first attempt failed")
 
 
@@ -74,6 +96,7 @@ class StructuredWorkerTest(unittest.TestCase):
         self.source_id = confirmed.schema.source_id
         self.dataset_id = confirmed.schema.dataset_id
         self.source_path = confirmed.path
+        self.schema = confirmed.schema
         with self.database.session() as session:
             session.add(
                 KnowledgeSourceRecord(
@@ -155,6 +178,36 @@ class StructuredWorkerTest(unittest.TestCase):
             dataset = session.get(StructuredDatasetRecord, (self.dataset_id, 1))
             assert dataset is not None
             dataset.status = "published"
+
+    def add_confirmed_dataset(self, dataset_id: str = "ds-summary") -> str:
+        with self.database.session() as session:
+            dataset = StructuredDatasetRecord(
+                dataset_id=dataset_id,
+                source_id=self.source_id,
+                worksheet_name="Summary",
+                schema_version=1,
+                schema_hash="c" * 64,
+                status="confirmed",
+            )
+            dataset.columns = [
+                StructuredColumnRecord(
+                    id=f"{dataset_id}:1:{index}",
+                    dataset_id=dataset_id,
+                    schema_version=1,
+                    physical_name=column.physical_name,
+                    original_name=column.original_name,
+                    display_name=column.display_name,
+                    data_type=column.data_type.value,
+                    aliases=list(column.aliases),
+                    allow_aggregate=column.allow_aggregate,
+                    allow_filter=column.allow_filter,
+                    null_policy=column.null_policy,
+                    sort_order=index,
+                )
+                for index, column in enumerate(self.schema.columns)
+            ]
+            session.add(dataset)
+        return dataset_id
 
     def test_only_one_worker_claims_a_publication_job(self) -> None:
         job = self.enqueue()
@@ -368,6 +421,71 @@ class StructuredWorkerTest(unittest.TestCase):
                 self.publication_result(),
             )
 
+    def test_source_state_aggregates_active_and_pending_datasets(self) -> None:
+        second_dataset_id = self.add_confirmed_dataset()
+        first = self.repository.enqueue_publication(self.source_id, self.dataset_id, "pub-a")
+        second = self.repository.enqueue_publication(self.source_id, second_dataset_id, "pub-b")
+        claimed_first = self.repository.claim_publication("worker-a", 60)
+        assert claimed_first is not None
+        self.assertEqual(claimed_first.id, first.id)
+
+        self.repository.complete_publication(
+            claimed_first.id,
+            claimed_first.lease_token,
+            self.publication_result("pub-a"),
+        )
+        with self.database.session() as session:
+            source = session.get(KnowledgeSourceRecord, self.source_id)
+            assert source is not None
+            self.assertEqual(source.status, IMPORTING)
+            self.assertEqual(source.records, 2)
+
+        claimed_second = self.repository.claim_publication("worker-b", 60)
+        assert claimed_second is not None
+        self.assertEqual(claimed_second.id, second.id)
+        self.repository.fail_publication(
+            claimed_second.id,
+            claimed_second.lease_token,
+            "second worksheet failed",
+        )
+        with self.database.session() as session:
+            source = session.get(KnowledgeSourceRecord, self.source_id)
+            assert source is not None
+            self.assertEqual(source.status, INDEXED)
+            self.assertEqual(source.records, 2)
+
+    def test_source_records_sum_all_active_dataset_publications(self) -> None:
+        second_dataset_id = self.add_confirmed_dataset()
+        self.repository.enqueue_publication(self.source_id, self.dataset_id, "pub-a")
+        self.repository.enqueue_publication(self.source_id, second_dataset_id, "pub-b")
+        claimed_first = self.repository.claim_publication("worker-a", 60)
+        assert claimed_first is not None
+        self.repository.complete_publication(
+            claimed_first.id,
+            claimed_first.lease_token,
+            self.publication_result("pub-a"),
+        )
+        claimed_second = self.repository.claim_publication("worker-b", 60)
+        assert claimed_second is not None
+        self.repository.complete_publication(
+            claimed_second.id,
+            claimed_second.lease_token,
+            StructuredPublicationResult(
+                publication_id="pub-b",
+                physical_table_name="structured_ds_summary_v1_pub_b",
+                row_count=5,
+                column_count=3,
+                null_counts={"order_amount": 0, "region": 0, "order_date": 0},
+                content_hash="d" * 64,
+            ),
+        )
+
+        with self.database.session() as session:
+            source = session.get(KnowledgeSourceRecord, self.source_id)
+            assert source is not None
+            self.assertEqual(source.status, INDEXED)
+            self.assertEqual(source.records, 7)
+
     def test_worker_publishes_one_job_and_sets_source_status_after_promotion(self) -> None:
         self.enqueue()
         publisher = RecordingPublisher(self.publication_result())
@@ -383,6 +501,7 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertEqual(len(publisher.calls), 1)
         self.assertEqual(publisher.calls[0][0], self.source_path)
         self.assertRegex(publisher.staging_tokens[0] or "", r"^[0-9a-f]{24}$")
+        self.assertEqual(publisher.staging_generations, [1])
         self.assertGreaterEqual(publisher.lease_checks, 2)
         status = self.repository.get_structured_status(self.source_id)
         self.assertEqual(status.job.status, "published")
@@ -406,6 +525,7 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertEqual([call[2] for call in publisher.calls], ["pub-new", "pub-new"])
         self.assertEqual(len(publisher.staging_tokens), 2)
         self.assertNotEqual(publisher.staging_tokens[0], publisher.staging_tokens[1])
+        self.assertEqual(publisher.staging_generations, [1, 2])
         self.assertTrue(
             all(re.fullmatch(r"[0-9a-f]{24}", token or "") for token in publisher.staging_tokens)
         )

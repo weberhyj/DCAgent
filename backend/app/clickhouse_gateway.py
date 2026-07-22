@@ -96,16 +96,33 @@ class ClickHouseGateway:
         schema: StructuredDatasetSchema,
         publication_id: str,
         content_hash: str,
+        *,
+        staging_generation: int | None = None,
+        staging_token: str | None = None,
     ) -> ClickHousePublicationTarget:
         if not _HASH_RE.fullmatch(content_hash):
             raise StructuredStorageError("content hash must be a lowercase SHA-256 value")
+        if staging_generation is not None and not (
+            1 <= staging_generation <= 99_999_999_999_999_999_999
+        ):
+            raise StructuredStorageError(
+                "ClickHouse staging generation must be a positive 20-digit integer"
+            )
         dataset_component = _safe_component(schema.dataset_id)
         publication_suffix = hashlib.sha256(publication_id.encode("utf-8")).hexdigest()[:12]
         physical_table_name = (
             f"structured_{dataset_component}_v{schema.schema_version}_{publication_suffix}"
         )
-        self._discard_stale_staging_tables(physical_table_name)
-        staging_table = f"{physical_table_name}_staging_{secrets.token_hex(6)}"
+        self._discard_stale_staging_tables(physical_table_name, staging_generation)
+        if staging_generation is None:
+            staging_table = f"{physical_table_name}_staging_{secrets.token_hex(6)}"
+        else:
+            owner = (
+                secrets.token_hex(6)
+                if staging_token is None
+                else hashlib.sha256(staging_token.encode("utf-8")).hexdigest()[:12]
+            )
+            staging_table = f"{physical_table_name}_staging_g{staging_generation:020d}_{owner}"
         _require_identifier(physical_table_name)
         _require_identifier(staging_table)
         self._command(f"DROP TABLE IF EXISTS {staging_table}")
@@ -117,7 +134,11 @@ class ClickHouseGateway:
             content_hash=content_hash,
         )
 
-    def _discard_stale_staging_tables(self, physical_table_name: str) -> None:
+    def _discard_stale_staging_tables(
+        self,
+        physical_table_name: str,
+        staging_generation: int | None,
+    ) -> None:
         if self._query_client is None:
             return
         _require_identifier(physical_table_name)
@@ -127,9 +148,15 @@ class ClickHouseGateway:
             "WHERE database = currentDatabase() "
             f"AND startsWith(name, '{prefix}')"
         )
-        safe_name = re.compile(rf"^{re.escape(prefix)}[0-9a-f]{{12}}$")
+        legacy_name = re.compile(rf"^{re.escape(prefix)}[0-9a-f]{{12}}$")
+        generated_name = re.compile(rf"^{re.escape(prefix)}g([0-9]{{20}})_[0-9a-f]{{12}}$")
         for table_name in _as_single_column_values(result):
-            if safe_name.fullmatch(table_name):
+            if staging_generation is None:
+                should_drop = legacy_name.fullmatch(table_name) is not None
+            else:
+                match = generated_name.fullmatch(table_name)
+                should_drop = match is not None and int(match.group(1)) < staging_generation
+            if should_drop:
                 self._command(f"DROP TABLE IF EXISTS {table_name}")
 
     def insert_batch(self, target: ClickHousePublicationTarget, batch: Any) -> None:

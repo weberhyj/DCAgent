@@ -31,6 +31,7 @@ class StructuredPublisher(Protocol):
         *,
         lease_guard: Callable[[], None] | None = None,
         staging_token: str | None = None,
+        staging_generation: int | None = None,
     ) -> StructuredPublicationResult: ...
 
 
@@ -128,6 +129,7 @@ class StructuredIngestionWorker:
                 job.publication_id,
                 lease_guard=renew,
                 staging_token=_staging_token(lease_token),
+                staging_generation=job.attempt,
             )
             _validate_publication_result(result, job, len(publication_input.schema.columns))
             renew(force=True, checkpoint_row=result.row_count)

@@ -109,6 +109,7 @@ class SpreadsheetPublisher:
         *,
         lease_guard: Callable[[], None] | None = None,
         staging_token: str | None = None,
+        staging_generation: int | None = None,
     ) -> StructuredPublicationResult:
         _check_lease(lease_guard)
         source_root = Path(getattr(self.sink, "root", Path("./data/parquet")))
@@ -121,10 +122,17 @@ class SpreadsheetPublisher:
         )
         output_root = publication_root
         if staging_token is not None:
-            output_root = publication_root / f"attempt-{_safe_path_component(staging_token)}"
+            output_root = publication_root / _attempt_directory_name(
+                staging_token,
+                staging_generation,
+            )
         _require_within_root(source_root, output_root)
         if staging_token is not None:
-            _clear_stale_attempt_directories(publication_root, output_root)
+            _clear_stale_attempt_directories(
+                publication_root,
+                output_root,
+                staging_generation=staging_generation,
+            )
         _clear_publication_directory(output_root)
         output_paths: list[Path] = []
         buffered: list[dict[str, Any]] = []
@@ -226,7 +234,16 @@ class SpreadsheetPublisher:
         target = None
         try:
             _check_lease(lease_guard)
-            target = self.clickhouse.prepare_publication(schema, publication_id, content_hash)
+            if staging_generation is None:
+                target = self.clickhouse.prepare_publication(schema, publication_id, content_hash)
+            else:
+                target = self.clickhouse.prepare_publication(
+                    schema,
+                    publication_id,
+                    content_hash,
+                    staging_generation=staging_generation,
+                    staging_token=staging_token,
+                )
             for batch in self.sink.iter_batches(output_paths):
                 _check_lease(lease_guard)
                 batches = list(batch.columns)
@@ -616,18 +633,36 @@ def _clear_publication_directory(output_root: Path, *, best_effort: bool = False
             raise
 
 
-def _clear_stale_attempt_directories(publication_root: Path, current_attempt: Path) -> None:
+def _attempt_directory_name(staging_token: str, staging_generation: int | None) -> str:
+    token = _safe_path_component(staging_token)
+    if staging_generation is None:
+        return f"attempt-{token}"
+    if not 1 <= staging_generation <= 99_999_999_999_999_999_999:
+        raise StructuredIngestionError(
+            "invalid_staging_generation",
+            "Parquet staging generation must be a positive 20-digit integer.",
+        )
+    return f"attempt-{staging_generation:020d}-{token}"
+
+
+def _clear_stale_attempt_directories(
+    publication_root: Path,
+    current_attempt: Path,
+    *,
+    staging_generation: int | None,
+) -> None:
     try:
         candidates = tuple(publication_root.iterdir())
     except FileNotFoundError:
         return
     for candidate in candidates:
-        if (
-            candidate == current_attempt
-            or not candidate.name.startswith("attempt-")
-            or not candidate.is_dir()
-            or candidate.is_symlink()
-        ):
+        if candidate == current_attempt or not candidate.is_dir() or candidate.is_symlink():
+            continue
+        generated = re.fullmatch(r"attempt-([0-9]{20})-[A-Za-z0-9_.-]+", candidate.name)
+        if staging_generation is None:
+            if generated is not None or not candidate.name.startswith("attempt-"):
+                continue
+        elif generated is None or int(generated.group(1)) >= staging_generation:
             continue
         _require_within_root(publication_root, candidate)
         _clear_publication_directory(candidate, best_effort=True)

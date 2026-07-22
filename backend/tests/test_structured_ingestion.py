@@ -28,7 +28,13 @@ class RecordingPublicationGateway:
         self.inserted_batch_rows: list[int] = []
         self.validations: list[dict[str, object]] = []
 
-    def prepare_publication(self, schema, publication_id: str, content_hash: str):
+    def prepare_publication(
+        self,
+        schema,
+        publication_id: str,
+        content_hash: str,
+        **_kwargs,
+    ):
         self.prepared.append((schema, publication_id, content_hash))
         return type(
             "Target",
@@ -601,6 +607,40 @@ class StructuredIngestionTest(unittest.TestCase):
         self.assertTrue(
             (publication_root / "attempt-current-owner" / "part-00000.parquet").exists()
         )
+
+    def test_attempt_generation_never_deletes_a_newer_owner(self) -> None:
+        confirmed = sample_confirmed_schema(self.temp_dir, row_count=1)
+        publication_root = self.temp_dir / "parquet" / "kb-sales" / "ds-sales" / "1" / "pub-gc"
+        newer = publication_root / "attempt-00000000000000000002-new-owner"
+        newer.mkdir(parents=True)
+        (newer / "keep.parquet").write_bytes(b"new")
+        publisher = SpreadsheetPublisher(
+            sink=ArrowParquetSink(self.temp_dir / "parquet"),
+            clickhouse=RecordingPublicationGateway(),
+        )
+
+        publisher.publish(
+            confirmed.path,
+            confirmed.schema,
+            "pub-gc",
+            staging_token="old-owner",
+            staging_generation=1,
+        )
+
+        older = publication_root / "attempt-00000000000000000001-old-owner"
+        self.assertTrue(newer.exists())
+        self.assertTrue(older.exists())
+
+        publisher.publish(
+            confirmed.path,
+            confirmed.schema,
+            "pub-gc",
+            staging_token="new-owner",
+            staging_generation=2,
+        )
+
+        self.assertFalse(older.exists())
+        self.assertTrue((newer / "part-00000.parquet").exists())
 
 
 if __name__ == "__main__":

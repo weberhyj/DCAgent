@@ -53,7 +53,7 @@ function deferred<T>() {
 
 describe('useChatKnowledgeManagement structured schema', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    vi.resetAllMocks()
     api.fetchStructuredPreview.mockResolvedValue(preview)
     api.fetchKnowledgeSources.mockResolvedValue([source])
   })
@@ -330,7 +330,9 @@ describe('useChatKnowledgeManagement structured schema', () => {
   it('stops polling when the job fails', async () => {
     vi.useFakeTimers()
     api.enqueueStructuredPublication.mockResolvedValue({ jobId: 'job-1', status: 'queued' })
-    api.fetchStructuredStatus.mockResolvedValue(structuredStatus('failed', 'validation failed'))
+    api.fetchStructuredStatus.mockResolvedValue(
+      structuredStatus('failed', 'validation failed', null),
+    )
     const management = useChatKnowledgeManagement()
 
     await management.publishStructuredSource('source/1', 'dataset-1')
@@ -340,6 +342,29 @@ describe('useChatKnowledgeManagement structured schema', () => {
     expect(management.structuredPublicationStatus.value?.job.errorMessage).toBe('validation failed')
     await vi.advanceTimersByTimeAsync(1600)
     expect(api.fetchStructuredStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('continues polling while a failed job is scheduled for retry', async () => {
+    vi.useFakeTimers()
+    api.enqueueStructuredPublication.mockResolvedValue({ jobId: 'job-1', status: 'queued' })
+    api.fetchStructuredStatus
+      .mockResolvedValueOnce(structuredStatus('failed', 'retrying', '2026-07-22T10:00:00Z'))
+      .mockResolvedValueOnce(structuredStatus('running'))
+      .mockResolvedValueOnce(structuredStatus('published'))
+    const management = useChatKnowledgeManagement()
+
+    const pending = management.publishStructuredSource('source/1', 'dataset-1')
+    await flushPromises()
+    expect(management.structuredPublicationStatus.value?.job.status).toBe('failed')
+    expect(management.structuredPublishing.value).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(800)
+    expect(management.structuredPublicationStatus.value?.job.status).toBe('running')
+    await vi.advanceTimersByTimeAsync(800)
+    await pending
+
+    expect(management.structuredPublicationStatus.value?.job.status).toBe('published')
+    expect(api.fetchStructuredStatus).toHaveBeenCalledTimes(3)
   })
 
   it('clears importing state when status polling fails', async () => {
@@ -402,7 +427,11 @@ describe('useChatKnowledgeManagement structured schema', () => {
   })
 })
 
-function structuredStatus(status: 'queued' | 'running' | 'published' | 'failed', errorMessage: string | null = null) {
+function structuredStatus(
+  status: 'queued' | 'running' | 'published' | 'failed',
+  errorMessage: string | null = null,
+  nextAttemptAt: string | null = null,
+) {
   return {
     sourceId: 'source/1',
     sourceStatus: status === 'failed' ? '\u89e3\u6790\u5931\u8d25' : '\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d',
@@ -417,7 +446,7 @@ function structuredStatus(status: 'queued' | 'running' | 'published' | 'failed',
       leaseExpiresAt: null,
       checkpointRow: 0,
       attempt: 1,
-      nextAttemptAt: null,
+      nextAttemptAt,
       errorMessage,
     },
     activePublication: status === 'published' ? {

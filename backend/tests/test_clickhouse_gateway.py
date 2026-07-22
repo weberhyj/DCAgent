@@ -156,6 +156,62 @@ class ClickHouseGatewayTest(unittest.TestCase):
         self.assertNotIn(f"DROP TABLE IF EXISTS {other_publication}", dropped)
         self.assertNotEqual(target.staging_table, safe_stale)
 
+    def test_generation_cleanup_never_drops_a_newer_staging_table(self) -> None:
+        publication_suffix = hashlib.sha256(b"pub-1").hexdigest()[:12]
+        physical_table = f"structured_ds_sales_v1_{publication_suffix}"
+        generation_one = f"{physical_table}_staging_g00000000000000000001_aaaaaaaaaaaa"
+        generation_two = f"{physical_table}_staging_g00000000000000000002_bbbbbbbbbbbb"
+        malformed = f"{physical_table}_staging_g2_cccccccccccc"
+        other_publication = (
+            "structured_ds_sales_v1_other_staging_g00000000000000000001_dddddddddddd"
+        )
+        ingest = RecordingIngestClient()
+        query = RecordingQueryClient(
+            [],
+            staging_tables=[generation_one, generation_two, malformed, other_publication],
+        )
+        gateway = ClickHouseGateway(ingest, query_client=query)
+
+        gateway.prepare_publication(
+            sample_confirmed_schema_pathless(),
+            "pub-1",
+            "a" * 64,
+            staging_generation=1,
+        )
+        dropped = [statement for statement, _settings in ingest.ddl if statement.startswith("DROP")]
+        self.assertNotIn(f"DROP TABLE IF EXISTS {generation_two}", dropped)
+
+        gateway.prepare_publication(
+            sample_confirmed_schema_pathless(),
+            "pub-1",
+            "a" * 64,
+            staging_generation=2,
+        )
+        dropped = [statement for statement, _settings in ingest.ddl if statement.startswith("DROP")]
+        self.assertIn(f"DROP TABLE IF EXISTS {generation_one}", dropped)
+        self.assertNotIn(f"DROP TABLE IF EXISTS {generation_two}", dropped)
+        self.assertNotIn(f"DROP TABLE IF EXISTS {malformed}", dropped)
+        self.assertNotIn(f"DROP TABLE IF EXISTS {other_publication}", dropped)
+
+    def test_invalid_generation_is_rejected_before_staging_cleanup(self) -> None:
+        publication_suffix = hashlib.sha256(b"pub-1").hexdigest()[:12]
+        physical_table = f"structured_ds_sales_v1_{publication_suffix}"
+        existing = f"{physical_table}_staging_g00000000000000000001_aaaaaaaaaaaa"
+        ingest = RecordingIngestClient()
+        query = RecordingQueryClient([], staging_tables=[existing])
+        gateway = ClickHouseGateway(ingest, query_client=query)
+
+        with self.assertRaisesRegex(StructuredStorageError, "generation"):
+            gateway.prepare_publication(
+                sample_confirmed_schema_pathless(),
+                "pub-1",
+                "a" * 64,
+                staging_generation=100_000_000_000_000_000_000,
+            )
+
+        self.assertEqual(query.queries, [])
+        self.assertEqual(ingest.ddl, [])
+
     def test_rejects_the_same_client_for_ingest_and_read_only_queries(self) -> None:
         client = RecordingIngestClient()
 

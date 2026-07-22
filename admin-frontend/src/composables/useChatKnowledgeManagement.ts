@@ -65,6 +65,10 @@ export function useChatKnowledgeManagement() {
     structuredPublicationEnqueueing.value
     || structuredPublicationStatus.value?.job.status === 'queued'
     || structuredPublicationStatus.value?.job.status === 'running'
+    || (
+      structuredPublicationStatus.value?.job.status === 'failed'
+      && structuredPublicationStatus.value.job.nextAttemptAt !== null
+    )
   ))
 
   function cancelStructuredPublicationPolling(clearStatus = false) {
@@ -271,7 +275,10 @@ export function useChatKnowledgeManagement() {
           return null
         }
         structuredPublicationStatus.value = status
-        if (status.job.status === 'published' || status.job.status === 'failed') {
+        if (
+          status.job.status === 'published'
+          || (status.job.status === 'failed' && status.job.nextAttemptAt === null)
+        ) {
           structuredPublicationController = null
           return status
         }

@@ -422,9 +422,10 @@ class StructuredRepository:
                     current.error_message = None
                     publication = _lock_publication(session, current.publication_id)
                     publication.status = "queued"
-                    source.status = "\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d"
-                    source.error_message = None
+                    self._refresh_source_publication_state(session, source)
                     session.flush()
+                else:
+                    self._refresh_source_publication_state(session, source)
                 return _job_from_record(current)
             if session.get(StructuredPublicationRecord, publication_id) is not None:
                 raise StructuredConflictError("Structured publication id already exists")
@@ -461,8 +462,7 @@ class StructuredRepository:
             )
             session.add(publication)
             session.add(job)
-            source.status = "\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d"
-            source.error_message = None
+            self._refresh_source_publication_state(session, source)
             session.flush()
             return _job_from_record(job)
 
@@ -577,8 +577,7 @@ class StructuredRepository:
                 record.next_attempt_at = None
                 record.error_message = None
                 publication.status = "running"
-                source.status = "\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d"
-                source.error_message = None
+                self._refresh_source_publication_state(session, source)
                 session.flush()
                 return _job_from_record(record)
         return None
@@ -645,9 +644,7 @@ class StructuredRepository:
             record.next_attempt_at = None
             record.error_message = None
             dataset.status = "published"
-            source.status = "\u5df2\u7d22\u5f15"
-            source.records = result.row_count
-            source.error_message = None
+            self._refresh_source_publication_state(session, source)
             session.flush()
             return _job_from_record(record)
 
@@ -691,12 +688,59 @@ class StructuredRepository:
                 )
             )
             dataset.status = "published" if active is not None else "failed"
-            source.status = (
-                "\u5df2\u7d22\u5f15" if active is not None else "\u89e3\u6790\u5931\u8d25"
-            )
-            source.error_message = None if active is not None else message
+            self._refresh_source_publication_state(session, source)
             session.flush()
             return _job_from_record(record)
+
+    def _refresh_source_publication_state(
+        self,
+        session: Session,
+        source: KnowledgeSourceRecord,
+    ) -> None:
+        job_states = session.execute(
+            select(
+                StructuredIngestionJobRecord.status,
+                StructuredIngestionJobRecord.error_message,
+            )
+            .where(
+                StructuredIngestionJobRecord.source_id == source.id,
+                StructuredIngestionJobRecord.status.in_(("queued", "running", "failed")),
+            )
+            .order_by(StructuredIngestionJobRecord.sequence.desc())
+        ).all()
+        active_count, active_records = session.execute(
+            select(
+                func.count(StructuredPublicationRecord.publication_id),
+                func.coalesce(func.sum(StructuredPublicationRecord.row_count), 0),
+            )
+            .select_from(StructuredPublicationRecord)
+            .join(
+                StructuredDatasetRecord,
+                and_(
+                    StructuredDatasetRecord.dataset_id == StructuredPublicationRecord.dataset_id,
+                    StructuredDatasetRecord.schema_version
+                    == StructuredPublicationRecord.schema_version,
+                ),
+            )
+            .where(
+                StructuredDatasetRecord.source_id == source.id,
+                StructuredPublicationRecord.status == "published",
+            )
+        ).one()
+        source.records = int(active_records or 0)
+        statuses = {status for status, _error_message in job_states}
+        if statuses.intersection({"queued", "running"}):
+            source.status = "\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d"
+            source.error_message = None
+        elif active_count:
+            source.status = "\u5df2\u7d22\u5f15"
+            source.error_message = None
+        elif "failed" in statuses:
+            source.status = "\u89e3\u6790\u5931\u8d25"
+            source.error_message = next(
+                (error for _status, error in job_states if error),
+                None,
+            )
 
     def get_active_publication(self, dataset_id: str) -> StructuredPublication | None:
         with self._database.session() as session:
