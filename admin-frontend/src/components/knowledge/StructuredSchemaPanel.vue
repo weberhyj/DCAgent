@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from 'vue'
 import type { DeepReadonly } from 'vue'
+import type { StructuredStatus } from '@/types/chat'
 
 type StructuredColumnType = 'string' | 'integer' | 'decimal' | 'date' | 'datetime' | 'boolean'
 type StructuredNullPolicy = 'ignore' | 'zero' | 'reject'
@@ -90,14 +91,19 @@ const props = withDefaults(defineProps<{
   confirming?: boolean
   confirmed?: boolean
   confirmationStatus?: string | null
+  publishing?: boolean
+  publicationStatus?: DeepReadonly<StructuredStatus> | null
 }>(), {
   confirming: false,
   confirmed: false,
   confirmationStatus: null,
+  publishing: false,
+  publicationStatus: null,
 })
 
 const emit = defineEmits<{
   confirm: [submission: StructuredSchemaSubmission]
+  publish: []
 }>()
 
 function createDrafts(preview: DeepReadonly<StructuredPreview>) {
@@ -207,6 +213,10 @@ const confirmationDisabled = computed(() => (
   props.confirming || confirmationLocked.value || hasBlockingDiagnostic.value || !schemaValid.value
 ))
 
+const publicationDisabled = computed(() => (
+  !confirmationLocked.value || props.confirming || props.publishing
+))
+
 function confirmSchema() {
   if (confirmationDisabled.value) return
 
@@ -225,12 +235,27 @@ function confirmSchema() {
     })),
   })
 }
+
+function publishStructuredData() {
+  if (publicationDisabled.value) return
+  emit('publish')
+}
 </script>
 
 <template>
   <section class="structured-schema-panel" data-testid="structured-schema-panel">
     <p v-if="confirmationLocked" class="structured-schema-panel__success">
       {{ '\u8868\u7ed3\u6784\u5df2\u786e\u8ba4' }}
+    </p>
+
+    <p
+      v-if="publicationStatus"
+      class="structured-schema-panel__publication-status"
+      data-testid="structured-publication-status"
+    >
+      <span>{{ publicationStatus.job.status }}</span>
+      <span v-if="publicationStatus.job.errorMessage">{{ publicationStatus.job.errorMessage }}</span>
+      <span v-else-if="publicationStatus.job.status === 'published'">Published</span>
     </p>
 
     <ul v-if="preview.diagnostics.length" class="structured-schema-panel__diagnostics">
@@ -368,6 +393,15 @@ function confirmSchema() {
     >
       {{ confirming ? 'Confirming...' : confirmationLocked ? 'Confirmed' : 'Confirm structure' }}
     </button>
+
+    <button
+      data-testid="structured-publish-button"
+      type="button"
+      :disabled="publicationDisabled"
+      @click="publishStructuredData"
+    >
+      {{ publishing ? 'Importing...' : publicationStatus?.job.status === 'published' ? 'Published' : 'Publish data' }}
+    </button>
   </section>
 </template>
 
@@ -430,5 +464,13 @@ select {
   margin: 0;
   color: #067647;
   font-weight: 600;
+}
+
+.structured-schema-panel__publication-status {
+  display: flex;
+  gap: 8px;
+  margin: 0;
+  color: #315c9d;
+  font-size: 12px;
 }
 </style>

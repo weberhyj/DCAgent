@@ -5,7 +5,7 @@ import csv
 import hashlib
 import re
 import shutil
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -106,7 +106,10 @@ class SpreadsheetPublisher:
         path: Path,
         schema: StructuredDatasetSchema,
         publication_id: str,
+        *,
+        lease_guard: Callable[[], None] | None = None,
     ) -> StructuredPublicationResult:
+        _check_lease(lease_guard)
         source_root = Path(getattr(self.sink, "root", Path("./data/parquet")))
         output_root = (
             source_root
@@ -133,6 +136,7 @@ class SpreadsheetPublisher:
 
         try:
             for row_number, values, formulas in _iter_source_rows(Path(path), schema):
+                _check_lease(lease_guard)
                 if _row_is_empty(values, formulas):
                     continue
                 row: dict[str, Any] = {}
@@ -183,6 +187,7 @@ class SpreadsheetPublisher:
                     len(buffered) >= self.batch_rows
                     or buffered_bytes + len(canonical_row) > self.batch_bytes
                 ):
+                    _check_lease(lease_guard)
                     output_paths.append(
                         self._write_batch(buffered, column_schema, output_root, len(output_paths))
                     )
@@ -192,12 +197,14 @@ class SpreadsheetPublisher:
                 buffered_bytes += len(canonical_row)
                 row_count += 1
                 if len(buffered) >= self.batch_rows or buffered_bytes >= self.batch_bytes:
+                    _check_lease(lease_guard)
                     output_paths.append(
                         self._write_batch(buffered, column_schema, output_root, len(output_paths))
                     )
                     buffered = []
                     buffered_bytes = 0
             if buffered:
+                _check_lease(lease_guard)
                 output_paths.append(
                     self._write_batch(buffered, column_schema, output_root, len(output_paths))
                 )
@@ -212,8 +219,10 @@ class SpreadsheetPublisher:
         )
         target = None
         try:
+            _check_lease(lease_guard)
             target = self.clickhouse.prepare_publication(schema, publication_id, content_hash)
             for batch in self.sink.iter_batches(output_paths):
+                _check_lease(lease_guard)
                 batches = list(batch.columns)
                 batches.append(pa.array([content_hash] * batch.num_rows, type=pa.string()))
                 batch_schema = pa.schema(
@@ -227,6 +236,7 @@ class SpreadsheetPublisher:
             numeric_range_values = {
                 name: (bounds[0], bounds[1]) for name, bounds in numeric_ranges.items()
             }
+            _check_lease(lease_guard)
             physical_table_name = self.clickhouse.validate_and_promote(
                 target,
                 row_count=row_count,
@@ -235,6 +245,7 @@ class SpreadsheetPublisher:
                 numeric_ranges=numeric_range_values,
                 content_hash=content_hash,
             )
+            _check_lease(lease_guard)
         except Exception:
             discard = getattr(self.clickhouse, "discard_publication", None)
             if discard is not None and target is not None:
@@ -264,6 +275,11 @@ class SpreadsheetPublisher:
         output_path = output_root / f"part-{part_number:05d}.parquet"
         self.sink.write_batch(batch, output_path)
         return output_path
+
+
+def _check_lease(lease_guard: Callable[[], None] | None) -> None:
+    if lease_guard is not None:
+        lease_guard()
 
 
 def _iter_source_rows(

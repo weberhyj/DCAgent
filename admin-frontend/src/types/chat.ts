@@ -108,6 +108,43 @@ export interface StructuredSchemaConfirmationResponse {
   datasets: StructuredDatasetSchema[]
 }
 
+export type StructuredPublicationJobStatus = 'queued' | 'running' | 'published' | 'failed'
+
+export interface StructuredPublicationJob {
+  id: string
+  sourceId: string
+  datasetId: string
+  schemaVersion: number
+  publicationId: string
+  status: StructuredPublicationJobStatus
+  leaseExpiresAt: string | null
+  checkpointRow: number
+  attempt: number
+  nextAttemptAt: string | null
+  errorMessage: string | null
+}
+
+export interface StructuredPublication {
+  publicationId: string
+  datasetId: string
+  schemaVersion: number
+  physicalTableName: string
+  rowCount: number
+  contentHash: string
+}
+
+export interface StructuredPublicationEnqueueResponse {
+  jobId: string
+  status: 'queued'
+}
+
+export interface StructuredStatus {
+  sourceId: string
+  sourceStatus: KnowledgeSourceStatus
+  job: StructuredPublicationJob
+  activePublication: StructuredPublication | null
+}
+
 export interface AgentStepAudit {
   id: string
   stepIndex: number

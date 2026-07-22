@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -75,6 +76,11 @@ from .structured_models import (
     StructuredDatasetSchema as StructuredDatasetSchemaModel,
 )
 from .structured_models import StructuredDiagnostic as StructuredDiagnosticModel
+from .structured_models import StructuredPublication as StructuredPublicationModel
+from .structured_repository import (
+    StructuredPublicationJob as StructuredPublicationJobModel,
+)
+from .structured_repository import StructuredStatus as StructuredStatusModel
 from .time_utils import normalize_display_timestamp
 
 StructuredAlias = Annotated[
@@ -520,6 +526,85 @@ class StructuredSchemaConfirmationResponse(ApiModel):
         return cls(
             status=result.status,
             datasets=[StructuredDatasetSchema.from_model(item) for item in result.datasets],
+        )
+
+
+class StructuredPublication(ApiModel):
+    publication_id: str = Field(alias="publicationId")
+    dataset_id: str = Field(alias="datasetId")
+    schema_version: int = Field(alias="schemaVersion")
+    physical_table_name: str = Field(alias="physicalTableName")
+    row_count: int = Field(alias="rowCount")
+    content_hash: str = Field(alias="contentHash")
+
+    @classmethod
+    def from_model(cls, publication: StructuredPublicationModel) -> StructuredPublication:
+        return cls(
+            publicationId=publication.publication_id,
+            datasetId=publication.dataset_id,
+            schemaVersion=publication.schema_version,
+            physicalTableName=publication.physical_table_name,
+            rowCount=publication.row_count,
+            contentHash=publication.content_hash,
+        )
+
+
+class StructuredPublicationJob(ApiModel):
+    id: str
+    source_id: str = Field(alias="sourceId")
+    dataset_id: str = Field(alias="datasetId")
+    schema_version: int = Field(alias="schemaVersion")
+    publication_id: str = Field(alias="publicationId")
+    status: Literal["queued", "running", "published", "failed"]
+    lease_expires_at: datetime | None = Field(alias="leaseExpiresAt")
+    checkpoint_row: int = Field(alias="checkpointRow")
+    attempt: int
+    next_attempt_at: datetime | None = Field(alias="nextAttemptAt")
+    error_message: str | None = Field(alias="errorMessage")
+
+    @classmethod
+    def from_model(cls, job: StructuredPublicationJobModel) -> StructuredPublicationJob:
+        return cls(
+            id=job.id,
+            sourceId=job.source_id,
+            datasetId=job.dataset_id,
+            schemaVersion=job.schema_version,
+            publicationId=job.publication_id,
+            status=job.status,
+            leaseExpiresAt=job.lease_expires_at,
+            checkpointRow=job.checkpoint_row,
+            attempt=job.attempt,
+            nextAttemptAt=job.next_attempt_at,
+            errorMessage=job.error_message,
+        )
+
+
+class StructuredPublicationEnqueueResponse(ApiModel):
+    job_id: str = Field(alias="jobId")
+    status: Literal["queued"]
+
+    @classmethod
+    def from_model(cls, job: StructuredPublicationJobModel) -> StructuredPublicationEnqueueResponse:
+        return cls(jobId=job.id, status="queued")
+
+
+class StructuredStatusResponse(ApiModel):
+    source_id: str = Field(alias="sourceId")
+    source_status: str = Field(alias="sourceStatus")
+    job: StructuredPublicationJob
+    active_publication: StructuredPublication | None = Field(alias="activePublication")
+
+    @classmethod
+    def from_model(cls, status: StructuredStatusModel) -> StructuredStatusResponse:
+        return cls(
+            sourceId=status.source_id,
+            sourceStatus=status.source_status,
+            job=StructuredPublicationJob.from_model(status.job),
+            activePublication=(
+                None
+                if status.active_publication is None
+                else StructuredPublication.from_model(status.active_publication)
+            ),
         )
 
 

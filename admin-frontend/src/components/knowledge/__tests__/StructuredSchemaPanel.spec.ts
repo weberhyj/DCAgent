@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import StructuredSchemaPanel from '../StructuredSchemaPanel.vue'
 
 type ColumnType = 'string' | 'integer' | 'decimal' | 'date' | 'datetime' | 'boolean'
@@ -268,6 +268,69 @@ describe('StructuredSchemaPanel', () => {
     expect(wrapper.get('[data-testid="display-name-amount"]').attributes('disabled')).toBeDefined()
     await wrapper.get('[data-testid="structured-confirm-button"]').trigger('click')
     expect(wrapper.emitted('confirm')).toBeUndefined()
+  })
+
+  it('emits publish from an enabled button after schema confirmation', async () => {
+    const wrapper = mount(StructuredSchemaPanel, {
+      props: { preview, confirmed: true, confirmationStatus: 'confirmed' },
+    })
+
+    const publish = wrapper.get('[data-testid="structured-publish-button"]')
+    expect(publish.attributes('disabled')).toBeUndefined()
+    await publish.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.emitted('publish')).toEqual([[]])
+  })
+
+  it('disables publication while importing and renders terminal status', async () => {
+    const wrapper = mount(StructuredSchemaPanel, {
+      props: {
+        preview,
+        confirmed: true,
+        confirmationStatus: 'confirmed',
+        publishing: true,
+        publicationStatus: {
+          sourceId: 'source-1',
+          sourceStatus: '\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d',
+          job: {
+            id: 'job-1',
+            sourceId: 'source-1',
+            datasetId: 'dataset-1',
+            schemaVersion: 1,
+            publicationId: 'pub-1',
+            status: 'running',
+            leaseExpiresAt: null,
+            checkpointRow: 0,
+            attempt: 1,
+            nextAttemptAt: null,
+            errorMessage: null,
+          },
+          activePublication: null,
+        },
+      },
+    })
+
+    const publish = wrapper.get('[data-testid="structured-publish-button"]')
+    expect(publish.attributes('disabled')).toBeDefined()
+    expect(publish.text()).toContain('Importing')
+    await publish.trigger('click')
+    await flushPromises()
+    expect(wrapper.emitted('publish')).toBeUndefined()
+
+    await wrapper.setProps({
+      publishing: false,
+      publicationStatus: {
+        ...wrapper.props('publicationStatus'),
+        job: {
+          ...wrapper.props('publicationStatus')?.job,
+          status: 'failed',
+          errorMessage: 'validation failed',
+        },
+      },
+    })
+    await flushPromises()
+    expect(wrapper.get('[data-testid="structured-publication-status"]').text()).toContain('validation failed')
   })
 
   it('enforces backend length/count limits and exposes visible validation messages', async () => {

@@ -56,8 +56,10 @@ from .schemas import (
     KnowledgeSourceRequest,
     SendMessageRequest,
     SpreadsheetPreview,
+    StructuredPublicationEnqueueResponse,
     StructuredSchemaConfirmationRequest,
     StructuredSchemaConfirmationResponse,
+    StructuredStatusResponse,
 )
 from .storage import KnowledgeFileStorage
 from .structured_repository import (
@@ -568,6 +570,39 @@ def confirm_structured_schema(
     except StructuredConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return StructuredSchemaConfirmationResponse.from_model(result)
+
+
+@router.post(
+    "/knowledge/sources/{source_id}/structured-publications",
+    response_model=StructuredPublicationEnqueueResponse,
+    status_code=202,
+)
+def enqueue_structured_publication(
+    source_id: str,
+    structured_repository: StructuredRepository = Depends(get_structured_repository),
+) -> StructuredPublicationEnqueueResponse:
+    try:
+        job = structured_repository.enqueue_source_publication(source_id)
+    except StructuredNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except StructuredConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return StructuredPublicationEnqueueResponse.from_model(job)
+
+
+@router.get(
+    "/knowledge/sources/{source_id}/structured-status",
+    response_model=StructuredStatusResponse,
+)
+def get_structured_status(
+    source_id: str,
+    structured_repository: StructuredRepository = Depends(get_structured_repository),
+) -> StructuredStatusResponse:
+    try:
+        status = structured_repository.get_structured_status(source_id)
+    except StructuredNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return StructuredStatusResponse.from_model(status)
 
 
 @router.get("/knowledge/sources/{source_id}/chunks", response_model=list[KnowledgeChunk])

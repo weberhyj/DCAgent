@@ -70,11 +70,14 @@ function createManagement(sourceType: string, name?: string) {
     structuredPreviewLoading: shallowRef(false),
     structuredSchemaConfirming: shallowRef(false),
     structuredSchemaConfirmation: shallowRef<{ status: string, datasets: never[] } | null>(null),
+    structuredPublicationStatus: shallowRef(null),
+    structuredPublishing: shallowRef(false),
     error: shallowRef<string | null>(null),
     loadKnowledgeSources: vi.fn().mockResolvedValue(undefined),
     inspectKnowledgeSource: vi.fn().mockResolvedValue(undefined),
     loadStructuredPreview: vi.fn().mockResolvedValue(undefined),
     confirmStructuredSchema: vi.fn().mockResolvedValue({ status: 'confirmed', datasets: [] }),
+    publishStructuredSource: vi.fn().mockResolvedValue(null),
   }
   return management
 }
@@ -212,5 +215,20 @@ describe('KnowledgeSourceDetailPage structured schema', () => {
     expect(confirm.attributes('disabled')).toBeDefined()
     await confirm.trigger('click')
     expect(management.confirmStructuredSchema).toHaveBeenCalledTimes(1)
+  })
+
+  it('passes the publish event to composable orchestration', async () => {
+    const management = createManagement('CSV')
+    management.structuredSchemaConfirmation.value = { status: 'confirmed', datasets: [] }
+    useManagement.mockReturnValue(management)
+    const wrapper = mount(KnowledgeSourceDetailPage, {
+      global: { stubs: { RouterLink: RouterLinkStub } },
+    })
+    await flushPromises()
+
+    await wrapper.get('[data-testid="structured-publish-button"]').trigger('click')
+    await flushPromises()
+
+    expect(management.publishStructuredSource).toHaveBeenCalledWith('source-1')
   })
 })

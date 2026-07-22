@@ -1,13 +1,17 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises, mount } from '@vue/test-utils'
+import { defineComponent, h } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useChatKnowledgeManagement } from './useChatKnowledgeManagement'
 
 const api = vi.hoisted(() => ({
   confirmStructuredSchema: vi.fn(),
   deleteKnowledgeSource: vi.fn(),
+  enqueueStructuredPublication: vi.fn(),
   fetchAgentRuns: vi.fn(),
   fetchKnowledgeChunks: vi.fn(),
   fetchKnowledgeSources: vi.fn(),
   fetchStructuredPreview: vi.fn(),
+  fetchStructuredStatus: vi.fn(),
   reindexKnowledgeSource: vi.fn(),
   uploadKnowledgeFiles: vi.fn(),
 }))
@@ -52,6 +56,10 @@ describe('useChatKnowledgeManagement structured schema', () => {
     vi.clearAllMocks()
     api.fetchStructuredPreview.mockResolvedValue(preview)
     api.fetchKnowledgeSources.mockResolvedValue([source])
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
   })
 
   it('loads structured preview through readonly state', async () => {
@@ -270,4 +278,133 @@ describe('useChatKnowledgeManagement structured schema', () => {
     expect(management.structuredPreview.value).toBeNull()
     expect(management.error.value).toContain('preview')
   })
+
+  it('enqueues publication and stops polling when the job is published', async () => {
+    vi.useFakeTimers()
+    api.enqueueStructuredPublication.mockResolvedValue({ jobId: 'job-1', status: 'queued' })
+    api.fetchStructuredStatus
+      .mockResolvedValueOnce(structuredStatus('running'))
+      .mockResolvedValueOnce(structuredStatus('published'))
+    const management = useChatKnowledgeManagement()
+
+    const pending = management.publishStructuredSource('source/1')
+    await flushPromises()
+    expect(api.enqueueStructuredPublication).toHaveBeenCalledWith(
+      'source/1',
+      expect.any(AbortSignal),
+    )
+    expect(management.structuredPublishing.value).toBe(true)
+    expect(management.structuredPublicationStatus.value?.job.status).toBe('running')
+
+    await vi.advanceTimersByTimeAsync(800)
+    await pending
+    expect(management.structuredPublicationStatus.value?.job.status).toBe('published')
+    expect(management.structuredPublishing.value).toBe(false)
+    expect(api.fetchStructuredStatus).toHaveBeenCalledTimes(2)
+
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(api.fetchStructuredStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('stops polling when the job fails', async () => {
+    vi.useFakeTimers()
+    api.enqueueStructuredPublication.mockResolvedValue({ jobId: 'job-1', status: 'queued' })
+    api.fetchStructuredStatus.mockResolvedValue(structuredStatus('failed', 'validation failed'))
+    const management = useChatKnowledgeManagement()
+
+    await management.publishStructuredSource('source/1')
+    await flushPromises()
+
+    expect(management.structuredPublishing.value).toBe(false)
+    expect(management.structuredPublicationStatus.value?.job.errorMessage).toBe('validation failed')
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(api.fetchStructuredStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears importing state when status polling fails', async () => {
+    api.enqueueStructuredPublication.mockResolvedValue({ jobId: 'job-1', status: 'queued' })
+    api.fetchStructuredStatus
+      .mockResolvedValueOnce(structuredStatus('running'))
+      .mockRejectedValueOnce(new Error('offline'))
+    vi.useFakeTimers()
+    const management = useChatKnowledgeManagement()
+
+    const pending = management.publishStructuredSource('source/1')
+    await flushPromises()
+    expect(management.structuredPublishing.value).toBe(true)
+    await vi.advanceTimersByTimeAsync(800)
+    await pending
+
+    expect(management.structuredPublishing.value).toBe(false)
+    expect(management.error.value).toContain('refreshed')
+  })
+
+  it('aborts polling on unmount', async () => {
+    vi.useFakeTimers()
+    api.enqueueStructuredPublication.mockResolvedValue({ jobId: 'job-1', status: 'queued' })
+    api.fetchStructuredStatus.mockResolvedValue(structuredStatus('running'))
+    let management!: ReturnType<typeof useChatKnowledgeManagement>
+    const wrapper = mount(defineComponent({
+      setup() {
+        management = useChatKnowledgeManagement()
+        return () => h('div')
+      },
+    }))
+
+    void management.publishStructuredSource('source/1')
+    await flushPromises()
+    const signal = api.fetchStructuredStatus.mock.calls[0][1] as AbortSignal
+    wrapper.unmount()
+    await flushPromises()
+
+    expect(signal.aborted).toBe(true)
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(api.fetchStructuredStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels source A polling on source change and ignores its stale response', async () => {
+    api.enqueueStructuredPublication.mockResolvedValue({ jobId: 'job-a', status: 'queued' })
+    const requestA = deferred<ReturnType<typeof structuredStatus>>()
+    api.fetchStructuredStatus.mockReturnValue(requestA.promise)
+    api.fetchStructuredPreview.mockResolvedValue({ ...preview, sourceId: 'source-b' })
+    const management = useChatKnowledgeManagement()
+
+    const pendingA = management.publishStructuredSource('source-a')
+    await flushPromises()
+    await management.loadStructuredPreview('source-b')
+    requestA.resolve(structuredStatus('published'))
+    await pendingA
+
+    expect(management.structuredPublicationStatus.value).toBeNull()
+    expect(management.structuredPublishing.value).toBe(false)
+    expect(management.error.value).toBeNull()
+  })
 })
+
+function structuredStatus(status: 'queued' | 'running' | 'published' | 'failed', errorMessage: string | null = null) {
+  return {
+    sourceId: 'source/1',
+    sourceStatus: status === 'failed' ? '\u89e3\u6790\u5931\u8d25' : '\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d',
+    job: {
+      id: 'job-1',
+      sourceId: 'source/1',
+      datasetId: 'dataset-1',
+      schemaVersion: 1,
+      publicationId: 'pub-1',
+      status,
+      leaseExpiresAt: null,
+      checkpointRow: 0,
+      attempt: 1,
+      nextAttemptAt: null,
+      errorMessage,
+    },
+    activePublication: status === 'published' ? {
+      publicationId: 'pub-1',
+      datasetId: 'dataset-1',
+      schemaVersion: 1,
+      physicalTableName: 'structured_dataset_1_v1',
+      rowCount: 2,
+      contentHash: 'a'.repeat(64),
+    } : null,
+  }
+}

@@ -16,8 +16,10 @@ import type {
 } from '@/types/chat'
 import type {
   StructuredPreview,
+  StructuredPublicationEnqueueResponse,
   StructuredSchemaConfirmationResponse,
   StructuredSchemaSubmission,
+  StructuredStatus,
 } from '@/types/chat'
 
 const http = axios.create({
@@ -134,6 +136,25 @@ export async function confirmStructuredSchema(
   const { data } = await http.put<StructuredSchemaConfirmationResponse>(
     `/knowledge/sources/${encodedSourceId}/structured-schema`,
     submission,
+  )
+  return data
+}
+
+export async function enqueueStructuredPublication(sourceId: string, signal?: AbortSignal) {
+  const encodedSourceId = encodeURIComponent(sourceId)
+  const { data } = await http.post<StructuredPublicationEnqueueResponse>(
+    `/knowledge/sources/${encodedSourceId}/structured-publications`,
+    undefined,
+    { signal },
+  )
+  return data
+}
+
+export async function fetchStructuredStatus(sourceId: string, signal?: AbortSignal) {
+  const encodedSourceId = encodeURIComponent(sourceId)
+  const { data } = await http.get<StructuredStatus>(
+    `/knowledge/sources/${encodedSourceId}/structured-status`,
+    { signal },
   )
   return data
 }

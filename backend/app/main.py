@@ -41,6 +41,10 @@ def create_default_repository(llm_provider: LLMProvider | None = None) -> ChatRe
     return repository
 
 
+def create_structured_repository(database: Database) -> StructuredRepository:
+    return StructuredRepository(database)
+
+
 def create_app(
     repository: ChatRepository | None = None,
     upload_dir: Path | None = None,
@@ -199,7 +203,7 @@ def create_production_app(
                 repository = repository_factory()
             own(repository)
 
-            structured_repository = StructuredRepository(database)  # type: ignore[arg-type]
+            structured_repository = create_structured_repository(database)  # type: ignore[arg-type]
             if ingestion_queue_factory is None:
                 ingestion_queue = own(
                     KnowledgeIngestionQueue(

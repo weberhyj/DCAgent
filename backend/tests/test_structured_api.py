@@ -184,6 +184,41 @@ class StructuredApiTest(unittest.TestCase):
         self.assertEqual(second.json()["datasets"][0]["schemaVersion"], 2)
         self.assertEqual(first.json()["datasets"][0]["columns"][0]["allowAggregate"], True)
 
+    def test_publication_post_only_enqueues_and_status_reports_job(self) -> None:
+        client = self.build_client()
+        source_id = self.upload_xlsx(client)
+        client.get("/api/knowledge/sources")
+        preview = client.get(f"/api/knowledge/sources/{source_id}/structured-preview").json()
+        confirmation = client.put(
+            f"/api/knowledge/sources/{source_id}/structured-schema",
+            json=self.confirmation_payload(preview),
+        )
+        self.assertEqual(confirmation.status_code, 200, confirmation.text)
+
+        enqueue = client.post(f"/api/knowledge/sources/{source_id}/structured-publications")
+        self.assertEqual(enqueue.status_code, 202, enqueue.text)
+        body = enqueue.json()
+        self.assertTrue(body["jobId"])
+        self.assertEqual(body["status"], "queued")
+
+        status = client.get(f"/api/knowledge/sources/{source_id}/structured-status")
+        self.assertEqual(status.status_code, 200, status.text)
+        status_body = status.json()
+        self.assertEqual(status_body["sourceId"], source_id)
+        self.assertEqual(status_body["sourceStatus"], "\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d")
+        self.assertEqual(status_body["job"]["id"], body["jobId"])
+        self.assertEqual(status_body["job"]["status"], "queued")
+        self.assertIsNone(status_body["activePublication"])
+
+    def test_publication_routes_preserve_feature_gate_and_missing_source_contract(self) -> None:
+        disabled = self.build_client(structured_query_enabled=False)
+        disabled_response = disabled.post("/api/knowledge/sources/missing/structured-publications")
+        self.assertEqual(disabled_response.status_code, 404, disabled_response.text)
+
+        client = self.build_client()
+        missing = client.post("/api/knowledge/sources/missing/structured-publications")
+        self.assertEqual(missing.status_code, 404, missing.text)
+
     def test_confirmation_rejects_missing_column_and_string_aggregate(self) -> None:
         client = self.build_client()
         source_id = self.upload_xlsx(client)

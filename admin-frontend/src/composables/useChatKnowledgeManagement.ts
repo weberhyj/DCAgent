@@ -1,11 +1,13 @@
-import { readonly, shallowRef } from 'vue'
+import { computed, getCurrentScope, onScopeDispose, readonly, shallowRef } from 'vue'
 import {
   confirmStructuredSchema as confirmStructuredSchemaApi,
   deleteKnowledgeSource,
+  enqueueStructuredPublication,
   fetchAgentRuns,
   fetchKnowledgeChunks,
   fetchKnowledgeSources,
   fetchStructuredPreview,
+  fetchStructuredStatus,
   reindexKnowledgeSource as reindexKnowledgeSourceApi,
   uploadKnowledgeFiles,
 } from '@/services/api'
@@ -16,12 +18,14 @@ import type {
   StructuredPreview,
   StructuredSchemaConfirmationResponse,
   StructuredSchemaSubmission,
+  StructuredStatus,
 } from '@/types/chat'
 import { isStructuredKnowledgeSource } from '@/utils/knowledgeSources'
 
 const KNOWLEDGE_INDEXING_STATUS: KnowledgeSource['status'] = '解析中'
 const KNOWLEDGE_POLL_INTERVAL_MS = 800
 const KNOWLEDGE_POLL_ATTEMPTS = 5
+const STRUCTURED_POLL_INTERVAL_MS = 800
 
 function hasIndexingSource(sources: readonly KnowledgeSource[]) {
   return sources.some((source) => source.status === KNOWLEDGE_INDEXING_STATUS)
@@ -38,6 +42,7 @@ export function useChatKnowledgeManagement() {
   const knowledgeChunks = shallowRef<KnowledgeChunk[]>([])
   const structuredPreview = shallowRef<StructuredPreview | null>(null)
   const structuredSchemaConfirmation = shallowRef<StructuredSchemaConfirmationResponse | null>(null)
+  const structuredPublicationStatus = shallowRef<StructuredStatus | null>(null)
   const agentRuns = shallowRef<AgentRunAudit[]>([])
   const activeKnowledgeSourceId = shallowRef<string | null>(null)
   const knowledgeSourcesLoading = shallowRef(false)
@@ -48,10 +53,32 @@ export function useChatKnowledgeManagement() {
   const knowledgeChunksLoading = shallowRef(false)
   const structuredPreviewLoading = shallowRef(false)
   const structuredSchemaConfirming = shallowRef(false)
+  const structuredPublicationEnqueueing = shallowRef(false)
   const agentRunsLoading = shallowRef(false)
   const error = shallowRef<string | null>(null)
   let structuredPreviewRequestToken = 0
   let structuredConfirmationRequestToken = 0
+  let structuredPublicationRequestToken = 0
+  let structuredPublicationController: AbortController | null = null
+  let structuredPublicationSourceId: string | null = null
+  const structuredPublishing = computed(() => (
+    structuredPublicationEnqueueing.value
+    || structuredPublicationStatus.value?.job.status === 'queued'
+    || structuredPublicationStatus.value?.job.status === 'running'
+  ))
+
+  function cancelStructuredPublicationPolling(clearStatus = false) {
+    structuredPublicationRequestToken += 1
+    structuredPublicationController?.abort()
+    structuredPublicationController = null
+    structuredPublicationSourceId = null
+    structuredPublicationEnqueueing.value = false
+    if (clearStatus) structuredPublicationStatus.value = null
+  }
+
+  if (getCurrentScope()) {
+    onScopeDispose(() => cancelStructuredPublicationPolling(true))
+  }
 
   async function loadKnowledgeSources() {
     knowledgeSourcesLoading.value = true
@@ -170,6 +197,9 @@ export function useChatKnowledgeManagement() {
   }
 
   async function loadStructuredPreview(sourceId: string) {
+    if (structuredPublicationSourceId && structuredPublicationSourceId !== sourceId) {
+      cancelStructuredPublicationPolling(true)
+    }
     const requestToken = ++structuredPreviewRequestToken
     structuredConfirmationRequestToken += 1
     structuredPreviewLoading.value = true
@@ -220,6 +250,49 @@ export function useChatKnowledgeManagement() {
     }
   }
 
+  async function publishStructuredSource(sourceId: string) {
+    if (structuredPublishing.value) return null
+    cancelStructuredPublicationPolling(true)
+    const requestToken = ++structuredPublicationRequestToken
+    const controller = new AbortController()
+    structuredPublicationController = controller
+    structuredPublicationSourceId = sourceId
+    structuredPublicationEnqueueing.value = true
+    error.value = null
+    try {
+      await enqueueStructuredPublication(sourceId, controller.signal)
+      if (requestToken !== structuredPublicationRequestToken || controller.signal.aborted) {
+        return null
+      }
+      structuredPublicationEnqueueing.value = false
+      while (requestToken === structuredPublicationRequestToken && !controller.signal.aborted) {
+        const status = await fetchStructuredStatus(sourceId, controller.signal)
+        if (requestToken !== structuredPublicationRequestToken || controller.signal.aborted) {
+          return null
+        }
+        structuredPublicationStatus.value = status
+        if (status.job.status === 'published' || status.job.status === 'failed') {
+          structuredPublicationController = null
+          return status
+        }
+        await abortableDelay(STRUCTURED_POLL_INTERVAL_MS, controller.signal)
+      }
+      return null
+    } catch {
+      if (requestToken === structuredPublicationRequestToken && !controller.signal.aborted) {
+        structuredPublicationStatus.value = null
+        structuredPublicationController = null
+        structuredPublicationSourceId = null
+        error.value = 'Structured publication could not be started or refreshed.'
+      }
+      return null
+    } finally {
+      if (requestToken === structuredPublicationRequestToken) {
+        structuredPublicationEnqueueing.value = false
+      }
+    }
+  }
+
   async function inspectKnowledgeSource(sourceId: string) {
     const source = knowledgeSources.value.find((item) => item.id === sourceId)
     if (isStructuredKnowledgeSource(source)) {
@@ -232,6 +305,7 @@ export function useChatKnowledgeManagement() {
 
     structuredPreviewRequestToken += 1
     structuredConfirmationRequestToken += 1
+    cancelStructuredPublicationPolling(true)
     structuredPreview.value = null
     structuredSchemaConfirmation.value = null
     structuredPreviewLoading.value = false
@@ -255,6 +329,7 @@ export function useChatKnowledgeManagement() {
     knowledgeChunks: readonly(knowledgeChunks),
     structuredPreview: readonly(structuredPreview),
     structuredSchemaConfirmation: readonly(structuredSchemaConfirmation),
+    structuredPublicationStatus: readonly(structuredPublicationStatus),
     agentRuns: readonly(agentRuns),
     activeKnowledgeSourceId: readonly(activeKnowledgeSourceId),
     knowledgeSourcesLoading: readonly(knowledgeSourcesLoading),
@@ -265,6 +340,7 @@ export function useChatKnowledgeManagement() {
     knowledgeChunksLoading: readonly(knowledgeChunksLoading),
     structuredPreviewLoading: readonly(structuredPreviewLoading),
     structuredSchemaConfirming: readonly(structuredSchemaConfirming),
+    structuredPublishing,
     agentRunsLoading: readonly(agentRunsLoading),
     error: readonly(error),
     loadKnowledgeSources,
@@ -276,5 +352,21 @@ export function useChatKnowledgeManagement() {
     inspectKnowledgeSource,
     loadStructuredPreview,
     confirmStructuredSchema,
+    publishStructuredSource,
+    cancelStructuredPublicationPolling,
   }
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+    const timeout = window.setTimeout(resolve, milliseconds)
+    signal.addEventListener('abort', () => {
+      window.clearTimeout(timeout)
+      resolve()
+    }, { once: true })
+  })
 }

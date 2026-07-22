@@ -14,15 +14,18 @@ const {
   knowledgeChunks,
   structuredPreview,
   structuredSchemaConfirmation,
+  structuredPublicationStatus,
   knowledgeSourcesLoading,
   knowledgeChunksLoading,
   structuredPreviewLoading,
   structuredSchemaConfirming,
+  structuredPublishing,
   error,
   loadKnowledgeSources,
   inspectKnowledgeSource,
   loadStructuredPreview,
   confirmStructuredSchema,
+  publishStructuredSource,
 } = useChatKnowledgeManagement()
 
 const sourceId = computed(() => String(route.params.sourceId ?? ''))
@@ -53,6 +56,10 @@ async function loadDetail() {
 
 async function handleStructuredConfirm(submission: StructuredSchemaSubmission) {
   await confirmStructuredSchema(sourceId.value, submission)
+}
+
+async function handleStructuredPublish() {
+  await publishStructuredSource(sourceId.value)
 }
 </script>
 
@@ -86,7 +93,10 @@ async function handleStructuredConfirm(submission: StructuredSchemaSubmission) {
       :confirming="structuredSchemaConfirming"
       :confirmed="structuredConfirmed"
       :confirmation-status="structuredConfirmationStatus"
+      :publishing="structuredPublishing"
+      :publication-status="structuredPublicationStatus"
       @confirm="handleStructuredConfirm"
+      @publish="handleStructuredPublish"
     />
     <div v-else-if="structuredSource" class="module-state">
       No structured schema preview is available.
