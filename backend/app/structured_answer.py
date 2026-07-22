@@ -50,10 +50,21 @@ _STRONG_AGGREGATE_SUFFIX_RE = re.compile(
     r"[？?。.]?$"
 )
 _STRUCTURED_FILTER_RE = re.compile(
-    r"(?:大于|不少于|小于|不超过)|(?:\d{4}-\d{2}-\d{2}\s*至\s*\d{4}-\d{2}-\d{2})"
+    r"(?:大于|不少于|小于|不超过|(?<!何)为(?!什么)|=)"
+    r"|(?:\d{4}-\d{2}-\d{2}\s*至\s*\d{4}-\d{2}-\d{2})"
 )
-_AGGREGATE_CONCEPT_QUESTION_RE = re.compile(
-    r"^(?:(?:请问|请解释|请说明))?(?:(?:什么是|何为).+|.+(?:是什么|是什么意思))$"
+_AGGREGATE_CONCEPT_MARKERS = (
+    "什么是",
+    "什么叫",
+    "何为",
+    "是什么",
+    "是什么意思",
+    "怎么理解",
+    "如何理解",
+    "解释",
+    "说明",
+    "介绍",
+    "定义",
 )
 
 
@@ -202,17 +213,27 @@ def _has_catalog_span_with_independent_aggregate(
     normalized_question: str,
     catalog_names: set[str],
 ) -> bool:
+    spans: set[tuple[int, int]] = set()
     for name in catalog_names:
         start = normalized_question.find(name)
         while start >= 0:
-            remaining = (
-                normalized_question[:start]
-                + "_" * len(name)
-                + normalized_question[start + len(name) :]
-            )
-            if _has_aggregate_language(remaining):
-                return True
+            spans.add((start, start + len(name)))
             start = normalized_question.find(name, start + 1)
+
+    maximal_spans = (
+        span
+        for span in spans
+        if not any(
+            other_start <= span[0]
+            and span[1] <= other_end
+            and other_end - other_start > span[1] - span[0]
+            for other_start, other_end in spans
+        )
+    )
+    for start, end in maximal_spans:
+        remaining = normalized_question[:start] + "_" * (end - start) + normalized_question[end:]
+        if _has_aggregate_language(remaining):
+            return True
     return False
 
 
@@ -222,20 +243,19 @@ def _is_implicit_row_count(question: str) -> bool:
 
 def _is_strong_structured_shape(question: str) -> bool:
     stripped = question.strip()
-    if _is_aggregate_concept_question(stripped):
+    has_structured_filter = _STRUCTURED_FILTER_RE.search(stripped) is not None
+    if _is_aggregate_concept_question(stripped) and not has_structured_filter:
         return False
     return (
         _is_implicit_row_count(stripped)
         or _STRONG_AGGREGATE_SUFFIX_RE.search(stripped) is not None
-        or (
-            _has_aggregate_language(stripped) and _STRUCTURED_FILTER_RE.search(stripped) is not None
-        )
+        or (_has_aggregate_language(stripped) and has_structured_filter)
     )
 
 
 def _is_aggregate_concept_question(question: str) -> bool:
     normalized = _normalize(question)
-    return _AGGREGATE_CONCEPT_QUESTION_RE.fullmatch(normalized) is not None
+    return any(marker in normalized for marker in _AGGREGATE_CONCEPT_MARKERS)
 
 
 def _normalize(value: str) -> str:

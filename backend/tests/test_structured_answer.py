@@ -662,6 +662,133 @@ class StructuredAnswerServiceTest(unittest.TestCase):
 
                 self.assertEqual(provider.calls, 1)
 
+    def _assert_catalog_failure_uses_legacy_path(self, question: str) -> None:
+        def failing_catalog():
+            raise RuntimeError("catalog down")
+
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                failing_catalog,
+                RecordingClickHouseGateway(),
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, question, "source")
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_catalog_failure_keeps_arbitrary_prefix_what_is_question_on_legacy_path(
+        self,
+    ) -> None:
+        self._assert_catalog_failure_uses_legacy_path("能否说明什么是平均值")
+
+    def test_catalog_failure_keeps_told_what_is_question_on_legacy_path(self) -> None:
+        self._assert_catalog_failure_uses_legacy_path("请告诉我什么是平均值")
+
+    def test_catalog_failure_keeps_what_called_question_on_legacy_path(self) -> None:
+        self._assert_catalog_failure_uses_legacy_path("请问什么叫平均值")
+
+    def test_catalog_failure_keeps_explanation_prefix_question_on_legacy_path(self) -> None:
+        self._assert_catalog_failure_uses_legacy_path("麻烦说明一下平均值")
+
+    def test_catalog_failure_keeps_explicit_equality_query_as_strong_candidate(self) -> None:
+        def failing_catalog():
+            raise RuntimeError("catalog down")
+
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                failing_catalog,
+                RecordingClickHouseGateway(),
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "请说明订单金额平均值且地区为华东",
+            "source",
+        )
+
+        self.assertEqual(provider.calls, 0)
+        self.assertIn("不可用", messages[-1].paragraphs[0].text)
+
+    def test_short_alias_contained_by_long_field_does_not_anchor_candidate(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        quantity = replace(
+            dataset.schema.columns[0],
+            original_name="销售数量",
+            display_name="销售数量",
+            aliases=("销售",),
+        )
+        quantity_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(quantity, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: quantity_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "销售数量", "source")
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(gateway.calls, [])
+
+    def test_long_field_span_still_allows_following_aggregate(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        quantity = replace(
+            dataset.schema.columns[0],
+            original_name="销售数量",
+            display_name="销售数量",
+            aliases=("销售",),
+        )
+        quantity_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(quantity, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: quantity_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "销售数量平均值", "source")
+
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(len(gateway.calls), 1)
+
     def test_catalog_failure_keeps_polite_what_is_question_on_legacy_path(self) -> None:
         provider = RecordingLLMProvider()
         repository = InMemoryChatRepository(
