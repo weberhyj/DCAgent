@@ -128,6 +128,24 @@ class StructuredIntentParserTest(unittest.TestCase):
             (StructuredFilter("order_date", "between", "2026-01-01", "2026-01-31"),),
         )
 
+    def test_date_filter_consumes_only_the_bound_date_field_mention(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        catalog = sample_catalog()
+        intent = parse_structured_intent(
+            "订单日期2026-01-01至2026-01-31的订单日期计数",
+            catalog,
+        )
+
+        self.assertEqual(intent.aggregate, "count")
+        self.assertEqual(intent.metric_physical_name, "order_date")
+        self.assertEqual(
+            intent.filters,
+            (StructuredFilter("order_date", "between", "2026-01-01", "2026-01-31"),),
+        )
+        plan = StructuredQueryPlanner(catalog).plan(intent, sample_publication())
+        self.assertIn("count(order_date) AS aggregate_value", plan.sql)
+
     def test_multiple_and_date_ranges_are_rejected(self) -> None:
         result = parse_structured_intent(
             "2026-01-01至2026-01-07且2026-02-01至2026-02-07的订单金额总和",
@@ -780,6 +798,97 @@ class StructuredIntentParserTest(unittest.TestCase):
         )
 
         self.assertEqual(result.dataset_id, "ds-other")
+
+    def test_equal_dataset_and_column_spans_fail_closed(self) -> None:
+        catalog = sample_catalog()
+        region_dataset = replace(
+            catalog.datasets[0],
+            schema=replace(catalog.datasets[0].schema, worksheet_name="地区"),
+        )
+        other_publication = replace(
+            sample_publication(),
+            publication_id="pub-other",
+            dataset_id="ds-other",
+            physical_table_name="structured_ds_other_v1",
+        )
+        other = replace(
+            catalog.datasets[0],
+            schema=replace(
+                catalog.datasets[0].schema,
+                dataset_id="ds-other",
+                worksheet_name="其他",
+            ),
+            source_name="other.xlsx",
+            active_publication=other_publication,
+        )
+
+        result = parse_structured_intent(
+            "地区计数",
+            replace(catalog, datasets=(region_dataset, other)),
+        )
+
+        self.assertIsInstance(result, (StructuredClarification, StructuredUnavailable))
+
+    def test_exact_dataset_id_wins_same_span_source_stem(self) -> None:
+        catalog = sample_catalog()
+        exact_publication = replace(
+            sample_publication(),
+            publication_id="pub-exact",
+            dataset_id="sales",
+            physical_table_name="structured_sales_v1",
+        )
+        exact = replace(
+            catalog.datasets[0],
+            schema=replace(catalog.datasets[0].schema, dataset_id="sales"),
+            source_name="exact.xlsx",
+            active_publication=exact_publication,
+        )
+        stem_publication = replace(
+            sample_publication(),
+            publication_id="pub-stem",
+            dataset_id="ds-stem",
+            physical_table_name="structured_ds_stem_v1",
+        )
+        stem = replace(
+            catalog.datasets[0],
+            schema=replace(catalog.datasets[0].schema, dataset_id="ds-stem"),
+            source_name="sales.xlsx",
+            active_publication=stem_publication,
+        )
+
+        result = parse_structured_intent(
+            "sales订单金额平均值",
+            replace(catalog, datasets=(exact, stem)),
+        )
+
+        self.assertEqual(result.dataset_id, "sales")
+
+    def test_implicit_filter_field_is_not_stolen_by_dataset_worksheet(self) -> None:
+        catalog = sample_catalog()
+        other_publication = replace(
+            sample_publication(),
+            publication_id="pub-other",
+            dataset_id="ds-other",
+            physical_table_name="structured_ds_other_v1",
+        )
+        other = replace(
+            catalog.datasets[0],
+            schema=replace(
+                catalog.datasets[0].schema,
+                dataset_id="ds-other",
+                worksheet_name="地区",
+            ),
+            source_name="other.xlsx",
+            active_publication=other_publication,
+        )
+
+        result = parse_structured_intent(
+            "统计华东地区订单金额的平均值",
+            replace(catalog, datasets=(catalog.datasets[0], other)),
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("ds-other", "ds-sales"))
 
     def test_display_name_tie_returns_all_candidates(self) -> None:
         catalog = sample_catalog()

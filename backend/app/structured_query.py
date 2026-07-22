@@ -384,33 +384,40 @@ def _parse_dataset_clause(
         for dataset in catalog.datasets
         for span in _column_name_spans(question, dataset.schema.columns)
     }
-    matches: list[tuple[int, _TextSpan, StructuredDatasetCatalog]] = []
+    matches: list[tuple[int, int, _TextSpan, StructuredDatasetCatalog]] = []
     for dataset in catalog.datasets:
         names = (
-            dataset.schema.dataset_id,
-            dataset.source_name,
-            PurePath(dataset.source_name).stem,
-            dataset.schema.worksheet_name,
+            (0, dataset.schema.dataset_id),
+            (1, dataset.source_name),
+            (1, PurePath(dataset.source_name).stem),
+            (2, dataset.schema.worksheet_name),
         )
-        for name in names:
+        for priority, name in names:
             normalized_name = _normalize(name)
             if not normalized_name:
                 continue
             for span in _find_normalized_spans(question, name):
-                if any(_strictly_contains(column_span, span) for column_span in column_spans):
+                if any(_contains(column_span, span) for column_span in column_spans):
                     continue
-                matches.append((len(normalized_name), span, dataset))
+                matches.append((priority, len(normalized_name), span, dataset))
 
     if matches:
+        best_priority_by_span = {
+            span: min(
+                priority for priority, _, candidate_span, _ in matches if candidate_span == span
+            )
+            for _, _, span, _ in matches
+        }
+        prioritized = [match for match in matches if match[0] == best_priority_by_span[match[2]]]
         independent = [
             match
-            for match in matches
+            for match in prioritized
             if not any(
-                other_length > match[0] and _contains(other_span, match[1])
-                for other_length, other_span, _ in matches
+                other_length > match[1] and _contains(other_span, match[2])
+                for _, other_length, other_span, _ in prioritized
             )
         ]
-        finalists = {dataset.schema.dataset_id: dataset for _, _, dataset in independent}
+        finalists = {dataset.schema.dataset_id: dataset for _, _, _, dataset in independent}
         if len(finalists) > 1:
             return _ClauseParseResult(
                 issue=StructuredClarification(
@@ -425,7 +432,7 @@ def _parse_dataset_clause(
             value=selected,
             consumed_spans=_merge_spans(
                 span
-                for _, span, dataset in independent
+                for _, _, span, dataset in independent
                 if dataset.schema.dataset_id == selected.schema.dataset_id
             ),
         )
@@ -532,16 +539,15 @@ def _parse_filter_clause(
         range_match = date_ranges[0]
         range_span = _TextSpan(range_match.start(), range_match.end())
         date_spans = list(_column_name_spans(date_question, (date_column,)))
-        date_consumed = [range_span, *date_spans]
-        if date_spans:
-            nearest = min(
-                date_spans,
-                key=lambda span: abs(span.end - range_span.start),
+        date_consumed = [range_span]
+        bound_date_span = _bound_date_field_span(available, range_span, date_spans)
+        if bound_date_span is not None:
+            date_consumed.append(
+                _TextSpan(
+                    min(bound_date_span.start, range_span.start),
+                    max(bound_date_span.end, range_span.end),
+                )
             )
-            if nearest.end <= range_span.start and re.fullmatch(
-                r"[\s的]*", available[nearest.end : range_span.start]
-            ):
-                date_consumed.append(_TextSpan(nearest.start, range_span.end))
         date_item = StructuredFilter(
             date_column.physical_name,
             "between",
@@ -577,6 +583,30 @@ def _parse_filter_clause(
         value=tuple(ordered),
         consumed_spans=_merge_spans(consumed),
     )
+
+
+def _bound_date_field_span(
+    question: str,
+    range_span: _TextSpan,
+    date_spans: Iterable[_TextSpan],
+) -> _TextSpan | None:
+    preceding = [
+        span
+        for span in date_spans
+        if span.end <= range_span.start
+        and re.fullmatch(r"[\s的]*", question[span.end : range_span.start])
+    ]
+    if preceding:
+        return max(preceding, key=lambda span: span.end)
+    following = [
+        span
+        for span in date_spans
+        if range_span.end <= span.start
+        and re.fullmatch(r"\s*", question[range_span.end : span.start])
+    ]
+    if following:
+        return min(following, key=lambda span: span.start)
+    return None
 
 
 def _parse_explicit_filter_clauses(
@@ -868,10 +898,6 @@ def _find_normalized_spans(value: str, name: str) -> tuple[_TextSpan, ...]:
 
 def _contains(container: _TextSpan, candidate: _TextSpan) -> bool:
     return container.start <= candidate.start and candidate.end <= container.end
-
-
-def _strictly_contains(container: _TextSpan, candidate: _TextSpan) -> bool:
-    return container != candidate and _contains(container, candidate)
 
 
 def _merge_spans(spans: Iterable[_TextSpan]) -> tuple[_TextSpan, ...]:
