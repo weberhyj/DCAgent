@@ -180,6 +180,26 @@ class StructuredIntentParserTest(unittest.TestCase):
         plan = StructuredQueryPlanner(catalog).plan(intent, sample_publication())
         self.assertIn("count(order_date) AS aggregate_value", plan.sql)
 
+    def test_row_count_word_does_not_reuse_bound_date_field(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        catalog = sample_catalog()
+        all_rows = parse_structured_intent(
+            "订单日期2026-01-01至2026-01-31多少条",
+            catalog,
+        )
+        field_count = parse_structured_intent(
+            "订单日期2026-01-01至2026-01-31计数",
+            catalog,
+        )
+
+        self.assertIsNone(all_rows.metric_physical_name)
+        self.assertEqual(field_count.metric_physical_name, "order_date")
+        all_rows_plan = StructuredQueryPlanner(catalog).plan(all_rows, sample_publication())
+        field_count_plan = StructuredQueryPlanner(catalog).plan(field_count, sample_publication())
+        self.assertIn("count() AS aggregate_value", all_rows_plan.sql)
+        self.assertIn("count(order_date) AS aggregate_value", field_count_plan.sql)
+
     def test_multiple_and_date_ranges_are_rejected(self) -> None:
         result = parse_structured_intent(
             "2026-01-01至2026-01-07且2026-02-01至2026-02-07的订单金额总和",

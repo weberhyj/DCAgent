@@ -41,6 +41,7 @@ class _ClauseParseResult[T]:
     value: T | None = None
     consumed_spans: tuple[_TextSpan, ...] = ()
     shared_columns: tuple[StructuredColumnSchema, ...] = ()
+    count_all_hint: bool = False
     issue: StructuredClarification | StructuredUnavailable | None = None
 
 
@@ -329,6 +330,7 @@ def resolve_structured_intent(
         aggregate,
         filter_result.value,
         filter_result.shared_columns,
+        aggregate_result.count_all_hint,
         consumed,
     )
     if metric_result.issue is not None:
@@ -356,12 +358,15 @@ def _parse_aggregate_clause(
     available = _mask_spans(question, excluded_spans)
     field_spans = _column_name_spans(available, columns)
     matches: dict[str, list[_TextSpan]] = {}
+    count_all_hint = False
     for aggregate, words in _AGGREGATE_WORDS:
         for word in words:
             for span in _find_normalized_spans(available, word):
                 if any(_contains(field_span, span) for field_span in field_spans):
                     continue
                 matches.setdefault(aggregate, []).append(span)
+                if aggregate == "count" and word == "多少条":
+                    count_all_hint = True
     if len(matches) > 1:
         return _ClauseParseResult(
             issue=StructuredClarification(
@@ -375,6 +380,7 @@ def _parse_aggregate_clause(
     return _ClauseParseResult(
         value=aggregate,
         consumed_spans=_merge_spans(matches[aggregate]),
+        count_all_hint=count_all_hint,
     )
 
 
@@ -467,8 +473,11 @@ def _parse_metric_clause(
     aggregate: str,
     filters: tuple[StructuredFilter, ...],
     shared_columns: tuple[StructuredColumnSchema, ...],
+    count_all_hint: bool,
     excluded_spans: tuple[_TextSpan, ...],
 ) -> _ClauseParseResult[StructuredColumnSchema | None]:
+    if aggregate == "count" and count_all_hint:
+        return _ClauseParseResult(value=None)
     available = _mask_spans(question, excluded_spans)
     aggregate_columns = (
         columns
