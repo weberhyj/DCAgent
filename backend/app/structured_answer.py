@@ -52,6 +52,9 @@ _STRONG_AGGREGATE_SUFFIX_RE = re.compile(
 _STRUCTURED_FILTER_RE = re.compile(
     r"(?:大于|不少于|小于|不超过)|(?:\d{4}-\d{2}-\d{2}\s*至\s*\d{4}-\d{2}-\d{2})"
 )
+_AGGREGATE_CONCEPT_QUESTION_RE = re.compile(
+    r"^(?:(?:请问|请解释|请说明))?(?:(?:什么是|何为).+|.+(?:是什么|是什么意思))$"
+)
 
 
 class StructuredAnswerService:
@@ -164,16 +167,10 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     ):
         return True
 
-    remaining = normalized
-    matched_catalog_name = False
     catalog_names = {
         name for dataset in catalog.datasets for name in _dataset_names(dataset) if name
     }
-    for name in sorted(catalog_names, key=len, reverse=True):
-        if name in remaining:
-            matched_catalog_name = True
-            remaining = remaining.replace(name, "")
-    return matched_catalog_name and _has_aggregate_language(remaining)
+    return _has_catalog_span_with_independent_aggregate(normalized, catalog_names)
 
 
 def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:
@@ -201,6 +198,24 @@ def _has_aggregate_language(question: str) -> bool:
     return any(_normalize(term) in normalized for term in _CHINESE_AGGREGATE_TERMS)
 
 
+def _has_catalog_span_with_independent_aggregate(
+    normalized_question: str,
+    catalog_names: set[str],
+) -> bool:
+    for name in catalog_names:
+        start = normalized_question.find(name)
+        while start >= 0:
+            remaining = (
+                normalized_question[:start]
+                + "_" * len(name)
+                + normalized_question[start + len(name) :]
+            )
+            if _has_aggregate_language(remaining):
+                return True
+            start = normalized_question.find(name, start + 1)
+    return False
+
+
 def _is_implicit_row_count(question: str) -> bool:
     return _IMPLICIT_ROW_COUNT_RE.fullmatch(question.strip()) is not None
 
@@ -220,9 +235,7 @@ def _is_strong_structured_shape(question: str) -> bool:
 
 def _is_aggregate_concept_question(question: str) -> bool:
     normalized = _normalize(question)
-    return normalized.startswith(("什么是", "何为")) or normalized.endswith(
-        ("是什么", "是什么意思")
-    )
+    return _AGGREGATE_CONCEPT_QUESTION_RE.fullmatch(normalized) is not None
 
 
 def _normalize(value: str) -> str:

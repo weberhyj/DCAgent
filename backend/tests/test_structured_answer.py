@@ -662,6 +662,154 @@ class StructuredAnswerServiceTest(unittest.TestCase):
 
                 self.assertEqual(provider.calls, 1)
 
+    def test_catalog_failure_keeps_polite_what_is_question_on_legacy_path(self) -> None:
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: (_ for _ in ()).throw(RuntimeError("catalog down")),
+                RecordingClickHouseGateway(),
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "请问什么是平均值", "source")
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_catalog_failure_keeps_polite_explanation_question_on_legacy_path(self) -> None:
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: (_ for _ in ()).throw(RuntimeError("catalog down")),
+                RecordingClickHouseGateway(),
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "请解释何为总和", "source")
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_catalog_failure_keeps_polite_meaning_question_on_legacy_path(self) -> None:
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: (_ for _ in ()).throw(RuntimeError("catalog down")),
+                RecordingClickHouseGateway(),
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "请说明平均值是什么意思", "source")
+
+        self.assertEqual(provider.calls, 1)
+
+    def test_aggregate_named_field_keeps_independent_aggregate_span(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        average = replace(
+            dataset.schema.columns[0],
+            original_name="平均",
+            display_name="平均",
+            aliases=(),
+        )
+        average_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(average, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: average_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "平均的平均值", "source")
+
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(len(gateway.calls), 1)
+
+    def test_masked_field_span_cannot_create_an_aggregate_across_its_boundary(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        average = replace(
+            dataset.schema.columns[0],
+            original_name="平均",
+            display_name="平均",
+            aliases=(),
+        )
+        average_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(average, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: average_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "平平均均", "source")
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(gateway.calls, [])
+
+    def test_single_character_alias_keeps_independent_aggregate_span(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        amount = replace(dataset.schema.columns[0], aliases=("均",))
+        alias_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(amount, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: alias_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "均平均值", "source")
+
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(len(gateway.calls), 1)
+
     def test_single_character_alias_can_anchor_structured_query(self) -> None:
         catalog = sample_catalog()
         dataset = catalog.datasets[0]
