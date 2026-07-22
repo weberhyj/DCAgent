@@ -115,6 +115,27 @@ class StructuredIntentParserTest(unittest.TestCase):
         self.assertIsInstance(result, StructuredClarification)
         self.assertEqual(result.candidates, ("delivery_date", "order_date"))
 
+    def test_explicit_date_field_is_consumed_before_count_metric_resolution(self) -> None:
+        result = parse_structured_intent(
+            "订单日期2026-01-01至2026-01-31的订单金额计数",
+            sample_catalog(),
+        )
+
+        self.assertEqual(result.aggregate, "count")
+        self.assertEqual(result.metric_physical_name, "order_amount")
+        self.assertEqual(
+            result.filters,
+            (StructuredFilter("order_date", "between", "2026-01-01", "2026-01-31"),),
+        )
+
+    def test_multiple_and_date_ranges_are_rejected(self) -> None:
+        result = parse_structured_intent(
+            "2026-01-01至2026-01-07且2026-02-01至2026-02-07的订单金额总和",
+            sample_catalog(),
+        )
+
+        self.assertIsInstance(result, (StructuredClarification, StructuredUnavailable))
+
     def test_supports_all_governed_aggregate_words(self) -> None:
         expectations = {
             "订单金额均值": "avg",
@@ -189,6 +210,25 @@ class StructuredIntentParserTest(unittest.TestCase):
         self.assertEqual(
             (result.aggregate, result.metric_physical_name), ("count", "order_quantity")
         )
+
+    def test_prefix_aggregate_word_is_not_count_when_metric_is_quantity(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        quantity = replace(
+            base.schema.columns[0],
+            physical_name="quantity",
+            original_name="数量",
+            display_name="数量",
+            aliases=("件数",),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(replace(base, schema=replace(base.schema, columns=(quantity,))),),
+        )
+
+        result = parse_structured_intent("平均数量", catalog)
+
+        self.assertEqual((result.aggregate, result.metric_physical_name), ("avg", "quantity"))
 
     def test_metric_resolution_excludes_consumed_explicit_filter_field(self) -> None:
         result = parse_structured_intent(
@@ -342,6 +382,18 @@ class StructuredIntentParserTest(unittest.TestCase):
         for question in (
             "省份=浙江的订单金额总和",
             "省份为浙江的订单金额总和",
+        ):
+            with self.subTest(question=question):
+                result = parse_structured_intent(question, sample_catalog())
+                self.assertIsInstance(
+                    result,
+                    (StructuredClarification, StructuredUnavailable),
+                )
+
+    def test_aggregate_like_unknown_equality_fields_are_rejected(self) -> None:
+        for question in (
+            "数量=10的订单金额计数",
+            "平均值=10的订单金额计数",
         ):
             with self.subTest(question=question):
                 result = parse_structured_intent(question, sample_catalog())
@@ -698,6 +750,36 @@ class StructuredIntentParserTest(unittest.TestCase):
         )
 
         self.assertEqual(result.dataset_id, "ds-sales")
+
+    def test_adjacent_chinese_dataset_name_wins_over_metric_substring(self) -> None:
+        catalog = sample_catalog()
+        orders = replace(
+            catalog.datasets[0],
+            schema=replace(catalog.datasets[0].schema, worksheet_name="订单"),
+        )
+        south_publication = replace(
+            sample_publication(),
+            publication_id="pub-other",
+            dataset_id="ds-other",
+            physical_table_name="structured_ds_other_v1",
+        )
+        south = replace(
+            catalog.datasets[0],
+            schema=replace(
+                catalog.datasets[0].schema,
+                dataset_id="ds-other",
+                worksheet_name="华南",
+            ),
+            source_name="other.xlsx",
+            active_publication=south_publication,
+        )
+
+        result = parse_structured_intent(
+            "华南订单金额平均值",
+            replace(catalog, datasets=(orders, south)),
+        )
+
+        self.assertEqual(result.dataset_id, "ds-other")
 
     def test_display_name_tie_returns_all_candidates(self) -> None:
         catalog = sample_catalog()
