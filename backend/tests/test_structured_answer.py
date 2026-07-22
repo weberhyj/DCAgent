@@ -295,6 +295,54 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(gateway.calls, [])
         self.assertEqual(messages[-1].paragraphs[0].text, "legacy Physoc answer")
 
+    def test_row_count_language_without_catalog_reference_keeps_legacy_agent_path(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        structured = CountingStructuredService(
+            StructuredAnswerService(lambda: sample_catalog(), gateway)
+        )
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=structured,
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "合同有多少条付款条款",
+            "source",
+        )
+
+        self.assertEqual(structured.calls, 1)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(messages[-1].paragraphs[0].text, "legacy Physoc answer")
+
+    def test_english_aggregate_substring_keeps_legacy_agent_path(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        structured = CountingStructuredService(
+            StructuredAnswerService(lambda: sample_catalog(), gateway)
+        )
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=structured,
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "summarize sales policy",
+            "source",
+        )
+
+        self.assertEqual(structured.calls, 1)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(messages[-1].paragraphs[0].text, "legacy Physoc answer")
+
     def test_ambiguous_structured_query_clarifies_without_clickhouse_or_llm(self) -> None:
         provider = RecordingLLMProvider()
         gateway = RecordingClickHouseGateway()

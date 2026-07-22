@@ -24,7 +24,7 @@ from .structured_query import (
 )
 from .time_utils import display_datetime_label
 
-_AGGREGATE_TERMS = (
+_CHINESE_AGGREGATE_TERMS = (
     "平均值",
     "平均",
     "均值",
@@ -40,17 +40,11 @@ _AGGREGATE_TERMS = (
     "最小值",
     "最小",
     "最低",
-    "average",
-    "avg",
-    "mean",
-    "sum",
-    "count",
-    "maximum",
-    "minimum",
-    "max",
-    "min",
 )
-_ROW_COUNT_TERMS = ("多少条", "记录数", "行数", "row count")
+_ENGLISH_AGGREGATE_RE = re.compile(
+    r"(?<![a-z0-9_])(?:average|avg|mean|sum|count|maximum|minimum|max|min)(?![a-z0-9_])",
+    re.IGNORECASE,
+)
 
 
 class StructuredAnswerService:
@@ -147,10 +141,8 @@ class StructuredAnswerService:
 
 def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     normalized = _normalize(question)
-    if not _has_aggregate_language(normalized):
+    if not _has_aggregate_language(question):
         return False
-    if any(_normalize(term) in normalized for term in _ROW_COUNT_TERMS):
-        return True
     return any(
         name and name in normalized
         for dataset in catalog.datasets
@@ -180,7 +172,9 @@ def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:
 
 def _has_aggregate_language(question: str) -> bool:
     normalized = _normalize(question)
-    return any(_normalize(term) in normalized for term in _AGGREGATE_TERMS)
+    return any(_normalize(term) in normalized for term in _CHINESE_AGGREGATE_TERMS) or bool(
+        _ENGLISH_AGGREGATE_RE.search(question)
+    )
 
 
 def _normalize(value: str) -> str:
