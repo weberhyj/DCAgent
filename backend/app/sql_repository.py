@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -401,10 +402,15 @@ class SqlChatRepository:
         database: Database,
         llm_provider: LLMProvider | None = None,
         structured_service: StructuredAnswerService | None = None,
+        *,
+        owns_database: bool = False,
     ) -> None:
         self._database = database
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service
+        self._owns_database = owns_database
+        self._close_lock = Lock()
+        self._closed = False
         self._agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
                 search_knowledge=self.search_knowledge_chunks,
@@ -414,9 +420,18 @@ class SqlChatRepository:
         )
 
     def close(self) -> None:
-        close = getattr(self._structured_service, "close", None)
-        if callable(close):
-            close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        try:
+            close = getattr(self._structured_service, "close", None)
+            if callable(close):
+                close()
+        finally:
+            if self._owns_database:
+                self._database.engine.dispose()
 
     def seed_if_empty(self, state: ChatState) -> None:
         with self._database.session() as session:

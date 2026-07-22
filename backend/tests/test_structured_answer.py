@@ -92,6 +92,28 @@ def empty_state() -> ChatState:
 
 
 class StructuredAnswerServiceTest(unittest.TestCase):
+    def test_default_repository_close_disposes_only_its_owned_database_once(self) -> None:
+        owned_database = Database("sqlite+pysqlite:///:memory:")
+        with patch.object(
+            owned_database.engine,
+            "dispose",
+            wraps=owned_database.engine.dispose,
+        ) as owned_dispose:
+            repository = create_default_repository(
+                environ={"OFFLINE_MODE": "true", "STRUCTURED_QUERY_ENABLED": "false"},
+                database_factory=lambda _url: owned_database,
+            )
+            repository.close()
+            repository.close()
+
+        owned_dispose.assert_called_once_with()
+
+        external_database = Database("sqlite+pysqlite:///:memory:")
+        external_database.create_schema()
+        with patch.object(external_database.engine, "dispose") as external_dispose:
+            SqlChatRepository(external_database).close()
+        external_dispose.assert_not_called()
+
     def test_lazy_gateway_closes_same_client_when_gateway_rejects_identity_reuse(self) -> None:
         client = LifecycleClickHouseClient()
         gateway = _LazyStructuredQueryGateway(lambda **_kwargs: client, "http://clickhouse")
@@ -618,6 +640,93 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         repository.send_message(conversation_id, "合同有多少条付款条款", "source")
 
         self.assertEqual(provider.calls, 1)
+
+    def test_catalog_failure_keeps_aggregate_concept_questions_on_legacy_path(self) -> None:
+        def failing_catalog():
+            raise RuntimeError("catalog down")
+
+        for question in ("什么是平均值", "平均值是什么"):
+            with self.subTest(question=question):
+                provider = RecordingLLMProvider()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(
+                        failing_catalog,
+                        RecordingClickHouseGateway(),
+                    ),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(provider.calls, 1)
+
+    def test_single_character_alias_can_anchor_structured_query(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        amount = replace(dataset.schema.columns[0], aliases=("量",))
+        single_alias_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(amount, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: single_alias_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "量平均值", "source")
+
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(len(gateway.calls), 1)
+
+    def test_aggregate_word_inside_field_name_requires_separate_aggregate_intent(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        quantity = replace(
+            dataset.schema.columns[0],
+            original_name="销售数量",
+            display_name="销售数量",
+            aliases=(),
+        )
+        quantity_catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(quantity, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: quantity_catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "销售数量", "source")
+        repository.send_message(conversation_id, "销售数量平均值", "source")
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(len(gateway.calls), 1)
 
     def test_ambiguous_structured_query_clarifies_without_clickhouse_or_llm(self) -> None:
         provider = RecordingLLMProvider()

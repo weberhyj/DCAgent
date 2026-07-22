@@ -157,18 +157,23 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     normalized = _normalize(question)
     if not _has_aggregate_language(question):
         return False
-    has_catalog_reference = any(
-        name and name in normalized
-        for dataset in catalog.datasets
-        for name in _dataset_names(dataset)
-    )
-    if has_catalog_reference:
-        return True
-    return (
+    if (
         _is_implicit_row_count(question)
         and len([dataset for dataset in catalog.datasets if dataset.active_publication is not None])
         == 1
-    )
+    ):
+        return True
+
+    remaining = normalized
+    matched_catalog_name = False
+    catalog_names = {
+        name for dataset in catalog.datasets for name in _dataset_names(dataset) if name
+    }
+    for name in sorted(catalog_names, key=len, reverse=True):
+        if name in remaining:
+            matched_catalog_name = True
+            remaining = remaining.replace(name, "")
+    return matched_catalog_name and _has_aggregate_language(remaining)
 
 
 def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:
@@ -188,7 +193,7 @@ def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:
                 *column.aliases,
             )
         )
-    return tuple(name for name in names if len(name) >= 2)
+    return tuple(name for name in names if name)
 
 
 def _has_aggregate_language(question: str) -> bool:
@@ -202,12 +207,21 @@ def _is_implicit_row_count(question: str) -> bool:
 
 def _is_strong_structured_shape(question: str) -> bool:
     stripped = question.strip()
+    if _is_aggregate_concept_question(stripped):
+        return False
     return (
         _is_implicit_row_count(stripped)
         or _STRONG_AGGREGATE_SUFFIX_RE.search(stripped) is not None
         or (
             _has_aggregate_language(stripped) and _STRUCTURED_FILTER_RE.search(stripped) is not None
         )
+    )
+
+
+def _is_aggregate_concept_question(question: str) -> bool:
+    normalized = _normalize(question)
+    return normalized.startswith(("什么是", "何为")) or normalized.endswith(
+        ("是什么", "是什么意思")
     )
 
 

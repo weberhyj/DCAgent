@@ -71,6 +71,7 @@ def create_default_repository(
         database,
         llm_provider=llm_provider or create_llm_provider(source),
         structured_service=structured_service,
+        owns_database=True,
     )
     return repository
 
