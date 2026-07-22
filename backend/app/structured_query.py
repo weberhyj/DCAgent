@@ -40,6 +40,7 @@ class _TextSpan:
 class _ClauseParseResult[T]:
     value: T | None = None
     consumed_spans: tuple[_TextSpan, ...] = ()
+    shared_columns: tuple[StructuredColumnSchema, ...] = ()
     issue: StructuredClarification | StructuredUnavailable | None = None
 
 
@@ -327,6 +328,7 @@ def resolve_structured_intent(
         dataset.schema.columns,
         aggregate,
         filter_result.value,
+        filter_result.shared_columns,
         consumed,
     )
     if metric_result.issue is not None:
@@ -384,6 +386,13 @@ def _parse_dataset_clause(
         for dataset in catalog.datasets
         for span in _column_name_spans(question, dataset.schema.columns)
     }
+    implicit_filter_field_starts = {
+        span.start
+        for dataset in catalog.datasets
+        for column in dataset.schema.columns
+        if column.allow_filter and column.data_type is StructuredColumnType.STRING
+        for span in _column_name_spans(question, (column,))
+    }
     matches: list[tuple[int, int, _TextSpan, StructuredDatasetCatalog]] = []
     for dataset in catalog.datasets:
         names = (
@@ -398,6 +407,8 @@ def _parse_dataset_clause(
                 continue
             for span in _find_normalized_spans(question, name):
                 if any(_contains(column_span, span) for column_span in column_spans):
+                    continue
+                if priority == 2 and span.end in implicit_filter_field_starts:
                     continue
                 matches.append((priority, len(normalized_name), span, dataset))
 
@@ -455,6 +466,7 @@ def _parse_metric_clause(
     columns: tuple[StructuredColumnSchema, ...],
     aggregate: str,
     filters: tuple[StructuredFilter, ...],
+    shared_columns: tuple[StructuredColumnSchema, ...],
     excluded_spans: tuple[_TextSpan, ...],
 ) -> _ClauseParseResult[StructuredColumnSchema | None]:
     available = _mask_spans(question, excluded_spans)
@@ -473,6 +485,16 @@ def _parse_metric_clause(
             consumed_spans=_column_name_spans(available, (metric,)),
         )
     if aggregate == "count":
+        reusable = tuple(dict.fromkeys(shared_columns))
+        if len(reusable) == 1:
+            return _ClauseParseResult(value=reusable[0])
+        if len(reusable) > 1:
+            return _ClauseParseResult(
+                issue=StructuredClarification(
+                    "多个筛选字段都可作为计数指标，请明确指标字段",
+                    tuple(sorted(column.physical_name for column in reusable)),
+                )
+            )
         return _ClauseParseResult(value=None)
 
     columns_by_name = {column.physical_name: column for column in columns}
@@ -507,6 +529,7 @@ def _parse_filter_clause(
     explicit_matches = explicit.value or ()
     all_matches = list(explicit_matches)
     consumed = list(explicit.consumed_spans)
+    shared_columns: list[StructuredColumnSchema] = []
 
     date_ranges = tuple(_DATE_RANGE_RE.finditer(available))
     if len(date_ranges) > 1:
@@ -542,6 +565,7 @@ def _parse_filter_clause(
         date_consumed = [range_span]
         bound_date_span = _bound_date_field_span(available, range_span, date_spans)
         if bound_date_span is not None:
+            shared_columns.append(date_column)
             date_consumed.append(
                 _TextSpan(
                     min(bound_date_span.start, range_span.start),
@@ -582,6 +606,7 @@ def _parse_filter_clause(
     return _ClauseParseResult(
         value=tuple(ordered),
         consumed_spans=_merge_spans(consumed),
+        shared_columns=tuple(dict.fromkeys(shared_columns)),
     )
 
 

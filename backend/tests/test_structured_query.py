@@ -146,6 +146,40 @@ class StructuredIntentParserTest(unittest.TestCase):
         plan = StructuredQueryPlanner(catalog).plan(intent, sample_publication())
         self.assertIn("count(order_date) AS aggregate_value", plan.sql)
 
+    def test_date_field_before_range_is_shared_with_count_metric(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        catalog = sample_catalog()
+        intent = parse_structured_intent(
+            "订单日期2026-01-01至2026-01-31计数",
+            catalog,
+        )
+
+        self.assertEqual(intent.metric_physical_name, "order_date")
+        self.assertEqual(
+            intent.filters,
+            (StructuredFilter("order_date", "between", "2026-01-01", "2026-01-31"),),
+        )
+        plan = StructuredQueryPlanner(catalog).plan(intent, sample_publication())
+        self.assertIn("count(order_date) AS aggregate_value", plan.sql)
+
+    def test_date_field_after_range_is_shared_with_count_metric(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        catalog = sample_catalog()
+        intent = parse_structured_intent(
+            "2026-01-01至2026-01-31订单日期计数",
+            catalog,
+        )
+
+        self.assertEqual(intent.metric_physical_name, "order_date")
+        self.assertEqual(
+            intent.filters,
+            (StructuredFilter("order_date", "between", "2026-01-01", "2026-01-31"),),
+        )
+        plan = StructuredQueryPlanner(catalog).plan(intent, sample_publication())
+        self.assertIn("count(order_date) AS aggregate_value", plan.sql)
+
     def test_multiple_and_date_ranges_are_rejected(self) -> None:
         result = parse_structured_intent(
             "2026-01-01至2026-01-07且2026-02-01至2026-02-07的订单金额总和",
@@ -889,6 +923,33 @@ class StructuredIntentParserTest(unittest.TestCase):
 
         self.assertIsInstance(result, StructuredClarification)
         self.assertEqual(result.candidates, ("ds-other", "ds-sales"))
+
+    def test_implicit_filter_value_is_not_stolen_by_dataset_worksheet(self) -> None:
+        catalog = sample_catalog()
+        east_publication = replace(
+            sample_publication(),
+            publication_id="pub-east",
+            dataset_id="ds-east",
+            physical_table_name="structured_ds_east_v1",
+        )
+        east = replace(
+            catalog.datasets[0],
+            schema=replace(
+                catalog.datasets[0].schema,
+                dataset_id="ds-east",
+                worksheet_name="华东",
+            ),
+            source_name="east.xlsx",
+            active_publication=east_publication,
+        )
+
+        result = parse_structured_intent(
+            "华东地区订单金额平均值",
+            replace(catalog, datasets=(catalog.datasets[0], east)),
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("ds-east", "ds-sales"))
 
     def test_display_name_tie_returns_all_candidates(self) -> None:
         catalog = sample_catalog()
