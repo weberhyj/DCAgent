@@ -762,7 +762,12 @@ class StructuredAnswerServiceTest(unittest.TestCase):
     def test_catalog_failure_metric_qualified_concept_wording_is_strong_candidate(
         self,
     ) -> None:
-        for question in ("什么是订单金额平均值", "订单金额平均值是什么"):
+        for question in (
+            "什么是订单金额平均值",
+            "订单金额平均值是什么",
+            "什么是订单金额加权平均值",
+            "订单金额加权平均值是什么",
+        ):
             with self.subTest(question=question):
                 self._assert_catalog_failure_is_strong_candidate(question)
 
@@ -774,11 +779,31 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "什么是移动平均值",
             "什么是几何平均值",
             "什么是调和平均值",
+            "我想了解什么是加权平均值",
+            "能帮我讲讲什么是移动平均值",
+            "请问调和平均值是什么",
         )
 
         for question in questions:
             with self.subTest(question=question):
                 self._assert_catalog_failure_uses_legacy_path(question)
+
+    def test_named_average_metric_phrases_route_to_structured_query(self) -> None:
+        for question in ("什么是订单金额加权平均值", "订单金额加权平均值是什么"):
+            with self.subTest(question=question):
+                provider = RecordingLLMProvider()
+                gateway = RecordingClickHouseGateway()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(lambda: sample_catalog(), gateway),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(provider.calls, 0)
+                self.assertEqual(len(gateway.calls), 1)
 
     def test_aggregate_looking_equality_values_keep_legacy_agent_path(self) -> None:
         catalog = sample_catalog()

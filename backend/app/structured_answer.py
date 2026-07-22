@@ -75,6 +75,12 @@ _HAS_EXPLICIT_FILTER_RE = re.compile(
 )
 _CONCEPT_ANYWHERE_PHRASES = ("什么是", "什么叫", "何为", "是什么意思")
 _CONCEPT_TERM_INTRODUCERS = ("解释一下", "讲讲", "介绍一下", "说明一下")
+_CONCEPT_QUESTION_LEADIN_SUFFIXES = (
+    "请问",
+    "想了解",
+    "想知道",
+    *_CONCEPT_TERM_INTRODUCERS,
+)
 _CONCEPT_TERM_SUFFIXES = (
     "是什么",
     "是什么意思",
@@ -366,6 +372,8 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
         return "strong"
     if _is_exact_aggregate_concept_shape(normalized):
         return "concept"
+    if _is_named_average_concept_shape(normalized):
+        return "concept"
     if _has_metric_qualified_concept_shape(normalized):
         return "strong"
     if _is_aggregate_concept_question(normalized):
@@ -386,6 +394,26 @@ def _is_exact_aggregate_concept_shape(normalized: str) -> bool:
         }
         for term in _AGGREGATE_CONCEPT_TERMS
     )
+
+
+def _is_named_average_concept_shape(normalized: str) -> bool:
+    for opener in ("什么是", "什么叫", "何为"):
+        start = normalized.find(opener)
+        while start >= 0:
+            if normalized[start + len(opener) :] in _NAMED_AVERAGE_CONCEPT_TERMS:
+                return True
+            start = normalized.find(opener, start + 1)
+    for term in _NAMED_AVERAGE_CONCEPT_TERMS:
+        for suffix in _CONCEPT_TERM_SUFFIXES:
+            phrase = f"{term}{suffix}"
+            if not normalized.endswith(phrase):
+                continue
+            leadin = normalized[: -len(phrase)]
+            if not leadin or any(
+                leadin.endswith(marker) for marker in _CONCEPT_QUESTION_LEADIN_SUFFIXES
+            ):
+                return True
+    return False
 
 
 def _has_metric_qualified_concept_shape(normalized: str) -> bool:
