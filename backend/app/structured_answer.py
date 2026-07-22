@@ -312,8 +312,13 @@ def _matching_aggregate_suffix(normalized: str) -> str | None:
 
 
 def _strip_natural_aggregate_tail(normalized: str) -> str:
-    tail = next((item for item in _NATURAL_AGGREGATE_TAILS if normalized.endswith(item)), None)
-    return normalized if tail is None else normalized[: -len(tail)]
+    remaining = normalized
+    while remaining:
+        tail = next((item for item in _NATURAL_AGGREGATE_TAILS if remaining.endswith(item)), None)
+        if tail is None or len(tail) >= len(remaining):
+            return remaining
+        remaining = remaining[: -len(tail)]
+    return remaining
 
 
 def _is_aggregate_concept_question(normalized: str) -> bool:
