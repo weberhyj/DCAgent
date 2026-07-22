@@ -6,12 +6,14 @@ import os
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.engine import make_url
 
+from .clickhouse_gateway import ClickHouseGateway
 from .database import Database, resolve_database_url
 from .evaluation_import import EvaluationImportService
 from .infra.health import (
@@ -24,20 +26,52 @@ from .infra.health import (
 )
 from .ingestion import KnowledgeIngestionQueue
 from .llm import LLMProvider, create_llm_provider
-from .offline_settings import OfflineSettings
+from .offline_settings import OfflineSettings, parse_bool
 from .repository import ChatRepository
 from .routes import router
 from .runtime_env import load_runtime_environment
 from .sql_repository import SqlChatRepository
 from .storage import KnowledgeFileStorage
+from .structured_answer import StructuredAnswerService
 from .structured_repository import StructuredRepository
 
 
-def create_default_repository(llm_provider: LLMProvider | None = None) -> ChatRepository:
-    load_runtime_environment()
-    database = Database(resolve_database_url())
+def create_default_repository(
+    llm_provider: LLMProvider | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    structured_query_enabled: bool | None = None,
+    database_factory: Callable[[str], Database] = Database,
+    clickhouse_client_factory: Callable[..., object] | None = None,
+) -> ChatRepository:
+    if environ is None:
+        load_runtime_environment()
+        source: Mapping[str, str] = os.environ
+    else:
+        source = environ
+    if structured_query_enabled is not None:
+        source = {
+            **source,
+            "STRUCTURED_QUERY_ENABLED": "true" if structured_query_enabled else "false",
+        }
+    enabled = parse_bool(source.get("STRUCTURED_QUERY_ENABLED"), default=False)
+    settings = OfflineSettings.from_environ(source) if enabled else None
+    database_url = settings.database_url if settings is not None else resolve_database_url(source)
+    database = database_factory(database_url)
     database.create_schema()
-    repository = SqlChatRepository(database, llm_provider=llm_provider or create_llm_provider())
+    structured_service = None
+    if settings is not None:
+        structured_repository = create_structured_repository(database)
+        structured_service, _clients = _create_structured_answer_service(
+            settings,
+            structured_repository,
+            clickhouse_client_factory=clickhouse_client_factory,
+        )
+    repository = SqlChatRepository(
+        database,
+        llm_provider=llm_provider or create_llm_provider(source),
+        structured_service=structured_service,
+    )
     return repository
 
 
@@ -55,7 +89,12 @@ def create_app(
     health_registry: DependencyHealthRegistry | None = None,
 ) -> FastAPI:
     app = _build_app()
-    app.state.repository = repository or create_default_repository(llm_provider)
+    if repository is None:
+        repository = create_default_repository(
+            llm_provider,
+            structured_query_enabled=structured_query_enabled,
+        )
+    app.state.repository = repository
     app.state.structured_repository = structured_repository
     app.state.structured_query_enabled = structured_query_enabled
     app.state.knowledge_ingestion_queue = ingestion_queue or KnowledgeIngestionQueue(
@@ -159,6 +198,7 @@ def create_production_app(
     health_http_client_factory: Callable[..., object] | None = None,
     postgres_health_engine_factory: Callable[..., object] | None = None,
     health_redis_client_factory: Callable[..., object] | None = None,
+    clickhouse_client_factory: Callable[..., object] | None = None,
     upload_dir: Path | None = None,
 ) -> FastAPI:
     environment_override = dict(environ) if environ is not None else None
@@ -194,16 +234,33 @@ def create_production_app(
             )
             database = own(database_builder(database_url))
 
+            structured_repository = create_structured_repository(database)  # type: ignore[arg-type]
+            structured_service = None
+            if settings.structured_query_enabled:
+                structured_service, clickhouse_clients = _create_structured_answer_service(
+                    settings,
+                    structured_repository,
+                    clickhouse_client_factory=clickhouse_client_factory,
+                )
+                for client in clickhouse_clients:
+                    own(client)
+
             if repository_factory is None:
                 repository: ChatRepository = SqlChatRepository(
                     database,  # type: ignore[arg-type]
                     llm_provider=llm_provider,  # type: ignore[arg-type]
+                    structured_service=structured_service,
                 )
             else:
                 repository = repository_factory()
+                if structured_service is not None:
+                    if not hasattr(repository, "_structured_service"):
+                        raise TypeError(
+                            "When STRUCTURED_QUERY_ENABLED=true, repository_factory must "
+                            "return a structured-service-aware repository"
+                        )
+                    repository._structured_service = structured_service  # type: ignore[attr-defined]
             own(repository)
-
-            structured_repository = create_structured_repository(database)  # type: ignore[arg-type]
             if ingestion_queue_factory is None:
                 ingestion_queue = own(
                     KnowledgeIngestionQueue(
@@ -295,6 +352,65 @@ def create_production_app(
                 await _close_owned_resource(resource)
 
     return _build_app(lifespan=lifespan)
+
+
+def _create_structured_answer_service(
+    settings: OfflineSettings,
+    structured_repository: StructuredRepository,
+    *,
+    clickhouse_client_factory: Callable[..., object] | None = None,
+) -> tuple[StructuredAnswerService, tuple[object, ...]]:
+    if not settings.structured_query_enabled:
+        raise ValueError("structured answer service requires STRUCTURED_QUERY_ENABLED=true")
+    if clickhouse_client_factory is None:
+        import clickhouse_connect
+
+        clickhouse_client_factory = clickhouse_connect.get_client
+    gateway = _LazyStructuredQueryGateway(clickhouse_client_factory, settings.clickhouse_url)
+    service = StructuredAnswerService(structured_repository.get_catalog, gateway)
+    return service, (gateway,)
+
+
+class _LazyStructuredQueryGateway:
+    def __init__(self, client_factory: Callable[..., object], dsn: str) -> None:
+        self._client_factory = client_factory
+        self._dsn = dsn
+        self._lock = Lock()
+        self._gateway: ClickHouseGateway | None = None
+        self._clients: tuple[object, object] | None = None
+
+    def query(self, statement: str, parameters: Mapping[str, object] | None = None) -> object:
+        return self._get_gateway().query(statement, parameters)
+
+    def close(self) -> None:
+        with self._lock:
+            clients = self._clients or ()
+            self._clients = None
+            self._gateway = None
+        for client in reversed(clients):
+            close = getattr(client, "close", None)
+            if callable(close):
+                with suppress(Exception):
+                    close()
+
+    def _get_gateway(self) -> ClickHouseGateway:
+        if self._gateway is not None:
+            return self._gateway
+        with self._lock:
+            if self._gateway is not None:
+                return self._gateway
+            ingest_client = self._client_factory(dsn=self._dsn)
+            try:
+                query_client = self._client_factory(dsn=self._dsn)
+            except Exception:
+                close = getattr(ingest_client, "close", None)
+                if callable(close):
+                    with suppress(Exception):
+                        close()
+                raise
+            self._clients = (ingest_client, query_client)
+            self._gateway = ClickHouseGateway(ingest_client, query_client=query_client)
+            return self._gateway
 
 
 def _create_custom_ingestion_queue(

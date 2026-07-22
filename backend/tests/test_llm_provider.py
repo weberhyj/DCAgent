@@ -684,6 +684,7 @@ class LLMProviderTest(unittest.TestCase):
     def test_repository_delegates_assistant_reply_to_injected_llm_provider(self) -> None:
         provider = RecordingLLMProvider()
         repository = InMemoryChatRepository(build_seed_state(), llm_provider=provider)
+        self.assertIsNone(repository._structured_service)
         repository.add_uploaded_knowledge_source(
             source_id="kb-llm",
             name="cashflow.txt",

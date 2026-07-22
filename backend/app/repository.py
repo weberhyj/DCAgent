@@ -4,7 +4,7 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass
 from threading import Lock
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -50,6 +50,9 @@ from .retrieval import (
     resolve_retrieval_min_score,
 )
 from .time_utils import display_datetime_label
+
+if TYPE_CHECKING:
+    from .structured_answer import StructuredAnswerService
 
 STATUS_INDEXED = "已索引"
 STATUS_INDEXING = "解析中"
@@ -417,9 +420,15 @@ class ChatRepository(Protocol):
 
 
 class InMemoryChatRepository:
-    def __init__(self, state: ChatState, llm_provider: LLMProvider | None = None) -> None:
+    def __init__(
+        self,
+        state: ChatState,
+        llm_provider: LLMProvider | None = None,
+        structured_service: StructuredAnswerService | None = None,
+    ) -> None:
         self._state = state
         self._llm_provider = llm_provider or TemplateLLMProvider()
+        self._structured_service = structured_service
         self._lock = Lock()
         self._agent_runs: list[AgentRunAudit] = []
         self._evaluation_cases: list[EvaluationCaseModel] = []
@@ -495,12 +504,23 @@ class InMemoryChatRepository:
             self._find_conversation(conversation_id)
             previous_messages = deepcopy(self._messages_for(conversation_id))
 
-        agent_result = self._agent.run(
-            conversation_id=conversation_id,
-            content=clean_content,
-            mode=mode,
-            previous_messages=previous_messages,
+        agent_result = (
+            None
+            if self._structured_service is None
+            else self._structured_service.try_answer(
+                conversation_id=conversation_id,
+                content=clean_content,
+                mode=mode,
+                previous_messages=previous_messages,
+            )
         )
+        if agent_result is None:
+            agent_result = self._agent.run(
+                conversation_id=conversation_id,
+                content=clean_content,
+                mode=mode,
+                previous_messages=previous_messages,
+            )
 
         with self._lock:
             conversation = self._find_conversation(conversation_id)

@@ -24,10 +24,12 @@ from .structured_models import (
     MAX_STRUCTURED_ALIAS_LENGTH,
     MAX_STRUCTURED_ALIASES_PER_COLUMN,
     SpreadsheetPreview,
+    StructuredCatalog,
     StructuredColumnPreview,
     StructuredColumnSchema,
     StructuredColumnType,
     StructuredConfirmationResult,
+    StructuredDatasetCatalog,
     StructuredDatasetPreview,
     StructuredDatasetSchema,
     StructuredDiagnostic,
@@ -751,6 +753,67 @@ class StructuredRepository:
                 )
             )
             return None if record is None else _publication_from_record(record)
+
+    def get_catalog(self) -> StructuredCatalog:
+        with self._database.session() as session:
+            records = session.scalars(
+                select(StructuredDatasetRecord)
+                .where(StructuredDatasetRecord.schema_version > PREVIEW_SCHEMA_VERSION)
+                .order_by(
+                    StructuredDatasetRecord.dataset_id,
+                    StructuredDatasetRecord.schema_version.desc(),
+                )
+            ).all()
+            publications = session.scalars(
+                select(StructuredPublicationRecord).where(
+                    StructuredPublicationRecord.status == "published"
+                )
+            ).all()
+            source_ids = {record.source_id for record in records}
+            sources = {
+                source.id: source
+                for source in session.scalars(
+                    select(KnowledgeSourceRecord).where(KnowledgeSourceRecord.id.in_(source_ids))
+                ).all()
+            }
+
+            records_by_dataset: dict[str, list[StructuredDatasetRecord]] = {}
+            for record in records:
+                records_by_dataset.setdefault(record.dataset_id, []).append(record)
+            publications_by_dataset: dict[str, list[StructuredPublicationRecord]] = {}
+            for publication in publications:
+                publications_by_dataset.setdefault(publication.dataset_id, []).append(publication)
+
+            catalog_items: list[StructuredDatasetCatalog] = []
+            for dataset_id in sorted(records_by_dataset):
+                dataset_records = records_by_dataset[dataset_id]
+                active_records = publications_by_dataset.get(dataset_id, [])
+                active_record = active_records[0] if len(active_records) == 1 else None
+                selected = next(
+                    (
+                        record
+                        for record in dataset_records
+                        if active_record is not None
+                        and record.schema_version == active_record.schema_version
+                    ),
+                    dataset_records[0],
+                )
+                source = sources.get(selected.source_id)
+                if source is None:
+                    continue
+                catalog_items.append(
+                    StructuredDatasetCatalog(
+                        schema=_schema_from_record(selected),
+                        source_name=source.name,
+                        active_publication=(
+                            None
+                            if active_record is None
+                            or active_record.schema_version != selected.schema_version
+                            else _publication_from_record(active_record)
+                        ),
+                    )
+                )
+            return StructuredCatalog(datasets=tuple(catalog_items))
 
     def get_structured_status(
         self,
