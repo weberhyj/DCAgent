@@ -768,6 +768,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "什么是订单金额加权平均值",
             "订单金额加权平均值是什么",
             "什么是订单金额加权平均值呢",
+            "我的订单金额平均值是什么",
         ):
             with self.subTest(question=question):
                 self._assert_catalog_failure_is_strong_candidate(question)
@@ -788,6 +789,10 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "能帮我说说加权平均值是什么",
             "麻烦告诉我调和平均值是什么",
             "请介绍加权平均值是什么",
+            "我想请教一下加权平均值是什么",
+            "可否聊聊移动平均值是什么",
+            "请简单说一下调和平均值是什么",
+            "请问平均值是什么",
         )
 
         for question in questions:

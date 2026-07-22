@@ -96,32 +96,24 @@ _NAMED_AVERAGE_CONCEPT_TERMS = (
     "几何平均值",
     "调和平均值",
 )
-_CONVERSATIONAL_CUE_ATOMS = tuple(
-    sorted(
-        (
-            "麻烦",
-            "告诉",
-            "介绍",
-            "解释",
-            "说明",
-            "了解",
-            "知道",
-            "一下",
-            "可以",
-            "请",
-            "问",
-            "能",
-            "帮",
-            "我",
-            "你",
-            "您",
-            "想",
-            "说",
-            "讲",
-        ),
-        key=len,
-        reverse=True,
-    )
+_HIGH_CONFIDENCE_CONCEPT_CUES = (
+    "请问",
+    "请教",
+    "可否",
+    "能否",
+    "麻烦",
+    "帮我",
+    "想了解",
+    "想知道",
+    "告诉",
+    "聊聊",
+    "说一下",
+    "讲讲",
+    "介绍",
+    "解释",
+    "说明",
+    "科普",
+    "关于",
 )
 _NATURAL_QUESTION_PARTICLES = ("呢", "吗", "吧", "呀", "啊")
 _AGGREGATE_CONCEPT_TERMS = tuple(
@@ -423,7 +415,7 @@ def _is_priority_aggregate_concept_shape(normalized: str) -> bool:
             leadin = normalized[: -len(phrase)]
             if not leadin:
                 return True
-            if term in _NAMED_AVERAGE_CONCEPT_TERMS and _is_conversational_leadin(leadin):
+            if _is_conversational_leadin(leadin):
                 return True
     return False
 
@@ -446,13 +438,7 @@ def _strip_concept_question_tail(value: str) -> str:
 
 
 def _is_conversational_leadin(value: str) -> bool:
-    remaining = value
-    while remaining:
-        cue = next((item for item in _CONVERSATIONAL_CUE_ATOMS if remaining.startswith(item)), None)
-        if cue is None:
-            return False
-        remaining = remaining[len(cue) :]
-    return True
+    return any(cue in value for cue in _HIGH_CONFIDENCE_CONCEPT_CUES)
 
 
 def _has_metric_qualified_concept_shape(normalized: str) -> bool:
