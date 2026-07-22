@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -476,10 +476,20 @@ class StructuredRepository:
         return (
             select(StructuredIngestionJobRecord)
             .where(
-                StructuredIngestionJobRecord.status.in_(("queued", "failed")),
-                (
-                    StructuredIngestionJobRecord.next_attempt_at.is_(None)
-                    | (StructuredIngestionJobRecord.next_attempt_at <= now_value)
+                or_(
+                    StructuredIngestionJobRecord.status == "queued",
+                    and_(
+                        StructuredIngestionJobRecord.status == "failed",
+                        (
+                            StructuredIngestionJobRecord.next_attempt_at.is_(None)
+                            | (StructuredIngestionJobRecord.next_attempt_at <= now_value)
+                        ),
+                    ),
+                    and_(
+                        StructuredIngestionJobRecord.status == "running",
+                        StructuredIngestionJobRecord.lease_expires_at.is_not(None),
+                        StructuredIngestionJobRecord.lease_expires_at <= now_value,
+                    ),
                 ),
             )
             .order_by(
@@ -632,18 +642,18 @@ class StructuredRepository:
                 current_time + timedelta(seconds=retry_delay_seconds)
             )
             record.error_message = message
-            dataset = session.get(
-                StructuredDatasetRecord,
-                (record.dataset_id, record.schema_version),
-            )
-            if dataset is not None:
-                dataset.status = "failed"
             active = session.scalar(
                 select(StructuredPublicationRecord.publication_id).where(
                     StructuredPublicationRecord.dataset_id == record.dataset_id,
                     StructuredPublicationRecord.status == "published",
                 )
             )
+            dataset = session.get(
+                StructuredDatasetRecord,
+                (record.dataset_id, record.schema_version),
+            )
+            if dataset is not None:
+                dataset.status = "published" if active is not None else "failed"
             source = _lock_source(session, record.source_id)
             if source is None:
                 raise StructuredNotFoundError("Knowledge source not found")

@@ -17,7 +17,7 @@ from app.database import (
 )
 from app.structured_models import StructuredPublicationResult
 from app.structured_repository import StructuredLeaseError, StructuredRepository
-from app.structured_worker import StructuredIngestionWorker
+from app.structured_worker import StructuredIngestionWorker, build_structured_worker
 from tests.support.structured_fakes import sample_confirmed_schema
 
 INDEXED = "\u5df2\u7d22\u5f15"
@@ -174,6 +174,53 @@ class StructuredWorkerTest(unittest.TestCase):
                 now=future,
             )
 
+    def test_expired_running_job_is_reclaimed_with_a_new_fenced_lease(self) -> None:
+        self.enqueue()
+        started_at = datetime(2026, 7, 22, 5, 0, tzinfo=UTC)
+        original = self.repository.claim_publication(
+            "worker-1",
+            lease_seconds=60,
+            now=started_at,
+        )
+        assert original is not None
+
+        reclaimed = self.repository.claim_publication(
+            "worker-2",
+            lease_seconds=60,
+            now=started_at + timedelta(seconds=60),
+        )
+
+        assert reclaimed is not None
+        self.assertEqual(reclaimed.id, original.id)
+        self.assertEqual(reclaimed.status, "running")
+        self.assertEqual(reclaimed.attempt, 2)
+        self.assertNotEqual(reclaimed.lease_token, original.lease_token)
+        with self.assertRaises(StructuredLeaseError):
+            self.repository.renew_publication_lease(
+                original.id,
+                original.lease_token,
+                60,
+                now=started_at + timedelta(seconds=60),
+            )
+
+    def test_unexpired_running_job_cannot_be_reclaimed(self) -> None:
+        self.enqueue()
+        started_at = datetime(2026, 7, 22, 5, 0, tzinfo=UTC)
+        claimed = self.repository.claim_publication(
+            "worker-1",
+            lease_seconds=60,
+            now=started_at,
+        )
+        assert claimed is not None
+
+        overlapping = self.repository.claim_publication(
+            "worker-2",
+            lease_seconds=60,
+            now=started_at + timedelta(seconds=59),
+        )
+
+        self.assertIsNone(overlapping)
+
     def test_failure_schedules_retry_and_next_claim_increments_attempt(self) -> None:
         self.enqueue()
         now = datetime(2026, 7, 22, 5, 0, tzinfo=UTC)
@@ -247,6 +294,8 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertEqual(status.source_status, INDEXED)
         self.assertEqual(status.job.status, "failed")
         self.assertEqual(status.active_publication.publication_id, "pub-old")
+        schema = self.repository.get_schema(self.dataset_id, 1)
+        self.assertEqual(schema.dataset_id, self.dataset_id)
 
     def test_failed_first_publication_marks_source_failed(self) -> None:
         self.enqueue()
@@ -355,6 +404,39 @@ class StructuredWorkerTest(unittest.TestCase):
 
         postgres_sql = str(statement.compile(dialect=postgresql.dialect())).upper()
         self.assertIn("FOR UPDATE SKIP LOCKED", postgres_sql)
+
+    def test_worker_factory_builds_distinct_ingest_and_query_clients(self) -> None:
+        clients: list[object] = []
+        calls: list[dict[str, object]] = []
+
+        def build_client(**kwargs):
+            calls.append(kwargs)
+            client = object()
+            clients.append(client)
+            return client
+
+        worker = build_structured_worker(
+            {
+                "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+                "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+                "PARQUET_ROOT": self.temp_dir.name,
+            },
+            database_factory=lambda _url: self.database,
+            clickhouse_client_factory=build_client,
+        )
+
+        gateway = worker._publisher.clickhouse
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls,
+            [
+                {"dsn": "http://127.0.0.1:8123"},
+                {"dsn": "http://127.0.0.1:8123"},
+            ],
+        )
+        self.assertIs(gateway._ingest_client, clients[0])
+        self.assertIs(gateway._query_client, clients[1])
+        self.assertIsNot(gateway._ingest_client, gateway._query_client)
 
 
 if __name__ == "__main__":

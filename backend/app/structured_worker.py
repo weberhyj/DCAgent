@@ -206,9 +206,10 @@ def build_structured_worker(
         import clickhouse_connect
 
         clickhouse_client_factory = clickhouse_connect.get_client
-    client = clickhouse_client_factory(dsn=settings.clickhouse_url)
+    ingest_client = clickhouse_client_factory(dsn=settings.clickhouse_url)
+    query_client = clickhouse_client_factory(dsn=settings.clickhouse_url)
     publisher = SpreadsheetPublisher(
-        clickhouse=ClickHouseGateway(client),
+        clickhouse=ClickHouseGateway(ingest_client, query_client=query_client),
         parquet_root=settings.parquet_root,
         batch_rows=settings.structured_ingest_batch_rows,
     )
