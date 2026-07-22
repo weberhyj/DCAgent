@@ -747,6 +747,42 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             with self.subTest(question=question):
                 self._assert_catalog_failure_is_strong_candidate(question)
 
+    def test_catalog_failure_concept_phrases_can_appear_anywhere(self) -> None:
+        questions = (
+            "我想了解什么是平均值",
+            "能帮我讲讲什么是平均值",
+            "通俗地解释一下平均值",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_uses_legacy_path(question)
+
+    def test_catalog_failure_natural_aggregate_tails_are_strong_candidates(self) -> None:
+        questions = (
+            "订单金额平均值是多少",
+            "请问订单金额平均值是多少",
+            "订单金额总和有多少",
+            "订单金额的最大值呢",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_is_strong_candidate(question)
+
+    def test_catalog_failure_chinese_equality_preserves_punctuation_delimiters(self) -> None:
+        questions = (
+            "订单金额平均值，地区为华东",
+            "订单金额平均值,地区为华东",
+            "订单金额平均值。地区为华东",
+            "订单金额平均值；地区为华东",
+            "订单金额平均值;地区为华东",
+        )
+
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_is_strong_candidate(question)
+
     def test_catalog_failure_keeps_arbitrary_prefix_what_is_question_on_legacy_path(
         self,
     ) -> None:

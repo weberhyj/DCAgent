@@ -71,19 +71,8 @@ _HAS_EXPLICIT_FILTER_RE = re.compile(
     r"(?:(?:大于|不少于|小于|不超过|[<>]=?)\s*-?\d+(?:\.\d+)?)|="
     r"|(?:\d{4}-\d{2}-\d{2}\s*至\s*\d{4}-\d{2}-\d{2})"
 )
-_CATALOG_FAILURE_POLITE_PREFIXES = (
-    "请告诉我",
-    "请问",
-    "能否",
-    "可否",
-    "可以",
-    "麻烦",
-    "烦请",
-    "劳烦",
-    "请",
-)
-_CONCEPT_OPENERS = ("什么是", "什么叫", "何为")
-_CONCEPT_VERBS = ("解释", "说明", "介绍", "定义")
+_CONCEPT_ANYWHERE_PHRASES = ("什么是", "什么叫", "何为", "是什么意思")
+_CONCEPT_TERM_INTRODUCERS = ("解释一下", "讲讲", "介绍一下", "说明一下")
 _CONCEPT_TERM_SUFFIXES = (
     "是什么",
     "是什么意思",
@@ -100,6 +89,8 @@ _COPULA_FRAGMENTS = frozenset(("因为", "作为", "称为", "成为", "认为",
 _AGGREGATE_CONCEPT_TERMS = tuple(
     sorted(("算术平均值", *_CHINESE_AGGREGATE_TERMS), key=len, reverse=True)
 )
+_NATURAL_AGGREGATE_TAILS = ("是多少", "有多少", "多少", "呢", "吗")
+_EQUALITY_FIELD_DELIMITERS = ("，", ",", "。", "；", ";", "且", "或")
 
 
 class StructuredAnswerService:
@@ -280,7 +271,7 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
     normalized = _normalize(stripped)
     if not _has_aggregate_language(normalized):
         return "weak"
-    if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(normalized):
+    if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(stripped):
         return "strong"
     if _is_aggregate_concept_question(normalized):
         return "concept"
@@ -289,26 +280,28 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
     return "weak"
 
 
-def _has_chinese_equality_filter(normalized: str) -> bool:
-    for index, character in enumerate(normalized):
-        if character != "为" or normalized[max(0, index - 1) : index + 1] in _COPULA_FRAGMENTS:
+def _has_chinese_equality_filter(question: str) -> bool:
+    for index, character in enumerate(question):
+        context = _normalize(question[max(0, index - 2) : index + 1])
+        if character != "为" or any(context.endswith(item) for item in _COPULA_FRAGMENTS):
             continue
-        field_start = max(normalized.rfind("且", 0, index), normalized.rfind("或", 0, index)) + 1
-        field = normalized[field_start:index]
-        value = normalized[index + 1 :]
-        if not field or not value:
+        field_start = max(question.rfind(item, 0, index) for item in _EQUALITY_FIELD_DELIMITERS) + 1
+        field = question[field_start:index]
+        value = question[index + 1 :]
+        if not _normalize(field) or not _normalize(value):
             continue
-        remaining = normalized[:field_start] + "_" * len(field) + normalized[index:]
+        remaining = question[:field_start] + "_" * len(field) + question[index:]
         if _has_aggregate_language(remaining):
             return True
     return False
 
 
 def _has_field_aggregate_suffix(normalized: str) -> bool:
-    suffix = _matching_aggregate_suffix(normalized)
+    base = _strip_natural_aggregate_tail(normalized)
+    suffix = _matching_aggregate_suffix(base)
     if suffix is None:
         return False
-    prefix = normalized[: -len(suffix)]
+    prefix = base[: -len(suffix)]
     if prefix.endswith("的"):
         prefix = prefix[:-1]
     return bool(prefix)
@@ -318,55 +311,49 @@ def _matching_aggregate_suffix(normalized: str) -> str | None:
     return next((term for term in _STRONG_AGGREGATE_SUFFIXES if normalized.endswith(term)), None)
 
 
+def _strip_natural_aggregate_tail(normalized: str) -> str:
+    tail = next((item for item in _NATURAL_AGGREGATE_TAILS if normalized.endswith(item)), None)
+    return normalized if tail is None else normalized[: -len(tail)]
+
+
 def _is_aggregate_concept_question(normalized: str) -> bool:
-    body = _strip_polite_prefixes(normalized)
-    if not _has_aggregate_language(body):
+    if not _has_aggregate_language(normalized):
         return False
-    if any(
-        body.startswith(opener)
-        and _matches_concept_term_phrase(body[len(opener) :], allow_bare=True)
-        for opener in _CONCEPT_OPENERS
+    if any(phrase in normalized for phrase in _CONCEPT_ANYWHERE_PHRASES):
+        return True
+    for introducer in _CONCEPT_TERM_INTRODUCERS:
+        start = normalized.find(introducer)
+        while start >= 0:
+            remainder = normalized[start + len(introducer) :]
+            if _matches_concept_term_phrase(remainder, allow_bare=True):
+                return True
+            start = normalized.find(introducer, start + 1)
+    if (
+        "说明因为" in normalized
+        and _contains_aggregate_concept_term(normalized)
+        and normalized.endswith(("影响", "原因", "后果", "结果"))
     ):
         return True
-    for verb in _CONCEPT_VERBS:
-        if not body.startswith(verb):
-            continue
-        remainder = body[len(verb) :]
-        if remainder.startswith("一下"):
-            remainder = remainder[2:]
-        if any(
-            remainder.startswith(opener)
-            and _matches_concept_term_phrase(remainder[len(opener) :], allow_bare=True)
-            for opener in _CONCEPT_OPENERS
-        ):
-            return True
-        if _matches_concept_term_phrase(remainder, allow_bare=True):
-            return True
-        if (
-            remainder.startswith("因为")
-            and _contains_aggregate_concept_term(remainder)
-            and remainder.endswith(("影响", "原因", "后果", "结果"))
-        ):
-            return True
-        if (
-            remainder.startswith("被称为")
-            and _contains_aggregate_concept_term(remainder)
-            and remainder.endswith(("概念", "含义", "定义"))
-        ):
-            return True
-    return _matches_concept_term_phrase(body, allow_bare=False)
+    if (
+        "介绍被称为" in normalized
+        and _contains_aggregate_concept_term(normalized)
+        and normalized.endswith(("概念", "含义", "定义"))
+    ):
+        return True
+    return any(
+        _matches_concept_term_phrase(normalized[start:], allow_bare=False)
+        for term in _AGGREGATE_CONCEPT_TERMS
+        for start in _find_occurrence_starts(normalized, term)
+    )
 
 
-def _strip_polite_prefixes(normalized: str) -> str:
-    remaining = normalized
-    while True:
-        prefix = next(
-            (item for item in _CATALOG_FAILURE_POLITE_PREFIXES if remaining.startswith(item)),
-            None,
-        )
-        if prefix is None:
-            return remaining
-        remaining = remaining[len(prefix) :]
+def _find_occurrence_starts(value: str, term: str) -> tuple[int, ...]:
+    starts: list[int] = []
+    start = value.find(term)
+    while start >= 0:
+        starts.append(start)
+        start = value.find(term, start + 1)
+    return tuple(starts)
 
 
 def _matches_concept_term_phrase(value: str, *, allow_bare: bool) -> bool:
