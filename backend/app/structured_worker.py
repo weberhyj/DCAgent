@@ -4,6 +4,7 @@ import os
 import signal
 import socket
 from collections.abc import Callable, Mapping
+from hashlib import sha256
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread, main_thread
 from time import monotonic, sleep
@@ -29,6 +30,7 @@ class StructuredPublisher(Protocol):
         publication_id: str,
         *,
         lease_guard: Callable[[], None] | None = None,
+        staging_token: str | None = None,
     ) -> StructuredPublicationResult: ...
 
 
@@ -125,6 +127,7 @@ class StructuredIngestionWorker:
                 publication_input.schema,
                 job.publication_id,
                 lease_guard=renew,
+                staging_token=_staging_token(lease_token),
             )
             _validate_publication_result(result, job, len(publication_input.schema.columns))
             renew(force=True, checkpoint_row=result.row_count)
@@ -190,6 +193,10 @@ def _validate_publication_result(
         character not in "0123456789abcdef" for character in result.content_hash
     ):
         raise ValueError("Publisher returned an invalid content hash")
+
+
+def _staging_token(lease_token: str) -> str:
+    return sha256(lease_token.encode("utf-8")).hexdigest()[:24]
 
 
 def build_structured_worker(

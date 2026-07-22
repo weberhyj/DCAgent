@@ -108,16 +108,20 @@ class SpreadsheetPublisher:
         publication_id: str,
         *,
         lease_guard: Callable[[], None] | None = None,
+        staging_token: str | None = None,
     ) -> StructuredPublicationResult:
         _check_lease(lease_guard)
         source_root = Path(getattr(self.sink, "root", Path("./data/parquet")))
-        output_root = (
+        publication_root = (
             source_root
             / _safe_path_component(schema.source_id)
             / _safe_path_component(schema.dataset_id)
             / str(schema.schema_version)
             / _safe_path_component(publication_id)
         )
+        output_root = publication_root
+        if staging_token is not None:
+            output_root = publication_root / f"attempt-{_safe_path_component(staging_token)}"
         _require_within_root(source_root, output_root)
         _clear_publication_directory(output_root)
         output_paths: list[Path] = []

@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from threading import Event, Thread
 
 from app.structured_ingestion import (
     ArrowParquetSink,
@@ -65,6 +66,21 @@ class FailingPublicationGateway(RecordingPublicationGateway):
 
     def discard_publication(self, target) -> None:
         self.discarded.append(target)
+
+
+class CoordinatedAttemptSink(ArrowParquetSink):
+    def __init__(self, root: Path, blocked_attempt_directory: str) -> None:
+        super().__init__(root)
+        self.blocked_attempt_directory = blocked_attempt_directory
+        self.blocked_attempt_written = Event()
+        self.release_blocked_attempt = Event()
+
+    def write_batch(self, batch, output_path: Path) -> None:
+        super().write_batch(batch, output_path)
+        if output_path.parent.name == self.blocked_attempt_directory:
+            self.blocked_attempt_written.set()
+            if not self.release_blocked_attempt.wait(timeout=5):
+                raise TimeoutError("blocked publication attempt was not released")
 
 
 class StructuredIngestionTest(unittest.TestCase):
@@ -493,6 +509,72 @@ class StructuredIngestionTest(unittest.TestCase):
             )
         )
         self.assertEqual([path.name for path in publication_parts], ["part-00000.parquet"])
+
+    def test_stale_attempt_cleanup_does_not_delete_takeover_attempt_parts(self) -> None:
+        confirmed = sample_confirmed_schema(self.temp_dir, row_count=1)
+        parquet_root = self.temp_dir / "parquet"
+        sink = CoordinatedAttemptSink(parquet_root, "attempt-old-owner")
+        lease_lost = Event()
+        old_errors: list[Exception] = []
+
+        def old_lease_guard() -> None:
+            if lease_lost.is_set():
+                raise RuntimeError("old lease lost")
+
+        def publish_old_attempt() -> None:
+            try:
+                SpreadsheetPublisher(
+                    sink=sink,
+                    clickhouse=RecordingPublicationGateway(),
+                ).publish(
+                    confirmed.path,
+                    confirmed.schema,
+                    "pub-overlap",
+                    lease_guard=old_lease_guard,
+                    staging_token="old-owner",
+                )
+            except Exception as error:
+                old_errors.append(error)
+
+        old_thread = Thread(target=publish_old_attempt)
+        old_thread.start()
+        self.assertTrue(
+            sink.blocked_attempt_written.wait(timeout=1),
+            f"old attempt failed before its blocked write: {old_errors}",
+        )
+
+        SpreadsheetPublisher(
+            sink=sink,
+            clickhouse=RecordingPublicationGateway(),
+        ).publish(
+            confirmed.path,
+            confirmed.schema,
+            "pub-overlap",
+            staging_token="new-owner",
+        )
+        new_part = (
+            parquet_root
+            / "kb-sales"
+            / "ds-sales"
+            / "1"
+            / "pub-overlap"
+            / "attempt-new-owner"
+            / "part-00000.parquet"
+        )
+        self.assertTrue(new_part.exists())
+
+        lease_lost.set()
+        sink.release_blocked_attempt.set()
+        old_thread.join(timeout=5)
+
+        self.assertFalse(old_thread.is_alive())
+        self.assertEqual([str(error) for error in old_errors], ["old lease lost"])
+        self.assertTrue(new_part.exists())
+        self.assertFalse(
+            (
+                parquet_root / "kb-sales" / "ds-sales" / "1" / "pub-overlap" / "attempt-old-owner"
+            ).exists()
+        )
 
 
 if __name__ == "__main__":

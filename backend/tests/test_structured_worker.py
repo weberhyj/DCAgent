@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -29,10 +30,12 @@ class RecordingPublisher:
     def __init__(self, result: StructuredPublicationResult | Exception) -> None:
         self.result = result
         self.calls: list[tuple[Path, object, str]] = []
+        self.staging_tokens: list[str | None] = []
         self.lease_checks = 0
 
-    def publish(self, path, schema, publication_id, *, lease_guard=None):
+    def publish(self, path, schema, publication_id, *, lease_guard=None, staging_token=None):
         self.calls.append((Path(path), schema, publication_id))
+        self.staging_tokens.append(staging_token)
         if lease_guard is not None:
             lease_guard()
             self.lease_checks += 1
@@ -42,6 +45,21 @@ class RecordingPublisher:
             lease_guard()
             self.lease_checks += 1
         return self.result
+
+
+class FailOncePublisher(RecordingPublisher):
+    def publish(self, path, schema, publication_id, *, lease_guard=None, staging_token=None):
+        if self.calls:
+            return super().publish(
+                path,
+                schema,
+                publication_id,
+                lease_guard=lease_guard,
+                staging_token=staging_token,
+            )
+        self.calls.append((Path(path), schema, publication_id))
+        self.staging_tokens.append(staging_token)
+        raise RuntimeError("first attempt failed")
 
 
 class StructuredWorkerTest(unittest.TestCase):
@@ -362,11 +380,33 @@ class StructuredWorkerTest(unittest.TestCase):
 
         self.assertEqual(len(publisher.calls), 1)
         self.assertEqual(publisher.calls[0][0], self.source_path)
+        self.assertRegex(publisher.staging_tokens[0] or "", r"^[0-9a-f]{24}$")
         self.assertGreaterEqual(publisher.lease_checks, 2)
         status = self.repository.get_structured_status(self.source_id)
         self.assertEqual(status.job.status, "published")
         self.assertEqual(status.job.checkpoint_row, 2)
         self.assertEqual(status.source_status, INDEXED)
+
+    def test_worker_retry_uses_a_new_staging_owner_for_same_publication(self) -> None:
+        self.enqueue()
+        publisher = FailOncePublisher(self.publication_result())
+        worker = StructuredIngestionWorker(
+            self.repository,
+            publisher,
+            worker_id="worker-1",
+            lease_seconds=60,
+            retry_delay_seconds=0,
+        )
+
+        self.assertTrue(worker.run_once())
+        self.assertTrue(worker.run_once())
+
+        self.assertEqual([call[2] for call in publisher.calls], ["pub-new", "pub-new"])
+        self.assertEqual(len(publisher.staging_tokens), 2)
+        self.assertNotEqual(publisher.staging_tokens[0], publisher.staging_tokens[1])
+        self.assertTrue(
+            all(re.fullmatch(r"[0-9a-f]{24}", token or "") for token in publisher.staging_tokens)
+        )
 
     def test_worker_failure_preserves_old_active_publication(self) -> None:
         self.add_active_publication()
