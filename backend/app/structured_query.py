@@ -314,7 +314,7 @@ def _resolve_dataset(
     question: str, catalog: StructuredCatalog
 ) -> StructuredDatasetCatalog | StructuredClarification | StructuredUnavailable:
     normalized = _normalize(question)
-    matches: list[tuple[int, int, StructuredDatasetCatalog]] = []
+    matches: list[tuple[int, int, int, int, StructuredDatasetCatalog]] = []
     for dataset in catalog.datasets:
         names = (
             (0, dataset.schema.dataset_id),
@@ -324,18 +324,26 @@ def _resolve_dataset(
         )
         for priority, name in names:
             normalized_name = _normalize(name)
-            if normalized_name and normalized_name in normalized:
-                matches.append((priority, len(normalized_name), dataset))
+            if not normalized_name:
+                continue
+            start = normalized.find(normalized_name)
+            while start >= 0:
+                end = start + len(normalized_name)
+                matches.append((priority, len(normalized_name), start, end, dataset))
+                start = normalized.find(normalized_name, start + 1)
 
     if matches:
-        best_priority = min(priority for priority, _, _ in matches)
+        best_priority = min(priority for priority, _, _, _, _ in matches)
         at_priority = [match for match in matches if match[0] == best_priority]
-        longest = max(length for _, length, _ in at_priority)
-        finalists = {
-            dataset.schema.dataset_id: dataset
-            for priority, length, dataset in at_priority
-            if priority == best_priority and length == longest
-        }
+        independent = [
+            match
+            for match in at_priority
+            if not any(
+                other_length > match[1] and other_start <= match[2] and match[3] <= other_end
+                for _, other_length, other_start, other_end, _ in at_priority
+            )
+        ]
+        finalists = {dataset.schema.dataset_id: dataset for _, _, _, _, dataset in independent}
         if len(finalists) > 1:
             return StructuredClarification(
                 "问题同时匹配多个数据集，请选择一个数据集",

@@ -289,6 +289,30 @@ class StructuredIntentParserTest(unittest.TestCase):
 
         self.assertEqual(result.dataset_id, "ds-regional-sales")
 
+    def test_dataset_resolution_clarifies_independently_mentioned_nested_names(self) -> None:
+        catalog = sample_catalog()
+        sales = catalog.datasets[0]
+        regional_publication = replace(
+            sample_publication(),
+            publication_id="pub-regional",
+            dataset_id="ds-regional-sales",
+            physical_table_name="structured_ds_regional_sales_v1",
+        )
+        regional = replace(
+            sales,
+            schema=replace(sales.schema, dataset_id="ds-regional-sales"),
+            source_name="regional-sales.xlsx",
+            active_publication=regional_publication,
+        )
+
+        result = parse_structured_intent(
+            "ds-sales和ds-regional-sales订单金额平均值",
+            replace(catalog, datasets=(sales, regional)),
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("ds-regional-sales", "ds-sales"))
+
     def test_dataset_resolution_same_priority_and_length_tie_clarifies(self) -> None:
         catalog = sample_catalog()
         first = catalog.datasets[0]
