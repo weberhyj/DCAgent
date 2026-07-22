@@ -38,6 +38,15 @@ class StructuredIntentParserTest(unittest.TestCase):
         self.assertIsInstance(result, StructuredClarification)
         self.assertEqual(set(result.candidates), {"net_amount", "order_amount"})
 
+    def test_independently_mentioned_metrics_clarify_even_when_lengths_differ(self) -> None:
+        result = resolve_structured_intent(
+            "订单金额和净金额平均值",
+            sample_catalog(ambiguous=True),
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("net_amount", "order_amount"))
+
     def test_parses_numeric_and_date_range_filters(self) -> None:
         intent = parse_structured_intent(
             "统计2026-01-01 至 2026-01-31订单金额大于100的总和",
@@ -120,6 +129,23 @@ class StructuredIntentParserTest(unittest.TestCase):
                 result = parse_structured_intent(question, sample_catalog())
                 self.assertEqual(result.aggregate, expected)
 
+    def test_multiple_distinct_aggregates_require_clarification(self) -> None:
+        result = parse_structured_intent(
+            "订单金额最大值和最小值",
+            sample_catalog(),
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("max", "min"))
+
+    def test_repeated_synonyms_for_one_aggregate_do_not_create_ambiguity(self) -> None:
+        result = parse_structured_intent(
+            "订单金额最大值也就是最高值",
+            sample_catalog(),
+        )
+
+        self.assertEqual(result.aggregate, "max")
+
     def test_count_resolves_confirmed_non_aggregate_field(self) -> None:
         result = parse_structured_intent("地区计数", sample_catalog())
 
@@ -175,6 +201,128 @@ class StructuredIntentParserTest(unittest.TestCase):
                     sample_catalog(),
                 )
                 self.assertIn(StructuredFilter("order_amount", operator, "100"), result.filters)
+
+    def test_composite_and_filters_keep_equality_value_bounded(self) -> None:
+        result = parse_structured_intent(
+            "地区=华东且订单金额大于100的总和",
+            sample_catalog(),
+        )
+
+        self.assertEqual(
+            result.filters,
+            (
+                StructuredFilter("region", "eq", "华东"),
+                StructuredFilter("order_amount", "gt", "100"),
+            ),
+        )
+
+    def test_or_filters_are_rejected_instead_of_compiled_as_and(self) -> None:
+        result = parse_structured_intent(
+            "地区=华东或地区=华南的订单金额总和",
+            sample_catalog(),
+        )
+
+        self.assertIsInstance(result, (StructuredClarification, StructuredUnavailable))
+
+    def test_equality_stops_at_chinese_comma_and_de_boundary(self) -> None:
+        comma = parse_structured_intent(
+            "地区=华东，订单金额大于100的总和",
+            sample_catalog(),
+        )
+        de_boundary = parse_structured_intent(
+            "地区=华东的订单金额总和",
+            sample_catalog(),
+        )
+
+        self.assertIn(StructuredFilter("region", "eq", "华东"), comma.filters)
+        self.assertIn(StructuredFilter("region", "eq", "华东"), de_boundary.filters)
+
+    def test_same_field_multiple_and_conditions_are_preserved(self) -> None:
+        result = parse_structured_intent(
+            "订单金额大于100且订单金额不超过200的总和",
+            sample_catalog(),
+        )
+
+        self.assertEqual(
+            result.filters,
+            (
+                StructuredFilter("order_amount", "gt", "100"),
+                StructuredFilter("order_amount", "lte", "200"),
+            ),
+        )
+
+    def test_numeric_comparison_rejects_non_numeric_confirmed_columns(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        boolean_column = replace(
+            base.schema.columns[1],
+            physical_name="is_active",
+            original_name="是否有效",
+            display_name="是否有效",
+            data_type=StructuredColumnType.BOOLEAN,
+            aliases=(),
+        )
+        cases = (
+            (catalog, "地区大于100的订单金额总和"),
+            (
+                replace(
+                    catalog,
+                    datasets=(
+                        replace(
+                            base,
+                            schema=replace(
+                                base.schema,
+                                columns=(base.schema.columns[0], boolean_column),
+                            ),
+                        ),
+                    ),
+                ),
+                "是否有效大于1的订单金额总和",
+            ),
+            (catalog, "订单日期大于2026-01-01的订单金额总和"),
+            (
+                replace(
+                    catalog,
+                    datasets=(
+                        replace(
+                            base,
+                            schema=replace(
+                                base.schema,
+                                columns=(
+                                    base.schema.columns[0],
+                                    base.schema.columns[1],
+                                    replace(
+                                        base.schema.columns[2],
+                                        data_type=StructuredColumnType.DATETIME,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                "订单日期不超过2026-01-31的订单金额总和",
+            ),
+        )
+
+        for case_catalog, question in cases:
+            with self.subTest(question=question):
+                result = parse_structured_intent(question, case_catalog)
+                self.assertIsInstance(
+                    result,
+                    (StructuredClarification, StructuredUnavailable),
+                )
+
+    def test_numeric_comparison_requires_complete_number_boundary(self) -> None:
+        for malformed in ("100abc", "100-200", "100.2.3"):
+            with self.subTest(malformed=malformed):
+                result = parse_structured_intent(
+                    f"订单金额大于{malformed}的总和",
+                    sample_catalog(),
+                )
+                self.assertIsInstance(
+                    result,
+                    (StructuredClarification, StructuredUnavailable),
+                )
 
     def test_filter_resolves_normalized_physical_name(self) -> None:
         result = parse_structured_intent(
@@ -247,6 +395,39 @@ class StructuredIntentParserTest(unittest.TestCase):
 
         self.assertEqual(result.filters, (StructuredFilter("sales_region", "eq", "华东"),))
 
+    def test_independent_filter_fields_before_one_operator_require_clarification(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        metric = base.schema.columns[0]
+        generic = replace(
+            base.schema.columns[1],
+            physical_name="generic_region",
+            original_name="通用片区",
+            display_name="通用片区",
+            aliases=("地区",),
+        )
+        sales = replace(
+            base.schema.columns[1],
+            physical_name="sales_region",
+            original_name="销售片区",
+            display_name="销售片区",
+            aliases=("销售地区",),
+        )
+        ambiguous = replace(
+            catalog,
+            datasets=(
+                replace(base, schema=replace(base.schema, columns=(metric, generic, sales))),
+            ),
+        )
+
+        result = parse_structured_intent(
+            "销售地区和地区=华东的订单金额总和",
+            ambiguous,
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("generic_region", "sales_region"))
+
     def test_unconfirmed_and_multiple_datasets_are_not_selected(self) -> None:
         catalog = sample_catalog()
         unconfirmed = replace(
@@ -312,6 +493,34 @@ class StructuredIntentParserTest(unittest.TestCase):
 
         self.assertIsInstance(result, StructuredClarification)
         self.assertEqual(result.candidates, ("ds-regional-sales", "ds-sales"))
+
+    def test_dataset_resolution_clarifies_independent_cross_priority_mentions(self) -> None:
+        catalog = sample_catalog()
+        sales = catalog.datasets[0]
+        other_publication = replace(
+            sample_publication(),
+            publication_id="pub-other",
+            dataset_id="ds-other",
+            physical_table_name="structured_ds_other_v1",
+        )
+        other = replace(
+            sales,
+            schema=replace(
+                sales.schema,
+                dataset_id="ds-other",
+                worksheet_name="华南",
+            ),
+            source_name="other.xlsx",
+            active_publication=other_publication,
+        )
+
+        result = parse_structured_intent(
+            "sales和华南的订单金额平均值",
+            replace(catalog, datasets=(sales, other)),
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("ds-other", "ds-sales"))
 
     def test_dataset_resolution_same_priority_and_length_tie_clarifies(self) -> None:
         catalog = sample_catalog()
