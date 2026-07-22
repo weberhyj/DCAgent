@@ -579,10 +579,11 @@ def confirm_structured_schema(
 )
 def enqueue_structured_publication(
     source_id: str,
+    dataset_id: str | None = Query(default=None, alias="datasetId"),
     structured_repository: StructuredRepository = Depends(get_structured_repository),
 ) -> StructuredPublicationEnqueueResponse:
     try:
-        job = structured_repository.enqueue_source_publication(source_id)
+        job = structured_repository.enqueue_source_publication(source_id, dataset_id)
     except StructuredNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except StructuredConflictError as error:
@@ -596,10 +597,11 @@ def enqueue_structured_publication(
 )
 def get_structured_status(
     source_id: str,
+    job_id: str | None = Query(default=None, alias="jobId"),
     structured_repository: StructuredRepository = Depends(get_structured_repository),
 ) -> StructuredStatusResponse:
     try:
-        status = structured_repository.get_structured_status(source_id)
+        status = structured_repository.get_structured_status(source_id, job_id)
     except StructuredNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     return StructuredStatusResponse.from_model(status)

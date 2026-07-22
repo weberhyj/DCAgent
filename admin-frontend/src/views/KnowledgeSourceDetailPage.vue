@@ -58,8 +58,8 @@ async function handleStructuredConfirm(submission: StructuredSchemaSubmission) {
   await confirmStructuredSchema(sourceId.value, submission)
 }
 
-async function handleStructuredPublish() {
-  await publishStructuredSource(sourceId.value)
+async function handleStructuredPublish(datasetId: string) {
+  await publishStructuredSource(sourceId.value, datasetId)
 }
 </script>
 

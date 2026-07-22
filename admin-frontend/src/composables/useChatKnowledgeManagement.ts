@@ -250,7 +250,7 @@ export function useChatKnowledgeManagement() {
     }
   }
 
-  async function publishStructuredSource(sourceId: string) {
+  async function publishStructuredSource(sourceId: string, datasetId: string) {
     if (structuredPublishing.value) return null
     cancelStructuredPublicationPolling(true)
     const requestToken = ++structuredPublicationRequestToken
@@ -260,13 +260,13 @@ export function useChatKnowledgeManagement() {
     structuredPublicationEnqueueing.value = true
     error.value = null
     try {
-      await enqueueStructuredPublication(sourceId, controller.signal)
+      const publication = await enqueueStructuredPublication(sourceId, datasetId, controller.signal)
       if (requestToken !== structuredPublicationRequestToken || controller.signal.aborted) {
         return null
       }
       structuredPublicationEnqueueing.value = false
       while (requestToken === structuredPublicationRequestToken && !controller.signal.aborted) {
-        const status = await fetchStructuredStatus(sourceId, controller.signal)
+        const status = await fetchStructuredStatus(sourceId, publication.jobId, controller.signal)
         if (requestToken !== structuredPublicationRequestToken || controller.signal.aborted) {
           return null
         }
@@ -357,16 +357,21 @@ export function useChatKnowledgeManagement() {
   }
 }
 
-function abortableDelay(milliseconds: number, signal: AbortSignal) {
+export function abortableDelay(milliseconds: number, signal: AbortSignal) {
   return new Promise<void>((resolve) => {
     if (signal.aborted) {
       resolve()
       return
     }
-    const timeout = window.setTimeout(resolve, milliseconds)
-    signal.addEventListener('abort', () => {
+    const onAbort = () => {
       window.clearTimeout(timeout)
+      signal.removeEventListener('abort', onAbort)
       resolve()
-    }, { once: true })
+    }
+    const timeout = window.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, milliseconds)
+    signal.addEventListener('abort', onAbort, { once: true })
   })
 }

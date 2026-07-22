@@ -123,6 +123,8 @@ class SpreadsheetPublisher:
         if staging_token is not None:
             output_root = publication_root / f"attempt-{_safe_path_component(staging_token)}"
         _require_within_root(source_root, output_root)
+        if staging_token is not None:
+            _clear_stale_attempt_directories(publication_root, output_root)
         _clear_publication_directory(output_root)
         output_paths: list[Path] = []
         buffered: list[dict[str, Any]] = []
@@ -612,3 +614,20 @@ def _clear_publication_directory(output_root: Path, *, best_effort: bool = False
     except OSError:
         if not best_effort:
             raise
+
+
+def _clear_stale_attempt_directories(publication_root: Path, current_attempt: Path) -> None:
+    try:
+        candidates = tuple(publication_root.iterdir())
+    except FileNotFoundError:
+        return
+    for candidate in candidates:
+        if (
+            candidate == current_attempt
+            or not candidate.name.startswith("attempt-")
+            or not candidate.is_dir()
+            or candidate.is_symlink()
+        ):
+            continue
+        _require_within_root(publication_root, candidate)
+        _clear_publication_directory(candidate, best_effort=True)

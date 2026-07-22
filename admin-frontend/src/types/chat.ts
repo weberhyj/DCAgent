@@ -115,6 +115,7 @@ export interface StructuredPublicationJob {
   sourceId: string
   datasetId: string
   schemaVersion: number
+  sequence: number
   publicationId: string
   status: StructuredPublicationJobStatus
   leaseExpiresAt: string | null

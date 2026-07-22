@@ -82,6 +82,7 @@ class StructuredPublicationJob:
     source_id: str
     dataset_id: str
     schema_version: int
+    sequence: int
     publication_id: str
     status: str
     lease_token: str | None
@@ -369,46 +370,57 @@ class StructuredRepository:
             source = _lock_source(session, source_id)
             if source is None:
                 raise StructuredNotFoundError("Knowledge source not found")
-            dataset = session.scalar(
-                select(StructuredDatasetRecord)
+            dataset_identity = session.execute(
+                select(
+                    StructuredDatasetRecord.dataset_id,
+                    StructuredDatasetRecord.schema_version,
+                )
                 .where(
                     StructuredDatasetRecord.source_id == source_id,
                     StructuredDatasetRecord.dataset_id == dataset_id,
                     StructuredDatasetRecord.schema_version > PREVIEW_SCHEMA_VERSION,
                 )
                 .order_by(StructuredDatasetRecord.schema_version.desc())
-                .with_for_update()
-            )
-            if dataset is None or dataset.status not in {
-                "confirmed",
-                "published",
-                "failed",
-            }:
+            ).first()
+            if dataset_identity is None:
                 raise StructuredConflictError(
                     "Structured schema must be confirmed before publication"
                 )
-
-            current = session.scalar(
-                select(StructuredIngestionJobRecord)
-                .where(
+            current_identity = session.execute(
+                select(StructuredIngestionJobRecord.id).where(
                     StructuredIngestionJobRecord.source_id == source_id,
                     StructuredIngestionJobRecord.dataset_id == dataset_id,
-                    StructuredIngestionJobRecord.schema_version == dataset.schema_version,
+                    StructuredIngestionJobRecord.schema_version == dataset_identity.schema_version,
                     StructuredIngestionJobRecord.status.in_(("queued", "running", "failed")),
                 )
-                .with_for_update()
+            ).first()
+            current = None
+            if current_identity is not None:
+                current = _lock_job(session, current_identity.id)
+            dataset = _lock_dataset(
+                session,
+                dataset_identity.dataset_id,
+                dataset_identity.schema_version,
             )
+            if (
+                dataset is None
+                or dataset.source_id != source_id
+                or dataset.status
+                not in {
+                    "confirmed",
+                    "published",
+                    "failed",
+                }
+            ):
+                raise StructuredConflictError(
+                    "Structured schema must be confirmed before publication"
+                )
             if current is not None:
                 if current.status == "failed":
                     current.status = "queued"
                     current.next_attempt_at = None
                     current.error_message = None
-                    publication = session.get(
-                        StructuredPublicationRecord,
-                        current.publication_id,
-                    )
-                    if publication is None:
-                        raise StructuredConflictError("Structured publication metadata is missing")
+                    publication = _lock_publication(session, current.publication_id)
                     publication.status = "queued"
                     source.status = "\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d"
                     source.error_message = None
@@ -416,6 +428,12 @@ class StructuredRepository:
                 return _job_from_record(current)
             if session.get(StructuredPublicationRecord, publication_id) is not None:
                 raise StructuredConflictError("Structured publication id already exists")
+
+            next_sequence = session.scalar(
+                select(func.coalesce(func.max(StructuredIngestionJobRecord.sequence), 0) + 1).where(
+                    StructuredIngestionJobRecord.source_id == source_id
+                )
+            )
 
             publication = StructuredPublicationRecord(
                 publication_id=publication_id,
@@ -431,6 +449,7 @@ class StructuredRepository:
                 source_id=source_id,
                 dataset_id=dataset_id,
                 schema_version=dataset.schema_version,
+                sequence=int(next_sequence or 1),
                 publication_id=publication_id,
                 status="queued",
                 lease_token=None,
@@ -447,12 +466,18 @@ class StructuredRepository:
             session.flush()
             return _job_from_record(job)
 
-    def enqueue_source_publication(self, source_id: str) -> StructuredPublicationJob:
+    def enqueue_source_publication(
+        self,
+        source_id: str,
+        dataset_id: str | None = None,
+    ) -> StructuredPublicationJob:
+        if dataset_id is not None:
+            return self.enqueue_publication(source_id, dataset_id)
         with self._database.session() as session:
             source = session.get(KnowledgeSourceRecord, source_id)
             if source is None:
                 raise StructuredNotFoundError("Knowledge source not found")
-            latest = session.scalar(
+            datasets = session.scalars(
                 select(StructuredDatasetRecord)
                 .where(
                     StructuredDatasetRecord.source_id == source_id,
@@ -463,40 +488,45 @@ class StructuredRepository:
                     StructuredDatasetRecord.schema_version.desc(),
                     StructuredDatasetRecord.worksheet_name,
                 )
-            )
-            if latest is None:
+            ).all()
+            latest_by_dataset = {dataset.dataset_id: dataset for dataset in datasets}
+            if not latest_by_dataset:
                 raise StructuredConflictError(
                     "Structured schema must be confirmed before publication"
                 )
-            dataset_id = latest.dataset_id
-        return self.enqueue_publication(source_id, dataset_id)
+            if len(latest_by_dataset) != 1:
+                raise StructuredConflictError(
+                    "datasetId is required when a source has multiple structured datasets"
+                )
+            selected_dataset_id = next(iter(latest_by_dataset))
+        return self.enqueue_publication(source_id, selected_dataset_id)
 
-    def publication_claim_statement(self, now: datetime):
+    def publication_candidate_statement(
+        self,
+        now: datetime,
+        excluded_job_ids: Sequence[str] = (),
+    ):
         now_value = _timestamp(now)
+        statement = select(
+            StructuredIngestionJobRecord.id,
+            StructuredIngestionJobRecord.source_id,
+        ).where(_publication_eligibility(now_value))
+        if excluded_job_ids:
+            statement = statement.where(
+                StructuredIngestionJobRecord.id.not_in(tuple(excluded_job_ids))
+            )
+        return statement.order_by(
+            StructuredIngestionJobRecord.next_attempt_at,
+            StructuredIngestionJobRecord.sequence,
+        ).limit(1)
+
+    def publication_claim_statement(self, job_id: str, now: datetime):
         return (
             select(StructuredIngestionJobRecord)
             .where(
-                or_(
-                    StructuredIngestionJobRecord.status == "queued",
-                    and_(
-                        StructuredIngestionJobRecord.status == "failed",
-                        (
-                            StructuredIngestionJobRecord.next_attempt_at.is_(None)
-                            | (StructuredIngestionJobRecord.next_attempt_at <= now_value)
-                        ),
-                    ),
-                    and_(
-                        StructuredIngestionJobRecord.status == "running",
-                        StructuredIngestionJobRecord.lease_expires_at.is_not(None),
-                        StructuredIngestionJobRecord.lease_expires_at <= now_value,
-                    ),
-                ),
+                StructuredIngestionJobRecord.id == job_id,
+                _publication_eligibility(_timestamp(now)),
             )
-            .order_by(
-                StructuredIngestionJobRecord.next_attempt_at,
-                StructuredIngestionJobRecord.id,
-            )
-            .limit(1)
             .with_for_update(skip_locked=True)
         )
 
@@ -510,29 +540,48 @@ class StructuredRepository:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         current_time = _utc_now(now)
-        with self._database.session() as session:
-            _begin_sqlite_write(session)
-            record = session.scalar(self.publication_claim_statement(current_time))
-            if record is None:
-                return None
-            token = f"{worker_id}:{secrets.token_urlsafe(24)}"
-            record.status = "running"
-            record.lease_token = token
-            record.lease_expires_at = _timestamp(current_time + timedelta(seconds=lease_seconds))
-            record.attempt += 1
-            record.next_attempt_at = None
-            record.error_message = None
-            publication = session.get(StructuredPublicationRecord, record.publication_id)
-            if publication is None:
-                raise StructuredConflictError("Structured publication metadata is missing")
-            publication.status = "running"
-            source = _lock_source(session, record.source_id)
-            if source is None:
-                raise StructuredNotFoundError("Knowledge source not found")
-            source.status = "\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d"
-            source.error_message = None
-            session.flush()
-            return _job_from_record(record)
+        excluded_job_ids: list[str] = []
+        for _ in range(32):
+            with self._database.session() as session:
+                _begin_sqlite_write(session)
+                candidate = session.execute(
+                    self.publication_candidate_statement(current_time, excluded_job_ids)
+                ).first()
+                if candidate is None:
+                    return None
+                source = _lock_source(session, candidate.source_id)
+                if source is None:
+                    excluded_job_ids.append(candidate.id)
+                    continue
+                record = session.scalar(
+                    self.publication_claim_statement(candidate.id, current_time)
+                )
+                if record is None or record.source_id != candidate.source_id:
+                    excluded_job_ids.append(candidate.id)
+                    continue
+                dataset = _lock_dataset(
+                    session,
+                    record.dataset_id,
+                    record.schema_version,
+                )
+                if dataset is None:
+                    raise StructuredConflictError("Structured dataset metadata is missing")
+                publication = _lock_publication(session, record.publication_id)
+                token = f"{worker_id}:{secrets.token_urlsafe(24)}"
+                record.status = "running"
+                record.lease_token = token
+                record.lease_expires_at = _timestamp(
+                    current_time + timedelta(seconds=lease_seconds)
+                )
+                record.attempt += 1
+                record.next_attempt_at = None
+                record.error_message = None
+                publication.status = "running"
+                source.status = "\u7ed3\u6784\u5316\u5bfc\u5165\u4e2d"
+                source.error_message = None
+                session.flush()
+                return _job_from_record(record)
+        return None
 
     def renew_publication_lease(
         self,
@@ -550,7 +599,7 @@ class StructuredRepository:
         current_time = _utc_now(now)
         with self._database.session() as session:
             _begin_sqlite_write(session)
-            record = _lock_job(session, job_id)
+            _, record = _lock_job_source_first(session, job_id)
             _require_current_lease(record, lease_token, current_time)
             record.lease_expires_at = _timestamp(current_time + timedelta(seconds=lease_seconds))
             if checkpoint_row is not None:
@@ -569,17 +618,18 @@ class StructuredRepository:
         current_time = _utc_now(now)
         with self._database.session() as session:
             _begin_sqlite_write(session)
-            record = _lock_job(session, job_id)
+            source, record = _lock_job_source_first(session, job_id)
             _require_current_lease(record, lease_token, current_time)
             if result.publication_id != record.publication_id:
                 raise StructuredConflictError("Publisher returned a different publication id")
-            publication = session.scalar(
-                select(StructuredPublicationRecord)
-                .where(StructuredPublicationRecord.publication_id == record.publication_id)
-                .with_for_update()
+            dataset = _lock_dataset(
+                session,
+                record.dataset_id,
+                record.schema_version,
             )
-            if publication is None:
-                raise StructuredConflictError("Structured publication metadata is missing")
+            if dataset is None:
+                raise StructuredConflictError("Structured dataset metadata is missing")
+            publication = _lock_publication(session, record.publication_id)
             session.query(StructuredPublicationRecord).filter(
                 StructuredPublicationRecord.dataset_id == record.dataset_id,
                 StructuredPublicationRecord.status == "published",
@@ -594,16 +644,7 @@ class StructuredRepository:
             record.lease_expires_at = None
             record.next_attempt_at = None
             record.error_message = None
-            dataset = session.get(
-                StructuredDatasetRecord,
-                (record.dataset_id, record.schema_version),
-            )
-            if dataset is None:
-                raise StructuredConflictError("Structured dataset metadata is missing")
             dataset.status = "published"
-            source = _lock_source(session, record.source_id)
-            if source is None:
-                raise StructuredNotFoundError("Knowledge source not found")
             source.status = "\u5df2\u7d22\u5f15"
             source.records = result.row_count
             source.error_message = None
@@ -625,15 +666,16 @@ class StructuredRepository:
         message = (error_message.strip() or "Structured publication failed")[:2000]
         with self._database.session() as session:
             _begin_sqlite_write(session)
-            record = _lock_job(session, job_id)
+            source, record = _lock_job_source_first(session, job_id)
             _require_current_lease(record, lease_token, current_time)
-            publication = session.scalar(
-                select(StructuredPublicationRecord)
-                .where(StructuredPublicationRecord.publication_id == record.publication_id)
-                .with_for_update()
+            dataset = _lock_dataset(
+                session,
+                record.dataset_id,
+                record.schema_version,
             )
-            if publication is None:
-                raise StructuredConflictError("Structured publication metadata is missing")
+            if dataset is None:
+                raise StructuredConflictError("Structured dataset metadata is missing")
+            publication = _lock_publication(session, record.publication_id)
             publication.status = "failed"
             record.status = "failed"
             record.lease_token = None
@@ -648,15 +690,7 @@ class StructuredRepository:
                     StructuredPublicationRecord.status == "published",
                 )
             )
-            dataset = session.get(
-                StructuredDatasetRecord,
-                (record.dataset_id, record.schema_version),
-            )
-            if dataset is not None:
-                dataset.status = "published" if active is not None else "failed"
-            source = _lock_source(session, record.source_id)
-            if source is None:
-                raise StructuredNotFoundError("Knowledge source not found")
+            dataset.status = "published" if active is not None else "failed"
             source.status = (
                 "\u5df2\u7d22\u5f15" if active is not None else "\u89e3\u6790\u5931\u8d25"
             )
@@ -674,16 +708,25 @@ class StructuredRepository:
             )
             return None if record is None else _publication_from_record(record)
 
-    def get_structured_status(self, source_id: str) -> StructuredStatus:
+    def get_structured_status(
+        self,
+        source_id: str,
+        job_id: str | None = None,
+    ) -> StructuredStatus:
         with self._database.session() as session:
             source = session.get(KnowledgeSourceRecord, source_id)
             if source is None:
                 raise StructuredNotFoundError("Knowledge source not found")
-            job = session.scalar(
-                select(StructuredIngestionJobRecord)
-                .where(StructuredIngestionJobRecord.source_id == source_id)
-                .order_by(StructuredIngestionJobRecord.id.desc())
+            statement = select(StructuredIngestionJobRecord).where(
+                StructuredIngestionJobRecord.source_id == source_id
             )
+            if job_id is not None:
+                statement = statement.where(StructuredIngestionJobRecord.id == job_id)
+            else:
+                statement = statement.order_by(StructuredIngestionJobRecord.sequence.desc()).limit(
+                    1
+                )
+            job = session.scalar(statement)
             if job is None:
                 raise StructuredNotFoundError("Structured publication job not found")
             active = session.scalar(
@@ -820,6 +863,35 @@ def _lock_source(session: Session, source_id: str) -> KnowledgeSourceRecord | No
     )
 
 
+def _lock_dataset(
+    session: Session,
+    dataset_id: str,
+    schema_version: int,
+) -> StructuredDatasetRecord | None:
+    return session.scalar(
+        select(StructuredDatasetRecord)
+        .where(
+            StructuredDatasetRecord.dataset_id == dataset_id,
+            StructuredDatasetRecord.schema_version == schema_version,
+        )
+        .with_for_update()
+    )
+
+
+def _lock_publication(
+    session: Session,
+    publication_id: str | None,
+) -> StructuredPublicationRecord:
+    record = session.scalar(
+        select(StructuredPublicationRecord)
+        .where(StructuredPublicationRecord.publication_id == publication_id)
+        .with_for_update()
+    )
+    if record is None:
+        raise StructuredConflictError("Structured publication metadata is missing")
+    return record
+
+
 def _lock_job(session: Session, job_id: str) -> StructuredIngestionJobRecord:
     record = session.scalar(
         select(StructuredIngestionJobRecord)
@@ -829,6 +901,45 @@ def _lock_job(session: Session, job_id: str) -> StructuredIngestionJobRecord:
     if record is None:
         raise StructuredNotFoundError("Structured publication job not found")
     return record
+
+
+def _lock_job_source_first(
+    session: Session,
+    job_id: str,
+) -> tuple[KnowledgeSourceRecord, StructuredIngestionJobRecord]:
+    identity = session.execute(
+        select(
+            StructuredIngestionJobRecord.id,
+            StructuredIngestionJobRecord.source_id,
+        ).where(StructuredIngestionJobRecord.id == job_id)
+    ).first()
+    if identity is None:
+        raise StructuredNotFoundError("Structured publication job not found")
+    source = _lock_source(session, identity.source_id)
+    if source is None:
+        raise StructuredNotFoundError("Knowledge source not found")
+    record = _lock_job(session, job_id)
+    if record.source_id != identity.source_id:
+        raise StructuredConflictError("Structured publication job source changed")
+    return source, record
+
+
+def _publication_eligibility(now_value: str):
+    return or_(
+        StructuredIngestionJobRecord.status == "queued",
+        and_(
+            StructuredIngestionJobRecord.status == "failed",
+            (
+                StructuredIngestionJobRecord.next_attempt_at.is_(None)
+                | (StructuredIngestionJobRecord.next_attempt_at <= now_value)
+            ),
+        ),
+        and_(
+            StructuredIngestionJobRecord.status == "running",
+            StructuredIngestionJobRecord.lease_expires_at.is_not(None),
+            StructuredIngestionJobRecord.lease_expires_at <= now_value,
+        ),
+    )
 
 
 def _require_current_lease(
@@ -876,6 +987,7 @@ def _job_from_record(record: StructuredIngestionJobRecord) -> StructuredPublicat
         source_id=record.source_id,
         dataset_id=record.dataset_id,
         schema_version=record.schema_version,
+        sequence=record.sequence,
         publication_id=record.publication_id,
         status=record.status,
         lease_token=record.lease_token,

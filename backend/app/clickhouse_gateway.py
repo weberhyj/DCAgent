@@ -104,6 +104,7 @@ class ClickHouseGateway:
         physical_table_name = (
             f"structured_{dataset_component}_v{schema.schema_version}_{publication_suffix}"
         )
+        self._discard_stale_staging_tables(physical_table_name)
         staging_table = f"{physical_table_name}_staging_{secrets.token_hex(6)}"
         _require_identifier(physical_table_name)
         _require_identifier(staging_table)
@@ -115,6 +116,21 @@ class ClickHouseGateway:
             physical_table_name=physical_table_name,
             content_hash=content_hash,
         )
+
+    def _discard_stale_staging_tables(self, physical_table_name: str) -> None:
+        if self._query_client is None:
+            return
+        _require_identifier(physical_table_name)
+        prefix = f"{physical_table_name}_staging_"
+        result = self._query(
+            "SELECT name FROM system.tables "
+            "WHERE database = currentDatabase() "
+            f"AND startsWith(name, '{prefix}')"
+        )
+        safe_name = re.compile(rf"^{re.escape(prefix)}[0-9a-f]{{12}}$")
+        for table_name in _as_single_column_values(result):
+            if safe_name.fullmatch(table_name):
+                self._command(f"DROP TABLE IF EXISTS {table_name}")
 
     def insert_batch(self, target: ClickHousePublicationTarget, batch: Any) -> None:
         _require_identifier(target.staging_table)
@@ -340,6 +356,27 @@ def _as_described_schema(result: Any) -> list[tuple[str, str]]:
     except (TypeError, IndexError) as error:
         raise StructuredStorageError(
             "ClickHouse DESCRIBE result has an unsupported shape"
+        ) from error
+
+
+def _as_single_column_values(result: Any) -> list[str]:
+    rows = getattr(result, "result_rows", None)
+    if rows is None:
+        named_results = getattr(result, "named_results", None)
+        if named_results is not None:
+            return [str(row["name"]) for row in named_results()]
+        rows = result
+    try:
+        values = []
+        for row in rows:
+            if isinstance(row, Mapping):
+                values.append(str(row["name"]))
+            else:
+                values.append(str(row[0]))
+        return values
+    except (KeyError, TypeError, IndexError) as error:
+        raise StructuredStorageError(
+            "ClickHouse staging table listing has an unsupported shape"
         ) from error
 
 

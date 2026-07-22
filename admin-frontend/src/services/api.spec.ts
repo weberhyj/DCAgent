@@ -352,4 +352,30 @@ describe('knowledge api service', () => {
       submission,
     )
   })
+
+  it('publishes one dataset and fetches the exact returned job status', async () => {
+    const controller = new AbortController()
+    const enqueue = { jobId: 'job/1', status: 'queued' as const }
+    const status = { sourceId: 'source/1', job: { id: 'job/1' } }
+    httpMock.post.mockResolvedValue({ data: enqueue })
+    httpMock.get.mockResolvedValue({ data: status })
+    const api = await loadApi()
+
+    expect(
+      await api.enqueueStructuredPublication('source/1', 'dataset/1', controller.signal),
+    ).toEqual(enqueue)
+    expect(
+      await api.fetchStructuredStatus('source/1', 'job/1', controller.signal),
+    ).toEqual(status)
+
+    expect(httpMock.post).toHaveBeenCalledWith(
+      '/knowledge/sources/source%2F1/structured-publications',
+      undefined,
+      { params: { datasetId: 'dataset/1' }, signal: controller.signal },
+    )
+    expect(httpMock.get).toHaveBeenCalledWith(
+      '/knowledge/sources/source%2F1/structured-status',
+      { params: { jobId: 'job/1' }, signal: controller.signal },
+    )
+  })
 })

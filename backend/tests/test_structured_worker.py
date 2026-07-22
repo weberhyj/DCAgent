@@ -5,9 +5,11 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import select
 
+import app.structured_repository as structured_repository_module
 from app.database import (
     Database,
     KnowledgeSourceRecord,
@@ -435,8 +437,18 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertEqual(status.job.status, "queued")
         self.assertIsNone(status.active_publication)
 
+    def test_status_can_select_an_exact_job_id(self) -> None:
+        job = self.enqueue()
+
+        status = self.repository.get_structured_status(self.source_id, job.id)
+
+        self.assertEqual(status.job.id, job.id)
+
     def test_postgres_claim_uses_skip_locked(self) -> None:
-        statement = self.repository.publication_claim_statement(datetime(2026, 7, 22, tzinfo=UTC))
+        statement = self.repository.publication_claim_statement(
+            "structured-job-1",
+            datetime(2026, 7, 22, tzinfo=UTC),
+        )
         sql = str(statement.compile(dialect=self.database.engine.dialect)).upper()
         self.assertNotIn("SKIP LOCKED", sql)
 
@@ -444,6 +456,93 @@ class StructuredWorkerTest(unittest.TestCase):
 
         postgres_sql = str(statement.compile(dialect=postgresql.dialect())).upper()
         self.assertIn("FOR UPDATE SKIP LOCKED", postgres_sql)
+
+    def test_known_job_mutation_locks_source_before_job(self) -> None:
+        self.enqueue()
+        claimed = self.repository.claim_publication("worker-1", 60)
+        assert claimed is not None
+        lock_order: list[str] = []
+        original_lock_source = structured_repository_module._lock_source
+        original_lock_job = structured_repository_module._lock_job
+
+        def record_source_lock(*args, **kwargs):
+            lock_order.append("source")
+            return original_lock_source(*args, **kwargs)
+
+        def record_job_lock(*args, **kwargs):
+            lock_order.append("job")
+            return original_lock_job(*args, **kwargs)
+
+        with (
+            patch.object(
+                structured_repository_module,
+                "_lock_source",
+                side_effect=record_source_lock,
+            ),
+            patch.object(
+                structured_repository_module,
+                "_lock_job",
+                side_effect=record_job_lock,
+            ),
+        ):
+            self.repository.renew_publication_lease(claimed.id, claimed.lease_token, 60)
+
+        self.assertEqual(lock_order[:2], ["source", "job"])
+
+    def test_requeue_uses_source_job_dataset_publication_lock_order(self) -> None:
+        self.enqueue()
+        claimed = self.repository.claim_publication("worker-1", 60)
+        assert claimed is not None
+        self.repository.fail_publication(claimed.id, claimed.lease_token, "retry")
+        lock_order: list[str] = []
+        originals = {
+            "source": structured_repository_module._lock_source,
+            "job": structured_repository_module._lock_job,
+            "dataset": structured_repository_module._lock_dataset,
+            "publication": structured_repository_module._lock_publication,
+        }
+
+        def record(name):
+            def wrapped(*args, **kwargs):
+                lock_order.append(name)
+                return originals[name](*args, **kwargs)
+
+            return wrapped
+
+        with (
+            patch.object(
+                structured_repository_module, "_lock_source", side_effect=record("source")
+            ),
+            patch.object(structured_repository_module, "_lock_job", side_effect=record("job")),
+            patch.object(
+                structured_repository_module,
+                "_lock_dataset",
+                side_effect=record("dataset"),
+            ),
+            patch.object(
+                structured_repository_module,
+                "_lock_publication",
+                side_effect=record("publication"),
+            ),
+        ):
+            self.repository.enqueue_publication(self.source_id, self.dataset_id)
+
+        self.assertEqual(lock_order, ["source", "job", "dataset", "publication"])
+
+    def test_postgres_claim_revalidates_one_candidate_with_skip_locked(self) -> None:
+        self.enqueue()
+        now = datetime(2026, 7, 22, tzinfo=UTC)
+
+        candidate = self.repository.publication_candidate_statement(now, ())
+        claim = self.repository.publication_claim_statement("structured-job-1", now)
+
+        from sqlalchemy.dialects import postgresql
+
+        candidate_sql = str(candidate.compile(dialect=postgresql.dialect())).upper()
+        claim_sql = str(claim.compile(dialect=postgresql.dialect())).upper()
+        self.assertNotIn("FOR UPDATE", candidate_sql)
+        self.assertIn("FOR UPDATE SKIP LOCKED", claim_sql)
+        self.assertIn("STRUCTURED_INGESTION_JOBS.ID", claim_sql)
 
     def test_worker_factory_builds_distinct_ingest_and_query_clients(self) -> None:
         clients: list[object] = []

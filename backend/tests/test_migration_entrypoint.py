@@ -16,7 +16,7 @@ from app.database import Database
 from app.migration_entrypoint import BaselineSchemaMismatch, run_migrations
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-CURRENT_REVISION = "20260721_02"
+CURRENT_REVISION = "20260722_03"
 
 
 def sqlite_url(path: Path) -> str:

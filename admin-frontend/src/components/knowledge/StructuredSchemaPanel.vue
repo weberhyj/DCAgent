@@ -103,7 +103,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   confirm: [submission: StructuredSchemaSubmission]
-  publish: []
+  publish: [datasetId: string]
 }>()
 
 function createDrafts(preview: DeepReadonly<StructuredPreview>) {
@@ -236,9 +236,9 @@ function confirmSchema() {
   })
 }
 
-function publishStructuredData() {
+function publishStructuredData(datasetId: string) {
   if (publicationDisabled.value) return
-  emit('publish')
+  emit('publish', datasetId)
 }
 </script>
 
@@ -246,16 +246,6 @@ function publishStructuredData() {
   <section class="structured-schema-panel" data-testid="structured-schema-panel">
     <p v-if="confirmationLocked" class="structured-schema-panel__success">
       {{ '\u8868\u7ed3\u6784\u5df2\u786e\u8ba4' }}
-    </p>
-
-    <p
-      v-if="publicationStatus"
-      class="structured-schema-panel__publication-status"
-      data-testid="structured-publication-status"
-    >
-      <span>{{ publicationStatus.job.status }}</span>
-      <span v-if="publicationStatus.job.errorMessage">{{ publicationStatus.job.errorMessage }}</span>
-      <span v-else-if="publicationStatus.job.status === 'published'">Published</span>
     </p>
 
     <ul v-if="preview.diagnostics.length" class="structured-schema-panel__diagnostics">
@@ -383,6 +373,29 @@ function publishStructuredData() {
           </tbody>
         </table>
       </div>
+
+      <p
+        v-if="publicationStatus?.job.datasetId === dataset.datasetId"
+        class="structured-schema-panel__publication-status"
+        data-testid="structured-publication-status"
+      >
+        <span>{{ publicationStatus.job.status }}</span>
+        <span v-if="publicationStatus.job.errorMessage">{{ publicationStatus.job.errorMessage }}</span>
+        <span v-else-if="publicationStatus.job.status === 'published'">Published</span>
+      </p>
+
+      <button
+        :data-testid="`structured-publish-button-${dataset.datasetId}`"
+        type="button"
+        :disabled="publicationDisabled"
+        @click="publishStructuredData(dataset.datasetId)"
+      >
+        {{ publishing && publicationStatus?.job.datasetId === dataset.datasetId
+          ? 'Importing...'
+          : publicationStatus?.job.datasetId === dataset.datasetId && publicationStatus.job.status === 'published'
+            ? 'Published'
+            : 'Publish data' }}
+      </button>
     </article>
 
     <button
@@ -394,14 +407,6 @@ function publishStructuredData() {
       {{ confirming ? 'Confirming...' : confirmationLocked ? 'Confirmed' : 'Confirm structure' }}
     </button>
 
-    <button
-      data-testid="structured-publish-button"
-      type="button"
-      :disabled="publicationDisabled"
-      @click="publishStructuredData"
-    >
-      {{ publishing ? 'Importing...' : publicationStatus?.job.status === 'published' ? 'Published' : 'Publish data' }}
-    </button>
   </section>
 </template>
 

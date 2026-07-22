@@ -275,12 +275,12 @@ describe('StructuredSchemaPanel', () => {
       props: { preview, confirmed: true, confirmationStatus: 'confirmed' },
     })
 
-    const publish = wrapper.get('[data-testid="structured-publish-button"]')
+    const publish = wrapper.get('[data-testid="structured-publish-button-dataset-1"]')
     expect(publish.attributes('disabled')).toBeUndefined()
     await publish.trigger('click')
     await flushPromises()
 
-    expect(wrapper.emitted('publish')).toEqual([[]])
+    expect(wrapper.emitted('publish')).toEqual([['dataset-1']])
   })
 
   it('disables publication while importing and renders terminal status', async () => {
@@ -298,6 +298,7 @@ describe('StructuredSchemaPanel', () => {
             sourceId: 'source-1',
             datasetId: 'dataset-1',
             schemaVersion: 1,
+            sequence: 1,
             publicationId: 'pub-1',
             status: 'running',
             leaseExpiresAt: null,
@@ -311,7 +312,7 @@ describe('StructuredSchemaPanel', () => {
       },
     })
 
-    const publish = wrapper.get('[data-testid="structured-publish-button"]')
+    const publish = wrapper.get('[data-testid="structured-publish-button-dataset-1"]')
     expect(publish.attributes('disabled')).toBeDefined()
     expect(publish.text()).toContain('Importing')
     await publish.trigger('click')

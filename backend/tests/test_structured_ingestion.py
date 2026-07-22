@@ -562,6 +562,10 @@ class StructuredIngestionTest(unittest.TestCase):
             / "part-00000.parquet"
         )
         self.assertTrue(new_part.exists())
+        old_attempt = (
+            parquet_root / "kb-sales" / "ds-sales" / "1" / "pub-overlap" / "attempt-old-owner"
+        )
+        self.assertFalse(old_attempt.exists())
 
         lease_lost.set()
         sink.release_blocked_attempt.set()
@@ -570,10 +574,32 @@ class StructuredIngestionTest(unittest.TestCase):
         self.assertFalse(old_thread.is_alive())
         self.assertEqual([str(error) for error in old_errors], ["old lease lost"])
         self.assertTrue(new_part.exists())
-        self.assertFalse(
-            (
-                parquet_root / "kb-sales" / "ds-sales" / "1" / "pub-overlap" / "attempt-old-owner"
-            ).exists()
+        self.assertFalse(old_attempt.exists())
+
+    def test_attempt_start_removes_only_stale_attempt_siblings(self) -> None:
+        confirmed = sample_confirmed_schema(self.temp_dir, row_count=1)
+        publication_root = self.temp_dir / "parquet" / "kb-sales" / "ds-sales" / "1" / "pub-gc"
+        stale = publication_root / "attempt-stale-owner"
+        legacy = publication_root / "legacy-output"
+        stale.mkdir(parents=True)
+        legacy.mkdir()
+        (stale / "part-00000.parquet").write_bytes(b"stale")
+        (legacy / "keep.txt").write_text("keep", encoding="utf-8")
+
+        SpreadsheetPublisher(
+            sink=ArrowParquetSink(self.temp_dir / "parquet"),
+            clickhouse=RecordingPublicationGateway(),
+        ).publish(
+            confirmed.path,
+            confirmed.schema,
+            "pub-gc",
+            staging_token="current-owner",
+        )
+
+        self.assertFalse(stale.exists())
+        self.assertTrue(legacy.exists())
+        self.assertTrue(
+            (publication_root / "attempt-current-owner" / "part-00000.parquet").exists()
         )
 
 

@@ -554,6 +554,7 @@ class StructuredPublicationJob(ApiModel):
     source_id: str = Field(alias="sourceId")
     dataset_id: str = Field(alias="datasetId")
     schema_version: int = Field(alias="schemaVersion")
+    sequence: int
     publication_id: str = Field(alias="publicationId")
     status: Literal["queued", "running", "published", "failed"]
     lease_expires_at: datetime | None = Field(alias="leaseExpiresAt")
@@ -569,6 +570,7 @@ class StructuredPublicationJob(ApiModel):
             sourceId=job.source_id,
             datasetId=job.dataset_id,
             schemaVersion=job.schema_version,
+            sequence=job.sequence,
             publicationId=job.publication_id,
             status=job.status,
             leaseExpiresAt=job.lease_expires_at,

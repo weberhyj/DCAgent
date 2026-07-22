@@ -1,7 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { defineComponent, h } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { useChatKnowledgeManagement } from './useChatKnowledgeManagement'
+import { abortableDelay, useChatKnowledgeManagement } from './useChatKnowledgeManagement'
 
 const api = vi.hoisted(() => ({
   confirmStructuredSchema: vi.fn(),
@@ -287,10 +287,11 @@ describe('useChatKnowledgeManagement structured schema', () => {
       .mockResolvedValueOnce(structuredStatus('published'))
     const management = useChatKnowledgeManagement()
 
-    const pending = management.publishStructuredSource('source/1')
+    const pending = management.publishStructuredSource('source/1', 'dataset-1')
     await flushPromises()
     expect(api.enqueueStructuredPublication).toHaveBeenCalledWith(
       'source/1',
+      'dataset-1',
       expect.any(AbortSignal),
     )
     expect(management.structuredPublishing.value).toBe(true)
@@ -301,9 +302,29 @@ describe('useChatKnowledgeManagement structured schema', () => {
     expect(management.structuredPublicationStatus.value?.job.status).toBe('published')
     expect(management.structuredPublishing.value).toBe(false)
     expect(api.fetchStructuredStatus).toHaveBeenCalledTimes(2)
+    expect(api.fetchStructuredStatus).toHaveBeenNthCalledWith(
+      1,
+      'source/1',
+      'job-1',
+      expect.any(AbortSignal),
+    )
 
     await vi.advanceTimersByTimeAsync(1600)
     expect(api.fetchStructuredStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('removes the delay abort listener after a normal polling timeout', async () => {
+    vi.useFakeTimers()
+    const addEventListener = vi.spyOn(AbortSignal.prototype, 'addEventListener')
+    const removeEventListener = vi.spyOn(AbortSignal.prototype, 'removeEventListener')
+    const controller = new AbortController()
+
+    const pending = abortableDelay(800, controller.signal)
+    await vi.advanceTimersByTimeAsync(800)
+    await pending
+
+    const handler = addEventListener.mock.calls.find(([event]) => event === 'abort')?.[1]
+    expect(removeEventListener).toHaveBeenCalledWith('abort', handler)
   })
 
   it('stops polling when the job fails', async () => {
@@ -312,7 +333,7 @@ describe('useChatKnowledgeManagement structured schema', () => {
     api.fetchStructuredStatus.mockResolvedValue(structuredStatus('failed', 'validation failed'))
     const management = useChatKnowledgeManagement()
 
-    await management.publishStructuredSource('source/1')
+    await management.publishStructuredSource('source/1', 'dataset-1')
     await flushPromises()
 
     expect(management.structuredPublishing.value).toBe(false)
@@ -329,7 +350,7 @@ describe('useChatKnowledgeManagement structured schema', () => {
     vi.useFakeTimers()
     const management = useChatKnowledgeManagement()
 
-    const pending = management.publishStructuredSource('source/1')
+    const pending = management.publishStructuredSource('source/1', 'dataset-1')
     await flushPromises()
     expect(management.structuredPublishing.value).toBe(true)
     await vi.advanceTimersByTimeAsync(800)
@@ -351,9 +372,9 @@ describe('useChatKnowledgeManagement structured schema', () => {
       },
     }))
 
-    void management.publishStructuredSource('source/1')
+    void management.publishStructuredSource('source/1', 'dataset-1')
     await flushPromises()
-    const signal = api.fetchStructuredStatus.mock.calls[0][1] as AbortSignal
+    const signal = api.fetchStructuredStatus.mock.calls[0][2] as AbortSignal
     wrapper.unmount()
     await flushPromises()
 
@@ -369,7 +390,7 @@ describe('useChatKnowledgeManagement structured schema', () => {
     api.fetchStructuredPreview.mockResolvedValue({ ...preview, sourceId: 'source-b' })
     const management = useChatKnowledgeManagement()
 
-    const pendingA = management.publishStructuredSource('source-a')
+    const pendingA = management.publishStructuredSource('source-a', 'dataset-a')
     await flushPromises()
     await management.loadStructuredPreview('source-b')
     requestA.resolve(structuredStatus('published'))
@@ -390,6 +411,7 @@ function structuredStatus(status: 'queued' | 'running' | 'published' | 'failed',
       sourceId: 'source/1',
       datasetId: 'dataset-1',
       schemaVersion: 1,
+      sequence: 1,
       publicationId: 'pub-1',
       status,
       leaseExpiresAt: null,

@@ -226,9 +226,9 @@ describe('KnowledgeSourceDetailPage structured schema', () => {
     })
     await flushPromises()
 
-    await wrapper.get('[data-testid="structured-publish-button"]').trigger('click')
+    await wrapper.get('[data-testid="structured-publish-button-dataset-1"]').trigger('click')
     await flushPromises()
 
-    expect(management.publishStructuredSource).toHaveBeenCalledWith('source-1')
+    expect(management.publishStructuredSource).toHaveBeenCalledWith('source-1', 'dataset-1')
   })
 })

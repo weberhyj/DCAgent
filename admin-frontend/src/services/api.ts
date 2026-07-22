@@ -140,21 +140,29 @@ export async function confirmStructuredSchema(
   return data
 }
 
-export async function enqueueStructuredPublication(sourceId: string, signal?: AbortSignal) {
+export async function enqueueStructuredPublication(
+  sourceId: string,
+  datasetId: string,
+  signal?: AbortSignal,
+) {
   const encodedSourceId = encodeURIComponent(sourceId)
   const { data } = await http.post<StructuredPublicationEnqueueResponse>(
     `/knowledge/sources/${encodedSourceId}/structured-publications`,
     undefined,
-    { signal },
+    { params: { datasetId }, signal },
   )
   return data
 }
 
-export async function fetchStructuredStatus(sourceId: string, signal?: AbortSignal) {
+export async function fetchStructuredStatus(
+  sourceId: string,
+  jobId: string,
+  signal?: AbortSignal,
+) {
   const encodedSourceId = encodeURIComponent(sourceId)
   const { data } = await http.get<StructuredStatus>(
     `/knowledge/sources/${encodedSourceId}/structured-status`,
-    { signal },
+    { params: { jobId }, signal },
   )
   return data
 }

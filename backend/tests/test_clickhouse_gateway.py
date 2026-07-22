@@ -35,12 +35,20 @@ class RenameCollisionIngestClient(RecordingIngestClient):
 
 
 class RecordingQueryClient:
-    def __init__(self, responses: list[object]) -> None:
+    def __init__(
+        self,
+        responses: list[object],
+        *,
+        staging_tables: list[str] | None = None,
+    ) -> None:
         self.responses = list(responses)
+        self.staging_tables = list(staging_tables or [])
         self.queries: list[tuple[str, dict[str, object]]] = []
 
     def query(self, statement: str, *, settings: dict[str, object]):
         self.queries.append((statement, settings))
+        if "system.tables" in statement:
+            return [(name,) for name in self.staging_tables]
         return self.responses.pop(0)
 
 
@@ -121,6 +129,32 @@ class ClickHouseGatewayTest(unittest.TestCase):
 
         self.assertEqual(first.physical_table_name, second.physical_table_name)
         self.assertNotEqual(first.staging_table, second.staging_table)
+
+    def test_prepare_cleans_only_strict_staging_matches_in_current_database(self) -> None:
+        publication_suffix = hashlib.sha256(b"pub-1").hexdigest()[:12]
+        physical_table = f"structured_ds_sales_v1_{publication_suffix}"
+        safe_stale = f"{physical_table}_staging_abcdef123456"
+        unsafe_suffix = f"{physical_table}_staging_abcdef12345g"
+        other_publication = "structured_ds_sales_v1_other_staging_abcdef123456"
+        ingest = RecordingIngestClient()
+        query = RecordingQueryClient(
+            [],
+            staging_tables=[safe_stale, unsafe_suffix, other_publication],
+        )
+        gateway = ClickHouseGateway(ingest, query_client=query)
+
+        target = gateway.prepare_publication(
+            sample_confirmed_schema_pathless(),
+            "pub-1",
+            "a" * 64,
+        )
+
+        self.assertIn("CURRENTDATABASE()", query.queries[0][0].upper())
+        dropped = [statement for statement, _settings in ingest.ddl if statement.startswith("DROP")]
+        self.assertIn(f"DROP TABLE IF EXISTS {safe_stale}", dropped)
+        self.assertNotIn(f"DROP TABLE IF EXISTS {unsafe_suffix}", dropped)
+        self.assertNotIn(f"DROP TABLE IF EXISTS {other_publication}", dropped)
+        self.assertNotEqual(target.staging_table, safe_stale)
 
     def test_rejects_the_same_client_for_ingest_and_read_only_queries(self) -> None:
         client = RecordingIngestClient()
@@ -508,8 +542,8 @@ class ClickHouseGatewayTest(unittest.TestCase):
 
         self.assertEqual(table, target.physical_table_name)
         self.assertTrue(any("RENAME TABLE" in statement for statement, _ in ingest.ddl))
-        self.assertEqual(len(query.queries), 2)
-        validation_statement = query.queries[1][0]
+        self.assertEqual(len(query.queries), 3)
+        validation_statement = query.queries[2][0]
         self.assertIn("SHA256", validation_statement)
         self.assertIn("toDecimalString(order_amount, 9)", validation_statement)
         self.assertIn("content_sum_0", validation_statement)

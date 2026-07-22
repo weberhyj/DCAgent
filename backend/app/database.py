@@ -390,6 +390,12 @@ class StructuredIngestionJobRecord(Base):
             ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
             ondelete="CASCADE",
         ),
+        Index(
+            "uq_structured_ingestion_jobs_source_sequence",
+            "source_id",
+            "sequence",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -400,6 +406,7 @@ class StructuredIngestionJobRecord(Base):
     )
     dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     publication_id: Mapped[str | None] = mapped_column(
         ForeignKey("structured_publications.publication_id", ondelete="SET NULL")
     )

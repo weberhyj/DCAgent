@@ -66,6 +66,21 @@ def workbook_bytes(rows: list[list[object]]) -> bytes:
     return buffer.getvalue()
 
 
+def multi_worksheet_workbook_bytes() -> bytes:
+    workbook = Workbook()
+    sales = workbook.active
+    sales.title = "Sales"
+    sales.append(["amount", "region"])
+    sales.append(["12.5", "East"])
+    returns = workbook.create_sheet("Returns")
+    returns.append(["amount", "region"])
+    returns.append(["3", "West"])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    workbook.close()
+    return buffer.getvalue()
+
+
 class StructuredApiTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -218,6 +233,27 @@ class StructuredApiTest(unittest.TestCase):
         client = self.build_client()
         missing = client.post("/api/knowledge/sources/missing/structured-publications")
         self.assertEqual(missing.status_code, 404, missing.text)
+
+    def test_publication_requires_dataset_id_when_multiple_worksheets_are_confirmed(self) -> None:
+        client = self.build_client()
+        source_id = self.upload(
+            client,
+            "sales.xlsx",
+            multi_worksheet_workbook_bytes(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        client.get("/api/knowledge/sources")
+        preview = client.get(f"/api/knowledge/sources/{source_id}/structured-preview").json()
+        confirmation = client.put(
+            f"/api/knowledge/sources/{source_id}/structured-schema",
+            json=self.confirmation_payload(preview),
+        )
+        self.assertEqual(confirmation.status_code, 200, confirmation.text)
+
+        response = client.post(f"/api/knowledge/sources/{source_id}/structured-publications")
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("dataset", response.json()["detail"].lower())
 
     def test_confirmation_rejects_missing_column_and_string_aggregate(self) -> None:
         client = self.build_client()

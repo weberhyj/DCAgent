@@ -199,6 +199,29 @@ def make_config(database_url: str) -> Config:
 
 
 class AlembicBaselineTest(unittest.TestCase):
+    def test_structured_job_sequence_is_present_after_head_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite+pysqlite:///{(Path(temp_dir) / 'sequence.db').as_posix()}"
+            command.upgrade(make_config(database_url), "head")
+
+            engine = create_engine(database_url)
+            try:
+                inspector = inspect(engine)
+                columns = {
+                    column["name"] for column in inspector.get_columns("structured_ingestion_jobs")
+                }
+                indexes = {
+                    index["name"]: tuple(index["column_names"])
+                    for index in inspector.get_indexes("structured_ingestion_jobs")
+                }
+                self.assertIn("sequence", columns)
+                self.assertEqual(
+                    indexes.get("uq_structured_ingestion_jobs_source_sequence"),
+                    ("source_id", "sequence"),
+                )
+            finally:
+                engine.dispose()
+
     def test_env_uses_supplied_connection_without_building_an_engine(self) -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")
         try:
