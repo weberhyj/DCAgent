@@ -262,6 +262,25 @@ class ClickHouseGateway:
         _require_identifier(target.staging_table)
         self._command(f"DROP TABLE IF EXISTS {target.staging_table}")
 
+    def query(
+        self,
+        statement: str,
+        parameters: Mapping[str, object] | None = None,
+    ) -> Any:
+        if self._query_client is None:
+            raise StructuredStorageError(
+                "ClickHouse structured queries require a separate read-only query client"
+            )
+        query = getattr(self._query_client, "query", None)
+        if query is None:
+            raise StructuredStorageError(
+                "ClickHouse query client cannot execute structured queries"
+            )
+        kwargs: dict[str, object] = {"settings": dict(self._query_settings)}
+        if parameters is not None:
+            kwargs["parameters"] = dict(parameters)
+        return query(statement, **kwargs)
+
     def _command(self, statement: str) -> None:
         command = getattr(self._ingest_client, "command", None)
         if command is not None:

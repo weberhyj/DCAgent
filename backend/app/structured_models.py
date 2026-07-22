@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
+from typing import Literal
 
 MAX_STRUCTURED_ALIASES_PER_COLUMN = 20
 MAX_STRUCTURED_ALIAS_LENGTH = 80
@@ -121,3 +123,60 @@ class StructuredDatasetCatalog:
 @dataclass(frozen=True, slots=True)
 class StructuredCatalog:
     datasets: tuple[StructuredDatasetCatalog, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredFilter:
+    physical_name: str
+    operator: Literal["eq", "gt", "gte", "lt", "lte", "between"]
+    value: str
+    upper_value: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredIntent:
+    dataset_id: str
+    aggregate: Literal["avg", "sum", "count", "min", "max"]
+    metric_physical_name: str | None
+    filters: tuple[StructuredFilter, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredClarification:
+    message: str
+    candidates: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredUnavailable:
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredQueryPlan:
+    publication_id: str
+    dataset_id: str
+    metric_physical_name: str | None
+    sql: str
+    parameters: Mapping[str, object]
+    aggregate: Literal["avg", "sum", "count", "min", "max"]
+    filters: tuple[StructuredFilter, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredAggregateResult:
+    dataset_id: str
+    schema_version: int
+    aggregate: Literal["avg", "sum", "count", "min", "max"]
+    metric_physical_name: str | None
+    metric_display_name: str | None
+    value: Decimal | int | None
+    total_count: int
+    valid_count: int
+    null_count: int
+    source_name: str
+    worksheet_name: str
+    publication_id: str
+    filters: tuple[StructuredFilter, ...]
+    elapsed_ms: float
+    audit_id: str
