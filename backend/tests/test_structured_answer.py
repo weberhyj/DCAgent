@@ -769,6 +769,9 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "订单金额加权平均值是什么",
             "什么是订单金额加权平均值呢",
             "我的订单金额平均值是什么",
+            "请问订单金额加权平均值是什么",
+            "我想了解订单金额移动平均值是什么",
+            "能否说明订单金额几何平均值是什么",
         ):
             with self.subTest(question=question):
                 self._assert_catalog_failure_is_strong_candidate(question)
@@ -793,6 +796,9 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "可否聊聊移动平均值是什么",
             "请简单说一下调和平均值是什么",
             "请问平均值是什么",
+            "请问加权平均值是什么",
+            "我想了解移动平均值是什么",
+            "能否说明几何平均值是什么",
         )
 
         for question in questions:
@@ -804,6 +810,9 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "什么是订单金额加权平均值",
             "订单金额加权平均值是什么",
             "什么是订单金额加权平均值呢",
+            "请问订单金额加权平均值是什么",
+            "我想了解订单金额移动平均值是什么",
+            "能否说明订单金额几何平均值是什么",
         ):
             with self.subTest(question=question):
                 provider = RecordingLLMProvider()

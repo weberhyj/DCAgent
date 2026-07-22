@@ -107,6 +107,7 @@ _HIGH_CONFIDENCE_CONCEPT_CUES = (
     "想知道",
     "告诉",
     "聊聊",
+    "说说",
     "说一下",
     "讲讲",
     "介绍",
@@ -114,6 +115,16 @@ _HIGH_CONFIDENCE_CONCEPT_CUES = (
     "说明",
     "科普",
     "关于",
+)
+_NEUTRAL_CONCEPT_BRIDGE_ATOMS = (
+    "简单地",
+    "通俗地",
+    "一下",
+    "简单",
+    "通俗",
+    "我",
+    "你",
+    "您",
 )
 _NATURAL_QUESTION_PARTICLES = ("呢", "吗", "吧", "呀", "啊")
 _AGGREGATE_CONCEPT_TERMS = tuple(
@@ -438,7 +449,28 @@ def _strip_concept_question_tail(value: str) -> str:
 
 
 def _is_conversational_leadin(value: str) -> bool:
-    return any(cue in value for cue in _HIGH_CONFIDENCE_CONCEPT_CUES)
+    matches = [
+        (start, len(cue))
+        for cue in _HIGH_CONFIDENCE_CONCEPT_CUES
+        if (start := value.rfind(cue)) >= 0
+    ]
+    if not matches:
+        return False
+    cue_start, cue_length = max(matches, key=lambda item: (item[0], item[1]))
+    return _is_neutral_concept_bridge(value[cue_start + cue_length :])
+
+
+def _is_neutral_concept_bridge(value: str) -> bool:
+    remaining = value
+    while remaining:
+        atom = next(
+            (item for item in _NEUTRAL_CONCEPT_BRIDGE_ATOMS if remaining.startswith(item)),
+            None,
+        )
+        if atom is None:
+            return False
+        remaining = remaining[len(atom) :]
+    return True
 
 
 def _has_metric_qualified_concept_shape(normalized: str) -> bool:
