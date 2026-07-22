@@ -4,7 +4,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import PurePath
 from typing import Literal
@@ -70,7 +70,7 @@ class StructuredQueryPlanner:
         metric = None
         if intent.metric_physical_name is not None:
             metric = columns.get(intent.metric_physical_name)
-            if metric is None or not metric.allow_aggregate:
+            if metric is None or (intent.aggregate != "count" and not metric.allow_aggregate):
                 raise UnsafeStructuredQueryError("unknown or disallowed aggregate column")
             _require_identifier(metric.physical_name)
         elif intent.aggregate != "count":
@@ -103,9 +103,18 @@ class StructuredQueryPlanner:
                 if item.upper_value is None:
                     raise UnsafeStructuredQueryError("between filter requires an upper value")
                 upper_name = f"filter_{index}_upper"
-                parameters[upper_name] = _convert_parameter(item.upper_value, column.data_type)
+                upper_value = _convert_parameter(item.upper_value, column.data_type)
+                upper_operator = "<="
+                if column.data_type is StructuredColumnType.DATETIME and re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}", item.upper_value
+                ):
+                    upper_value = upper_value + timedelta(days=1)
+                    upper_operator = "<"
+                parameters[upper_name] = upper_value
                 upper_placeholder = f"{{{upper_name}:{parameter_type}}}"
-                predicates.append(f"({name} >= {placeholder} AND {name} <= {upper_placeholder})")
+                predicates.append(
+                    f"({name} >= {placeholder} AND {name} {upper_operator} {upper_placeholder})"
+                )
             else:
                 operator = {
                     "eq": "=",
@@ -273,7 +282,7 @@ def resolve_structured_intent(
         return dataset
 
     filters = _resolve_filters(question, dataset.schema.columns)
-    if isinstance(filters, StructuredClarification):
+    if isinstance(filters, (StructuredClarification, StructuredUnavailable)):
         return filters
 
     metric = _resolve_metric(question, dataset.schema.columns, aggregate)
@@ -305,24 +314,34 @@ def _resolve_dataset(
     question: str, catalog: StructuredCatalog
 ) -> StructuredDatasetCatalog | StructuredClarification | StructuredUnavailable:
     normalized = _normalize(question)
-    mentioned = []
+    matches: list[tuple[int, int, StructuredDatasetCatalog]] = []
     for dataset in catalog.datasets:
-        names = {
-            dataset.schema.dataset_id,
-            dataset.schema.worksheet_name,
-            dataset.source_name,
-            PurePath(dataset.source_name).stem,
-        }
-        if any(_normalize(name) and _normalize(name) in normalized for name in names):
-            mentioned.append(dataset)
-
-    if len(mentioned) > 1:
-        return StructuredClarification(
-            "问题同时匹配多个数据集，请选择一个数据集",
-            tuple(sorted(dataset.schema.dataset_id for dataset in mentioned)),
+        names = (
+            (0, dataset.schema.dataset_id),
+            (1, dataset.source_name),
+            (1, PurePath(dataset.source_name).stem),
+            (2, dataset.schema.worksheet_name),
         )
-    if mentioned:
-        selected = mentioned[0]
+        for priority, name in names:
+            normalized_name = _normalize(name)
+            if normalized_name and normalized_name in normalized:
+                matches.append((priority, len(normalized_name), dataset))
+
+    if matches:
+        best_priority = min(priority for priority, _, _ in matches)
+        at_priority = [match for match in matches if match[0] == best_priority]
+        longest = max(length for _, length, _ in at_priority)
+        finalists = {
+            dataset.schema.dataset_id: dataset
+            for priority, length, dataset in at_priority
+            if priority == best_priority and length == longest
+        }
+        if len(finalists) > 1:
+            return StructuredClarification(
+                "问题同时匹配多个数据集，请选择一个数据集",
+                tuple(sorted(finalists)),
+            )
+        selected = next(iter(finalists.values()))
         if selected.active_publication is None:
             return StructuredUnavailable("指定数据集尚未确认并发布")
         return selected
@@ -343,7 +362,11 @@ def _resolve_metric(
     columns: tuple[StructuredColumnSchema, ...],
     aggregate: str,
 ) -> StructuredColumnSchema | StructuredClarification | StructuredUnavailable | None:
-    aggregate_columns = tuple(column for column in columns if column.allow_aggregate)
+    aggregate_columns = (
+        columns
+        if aggregate == "count"
+        else tuple(column for column in columns if column.allow_aggregate)
+    )
     matches = _resolve_columns(question, aggregate_columns)
     if isinstance(matches, StructuredClarification):
         return matches
@@ -356,37 +379,12 @@ def _resolve_metric(
 
 def _resolve_filters(
     question: str, columns: tuple[StructuredColumnSchema, ...]
-) -> tuple[StructuredFilter, ...] | StructuredClarification:
-    filters: list[StructuredFilter] = []
+) -> tuple[StructuredFilter, ...] | StructuredClarification | StructuredUnavailable:
     filter_columns = tuple(column for column in columns if column.allow_filter)
-
-    for column in filter_columns:
-        for name in _column_names(column):
-            escaped = re.escape(name)
-            comparison = re.search(
-                rf"{escaped}\s*(大于|不少于|小于|不超过)\s*({_NUMBER_RE})",
-                question,
-                re.IGNORECASE,
-            )
-            if comparison:
-                filters.append(
-                    StructuredFilter(
-                        column.physical_name,
-                        _COMPARISON_OPERATORS[comparison.group(1)],
-                        comparison.group(2),
-                    )
-                )
-                break
-            equality = re.search(
-                rf"{escaped}\s*(?:为|=)\s*([^\s，,。的]+)",
-                question,
-                re.IGNORECASE,
-            )
-            if equality:
-                filters.append(
-                    StructuredFilter(column.physical_name, "eq", equality.group(1).strip())
-                )
-                break
+    explicit = _resolve_explicit_filters(question, filter_columns)
+    if isinstance(explicit, StructuredClarification):
+        return explicit
+    filters = list(explicit)
 
     date_range = _DATE_RANGE_RE.search(question)
     if date_range:
@@ -408,35 +406,118 @@ def _resolve_filters(
                 tuple(sorted(column.physical_name for column in date_columns)),
             )
         else:
-            date_column = None
-        if date_column is not None:
-            filters.append(
-                StructuredFilter(
-                    date_column.physical_name,
-                    "between",
-                    date_range.group(1),
-                    date_range.group(2),
-                )
+            return StructuredUnavailable("问题包含日期范围，但数据集没有可筛选的日期字段")
+        filters.append(
+            StructuredFilter(
+                date_column.physical_name,
+                "between",
+                date_range.group(1),
+                date_range.group(2),
             )
+        )
 
-    explicitly_filtered = {item.physical_name for item in filters}
-    for column in filter_columns:
-        if (
-            column.physical_name in explicitly_filtered
-            or column.data_type is not StructuredColumnType.STRING
-        ):
-            continue
-        for name in sorted(_column_names(column), key=len, reverse=True):
-            implicit = re.search(rf"([A-Za-z0-9\u4e00-\u9fff]{{1,20}}){re.escape(name)}", question)
-            if implicit is None:
-                continue
-            value = re.sub(r"^(?:请问|请|统计|计算|查询|求)", "", implicit.group(1))
-            if value and not any(word in value for _, words in _AGGREGATE_WORDS for word in words):
-                filters.append(StructuredFilter(column.physical_name, "eq", value))
-                explicitly_filtered.add(column.physical_name)
-                break
+    implicit = _resolve_implicit_filters(
+        question,
+        tuple(
+            column
+            for column in filter_columns
+            if column.physical_name not in {item.physical_name for item in filters}
+        ),
+    )
+    if isinstance(implicit, StructuredClarification):
+        return implicit
+    filters.extend(implicit)
 
     return tuple(filters)
+
+
+def _resolve_explicit_filters(
+    question: str,
+    columns: tuple[StructuredColumnSchema, ...],
+) -> tuple[StructuredFilter, ...] | StructuredClarification:
+    matches: dict[int, list[tuple[int, int, StructuredColumnSchema, StructuredFilter]]] = {}
+    for column in columns:
+        for priority, name in _resolution_names(column):
+            field_pattern = _field_pattern(name, normalized=priority == 0)
+            comparison_pattern = re.compile(
+                rf"{field_pattern}\s*(?P<operator>大于|不少于|小于|不超过)"
+                rf"\s*(?P<value>{_NUMBER_RE})",
+                re.IGNORECASE,
+            )
+            for match in comparison_pattern.finditer(question):
+                item = StructuredFilter(
+                    column.physical_name,
+                    _COMPARISON_OPERATORS[match.group("operator")],
+                    match.group("value"),
+                )
+                matches.setdefault(match.start("operator"), []).append(
+                    (priority, len(_normalize(name)), column, item)
+                )
+            equality_pattern = re.compile(
+                rf"{field_pattern}\s*(?P<operator>为|=)\s*(?P<value>[^\s，,。的]+)",
+                re.IGNORECASE,
+            )
+            for match in equality_pattern.finditer(question):
+                item = StructuredFilter(
+                    column.physical_name,
+                    "eq",
+                    match.group("value").strip(),
+                )
+                matches.setdefault(match.start("operator"), []).append(
+                    (priority, len(_normalize(name)), column, item)
+                )
+    return _select_filter_matches(matches)
+
+
+def _resolve_implicit_filters(
+    question: str,
+    columns: tuple[StructuredColumnSchema, ...],
+) -> tuple[StructuredFilter, ...] | StructuredClarification:
+    matches: dict[int, list[tuple[int, int, StructuredColumnSchema, StructuredFilter]]] = {}
+    for column in columns:
+        if column.data_type is not StructuredColumnType.STRING:
+            continue
+        for priority, name in _resolution_names(column):
+            field_pattern = _field_pattern(name, normalized=priority == 0)
+            pattern = re.compile(
+                rf"(?P<value>[A-Za-z0-9\u4e00-\u9fff]{{1,20}}){field_pattern}",
+                re.IGNORECASE,
+            )
+            for match in pattern.finditer(question):
+                if re.match(
+                    r"\s*(?:为|=|大于|不少于|小于|不超过)",
+                    question[match.end() :],
+                ):
+                    continue
+                value = re.sub(r"^(?:请问|请|统计|计算|查询|求)", "", match.group("value"))
+                if not value or any(
+                    word in value for _, words in _AGGREGATE_WORDS for word in words
+                ):
+                    continue
+                item = StructuredFilter(column.physical_name, "eq", value)
+                matches.setdefault(match.end(), []).append(
+                    (priority, len(_normalize(name)), column, item)
+                )
+    return _select_filter_matches(matches)
+
+
+def _select_filter_matches(
+    matches: dict[int, list[tuple[int, int, StructuredColumnSchema, StructuredFilter]]],
+) -> tuple[StructuredFilter, ...] | StructuredClarification:
+    selected: list[StructuredFilter] = []
+    for _, candidates in sorted(matches.items()):
+        best_priority = min(priority for priority, _, _, _ in candidates)
+        at_priority = [item for item in candidates if item[0] == best_priority]
+        longest = max(length for _, length, _, _ in at_priority)
+        finalists = [item for item in at_priority if item[1] == longest]
+        by_column = {column.physical_name: item for _, _, column, item in finalists}
+        if len(by_column) > 1:
+            return StructuredClarification(
+                "字段名称存在歧义，请选择一个字段",
+                tuple(sorted(by_column)),
+            )
+        selected.append(next(iter(by_column.values())))
+    return tuple(dict.fromkeys(selected))
 
 
 def _resolve_columns(
@@ -496,6 +577,26 @@ def _column_names(column: StructuredColumnSchema) -> tuple[str, ...]:
             (column.physical_name, column.display_name, column.original_name, *column.aliases)
         )
     )
+
+
+def _resolution_names(column: StructuredColumnSchema) -> tuple[tuple[int, str], ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                (0, column.physical_name),
+                (1, column.display_name),
+                (1, column.original_name),
+                *((2, alias) for alias in column.aliases),
+            )
+        )
+    )
+
+
+def _field_pattern(name: str, *, normalized: bool) -> str:
+    if not normalized:
+        return re.escape(name)
+    normalized_name = _normalize(name)
+    return r"[\s_-]*".join(re.escape(character) for character in normalized_name)
 
 
 def _normalize(value: str) -> str:

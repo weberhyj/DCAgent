@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from decimal import Decimal
 
 from app.structured_models import (
     StructuredClarification,
+    StructuredColumnType,
     StructuredFilter,
     StructuredIntent,
+    StructuredUnavailable,
 )
 from app.structured_query import parse_structured_intent, resolve_structured_intent
 from tests.support.structured_fakes import (
@@ -48,6 +51,61 @@ class StructuredIntentParserTest(unittest.TestCase):
             intent.filters,
         )
 
+    def test_date_range_without_confirmed_date_field_never_runs_unfiltered(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        without_date = replace(
+            catalog,
+            datasets=(
+                replace(
+                    base,
+                    schema=replace(
+                        base.schema,
+                        columns=tuple(
+                            column
+                            for column in base.schema.columns
+                            if column.physical_name != "order_date"
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        result = parse_structured_intent(
+            "统计2026-01-01 至 2026-01-31订单金额总和",
+            without_date,
+        )
+
+        self.assertIsInstance(result, (StructuredClarification, StructuredUnavailable))
+
+    def test_date_range_with_multiple_date_fields_requires_clarification(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        second_date = replace(
+            base.schema.columns[2],
+            physical_name="delivery_date",
+            original_name="配送日期",
+            display_name="配送日期",
+            aliases=("日期",),
+        )
+        multiple_dates = replace(
+            catalog,
+            datasets=(
+                replace(
+                    base,
+                    schema=replace(base.schema, columns=(*base.schema.columns, second_date)),
+                ),
+            ),
+        )
+
+        result = parse_structured_intent(
+            "2026-01-01 至 2026-01-31订单金额总和",
+            multiple_dates,
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("delivery_date", "order_date"))
+
     def test_supports_all_governed_aggregate_words(self) -> None:
         expectations = {
             "订单金额均值": "avg",
@@ -61,6 +119,12 @@ class StructuredIntentParserTest(unittest.TestCase):
             with self.subTest(question=question):
                 result = parse_structured_intent(question, sample_catalog())
                 self.assertEqual(result.aggregate, expected)
+
+    def test_count_resolves_confirmed_non_aggregate_field(self) -> None:
+        result = parse_structured_intent("地区计数", sample_catalog())
+
+        self.assertEqual(result.aggregate, "count")
+        self.assertEqual(result.metric_physical_name, "region")
 
     def test_resolves_normalized_physical_dataset_and_column_names(self) -> None:
         result = parse_structured_intent(
@@ -112,6 +176,77 @@ class StructuredIntentParserTest(unittest.TestCase):
                 )
                 self.assertIn(StructuredFilter("order_amount", operator, "100"), result.filters)
 
+    def test_filter_resolves_normalized_physical_name(self) -> None:
+        result = parse_structured_intent(
+            "ORDER AMOUNT大于100的总和",
+            sample_catalog(),
+        )
+
+        self.assertIn(StructuredFilter("order_amount", "gt", "100"), result.filters)
+
+    def test_ambiguous_filter_alias_returns_clarification(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        metric = base.schema.columns[0]
+        first_filter = replace(
+            base.schema.columns[1],
+            physical_name="sales_region",
+            original_name="销售片区",
+            display_name="销售片区",
+            aliases=("区域",),
+        )
+        second_filter = replace(
+            base.schema.columns[1],
+            physical_name="delivery_region",
+            original_name="配送片区",
+            display_name="配送片区",
+            aliases=("区域",),
+        )
+        ambiguous = replace(
+            catalog,
+            datasets=(
+                replace(
+                    base,
+                    schema=replace(
+                        base.schema,
+                        columns=(metric, first_filter, second_filter),
+                    ),
+                ),
+            ),
+        )
+
+        result = parse_structured_intent("区域=华东的订单金额总和", ambiguous)
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("delivery_region", "sales_region"))
+
+    def test_filter_prefers_longest_alias_without_adding_short_alias_filter(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        metric = base.schema.columns[0]
+        short = replace(
+            base.schema.columns[1],
+            physical_name="generic_region",
+            original_name="通用片区",
+            display_name="通用片区",
+            aliases=("地区",),
+        )
+        long = replace(
+            base.schema.columns[1],
+            physical_name="sales_region",
+            original_name="销售片区",
+            display_name="销售片区",
+            aliases=("销售地区",),
+        )
+        aliased = replace(
+            catalog,
+            datasets=(replace(base, schema=replace(base.schema, columns=(metric, short, long))),),
+        )
+
+        result = parse_structured_intent("销售地区=华东的订单金额总和", aliased)
+
+        self.assertEqual(result.filters, (StructuredFilter("sales_region", "eq", "华东"),))
+
     def test_unconfirmed_and_multiple_datasets_are_not_selected(self) -> None:
         catalog = sample_catalog()
         unconfirmed = replace(
@@ -130,6 +265,53 @@ class StructuredIntentParserTest(unittest.TestCase):
 
         self.assertEqual(unavailable.message, "指定数据集尚未确认并发布")
         self.assertIsInstance(ambiguous, StructuredClarification)
+
+    def test_dataset_resolution_prefers_longest_normalized_name(self) -> None:
+        catalog = sample_catalog()
+        sales = catalog.datasets[0]
+        regional_publication = replace(
+            sample_publication(),
+            publication_id="pub-regional",
+            dataset_id="ds-regional-sales",
+            physical_table_name="structured_ds_regional_sales_v1",
+        )
+        regional = replace(
+            sales,
+            schema=replace(sales.schema, dataset_id="ds-regional-sales"),
+            source_name="regional-sales.xlsx",
+            active_publication=regional_publication,
+        )
+
+        result = parse_structured_intent(
+            "regional-sales订单金额平均值",
+            replace(catalog, datasets=(sales, regional)),
+        )
+
+        self.assertEqual(result.dataset_id, "ds-regional-sales")
+
+    def test_dataset_resolution_same_priority_and_length_tie_clarifies(self) -> None:
+        catalog = sample_catalog()
+        first = catalog.datasets[0]
+        second_publication = replace(
+            sample_publication(),
+            publication_id="pub-sales-2",
+            dataset_id="ds-sales-2",
+            physical_table_name="structured_ds_sales_2_v1",
+        )
+        second = replace(
+            first,
+            schema=replace(first.schema, dataset_id="ds-sales-2"),
+            source_name="sales.csv",
+            active_publication=second_publication,
+        )
+
+        result = parse_structured_intent(
+            "sales订单金额平均值",
+            replace(catalog, datasets=(first, second)),
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("ds-sales", "ds-sales-2"))
 
     def test_display_name_tie_returns_all_candidates(self) -> None:
         catalog = sample_catalog()
@@ -228,6 +410,47 @@ class StructuredQueryPlannerTest(unittest.TestCase):
         self.assertIn("{filter_0:String}", plan.sql)
         self.assertIn("{filter_1:Decimal(38, 9)}", plan.sql)
 
+    def test_datetime_date_range_covers_entire_end_day_with_half_open_bound(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        datetime_column = replace(
+            base.schema.columns[2],
+            data_type=StructuredColumnType.DATETIME,
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    base,
+                    schema=replace(
+                        base.schema,
+                        columns=(base.schema.columns[0], base.schema.columns[1], datetime_column),
+                    ),
+                ),
+            ),
+        )
+        plan = StructuredQueryPlanner(catalog).plan(
+            StructuredIntent(
+                "ds-sales",
+                "sum",
+                "order_amount",
+                (
+                    StructuredFilter(
+                        "order_date",
+                        "between",
+                        "2026-01-01",
+                        "2026-01-31",
+                    ),
+                ),
+            ),
+            sample_publication(),
+        )
+
+        self.assertIn("order_date < {filter_0_upper:DateTime64(3)}", plan.sql)
+        self.assertEqual(plan.parameters["filter_0_upper"], datetime(2026, 2, 1))
+
     def test_count_all_rows_and_count_non_null_are_distinct(self) -> None:
         from app.structured_query import StructuredQueryPlanner
 
@@ -243,6 +466,16 @@ class StructuredQueryPlannerTest(unittest.TestCase):
         self.assertIn("count() AS aggregate_value", all_rows.sql)
         self.assertIn("count(order_amount) AS aggregate_value", non_null.sql)
         self.assertIn("count(order_amount) AS valid_count", non_null.sql)
+
+    def test_count_accepts_any_confirmed_field(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        plan = StructuredQueryPlanner(sample_catalog()).plan(
+            StructuredIntent("ds-sales", "count", "region", ()), sample_publication()
+        )
+
+        self.assertIn("count(region) AS aggregate_value", plan.sql)
+        self.assertIn("count(region) AS valid_count", plan.sql)
 
     def test_sum_min_and_max_use_only_confirmed_metric(self) -> None:
         from app.structured_query import StructuredQueryPlanner
