@@ -72,6 +72,32 @@ class SwitchableCatalogProvider:
         return self.catalog
 
 
+class OutOfOrderCatalogProvider:
+    def __init__(self, old_catalog, new_catalog, second_error: Exception | None = None) -> None:
+        self.old_catalog = old_catalog
+        self.new_catalog = new_catalog
+        self.second_error = second_error
+        self.first_started = Event()
+        self.release_first = Event()
+        self._calls = 0
+        self._lock = Lock()
+
+    def __call__(self):
+        with self._lock:
+            call_index = self._calls
+            self._calls += 1
+        if call_index == 0:
+            self.first_started.set()
+            if not self.release_first.wait(timeout=2):
+                raise RuntimeError("timed out waiting to release first catalog request")
+            return self.old_catalog
+        if call_index == 1:
+            if self.second_error is not None:
+                raise self.second_error
+            return self.new_catalog
+        raise RuntimeError("catalog down")
+
+
 class LifecycleClickHouseClient:
     def __init__(self, query_handler=None) -> None:
         self.close_calls = 0
@@ -912,6 +938,119 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(legacy_provider.calls, 1)
         self.assertEqual(gateway.calls, [])
         self.assertIn("不可用", messages[-1].paragraphs[0].text)
+
+    def test_later_catalog_request_wins_when_successes_complete_out_of_order(self) -> None:
+        provider = OutOfOrderCatalogProvider(
+            self._catalog_with_aggregate_field("产品说明"),
+            self._catalog_with_aggregate_field("产品介绍"),
+        )
+        gateway = RecordingClickHouseGateway()
+        service = StructuredAnswerService(provider, gateway)
+        outcomes: dict[str, object] = {}
+        errors: list[BaseException] = []
+        outcome_lock = Lock()
+
+        def warm_snapshot(name: str) -> None:
+            try:
+                outcome = service.try_answer(name, "什么是平均值", "source", ())
+                with outcome_lock:
+                    outcomes[name] = outcome
+            except BaseException as error:
+                with outcome_lock:
+                    errors.append(error)
+
+        first = Thread(target=warm_snapshot, args=("first",))
+        second = Thread(target=warm_snapshot, args=("second",))
+        first.start()
+        try:
+            self.assertTrue(provider.first_started.wait(timeout=2))
+            second.start()
+            second.join(timeout=2)
+            self.assertFalse(second.is_alive())
+        finally:
+            provider.release_first.set()
+            first.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(outcomes, {"first": None, "second": None})
+
+        legacy_provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=legacy_provider,
+            structured_service=service,
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, new_field_messages = repository.send_message(
+            conversation_id,
+            "产品介绍平均值是什么",
+            "source",
+        )
+        self.assertEqual(legacy_provider.calls, 0)
+        self.assertIn("不可用", new_field_messages[-1].paragraphs[0].text)
+
+        _, _, old_field_messages = repository.send_message(
+            conversation_id,
+            "产品说明平均值是什么",
+            "source",
+        )
+        self.assertEqual(legacy_provider.calls, 1)
+        self.assertEqual(old_field_messages[-1].paragraphs[0].text, "legacy Physoc answer")
+        self.assertEqual(gateway.calls, [])
+
+    def test_later_failed_catalog_request_does_not_discard_earlier_success(self) -> None:
+        catalog = self._catalog_with_aggregate_field("产品说明")
+        provider = OutOfOrderCatalogProvider(
+            catalog,
+            catalog,
+            second_error=RuntimeError("catalog down"),
+        )
+        gateway = RecordingClickHouseGateway()
+        service = StructuredAnswerService(provider, gateway)
+        errors: list[BaseException] = []
+        error_lock = Lock()
+
+        def warm_snapshot() -> None:
+            try:
+                service.try_answer("warm", "什么是平均值", "source", ())
+            except BaseException as error:
+                with error_lock:
+                    errors.append(error)
+
+        first = Thread(target=warm_snapshot)
+        second = Thread(target=warm_snapshot)
+        first.start()
+        try:
+            self.assertTrue(provider.first_started.wait(timeout=2))
+            second.start()
+            second.join(timeout=2)
+            self.assertFalse(second.is_alive())
+        finally:
+            provider.release_first.set()
+            first.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertEqual(errors, [])
+
+        legacy_provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=legacy_provider,
+            structured_service=service,
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "产品说明平均值是什么",
+            "source",
+        )
+
+        self.assertEqual(legacy_provider.calls, 0)
+        self.assertIn("不可用", messages[-1].paragraphs[0].text)
+        self.assertEqual(gateway.calls, [])
 
     def test_named_average_metric_phrases_route_to_structured_query(self) -> None:
         for question in (

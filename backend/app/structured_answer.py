@@ -115,6 +115,8 @@ class StructuredAnswerService:
         self._clickhouse_gateway = clickhouse_gateway
         self._catalog_snapshot: StructuredCatalog | None = None
         self._catalog_snapshot_lock = Lock()
+        self._catalog_request_generation = 0
+        self._latest_successful_catalog_generation = 0
 
     def close(self) -> None:
         close = getattr(self._clickhouse_gateway, "close", None)
@@ -133,6 +135,7 @@ class StructuredAnswerService:
         if not _has_aggregate_language(question):
             return None
 
+        catalog_request_generation = self._next_catalog_request_generation()
         try:
             catalog = self._catalog_provider()
         except Exception:
@@ -149,7 +152,7 @@ class StructuredAnswerService:
                 "结构化查询服务不可用：无法读取已发布的数据目录。",
                 "catalog unavailable",
             )
-        self._replace_catalog_snapshot(catalog)
+        self._replace_catalog_snapshot(catalog, catalog_request_generation)
         if not is_structured_candidate(question, catalog):
             return None
 
@@ -210,9 +213,21 @@ class StructuredAnswerService:
             source_ids=[result.dataset_id],
         )
 
-    def _replace_catalog_snapshot(self, catalog: StructuredCatalog) -> None:
+    def _next_catalog_request_generation(self) -> int:
         with self._catalog_snapshot_lock:
+            self._catalog_request_generation += 1
+            return self._catalog_request_generation
+
+    def _replace_catalog_snapshot(
+        self,
+        catalog: StructuredCatalog,
+        request_generation: int,
+    ) -> None:
+        with self._catalog_snapshot_lock:
+            if request_generation < self._latest_successful_catalog_generation:
+                return
             self._catalog_snapshot = catalog
+            self._latest_successful_catalog_generation = request_generation
 
     def _get_catalog_snapshot(self) -> StructuredCatalog | None:
         with self._catalog_snapshot_lock:
