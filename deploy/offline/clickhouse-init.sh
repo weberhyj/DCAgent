@@ -47,6 +47,6 @@ GRANT SELECT ON default.* TO \`$query_user\`;
 CREATE USER IF NOT EXISTS \`$ingest_user\` IDENTIFIED WITH sha256_password BY '$ingest_password';
 ALTER USER \`$ingest_user\` IDENTIFIED WITH sha256_password BY '$ingest_password';
 REVOKE ALL ON *.* FROM \`$ingest_user\`;
-GRANT CREATE TABLE, INSERT, SELECT, ALTER TABLE, DROP TABLE, TRUNCATE ON default.* TO \`$ingest_user\`;
+GRANT CREATE TABLE, SHOW COLUMNS, INSERT, SELECT, ALTER TABLE, DROP TABLE, TRUNCATE ON default.* TO \`$ingest_user\`;
 GRANT SELECT ON system.tables TO \`$ingest_user\`;
 SQL

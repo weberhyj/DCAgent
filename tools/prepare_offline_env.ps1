@@ -691,7 +691,12 @@ $clickhouseConfiguredCount = @(
             )
         }
 ).Count
-if ($clickhouseConfiguredCount -notin @(0, 2)) {
+if ($clickhouseConfiguredCount -eq 0) {
+    Set-OfflineEnvValue -Path $envPath -Name "CLICKHOUSE_QUERY_PASSWORD_FILE" -Value "../../artifacts/secrets/clickhouse-query-password"
+    Set-OfflineEnvValue -Path $envPath -Name "CLICKHOUSE_INGEST_PASSWORD_FILE" -Value "../../artifacts/secrets/clickhouse-ingest-password"
+    $clickhouseConfiguredCount = 2
+}
+elseif ($clickhouseConfiguredCount -ne 2) {
     throw "Both ClickHouse password file paths must be configured together"
 }
 $clickhouseSecretPaths = @()

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -152,6 +155,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             "REVOKE ALL ON *.*",
             "GRANT SELECT ON default.*",
             "CREATE TABLE",
+            "SHOW COLUMNS",
             "INSERT",
             "ALTER TABLE",
             "DROP TABLE",
@@ -200,6 +204,130 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             "Assert-OfflineLinuxPathContract",
         ):
             self.assertIn(security_check, prepare)
+
+    def test_prepare_upgrades_legacy_env_with_managed_clickhouse_secrets(self) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable")
+
+        source_script = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        def replace_function(text: str, name: str, replacement: str) -> str:
+            start = text.index(f"function {name} {{")
+            next_function = text.index("\nfunction ", start + 1)
+            return (
+                text[:start] + replacement.rstrip() + "\n" + text[next_function + 1 :]
+            )
+
+        source_script = replace_function(
+            source_script,
+            "Test-OfflineLinuxHost",
+            "function Test-OfflineLinuxHost { return $false }",
+        )
+        source_script = replace_function(
+            source_script,
+            "Protect-SecretPath",
+            "function Protect-SecretPath { param([string]$Path, [switch]$Directory) }",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "deploy" / "offline").mkdir(parents=True)
+            (root / "tools").mkdir()
+            for managed_directory in (
+                root / "artifacts" / "data" / "postgres",
+                root / "artifacts" / "data" / "clickhouse",
+                root / "artifacts" / "data" / "qdrant",
+                root / "artifacts" / "data" / "redis",
+                root / "artifacts" / "models",
+            ):
+                managed_directory.mkdir(parents=True)
+
+            env_path = root / "deploy" / "offline" / ".env"
+            legacy_env = (
+                "DATA_ROOT=../../artifacts/data\n"
+                "MODEL_ROOT=../../artifacts/models\n"
+                "POSTGRES_PASSWORD_FILE=../../artifacts/secrets/postgres-password\n"
+                "DATABASE_URL_SECRET_FILE=../../artifacts/secrets/database-url\n"
+                "STRUCTURED_QUERY_ENABLED=false\n"
+                "DCAGENT_UID=1000\n"
+                "DCAGENT_GID=1000\n"
+            )
+            env_path.write_text(legacy_env, encoding="utf-8")
+            (root / "deploy" / "offline" / ".env.example").write_text(
+                legacy_env,
+                encoding="utf-8",
+            )
+            copied_script = root / "tools" / "prepare_offline_env.ps1"
+            copied_script.write_text(source_script, encoding="utf-8", newline="\n")
+
+            def run() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(copied_script),
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            first = run()
+            self.assertEqual(0, first.returncode, first.stderr)
+            values = active_assignments(env_path.read_text(encoding="utf-8"))
+            self.assertEqual(values["STRUCTURED_QUERY_ENABLED"], "false")
+            self.assertEqual(
+                values["CLICKHOUSE_QUERY_PASSWORD_FILE"],
+                "../../artifacts/secrets/clickhouse-query-password",
+            )
+            self.assertEqual(
+                values["CLICKHOUSE_INGEST_PASSWORD_FILE"],
+                "../../artifacts/secrets/clickhouse-ingest-password",
+            )
+
+            secret_paths = (
+                root / "artifacts" / "secrets" / "clickhouse-query-password",
+                root / "artifacts" / "secrets" / "clickhouse-ingest-password",
+            )
+            first_secrets = tuple(path.read_bytes() for path in secret_paths)
+            for secret in first_secrets:
+                self.assertRegex(secret.decode("ascii"), r"^[A-Za-z0-9_-]{43}$")
+                self.assertNotIn(secret.decode("ascii"), first.stdout + first.stderr)
+
+            first_env = env_path.read_bytes()
+            second = run()
+            self.assertEqual(0, second.returncode, second.stderr)
+            self.assertEqual(first_env, env_path.read_bytes())
+            self.assertEqual(
+                first_secrets, tuple(path.read_bytes() for path in secret_paths)
+            )
+
+            partial_env = (
+                "\n".join(
+                    line
+                    for line in env_path.read_text(encoding="utf-8").splitlines()
+                    if not line.startswith("CLICKHOUSE_INGEST_PASSWORD_FILE=")
+                )
+                + "\n"
+            )
+            env_path.write_text(partial_env, encoding="utf-8")
+            partial = run()
+            self.assertNotEqual(0, partial.returncode)
+            self.assertIn(
+                "Both ClickHouse password file paths must be configured together",
+                partial.stdout + partial.stderr,
+            )
+            self.assertEqual(
+                first_secrets, tuple(path.read_bytes() for path in secret_paths)
+            )
 
     def test_docs_describe_enablement_migration_smoke_and_fail_closed_rollback(
         self,
