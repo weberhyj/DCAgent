@@ -26,7 +26,7 @@ from .infra.health import (
 )
 from .ingestion import KnowledgeIngestionQueue
 from .llm import LLMProvider, create_llm_provider
-from .offline_settings import OfflineSettings, parse_bool
+from .offline_settings import OfflineSettings, parse_bool, read_secret_file
 from .repository import ChatRepository
 from .routes import router
 from .runtime_env import load_runtime_environment
@@ -378,15 +378,40 @@ def _create_structured_answer_service(
         import clickhouse_connect
 
         clickhouse_client_factory = clickhouse_connect.get_client
-    gateway = _LazyStructuredQueryGateway(clickhouse_client_factory, settings.clickhouse_url)
+    query_password = (
+        read_secret_file(
+            settings.clickhouse_query_password_file,
+            "CLICKHOUSE_QUERY_PASSWORD_FILE",
+        )
+        if settings.clickhouse_query_password_file is not None
+        else ""
+    )
+    gateway = _LazyStructuredQueryGateway(
+        clickhouse_client_factory,
+        settings.clickhouse_url,
+        username=settings.clickhouse_query_user,
+        password=query_password,
+        timeout_seconds=settings.structured_query_timeout_seconds,
+    )
     service = StructuredAnswerService(structured_repository.get_catalog, gateway)
     return service, (gateway,)
 
 
 class _LazyStructuredQueryGateway:
-    def __init__(self, client_factory: Callable[..., object], dsn: str) -> None:
+    def __init__(
+        self,
+        client_factory: Callable[..., object],
+        dsn: str,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
         self._client_factory = client_factory
         self._dsn = dsn
+        self._username = username
+        self._password = password
+        self._timeout_seconds = timeout_seconds
         self._condition = Condition()
         self._closed = False
         self._initializing = False
@@ -451,10 +476,16 @@ class _LazyStructuredQueryGateway:
         raise StructuredStorageError("ClickHouse structured query gateway is closed")
 
     def _build_gateway(self) -> tuple[ClickHouseGateway, tuple[object, object]]:
-        ingest_client = self._client_factory(dsn=self._dsn)
+        client_kwargs: dict[str, object] = {"dsn": self._dsn}
+        if self._username is not None:
+            client_kwargs["username"] = self._username
+            client_kwargs["password"] = self._password or ""
+        if self._timeout_seconds is not None:
+            client_kwargs["send_receive_timeout"] = self._timeout_seconds
+        ingest_client = self._client_factory(**client_kwargs)
         try:
             query_client = self._client_factory(
-                dsn=self._dsn,
+                **client_kwargs,
                 autogenerate_session_id=False,
             )
         except Exception:
@@ -462,7 +493,11 @@ class _LazyStructuredQueryGateway:
             raise
         clients = (ingest_client, query_client)
         try:
-            gateway = ClickHouseGateway(ingest_client, query_client=query_client)
+            gateway = ClickHouseGateway(
+                ingest_client,
+                query_client=query_client,
+                max_execution_time=self._timeout_seconds or 30,
+            )
         except Exception:
             _close_clickhouse_clients(clients)
             raise

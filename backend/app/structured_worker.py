@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 from .clickhouse_gateway import ClickHouseGateway
 from .database import Database
-from .offline_settings import OfflineSettings
+from .offline_settings import OfflineSettings, read_secret_file
 from .structured_ingestion import SpreadsheetPublisher
 from .structured_models import StructuredPublicationResult
 from .structured_repository import (
@@ -215,13 +215,41 @@ def build_structured_worker(
         import clickhouse_connect
 
         clickhouse_client_factory = clickhouse_connect.get_client
-    ingest_client = clickhouse_client_factory(dsn=settings.clickhouse_url)
-    query_client = clickhouse_client_factory(dsn=settings.clickhouse_url)
-    publisher = SpreadsheetPublisher(
-        clickhouse=ClickHouseGateway(ingest_client, query_client=query_client),
-        parquet_root=settings.parquet_root,
-        batch_rows=settings.structured_ingest_batch_rows,
+    ingest_password = (
+        read_secret_file(
+            settings.clickhouse_ingest_password_file,
+            "CLICKHOUSE_INGEST_PASSWORD_FILE",
+        )
+        if settings.clickhouse_ingest_password_file is not None
+        else ""
     )
+    client_kwargs = {
+        "dsn": settings.clickhouse_url,
+        "username": settings.clickhouse_ingest_user,
+        "password": ingest_password,
+        "send_receive_timeout": settings.structured_query_timeout_seconds,
+    }
+    clients: tuple[object, ...] = ()
+    try:
+        ingest_client = clickhouse_client_factory(**client_kwargs)
+        clients = (ingest_client,)
+        query_client = clickhouse_client_factory(
+            **client_kwargs,
+            autogenerate_session_id=False,
+        )
+        clients = (ingest_client, query_client)
+        publisher = SpreadsheetPublisher(
+            clickhouse=ClickHouseGateway(
+                ingest_client,
+                query_client=query_client,
+                max_execution_time=settings.structured_query_timeout_seconds,
+            ),
+            parquet_root=settings.parquet_root,
+            batch_rows=settings.structured_ingest_batch_rows,
+        )
+    except Exception:
+        _close_clients(clients)
+        raise
     worker_id = source.get("STRUCTURED_WORKER_ID", f"{socket.gethostname()}:{os.getpid()}")
     return StructuredIngestionWorker(
         repository,
@@ -231,6 +259,20 @@ def build_structured_worker(
         retry_delay_seconds=int(source.get("STRUCTURED_JOB_RETRY_SECONDS", "60")),
         poll_interval_seconds=float(source.get("STRUCTURED_JOB_POLL_SECONDS", "1")),
     )
+
+
+def _close_clients(clients: tuple[object, ...]) -> None:
+    closed_ids: set[int] = set()
+    for client in reversed(clients):
+        if id(client) in closed_ids:
+            continue
+        closed_ids.add(id(client))
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
 
 def main() -> None:

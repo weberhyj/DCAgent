@@ -668,6 +668,11 @@ class StructuredWorkerTest(unittest.TestCase):
         clients: list[object] = []
         calls: list[dict[str, object]] = []
 
+        root = Path(self.temp_dir.name)
+        ingest_password = root / "ingest-password"
+        query_password = root / "missing-query-password"
+        ingest_password.write_text("ingest-secret", encoding="utf-8")
+
         def build_client(**kwargs):
             calls.append(kwargs)
             client = object()
@@ -679,6 +684,12 @@ class StructuredWorkerTest(unittest.TestCase):
                 "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
                 "CLICKHOUSE_URL": "http://127.0.0.1:8123",
                 "PARQUET_ROOT": self.temp_dir.name,
+                "STRUCTURED_QUERY_ENABLED": "true",
+                "CLICKHOUSE_INGEST_USER": "ingest-user",
+                "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+                "CLICKHOUSE_QUERY_USER": "query-user",
+                "CLICKHOUSE_QUERY_PASSWORD_FILE": str(query_password),
+                "STRUCTURED_QUERY_TIMEOUT_SECONDS": "4",
             },
             database_factory=lambda _url: self.database,
             clickhouse_client_factory=build_client,
@@ -689,13 +700,80 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                {"dsn": "http://127.0.0.1:8123"},
-                {"dsn": "http://127.0.0.1:8123"},
+                {
+                    "dsn": "http://127.0.0.1:8123",
+                    "username": "ingest-user",
+                    "password": "ingest-secret",
+                    "send_receive_timeout": 4,
+                },
+                {
+                    "dsn": "http://127.0.0.1:8123",
+                    "username": "ingest-user",
+                    "password": "ingest-secret",
+                    "send_receive_timeout": 4,
+                    "autogenerate_session_id": False,
+                },
             ],
         )
+        self.assertNotIn("query-user", repr(calls))
+        self.assertNotIn("query-secret", repr(calls))
+        self.assertEqual(gateway._settings["max_execution_time"], 4)
         self.assertIs(gateway._ingest_client, clients[0])
         self.assertIs(gateway._query_client, clients[1])
         self.assertIsNot(gateway._ingest_client, gateway._query_client)
+
+    def test_worker_factory_closes_ingest_client_when_query_client_creation_fails(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        ingest_client = Client()
+        calls = 0
+
+        def build_client(**_kwargs: object) -> Client:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("query client failed")
+            return ingest_client
+
+        with self.assertRaisesRegex(RuntimeError, "query client failed"):
+            build_structured_worker(
+                {
+                    "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+                    "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+                    "PARQUET_ROOT": self.temp_dir.name,
+                },
+                database_factory=lambda _url: self.database,
+                clickhouse_client_factory=build_client,
+            )
+
+        self.assertEqual(ingest_client.close_calls, 1)
+
+    def test_worker_factory_closes_shared_client_when_gateway_rejects_identity_reuse(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        client = Client()
+        with self.assertRaisesRegex(RuntimeError, "separate read-only identities"):
+            build_structured_worker(
+                {
+                    "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+                    "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+                    "PARQUET_ROOT": self.temp_dir.name,
+                },
+                database_factory=lambda _url: self.database,
+                clickhouse_client_factory=lambda **_kwargs: client,
+            )
+
+        self.assertEqual(client.close_calls, 1)
 
 
 if __name__ == "__main__":

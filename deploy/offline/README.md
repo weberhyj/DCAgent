@@ -26,7 +26,62 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 
 - The default topology starts data services, schema migration, the embedding service, and API.
 - `--profile generation` enables the private llama.cpp service after its locked local model is installed.
-- `--profile indexing` is reserved for the Phase 2 ingestion worker. The image command intentionally points to the future `app.ingestion_worker` module, so leave this profile disabled until Phase 2 lands.
+- `--profile indexing` enables the structured spreadsheet worker (`app.structured_worker`). Keep it disabled while `STRUCTURED_QUERY_ENABLED=false`.
+
+## Structured aggregation rollout and rollback
+
+Structured Excel/CSV aggregation is disabled by default. Keep
+`STRUCTURED_QUERY_ENABLED=false` until all of the following gates are complete:
+
+1. Back up PostgreSQL, verify restore, and let the one-shot `schema-migration` service apply the
+   structured metadata migration.
+2. Provision separate least-privilege ClickHouse accounts named by `CLICKHOUSE_QUERY_USER` and
+   `CLICKHOUSE_INGEST_USER`. The query account is read-only; the ingestion account may create,
+   insert, validate, rename, and promote the governed versioned tables.
+3. Create the files referenced by `CLICKHOUSE_QUERY_PASSWORD_FILE` and
+   `CLICKHOUSE_INGEST_PASSWORD_FILE` under `artifacts/secrets`, restrict them to mode `0600`, and
+   ensure the deployment account owns them. Never put either password directly in `.env`.
+4. Start the default topology once so migration succeeds:
+
+   ```powershell
+   & tools/invoke_offline_compose.ps1 up -d
+   ```
+
+5. In the administrator UI, upload the XLSX/CSV file, inspect inferred types and aliases, and save a
+   confirmed schema. Unconfirmed datasets cannot be published or queried.
+6. Set `STRUCTURED_QUERY_ENABLED=true`, then reconcile the API and start the worker with the
+   indexing profile:
+
+   ```powershell
+   & tools/invoke_offline_compose.ps1 --profile indexing up -d
+   ```
+
+Wait for the selected publication to reach `published` before exposing aggregate questions. A
+confirmed schema by itself is not queryable; the indexing worker profile must successfully promote
+an immutable ClickHouse publication.
+
+For the smoke aggregate gate, use a small reviewed worksheet with known values and nulls. Confirm
+its schema, publish it, ask for `avg`, `sum`, `count`, `min`, and `max`, and compare the answer value,
+source file, worksheet, total/valid/null counts, schema version, and publication ID with the known
+fixture. The gate fails if an aggregate invokes Physoc/template generation or is calculated from
+document slices.
+
+If ClickHouse is unavailable or a structured query times out, the API must return an explicit
+structured-data unavailable response. It must not fall back to slice arithmetic or the legacy RAG
+path for that aggregate question.
+
+Rollback is configuration-only and preserves published data. Set
+`STRUCTURED_QUERY_ENABLED=false`, stop the current topology, and restart without the indexing
+profile:
+
+```powershell
+& tools/invoke_offline_compose.ps1 down
+& tools/invoke_offline_compose.ps1 up -d
+```
+
+Verify ordinary document questions still use the legacy/template path and structured upload routes
+are no longer active. Do not delete Parquet parts, ClickHouse tables, or structured metadata during
+rollback; retaining them permits a reviewed re-enable.
 
 ## Current development gates
 

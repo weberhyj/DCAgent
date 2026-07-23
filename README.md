@@ -85,6 +85,23 @@ Physoc 模式无需 LLM_API_KEY。后端向 `LLM_API_BASE` 与 `LLM_STREAM_PATH`
 
 两个前端项目都支持通过 `VITE_API_PROXY_TARGET` 覆盖本地 API 代理目标，默认代理到 `http://127.0.0.1:8000`。
 
+## Structured spreadsheet aggregation
+
+Exact Excel/CSV aggregation is an opt-in local feature. The shipped default is
+`STRUCTURED_QUERY_ENABLED=false`, which preserves the existing template/legacy document RAG path.
+Enabling it does not add an external API: published rows stay in local Parquet staging and the
+private ClickHouse service.
+
+The query API uses the `CLICKHOUSE_QUERY_USER` account and its password file; the indexing worker
+uses the separate `CLICKHOUSE_INGEST_USER` account and password file. Password values must not be
+placed in `.env` or an example file. The default query timeout is 4 seconds and the default bounded
+ingestion batch is 50,000 rows.
+
+The feature is usable only after an administrator has approved a confirmed schema for the XLSX/CSV
+dataset and the offline `--profile indexing` worker has published that schema version. See
+[`deploy/offline/README.md`](deploy/offline/README.md) for migration, worker startup, smoke aggregate,
+rollback, and ClickHouse failure handling.
+
 ## 启动
 
 后端：

@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 from unittest.mock import patch
 
@@ -359,6 +361,57 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 },
             ],
         )
+
+    def test_default_repository_uses_only_query_credentials_and_bounded_timeout(self) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        client_calls: list[dict[str, object]] = []
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            query_password = root / "query-password"
+            ingest_password = root / "missing-ingest-password"
+            query_password.write_text("query-secret", encoding="utf-8")
+
+            def build_client(**kwargs: object) -> LifecycleClickHouseClient:
+                client_calls.append(kwargs)
+                return LifecycleClickHouseClient()
+
+            repository = create_default_repository(
+                environ={
+                    "OFFLINE_MODE": "true",
+                    "STRUCTURED_QUERY_ENABLED": "true",
+                    "CLICKHOUSE_QUERY_USER": "query-user",
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE": str(query_password),
+                    "CLICKHOUSE_INGEST_USER": "ingest-user",
+                    "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+                    "STRUCTURED_QUERY_TIMEOUT_SECONDS": "4",
+                },
+                database_factory=lambda _url: database,
+                clickhouse_client_factory=build_client,
+            )
+            gateway = repository._structured_service._clickhouse_gateway
+            gateway.query("SELECT 1", {})
+
+        self.assertEqual(
+            client_calls,
+            [
+                {
+                    "dsn": "http://127.0.0.1:8123",
+                    "username": "query-user",
+                    "password": "query-secret",
+                    "send_receive_timeout": 4,
+                },
+                {
+                    "dsn": "http://127.0.0.1:8123",
+                    "username": "query-user",
+                    "password": "query-secret",
+                    "send_receive_timeout": 4,
+                    "autogenerate_session_id": False,
+                },
+            ],
+        )
+        self.assertEqual(gateway._gateway._settings["max_execution_time"], 4)
+        self.assertNotIn("ingest-user", repr(client_calls))
+        self.assertNotIn("ingest-secret", repr(client_calls))
 
     def test_lazy_gateway_shared_query_client_avoids_session_concurrency_errors(self) -> None:
         all_queries_attempted = Event()
