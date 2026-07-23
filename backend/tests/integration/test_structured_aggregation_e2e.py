@@ -313,11 +313,16 @@ class StructuredAggregationEndToEndTest(unittest.TestCase):
                                 json={"content": question, "mode": "source"},
                             )
                             self.assertEqual(response.status_code, 200, response.text)
-                            self.assertEqual(gateway.last_result, _reference(aggregate, predicate))
+                            expected = _reference(aggregate, predicate)
+                            self.assertEqual(gateway.last_result, expected)
+                            answer = response.json()["messages"][-1]["paragraphs"][0]["text"]
+                            self.assertIn(f"aggregate={aggregate}", answer)
                             self.assertIn(
-                                f"aggregate={aggregate}",
-                                response.json()["messages"][-1]["paragraphs"][0]["text"],
+                                f"value={format(expected['aggregate_value'], ',')}", answer
                             )
+                            self.assertIn(f"total={expected['total_count']}", answer)
+                            self.assertIn(f"valid={expected['valid_count']}", answer)
+                            self.assertIn(f"null={expected['null_count']}", answer)
 
                     count_all_conversation = client.post("/api/conversations").json()[
                         "activeConversationId"
@@ -398,6 +403,116 @@ class StructuredAggregationEndToEndTest(unittest.TestCase):
                 database.engine.dispose()
 
 
+def _create_target_host_clients(
+    client_factory,
+    ingest_kwargs: dict[str, object],
+    query_kwargs: dict[str, object],
+):
+    ingest = client_factory(**ingest_kwargs)
+    try:
+        query = client_factory(**query_kwargs)
+        if query is ingest:
+            raise RuntimeError("target-host gate requires separate ingest and query clients")
+    except BaseException as error:
+        try:
+            ingest.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"ingest client cleanup also failed: {cleanup_error}")
+        raise
+    return ingest, query
+
+
+def _cleanup_target_host_clients(
+    ingest: object,
+    query: object,
+    staging: str,
+    table: str,
+) -> BaseException | None:
+    failures: list[BaseException] = []
+    for statement in (f"DROP TABLE IF EXISTS {staging}", f"DROP TABLE IF EXISTS {table}"):
+        try:
+            ingest.command(statement)
+        except BaseException as error:
+            failures.append(error)
+    for client in (query, ingest):
+        try:
+            client.close()
+        except BaseException as error:
+            failures.append(error)
+    return failures[0] if failures else None
+
+
+def _raise_or_note_cleanup(
+    primary_error: BaseException | None,
+    cleanup_error: BaseException | None,
+) -> None:
+    if cleanup_error is None:
+        return
+    if primary_error is None:
+        raise cleanup_error
+    primary_error.add_note(f"target-host cleanup also failed: {cleanup_error}")
+
+
+class StructuredAggregationTargetHostHelperTest(unittest.TestCase):
+    def test_query_client_creation_failure_closes_ingest_client(self) -> None:
+        ingest = type(
+            "Ingest",
+            (),
+            {
+                "close_calls": 0,
+                "close": lambda self: setattr(self, "close_calls", self.close_calls + 1),
+            },
+        )()
+        calls = 0
+
+        def factory(**_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("query client failed")
+            return ingest
+
+        with self.assertRaisesRegex(RuntimeError, "query client failed"):
+            _create_target_host_clients(factory, {"role": "ingest"}, {"role": "query"})
+
+        self.assertEqual(ingest.close_calls, 1)
+
+    def test_cleanup_attempts_every_drop_and_close_without_masking_primary_error(self) -> None:
+        events = []
+        cleanup_failure = RuntimeError("staging drop failed")
+
+        class Ingest:
+            def command(self, statement):
+                events.append(statement)
+                if statement.endswith("staging"):
+                    raise cleanup_failure
+
+            def close(self):
+                events.append("close-ingest")
+
+        class Query:
+            def close(self):
+                events.append("close-query")
+
+        cleanup_error = _cleanup_target_host_clients(Ingest(), Query(), "table_staging", "table")
+
+        self.assertIs(cleanup_error, cleanup_failure)
+        self.assertEqual(
+            events,
+            [
+                "DROP TABLE IF EXISTS table_staging",
+                "DROP TABLE IF EXISTS table",
+                "close-query",
+                "close-ingest",
+            ],
+        )
+        primary = ValueError("primary query failure")
+        _raise_or_note_cleanup(primary, cleanup_error)
+        self.assertIn("staging drop failed", primary.__notes__[0])
+        with self.assertRaisesRegex(RuntimeError, "staging drop failed"):
+            _raise_or_note_cleanup(None, cleanup_error)
+
+
 def _target_host_missing_configuration() -> tuple[str, ...]:
     required = (
         "RUN_OFFLINE_INTEGRATION",
@@ -430,25 +545,29 @@ class StructuredAggregationTargetHostGateTest(unittest.TestCase):
         staging = f"{table}_staging"
         host = os.environ["CLICKHOUSE_HOST"]
         port = int(os.getenv("CLICKHOUSE_PORT", "8123"))
-        ingest = clickhouse_connect.get_client(
-            host=host,
-            port=port,
-            username=os.getenv("CLICKHOUSE_INGEST_USER", "structured_ingest"),
-            password=require_secret_file(
-                Path(os.environ["CLICKHOUSE_INGEST_PASSWORD_FILE"]),
-                "CLICKHOUSE_INGEST_PASSWORD_FILE",
-            ),
+        ingest, query = _create_target_host_clients(
+            clickhouse_connect.get_client,
+            {
+                "host": host,
+                "port": port,
+                "username": os.getenv("CLICKHOUSE_INGEST_USER", "structured_ingest"),
+                "password": require_secret_file(
+                    Path(os.environ["CLICKHOUSE_INGEST_PASSWORD_FILE"]),
+                    "CLICKHOUSE_INGEST_PASSWORD_FILE",
+                ),
+            },
+            {
+                "host": host,
+                "port": port,
+                "username": os.getenv("CLICKHOUSE_QUERY_USER", "structured_query"),
+                "password": require_secret_file(
+                    Path(os.environ["CLICKHOUSE_QUERY_PASSWORD_FILE"]),
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE",
+                ),
+                "autogenerate_session_id": False,
+            },
         )
-        query = clickhouse_connect.get_client(
-            host=host,
-            port=port,
-            username=os.getenv("CLICKHOUSE_QUERY_USER", "structured_query"),
-            password=require_secret_file(
-                Path(os.environ["CLICKHOUSE_QUERY_PASSWORD_FILE"]),
-                "CLICKHOUSE_QUERY_PASSWORD_FILE",
-            ),
-            autogenerate_session_id=False,
-        )
+        primary_error: BaseException | None = None
         try:
             ingest.command(f"DROP TABLE IF EXISTS {staging}")
             ingest.command(f"DROP TABLE IF EXISTS {table}")
@@ -464,11 +583,14 @@ class StructuredAggregationTargetHostGateTest(unittest.TestCase):
             ingest.command(f"RENAME TABLE {staging} TO {table}")
             result = query.query(f"SELECT count(), avg(amount) FROM {table}").result_rows[0]
             self.assertEqual(result, (3, Decimal("20")))
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            ingest.command(f"DROP TABLE IF EXISTS {staging}")
-            ingest.command(f"DROP TABLE IF EXISTS {table}")
-            ingest.close()
-            query.close()
+            _raise_or_note_cleanup(
+                primary_error,
+                _cleanup_target_host_clients(ingest, query, staging, table),
+            )
 
 
 if __name__ == "__main__":

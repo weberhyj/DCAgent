@@ -245,6 +245,22 @@ def expected_aggregate_values(
     )
 
 
+def _matches_exact_integer(actual: object, expected: int) -> bool:
+    if isinstance(actual, bool):
+        return False
+    if isinstance(actual, int):
+        return actual == expected
+    if isinstance(actual, Decimal):
+        return (
+            actual.is_finite()
+            and actual == actual.to_integral_value()
+            and actual == Decimal(expected)
+        )
+    if isinstance(actual, float):
+        return math.isfinite(actual) and actual.is_integer() and actual == expected
+    return False
+
+
 def execute_workload(
     config: BenchmarkConfig,
     *,
@@ -358,7 +374,7 @@ class _ClickHouseTarget:
         actual = rows[0][0]
         expected = self.expected_values[query_index]
         if isinstance(expected, int):
-            matches = not isinstance(actual, bool) and int(actual) == expected
+            matches = _matches_exact_integer(actual, expected)
         else:
             try:
                 matches = abs(Decimal(str(actual)) - expected) <= Decimal("0.000000001")

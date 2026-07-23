@@ -232,6 +232,38 @@ class StructuredAggregationBenchmarkTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "mismatch"):
             wrong.query(0)
 
+    def test_count_result_requires_exact_integer_semantics(self) -> None:
+        from tools.structured_aggregation_benchmark import _ClickHouseTarget
+
+        class Client:
+            def __init__(self, value):
+                self.value = value
+
+            def query(self, _statement):
+                return type("Result", (), {"result_rows": [(self.value,)]})()
+
+        ingest = object()
+        for value in (Decimal("10.9"), 10.1, True, "10"):
+            with self.subTest(value=value):
+                target = _ClickHouseTarget(ingest, Client(value), "benchmark", 1_000)
+                target.expected_values = (
+                    *target.expected_values[:2],
+                    10,
+                    *target.expected_values[3:],
+                )
+                with self.assertRaisesRegex(RuntimeError, "mismatch"):
+                    target.query(2)
+
+        for value in (Decimal("10.0"), 10):
+            with self.subTest(value=value):
+                target = _ClickHouseTarget(ingest, Client(value), "benchmark", 1_000)
+                target.expected_values = (
+                    *target.expected_values[:2],
+                    10,
+                    *target.expected_values[3:],
+                )
+                target.query(2)
+
     def test_workload_uses_requested_concurrency_and_counts_query_errors(self) -> None:
         from tools.structured_aggregation_benchmark import (
             BenchmarkConfig,
