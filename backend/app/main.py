@@ -453,7 +453,10 @@ class _LazyStructuredQueryGateway:
     def _build_gateway(self) -> tuple[ClickHouseGateway, tuple[object, object]]:
         ingest_client = self._client_factory(dsn=self._dsn)
         try:
-            query_client = self._client_factory(dsn=self._dsn)
+            query_client = self._client_factory(
+                dsn=self._dsn,
+                autogenerate_session_id=False,
+            )
         except Exception:
             _close_clickhouse_clients((ingest_client,))
             raise
