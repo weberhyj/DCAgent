@@ -71,7 +71,9 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     self.assertTrue(values[key])
 
     def test_compose_passes_only_query_settings_to_api(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
         api = service_block(compose, "api")
         for key in (
             "STRUCTURED_QUERY_ENABLED",
@@ -85,7 +87,9 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             self.assertNotRegex(api, rf"(?m)^\s+{key}:")
 
     def test_compose_passes_only_ingestion_settings_to_indexing_worker(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
         worker = service_block(compose, "ingestion-worker")
         for key in (
             "STRUCTURED_QUERY_ENABLED",
@@ -102,9 +106,15 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertIn('profiles: ["indexing"]', worker)
         self.assertIn('command: ["python", "-m", "app.structured_worker"]', worker)
 
-    def test_compose_keeps_legacy_generation_default_and_declares_password_secrets(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
-        env = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
+    def test_compose_keeps_legacy_generation_default_and_declares_password_secrets(
+        self,
+    ) -> None:
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        env = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("LLM_PROVIDER=template", env)
         self.assertIn('profiles: ["indexing"]', compose)
         self.assertIn('profiles: ["generation"]', compose)
@@ -113,7 +123,9 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertIn("CLICKHOUSE_QUERY_PASSWORD_FILE", env)
         self.assertIn("CLICKHOUSE_INGEST_PASSWORD_FILE", env)
 
-    def test_docs_describe_enablement_migration_smoke_and_fail_closed_rollback(self) -> None:
+    def test_docs_describe_enablement_migration_smoke_and_fail_closed_rollback(
+        self,
+    ) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         offline_readme = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
             encoding="utf-8"
@@ -128,6 +140,8 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             "clickhouse",
             "confirmed schema",
             "must not fall back",
+            "role-specific password file",
+            "worker refuses to start",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, combined)

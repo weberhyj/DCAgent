@@ -40,7 +40,7 @@ Structured Excel/CSV aggregation is disabled by default. Keep
    insert, validate, rename, and promote the governed versioned tables.
 3. Create the files referenced by `CLICKHOUSE_QUERY_PASSWORD_FILE` and
    `CLICKHOUSE_INGEST_PASSWORD_FILE` under `artifacts/secrets`, restrict them to mode `0600`, and
-   ensure the deployment account owns them. Never put either password directly in `.env`.
+   ensure the deployment account owns them. Each enabled process requires its role-specific password file: API requires the query file and the worker requires the ingest file. Never put either password directly in `.env`.
 4. Start the default topology once so migration succeeds:
 
    ```powershell
@@ -72,7 +72,8 @@ path for that aggregate question.
 
 Rollback is configuration-only and preserves published data. Set
 `STRUCTURED_QUERY_ENABLED=false`, stop the current topology, and restart without the indexing
-profile:
+profile. The worker refuses to start while the feature flag is false, so rollback cannot continue
+publishing in the background:
 
 ```powershell
 & tools/invoke_offline_compose.ps1 down

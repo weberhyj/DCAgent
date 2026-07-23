@@ -420,6 +420,21 @@ class StructuredApiTest(unittest.TestCase):
 
 
 class StructuredWiringTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.query_password = Path(self.temp_dir.name) / "query-password"
+        self.query_password.write_text("query-secret", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def enabled_environment(self) -> dict[str, str]:
+        return {
+            "OFFLINE_MODE": "false",
+            "STRUCTURED_QUERY_ENABLED": "true",
+            "CLICKHOUSE_QUERY_PASSWORD_FILE": str(self.query_password),
+        }
+
     def test_offline_settings_parse_structured_query_flag_defaulting_false(self) -> None:
         self.assertFalse(OfflineSettings.from_environ({}).structured_query_enabled)
         self.assertTrue(
@@ -447,7 +462,7 @@ class StructuredWiringTest(unittest.TestCase):
     def test_enabled_production_app_rejects_legacy_one_argument_queue_factory(self) -> None:
         database = Database("sqlite+pysqlite:///:memory:")
         production = create_production_app(
-            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "true"},
+            environ=self.enabled_environment(),
             repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
             database_factory=lambda _url: database,
             llm_provider_factory=lambda _environment: TemplateLLMProvider(),
@@ -477,7 +492,7 @@ class StructuredWiringTest(unittest.TestCase):
             return custom_queue
 
         production = create_production_app(
-            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "true"},
+            environ=self.enabled_environment(),
             repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
             database_factory=lambda _url: database,
             llm_provider_factory=lambda _environment: TemplateLLMProvider(),
@@ -494,7 +509,7 @@ class StructuredWiringTest(unittest.TestCase):
     def test_production_app_passes_flag_and_repository_to_default_queue(self) -> None:
         database = Database("sqlite+pysqlite:///:memory:")
         production = create_production_app(
-            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "true"},
+            environ=self.enabled_environment(),
             repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
             database_factory=lambda _url: database,
             llm_provider_factory=lambda _environment: TemplateLLMProvider(),

@@ -368,7 +368,6 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             query_password = root / "query-password"
-            ingest_password = root / "missing-ingest-password"
             query_password.write_text("query-secret", encoding="utf-8")
 
             def build_client(**kwargs: object) -> LifecycleClickHouseClient:
@@ -381,8 +380,6 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                     "STRUCTURED_QUERY_ENABLED": "true",
                     "CLICKHOUSE_QUERY_USER": "query-user",
                     "CLICKHOUSE_QUERY_PASSWORD_FILE": str(query_password),
-                    "CLICKHOUSE_INGEST_USER": "ingest-user",
-                    "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
                     "STRUCTURED_QUERY_TIMEOUT_SECONDS": "4",
                 },
                 database_factory=lambda _url: database,
@@ -412,6 +409,34 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(gateway._gateway._settings["max_execution_time"], 4)
         self.assertNotIn("ingest-user", repr(client_calls))
         self.assertNotIn("ingest-secret", repr(client_calls))
+
+    def test_default_repository_requires_query_secret_before_database_or_clickhouse(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            directory = root / "directory"
+            directory.mkdir()
+            for value in (None, "", str(root / "missing"), str(directory)):
+                database_calls: list[str] = []
+                client_calls: list[dict[str, object]] = []
+                environ = {
+                    "OFFLINE_MODE": "true",
+                    "STRUCTURED_QUERY_ENABLED": "true",
+                }
+                if value is not None:
+                    environ["CLICKHOUSE_QUERY_PASSWORD_FILE"] = value
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "CLICKHOUSE_QUERY_PASSWORD_FILE",
+                    ):
+                        create_default_repository(
+                            llm_provider=RecordingLLMProvider(),
+                            environ=environ,
+                            database_factory=lambda url: database_calls.append(url),
+                            clickhouse_client_factory=lambda **kwargs: client_calls.append(kwargs),
+                        )
+                    self.assertEqual(database_calls, [])
+                    self.assertEqual(client_calls, [])
 
     def test_lazy_gateway_shared_query_client_avoids_session_concurrency_errors(self) -> None:
         all_queries_attempted = Event()
@@ -472,12 +497,19 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             clients.append(client)
             return client
 
-        repository = create_default_repository(
-            environ={"OFFLINE_MODE": "true", "STRUCTURED_QUERY_ENABLED": "true"},
-            database_factory=lambda _url: database,
-            clickhouse_client_factory=build_client,
-        )
-        repository._structured_service._clickhouse_gateway.query("SELECT 1", {})
+        with TemporaryDirectory() as temp_dir:
+            password_file = Path(temp_dir) / "query-password"
+            password_file.write_text("query-secret", encoding="utf-8")
+            repository = create_default_repository(
+                environ={
+                    "OFFLINE_MODE": "true",
+                    "STRUCTURED_QUERY_ENABLED": "true",
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE": str(password_file),
+                },
+                database_factory=lambda _url: database,
+                clickhouse_client_factory=build_client,
+            )
+            repository._structured_service._clickhouse_gateway.query("SELECT 1", {})
 
         repository.close()
         repository.close()
@@ -528,15 +560,22 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             clients.append(kwargs)
             return Client()
 
-        repository = create_default_repository(
-            environ={"OFFLINE_MODE": "true", "STRUCTURED_QUERY_ENABLED": "true"},
-            database_factory=lambda _url: database,
-            clickhouse_client_factory=build_client,
-        )
+        with TemporaryDirectory() as temp_dir:
+            password_file = Path(temp_dir) / "query-password"
+            password_file.write_text("query-secret", encoding="utf-8")
+            repository = create_default_repository(
+                environ={
+                    "OFFLINE_MODE": "true",
+                    "STRUCTURED_QUERY_ENABLED": "true",
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE": str(password_file),
+                },
+                database_factory=lambda _url: database,
+                clickhouse_client_factory=build_client,
+            )
 
-        self.assertIsNotNone(repository._structured_service)
-        self.assertEqual(clients, [])
-        repository._structured_service._clickhouse_gateway.query("SELECT 1", {})
+            self.assertIsNotNone(repository._structured_service)
+            self.assertEqual(clients, [])
+            repository._structured_service._clickhouse_gateway.query("SELECT 1", {})
         self.assertEqual(len(clients), 2)
 
     def test_production_default_does_not_construct_clickhouse_when_disabled(self) -> None:
@@ -587,22 +626,29 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             clients.append(client)
             return client
 
-        app = create_production_app(
-            environ={"OFFLINE_MODE": "true", "STRUCTURED_QUERY_ENABLED": "true"},
-            database_factory=lambda _url: database,
-            repository_factory=lambda: repository,
-            health_registry_factory=lambda: DependencyHealthRegistry([]),
-            ingestion_queue_factory=lambda **_kwargs: object(),
-            storage_factory=lambda _root: object(),
-            evaluation_import_service_factory=lambda: object(),
-            clickhouse_client_factory=build_client,
-        )
         from fastapi.testclient import TestClient
 
-        with TestClient(app):
-            self.assertIsNotNone(repository._structured_service)
-            self.assertEqual(len([item for item in clients if isinstance(item, Client)]), 0)
-            repository._structured_service._clickhouse_gateway.query("SELECT 1", {})
+        with TemporaryDirectory() as temp_dir:
+            password_file = Path(temp_dir) / "query-password"
+            password_file.write_text("query-secret", encoding="utf-8")
+            app = create_production_app(
+                environ={
+                    "OFFLINE_MODE": "true",
+                    "STRUCTURED_QUERY_ENABLED": "true",
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE": str(password_file),
+                },
+                database_factory=lambda _url: database,
+                repository_factory=lambda: repository,
+                health_registry_factory=lambda: DependencyHealthRegistry([]),
+                ingestion_queue_factory=lambda **_kwargs: object(),
+                storage_factory=lambda _root: object(),
+                evaluation_import_service_factory=lambda: object(),
+                clickhouse_client_factory=build_client,
+            )
+            with TestClient(app):
+                self.assertIsNotNone(repository._structured_service)
+                self.assertEqual(len([item for item in clients if isinstance(item, Client)]), 0)
+                repository._structured_service._clickhouse_gateway.query("SELECT 1", {})
         self.assertEqual(len([item for item in clients if isinstance(item, Client)]), 2)
         self.assertTrue(all(item.close_calls == 1 for item in clients if isinstance(item, Client)))
 

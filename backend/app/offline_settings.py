@@ -38,6 +38,12 @@ def read_secret_file(path: str | Path, field_name: str) -> str:
     return value
 
 
+def require_secret_file(path: Path | None, field_name: str) -> str:
+    if path is None:
+        raise OfflineSettingsError(f"{field_name} is required when STRUCTURED_QUERY_ENABLED=true")
+    return read_secret_file(path, field_name)
+
+
 def _password_file_from_environ(
     environ: Mapping[str, str],
     *,

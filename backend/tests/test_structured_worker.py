@@ -670,7 +670,6 @@ class StructuredWorkerTest(unittest.TestCase):
 
         root = Path(self.temp_dir.name)
         ingest_password = root / "ingest-password"
-        query_password = root / "missing-query-password"
         ingest_password.write_text("ingest-secret", encoding="utf-8")
 
         def build_client(**kwargs):
@@ -687,8 +686,6 @@ class StructuredWorkerTest(unittest.TestCase):
                 "STRUCTURED_QUERY_ENABLED": "true",
                 "CLICKHOUSE_INGEST_USER": "ingest-user",
                 "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
-                "CLICKHOUSE_QUERY_USER": "query-user",
-                "CLICKHOUSE_QUERY_PASSWORD_FILE": str(query_password),
                 "STRUCTURED_QUERY_TIMEOUT_SECONDS": "4",
             },
             database_factory=lambda _url: self.database,
@@ -722,6 +719,46 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertIs(gateway._query_client, clients[1])
         self.assertIsNot(gateway._ingest_client, gateway._query_client)
 
+    def test_worker_factory_requires_ingest_secret_before_resource_factories(self) -> None:
+        root = Path(self.temp_dir.name)
+        directory = root / "password-directory"
+        directory.mkdir()
+        for value in (None, "", str(root / "missing"), str(directory)):
+            database_calls: list[str] = []
+            client_calls: list[dict[str, object]] = []
+            environ = {
+                "STRUCTURED_QUERY_ENABLED": "true",
+                "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+            }
+            if value is not None:
+                environ["CLICKHOUSE_INGEST_PASSWORD_FILE"] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "CLICKHOUSE_INGEST_PASSWORD_FILE"):
+                    build_structured_worker(
+                        environ,
+                        database_factory=lambda url: database_calls.append(url),
+                        clickhouse_client_factory=lambda **kwargs: client_calls.append(kwargs),
+                    )
+                self.assertEqual(database_calls, [])
+                self.assertEqual(client_calls, [])
+
+    def test_worker_factory_refuses_disabled_feature_before_resource_factories(self) -> None:
+        database_calls: list[str] = []
+        client_calls: list[dict[str, object]] = []
+
+        with self.assertRaisesRegex(ValueError, "STRUCTURED_QUERY_ENABLED=true"):
+            build_structured_worker(
+                {
+                    "STRUCTURED_QUERY_ENABLED": "false",
+                    "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+                },
+                database_factory=lambda url: database_calls.append(url),
+                clickhouse_client_factory=lambda **kwargs: client_calls.append(kwargs),
+            )
+
+        self.assertEqual(database_calls, [])
+        self.assertEqual(client_calls, [])
+
     def test_worker_factory_closes_ingest_client_when_query_client_creation_fails(self) -> None:
         class Client:
             def __init__(self) -> None:
@@ -731,6 +768,8 @@ class StructuredWorkerTest(unittest.TestCase):
                 self.close_calls += 1
 
         ingest_client = Client()
+        ingest_password = Path(self.temp_dir.name) / "cleanup-ingest-password"
+        ingest_password.write_text("ingest-secret", encoding="utf-8")
         calls = 0
 
         def build_client(**_kwargs: object) -> Client:
@@ -743,6 +782,8 @@ class StructuredWorkerTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "query client failed"):
             build_structured_worker(
                 {
+                    "STRUCTURED_QUERY_ENABLED": "true",
+                    "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
                     "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
                     "CLICKHOUSE_URL": "http://127.0.0.1:8123",
                     "PARQUET_ROOT": self.temp_dir.name,
@@ -762,9 +803,13 @@ class StructuredWorkerTest(unittest.TestCase):
                 self.close_calls += 1
 
         client = Client()
+        ingest_password = Path(self.temp_dir.name) / "shared-ingest-password"
+        ingest_password.write_text("ingest-secret", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "separate read-only identities"):
             build_structured_worker(
                 {
+                    "STRUCTURED_QUERY_ENABLED": "true",
+                    "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
                     "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
                     "CLICKHOUSE_URL": "http://127.0.0.1:8123",
                     "PARQUET_ROOT": self.temp_dir.name,

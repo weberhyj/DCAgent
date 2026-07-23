@@ -26,7 +26,7 @@ from .infra.health import (
 )
 from .ingestion import KnowledgeIngestionQueue
 from .llm import LLMProvider, create_llm_provider
-from .offline_settings import OfflineSettings, parse_bool, read_secret_file
+from .offline_settings import OfflineSettings, parse_bool, require_secret_file
 from .repository import ChatRepository
 from .routes import router
 from .runtime_env import load_runtime_environment
@@ -56,6 +56,14 @@ def create_default_repository(
         }
     enabled = parse_bool(source.get("STRUCTURED_QUERY_ENABLED"), default=False)
     settings = OfflineSettings.from_environ(source) if enabled else None
+    query_password = (
+        require_secret_file(
+            settings.clickhouse_query_password_file,
+            "CLICKHOUSE_QUERY_PASSWORD_FILE",
+        )
+        if settings is not None
+        else None
+    )
     database_url = settings.database_url if settings is not None else resolve_database_url(source)
     database = database_factory(database_url)
     database.create_schema()
@@ -65,6 +73,7 @@ def create_default_repository(
         structured_service, _clients = _create_structured_answer_service(
             settings,
             structured_repository,
+            query_password=query_password,
             clickhouse_client_factory=clickhouse_client_factory,
         )
     repository = SqlChatRepository(
@@ -234,6 +243,14 @@ def create_production_app(
                 source = environment_override
 
             settings = OfflineSettings.from_environ(source)
+            query_password = (
+                require_secret_file(
+                    settings.clickhouse_query_password_file,
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE",
+                )
+                if settings.structured_query_enabled
+                else None
+            )
             if health_registry_factory is None:
                 validate_health_service_urls(settings, source)
             provider_builder = llm_provider_factory or create_llm_provider
@@ -252,6 +269,7 @@ def create_production_app(
                 structured_service, clickhouse_clients = _create_structured_answer_service(
                     settings,
                     structured_repository,
+                    query_password=query_password,
                     clickhouse_client_factory=clickhouse_client_factory,
                 )
                 for client in clickhouse_clients:
@@ -370,6 +388,7 @@ def _create_structured_answer_service(
     settings: OfflineSettings,
     structured_repository: StructuredRepository,
     *,
+    query_password: str | None = None,
     clickhouse_client_factory: Callable[..., object] | None = None,
 ) -> tuple[StructuredAnswerService, tuple[object, ...]]:
     if not settings.structured_query_enabled:
@@ -378,14 +397,11 @@ def _create_structured_answer_service(
         import clickhouse_connect
 
         clickhouse_client_factory = clickhouse_connect.get_client
-    query_password = (
-        read_secret_file(
+    if query_password is None:
+        query_password = require_secret_file(
             settings.clickhouse_query_password_file,
             "CLICKHOUSE_QUERY_PASSWORD_FILE",
         )
-        if settings.clickhouse_query_password_file is not None
-        else ""
-    )
     gateway = _LazyStructuredQueryGateway(
         clickhouse_client_factory,
         settings.clickhouse_url,

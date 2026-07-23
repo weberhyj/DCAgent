@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 from .clickhouse_gateway import ClickHouseGateway
 from .database import Database
-from .offline_settings import OfflineSettings, read_secret_file
+from .offline_settings import OfflineSettings, require_secret_file
 from .structured_ingestion import SpreadsheetPublisher
 from .structured_models import StructuredPublicationResult
 from .structured_repository import (
@@ -209,20 +209,18 @@ def build_structured_worker(
 ) -> StructuredIngestionWorker:
     source = os.environ if environ is None else environ
     settings = OfflineSettings.from_environ(source)
+    if not settings.structured_query_enabled:
+        raise ValueError("structured worker requires STRUCTURED_QUERY_ENABLED=true")
+    ingest_password = require_secret_file(
+        settings.clickhouse_ingest_password_file,
+        "CLICKHOUSE_INGEST_PASSWORD_FILE",
+    )
     database = database_factory(settings.database_url)
     repository = StructuredRepository(database)
     if clickhouse_client_factory is None:
         import clickhouse_connect
 
         clickhouse_client_factory = clickhouse_connect.get_client
-    ingest_password = (
-        read_secret_file(
-            settings.clickhouse_ingest_password_file,
-            "CLICKHOUSE_INGEST_PASSWORD_FILE",
-        )
-        if settings.clickhouse_ingest_password_file is not None
-        else ""
-    )
     client_kwargs = {
         "dsn": settings.clickhouse_url,
         "username": settings.clickhouse_ingest_user,
