@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "DC-Agent backend service"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "asynctor>=0.13.2",
     "fastapi>=0.116.0",
+    "gunicorn>=26.0.0",
     "httpx>=0.28.0",
     "langgraph>=0.2.0,<2.0.0",
     "openpyxl>=3.1.0",
@@ -36,7 +38,7 @@ offline = [
     "psutil>=7,<8",
 ]
 benchmark = [{ include-group = "offline" }, "locust>=2.37,<3"]
-dev = ["alembic>=1.16,<2", "ruff==0.15.22"]
+dev = ["alembic>=1.16,<2", "fastapi-cli>=0.0.32"]
 
 [tool.uv]
 package = false
