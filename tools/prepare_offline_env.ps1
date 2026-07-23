@@ -10,6 +10,8 @@ $envPath = Join-Path $repo "deploy/offline/.env"
 $secretDir = Join-Path $repo "artifacts/secrets"
 $passwordPath = Join-Path $secretDir "postgres-password"
 $databasePath = Join-Path $secretDir "database-url"
+$clickhouseQueryPasswordPath = Join-Path $secretDir "clickhouse-query-password"
+$clickhouseIngestPasswordPath = Join-Path $secretDir "clickhouse-ingest-password"
 
 function Get-OfflineEnvValue {
     param(
@@ -529,6 +531,43 @@ function New-OfflinePassword {
     return [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_').TrimEnd('=')
 }
 
+function Assert-OfflinePasswordSecret {
+    param([string]$Path)
+
+    Assert-OfflineRegularFile -Path $Path
+    $password = [IO.File]::ReadAllText(
+        (Resolve-Path -LiteralPath $Path),
+        [Text.Encoding]::ASCII
+    )
+    if ($password -notmatch '^[A-Za-z0-9_-]{43}$') {
+        throw "Offline ClickHouse password must be a 43-character URL-safe secret: $Path"
+    }
+}
+
+function Publish-OfflinePasswordSecret {
+    param(
+        [string]$Path,
+        [string]$Password
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        throw "Refusing to overwrite an existing ClickHouse password secret: $Path"
+    }
+    $stagedPath = "$Path.new"
+    try {
+        Remove-SafeSecretLeaf -Path $stagedPath
+        Set-Content -LiteralPath $stagedPath -Value $Password -NoNewline -Encoding Ascii
+        Protect-SecretPath -Path $stagedPath
+        Assert-OfflinePasswordSecret -Path $stagedPath
+        Move-Item -LiteralPath $stagedPath -Destination $Path
+        Protect-SecretPath -Path $Path
+        Assert-OfflinePasswordSecret -Path $Path
+    }
+    finally {
+        Remove-SafeSecretLeaf -Path $stagedPath
+    }
+}
+
 function Assert-OfflineSecretPair {
     param(
         [string]$PasswordFile,
@@ -640,13 +679,40 @@ $configuredPasswordPath = Resolve-OfflineComposePath -Name "POSTGRES_PASSWORD_FI
 $configuredDatabasePath = Resolve-OfflineComposePath -Name "DATABASE_URL_SECRET_FILE"
 Assert-OfflineExpectedPath -Name "POSTGRES_PASSWORD_FILE" -ActualPath $configuredPasswordPath -ExpectedPath $passwordPath
 Assert-OfflineExpectedPath -Name "DATABASE_URL_SECRET_FILE" -ActualPath $configuredDatabasePath -ExpectedPath $databasePath
-foreach ($targetPath in @(
+$clickhouseSecretNames = @(
+    "CLICKHOUSE_QUERY_PASSWORD_FILE",
+    "CLICKHOUSE_INGEST_PASSWORD_FILE"
+)
+$clickhouseConfiguredCount = @(
+    $clickhouseSecretNames |
+        Where-Object {
+            -not [string]::IsNullOrWhiteSpace(
+                (Get-OfflineEnvValue -Path $envPath -Name $_ -RejectQuotes)
+            )
+        }
+).Count
+if ($clickhouseConfiguredCount -notin @(0, 2)) {
+    throw "Both ClickHouse password file paths must be configured together"
+}
+$clickhouseSecretPaths = @()
+if ($clickhouseConfiguredCount -eq 2) {
+    $configuredClickhouseQueryPasswordPath = Resolve-OfflineComposePath -Name "CLICKHOUSE_QUERY_PASSWORD_FILE"
+    $configuredClickhouseIngestPasswordPath = Resolve-OfflineComposePath -Name "CLICKHOUSE_INGEST_PASSWORD_FILE"
+    Assert-OfflineExpectedPath -Name "CLICKHOUSE_QUERY_PASSWORD_FILE" -ActualPath $configuredClickhouseQueryPasswordPath -ExpectedPath $clickhouseQueryPasswordPath
+    Assert-OfflineExpectedPath -Name "CLICKHOUSE_INGEST_PASSWORD_FILE" -ActualPath $configuredClickhouseIngestPasswordPath -ExpectedPath $clickhouseIngestPasswordPath
+    $clickhouseSecretPaths = @(
+        $clickhouseQueryPasswordPath,
+        $clickhouseIngestPasswordPath
+    )
+}
+$managedTargetPaths = @(
     $dataRoot,
     $modelRoot,
     $secretDir,
     $passwordPath,
     $databasePath
-)) {
+) + $clickhouseSecretPaths
+foreach ($targetPath in $managedTargetPaths) {
     Assert-OfflinePathAncestorsAreNotLinks -Path $targetPath
 }
 if (Test-Path -LiteralPath $secretDir) {
@@ -669,6 +735,11 @@ if ($present -eq 2) {
     Assert-OfflineRegularFile -Path $databasePath
     Assert-OfflineSecretPair -PasswordFile $passwordPath -DatabaseFile $databasePath
 }
+foreach ($clickhouseSecretPath in $clickhouseSecretPaths) {
+    if (Test-Path -LiteralPath $clickhouseSecretPath) {
+        Assert-OfflinePasswordSecret -Path $clickhouseSecretPath
+    }
+}
 if (Test-OfflineLinuxHost) {
     if (Test-Path -LiteralPath $secretDir) {
         Assert-OfflineLinuxPathContract -Path $secretDir -ExpectedMode "700" -ExpectedUID $offlineIdentity.UID -ExpectedGID $offlineIdentity.GID
@@ -676,6 +747,11 @@ if (Test-OfflineLinuxHost) {
     if ($present -eq 2) {
         Assert-OfflineLinuxPathContract -Path $passwordPath -ExpectedMode "600" -ExpectedUID $offlineIdentity.UID -ExpectedGID $offlineIdentity.GID
         Assert-OfflineLinuxPathContract -Path $databasePath -ExpectedMode "600" -ExpectedUID $offlineIdentity.UID -ExpectedGID $offlineIdentity.GID
+    }
+    foreach ($clickhouseSecretPath in $clickhouseSecretPaths) {
+        if (Test-Path -LiteralPath $clickhouseSecretPath) {
+            Assert-OfflineLinuxPathContract -Path $clickhouseSecretPath -ExpectedMode "600" -ExpectedUID $offlineIdentity.UID -ExpectedGID $offlineIdentity.GID
+        }
     }
 }
 
@@ -710,5 +786,18 @@ if ($RotateSecrets -or $present -eq 0) {
     if (Test-OfflineLinuxHost) {
         Assert-OfflineLinuxPathContract -Path $passwordPath -ExpectedMode "600" -ExpectedUID $offlineIdentity.UID -ExpectedGID $offlineIdentity.GID
         Assert-OfflineLinuxPathContract -Path $databasePath -ExpectedMode "600" -ExpectedUID $offlineIdentity.UID -ExpectedGID $offlineIdentity.GID
+    }
+}
+
+foreach ($clickhouseSecretPath in $clickhouseSecretPaths) {
+    if (Test-Path -LiteralPath $clickhouseSecretPath) {
+        Protect-SecretPath -Path $clickhouseSecretPath
+        Assert-OfflinePasswordSecret -Path $clickhouseSecretPath
+    }
+    else {
+        Publish-OfflinePasswordSecret -Path $clickhouseSecretPath -Password (New-OfflinePassword)
+    }
+    if (Test-OfflineLinuxHost) {
+        Assert-OfflineLinuxPathContract -Path $clickhouseSecretPath -ExpectedMode "600" -ExpectedUID $offlineIdentity.UID -ExpectedGID $offlineIdentity.GID
     }
 }

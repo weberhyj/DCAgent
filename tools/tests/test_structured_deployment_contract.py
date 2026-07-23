@@ -97,11 +97,14 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             "CLICKHOUSE_INGEST_USER",
             "CLICKHOUSE_INGEST_PASSWORD_FILE",
             "PARQUET_ROOT",
-            "STRUCTURED_QUERY_TIMEOUT_SECONDS",
             "STRUCTURED_INGEST_BATCH_ROWS",
         ):
             self.assertRegex(worker, rf"(?m)^\s+{key}:")
-        for key in ("CLICKHOUSE_QUERY_USER", "CLICKHOUSE_QUERY_PASSWORD_FILE"):
+        for key in (
+            "CLICKHOUSE_QUERY_USER",
+            "CLICKHOUSE_QUERY_PASSWORD_FILE",
+            "STRUCTURED_QUERY_TIMEOUT_SECONDS",
+        ):
             self.assertNotRegex(worker, rf"(?m)^\s+{key}:")
         self.assertIn('profiles: ["indexing"]', worker)
         self.assertIn('command: ["python", "-m", "app.structured_worker"]', worker)
@@ -122,6 +125,81 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertIn("clickhouse_ingest_password:", compose)
         self.assertIn("CLICKHOUSE_QUERY_PASSWORD_FILE", env)
         self.assertIn("CLICKHOUSE_INGEST_PASSWORD_FILE", env)
+
+    def test_compose_bootstraps_role_specific_clickhouse_accounts(self) -> None:
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        clickhouse = service_block(compose, "clickhouse")
+        for token in (
+            "CLICKHOUSE_QUERY_USER:",
+            "CLICKHOUSE_INGEST_USER:",
+            'CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"',
+            "clickhouse_query_password",
+            "clickhouse_ingest_password",
+            "/docker-entrypoint-initdb.d/010-dcagent-structured-users.sh",
+        ):
+            self.assertIn(token, clickhouse)
+
+        init_script = REPO_ROOT / "deploy" / "offline" / "clickhouse-init.sh"
+        self.assertTrue(init_script.is_file())
+        script = init_script.read_text(encoding="utf-8")
+        for token in (
+            "/run/secrets/clickhouse_query_password",
+            "/run/secrets/clickhouse_ingest_password",
+            "CREATE USER IF NOT EXISTS",
+            "ALTER USER",
+            "REVOKE ALL ON *.*",
+            "GRANT SELECT ON default.*",
+            "CREATE TABLE",
+            "INSERT",
+            "ALTER TABLE",
+            "DROP TABLE",
+            "TRUNCATE",
+        ):
+            self.assertIn(token, script)
+
+    def test_offline_tools_govern_clickhouse_secrets_at_fixed_paths(self) -> None:
+        prepare = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(
+            encoding="utf-8"
+        )
+        wrapper = (REPO_ROOT / "tools" / "invoke_offline_compose.ps1").read_text(
+            encoding="utf-8"
+        )
+        for filename, env_name, compose_name in (
+            (
+                "clickhouse-query-password",
+                "CLICKHOUSE_QUERY_PASSWORD_FILE",
+                "clickhouse_query_password",
+            ),
+            (
+                "clickhouse-ingest-password",
+                "CLICKHOUSE_INGEST_PASSWORD_FILE",
+                "clickhouse_ingest_password",
+            ),
+        ):
+            with self.subTest(filename=filename):
+                self.assertIn(filename, prepare)
+                self.assertRegex(
+                    prepare,
+                    rf'Assert-OfflineExpectedPath\s+-Name\s+"{env_name}"',
+                )
+                self.assertIn(filename, wrapper)
+                self.assertIn(f'"{compose_name}"', wrapper)
+        self.assertIn(
+            "Publish-OfflinePasswordSecret -Path $clickhouseSecretPath", prepare
+        )
+        self.assertIn(
+            "Assert-OfflinePasswordSecret -Path $clickhouseSecretPath", prepare
+        )
+
+        for security_check in (
+            "Assert-OfflinePathAncestorsAreNotLinks",
+            "Assert-OfflineRegularFile",
+            "Protect-SecretPath",
+            "Assert-OfflineLinuxPathContract",
+        ):
+            self.assertIn(security_check, prepare)
 
     def test_docs_describe_enablement_migration_smoke_and_fail_closed_rollback(
         self,

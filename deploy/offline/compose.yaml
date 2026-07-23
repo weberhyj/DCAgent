@@ -27,10 +27,23 @@ services:
   clickhouse:
     image: ${CLICKHOUSE_IMAGE:?CLICKHOUSE_IMAGE is required}
     restart: unless-stopped
+    environment:
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_QUERY_USER: ${CLICKHOUSE_QUERY_USER:?CLICKHOUSE_QUERY_USER is required}
+      CLICKHOUSE_INGEST_USER: ${CLICKHOUSE_INGEST_USER:?CLICKHOUSE_INGEST_USER is required}
+    secrets:
+      - clickhouse_query_password
+      - clickhouse_ingest_password
     volumes:
       - type: bind
         source: ${DATA_ROOT:?DATA_ROOT is required}/clickhouse
         target: /var/lib/clickhouse
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./clickhouse-init.sh
+        target: /docker-entrypoint-initdb.d/010-dcagent-structured-users.sh
+        read_only: true
         bind:
           create_host_path: false
     networks:
@@ -233,7 +246,6 @@ services:
       CLICKHOUSE_URL: ${CLICKHOUSE_URL:?CLICKHOUSE_URL is required}
       CLICKHOUSE_INGEST_USER: ${CLICKHOUSE_INGEST_USER:?CLICKHOUSE_INGEST_USER is required}
       CLICKHOUSE_INGEST_PASSWORD_FILE: /run/secrets/clickhouse_ingest_password
-      STRUCTURED_QUERY_TIMEOUT_SECONDS: ${STRUCTURED_QUERY_TIMEOUT_SECONDS:?STRUCTURED_QUERY_TIMEOUT_SECONDS is required}
       STRUCTURED_INGEST_BATCH_ROWS: ${STRUCTURED_INGEST_BATCH_ROWS:?STRUCTURED_INGEST_BATCH_ROWS is required}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0

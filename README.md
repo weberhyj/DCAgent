@@ -94,8 +94,9 @@ private ClickHouse service.
 
 The query API uses the `CLICKHOUSE_QUERY_USER` account and its password file; the indexing worker
 uses the separate `CLICKHOUSE_INGEST_USER` account and password file. Password values must not be
-placed in `.env` or an example file. The default query timeout is 4 seconds and the default bounded
-ingestion batch is 50,000 rows.
+placed in `.env` or an example file. The 4-second timeout applies only to API aggregate connection
+and query execution. Structured publication keeps the storage gateway's independent 30-second
+execution default, and the default bounded ingestion batch is 50,000 rows.
 
 The feature is usable only after an administrator has approved a confirmed schema for the XLSX/CSV
 dataset and the offline `--profile indexing` worker has published that schema version. See

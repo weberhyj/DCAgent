@@ -145,12 +145,20 @@ class ComposeContractTest(unittest.TestCase):
                 root / "artifacts" / "secrets" / "postgres-password"
             ).resolve()
             database_path = (root / "artifacts" / "secrets" / "database-url").resolve()
+            query_password_path = (
+                root / "artifacts" / "secrets" / "clickhouse-query-password"
+            ).resolve()
+            ingest_password_path = (
+                root / "artifacts" / "secrets" / "clickhouse-ingest-password"
+            ).resolve()
             safe_image = "registry.internal/dc-agent/runtime@sha256:" + "a" * 64
             (root / "deploy" / "offline" / ".env").write_text(
                 f"DATA_ROOT={data_root}\n"
                 f"MODEL_ROOT={model_root}\n"
                 f"POSTGRES_PASSWORD_FILE={password_path}\n"
                 f"DATABASE_URL_SECRET_FILE={database_path}\n"
+                f"CLICKHOUSE_QUERY_PASSWORD_FILE={query_password_path}\n"
+                f"CLICKHOUSE_INGEST_PASSWORD_FILE={ingest_password_path}\n"
                 f"POSTGRES_IMAGE={safe_image}\n"
                 "DCAGENT_UID=1000\n"
                 "DCAGENT_GID=1000\n",
@@ -177,7 +185,11 @@ class ComposeContractTest(unittest.TestCase):
                     "clickhouse": {
                         "image": safe_image,
                         "volumes": [
-                            bind(data_root / "clickhouse", "/var/lib/clickhouse")
+                            bind(data_root / "clickhouse", "/var/lib/clickhouse"),
+                            bind(
+                                root / "deploy" / "offline" / "clickhouse-init.sh",
+                                "/docker-entrypoint-initdb.d/010-dcagent-structured-users.sh",
+                            ),
                         ],
                     },
                     "qdrant": {
@@ -228,6 +240,8 @@ class ComposeContractTest(unittest.TestCase):
                 "secrets": {
                     "postgres_password": {"file": str(password_path)},
                     "database_url": {"file": str(database_path)},
+                    "clickhouse_query_password": {"file": str(query_password_path)},
+                    "clickhouse_ingest_password": {"file": str(ingest_password_path)},
                 },
             }
             render_path = root / "render.json"
@@ -477,6 +491,25 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn(
                 "secret", (rejected_secret.stdout + rejected_secret.stderr).lower()
             )
+
+            for secret_name in (
+                "clickhouse_query_password",
+                "clickhouse_ingest_password",
+            ):
+                with self.subTest(secret_name=secret_name):
+                    unsafe_clickhouse_secret = json.loads(json.dumps(rendered))
+                    unsafe_clickhouse_secret["secrets"][secret_name]["file"] = str(
+                        root / "external-secret"
+                    )
+                    rejected_clickhouse_secret = run(unsafe_clickhouse_secret)
+                    self.assertNotEqual(0, rejected_clickhouse_secret.returncode)
+                    self.assertIn(
+                        "secret",
+                        (
+                            rejected_clickhouse_secret.stdout
+                            + rejected_clickhouse_secret.stderr
+                        ).lower(),
+                    )
 
             public_api = json.loads(json.dumps(rendered))
             public_api["services"]["api"]["ports"][0]["host_ip"] = "0.0.0.0"
@@ -1675,8 +1708,8 @@ class ComposeContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertNotRegex(compose_text, r"(?m)^\s*-\s+\$\{[^}]+\}[^\n]*:")
-        self.assertEqual(12, compose_text.count("type: bind"))
-        self.assertEqual(12, compose_text.count("create_host_path: false"))
+        self.assertEqual(13, compose_text.count("type: bind"))
+        self.assertEqual(13, compose_text.count("create_host_path: false"))
 
     def test_linux_identity_and_path_hardening_contract(self) -> None:
         script_text = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(

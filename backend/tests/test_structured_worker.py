@@ -701,20 +701,18 @@ class StructuredWorkerTest(unittest.TestCase):
                     "dsn": "http://127.0.0.1:8123",
                     "username": "ingest-user",
                     "password": "ingest-secret",
-                    "send_receive_timeout": 4,
                 },
                 {
                     "dsn": "http://127.0.0.1:8123",
                     "username": "ingest-user",
                     "password": "ingest-secret",
-                    "send_receive_timeout": 4,
                     "autogenerate_session_id": False,
                 },
             ],
         )
         self.assertNotIn("query-user", repr(calls))
         self.assertNotIn("query-secret", repr(calls))
-        self.assertEqual(gateway._settings["max_execution_time"], 4)
+        self.assertEqual(gateway._settings["max_execution_time"], 30)
         self.assertIs(gateway._ingest_client, clients[0])
         self.assertIs(gateway._query_client, clients[1])
         self.assertIsNot(gateway._ingest_client, gateway._query_client)

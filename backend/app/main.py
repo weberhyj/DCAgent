@@ -497,6 +497,7 @@ class _LazyStructuredQueryGateway:
             client_kwargs["username"] = self._username
             client_kwargs["password"] = self._password or ""
         if self._timeout_seconds is not None:
+            client_kwargs["connect_timeout"] = self._timeout_seconds
             client_kwargs["send_receive_timeout"] = self._timeout_seconds
         ingest_client = self._client_factory(**client_kwargs)
         try:

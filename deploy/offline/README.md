@@ -4,7 +4,7 @@ This Compose project is the private, single-server deployment contract for DC-Ag
 
 ## Prepare local configuration
 
-Run `tools/prepare_offline_env.ps1` from the repository root. The script copies `.env.example` only when `.env` is absent and creates the PostgreSQL password/database URL secret pair only when neither file exists. It refuses a partial pair and never prints secret values. Secret files are staged, validated, permission-restricted, and published as a recoverable pair.
+Run `tools/prepare_offline_env.ps1` from the repository root. The script copies `.env.example` only when `.env` is absent and creates the PostgreSQL password/database URL secret pair only when neither file exists. It also preserves valid existing ClickHouse role passwords or generates missing 43-character URL-safe passwords at the fixed repository-managed paths. It refuses partial path configuration and never prints secret values. Secret files are staged, validated, permission-restricted, and published without allowing `.env` to redirect them outside `artifacts/secrets`.
 
 The supported production host contract is **local rootful Linux Compose v2**. The same non-root deployment account must prepare configuration, build the three Python images, and start Compose. `tools/invoke_offline_compose.ps1` is the only supported Compose entry point; do not invoke `docker compose` directly. The wrapper removes every `.env` key and Compose model-selector variable from the child process environment, fixes and inspects the local `default` Docker context, renders every profile with `config --format json`, validates the fixed project name, internal digest-pinned images, approved bind/secret paths, and only then executes the requested Compose arguments. For example, run `& tools/invoke_offline_compose.ps1 up -d`. Configuration/project overrides, one-off `run`, `create`, `start`, `restart`, build-argument overrides, and `up` flags that skip recreation, builds, dependencies, or alter scale are rejected; use `up` to reconcile stopped services with the validated model. On first generation the preparation script records the account's `id -u` and `id -g` as `DCAGENT_UID` and `DCAGENT_GID`; an existing `.env` and any shell overrides must match those exact non-zero numeric values. The locked `PYTHON_BASE_IMAGE` must be a Debian-family image that provides `groupadd` and `useradd`, with the `dcagent` name and selected IDs unused. The Dockerfiles create and verify `dcagent` with those IDs and still finish as `USER dcagent`; rebuild these host-bound images when the deployment UID/GID changes. Host secret files remain mode `0600`; the secret directory and writable `raw`/`parquet` directories remain owned by the deployment account at mode `0700`.
 
@@ -35,12 +35,26 @@ Structured Excel/CSV aggregation is disabled by default. Keep
 
 1. Back up PostgreSQL, verify restore, and let the one-shot `schema-migration` service apply the
    structured metadata migration.
-2. Provision separate least-privilege ClickHouse accounts named by `CLICKHOUSE_QUERY_USER` and
-   `CLICKHOUSE_INGEST_USER`. The query account is read-only; the ingestion account may create,
-   insert, validate, rename, and promote the governed versioned tables.
-3. Create the files referenced by `CLICKHOUSE_QUERY_PASSWORD_FILE` and
-   `CLICKHOUSE_INGEST_PASSWORD_FILE` under `artifacts/secrets`, restrict them to mode `0600`, and
-   ensure the deployment account owns them. Each enabled process requires its role-specific password file: API requires the query file and the worker requires the ingest file. Never put either password directly in `.env`.
+2. Run `tools/prepare_offline_env.ps1`. It fixes `CLICKHOUSE_QUERY_PASSWORD_FILE` and
+   `CLICKHOUSE_INGEST_PASSWORD_FILE` to repository-managed files under `artifacts/secrets`, creates
+   missing values with a CSPRNG, preserves valid existing values, and restricts them to mode `0600`
+   under the deployment account. Never put either password directly in `.env`.
+3. The version-controlled `clickhouse-init.sh` creates or updates separate least-privilege accounts
+   named by `CLICKHOUSE_QUERY_USER` and `CLICKHOUSE_INGEST_USER`. The query account receives only
+   `SELECT` on `default.*`; the ingestion account receives the table publication privileges plus
+   read access to `system.tables`. A fresh ClickHouse data directory runs the bootstrap through
+   `/docker-entrypoint-initdb.d`. For an existing data directory, reconcile the same idempotent
+   bootstrap before enabling structured queries:
+
+   ```powershell
+   & tools/invoke_offline_compose.ps1 up -d clickhouse
+   & tools/invoke_offline_compose.ps1 exec -T clickhouse /bin/sh /docker-entrypoint-initdb.d/010-dcagent-structured-users.sh
+   ```
+
+   Do not enable the feature if this command fails. `-RotateSecrets` deliberately does not rotate
+   ClickHouse passwords because changing a file without updating an initialized account would break
+   authentication. Each container receives only its own role-specific password file under
+   `/run/secrets`.
 4. Start the default topology once so migration succeeds:
 
    ```powershell
@@ -68,7 +82,10 @@ document slices.
 
 If ClickHouse is unavailable or a structured query times out, the API must return an explicit
 structured-data unavailable response. It must not fall back to slice arithmetic or the legacy RAG
-path for that aggregate question.
+path for that aggregate question. `STRUCTURED_QUERY_TIMEOUT_SECONDS=4` applies only to the API's
+ClickHouse connect/read path. The indexing worker does not inherit that limit; publication retains
+the storage gateway's independent 30-second execution default until a dedicated publish setting is
+introduced.
 
 Rollback is configuration-only and preserves published data. Set
 `STRUCTURED_QUERY_ENABLED=false`, stop the current topology, and restart without the indexing

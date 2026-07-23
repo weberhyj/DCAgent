@@ -225,7 +225,6 @@ def build_structured_worker(
         "dsn": settings.clickhouse_url,
         "username": settings.clickhouse_ingest_user,
         "password": ingest_password,
-        "send_receive_timeout": settings.structured_query_timeout_seconds,
     }
     clients: tuple[object, ...] = ()
     try:
@@ -240,7 +239,6 @@ def build_structured_worker(
             clickhouse=ClickHouseGateway(
                 ingest_client,
                 query_client=query_client,
-                max_execution_time=settings.structured_query_timeout_seconds,
             ),
             parquet_root=settings.parquet_root,
             batch_rows=settings.structured_ingest_batch_rows,
