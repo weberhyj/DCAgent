@@ -61,6 +61,17 @@ class RecordingClickHouseGateway:
         return self.result
 
 
+class SwitchableCatalogProvider:
+    def __init__(self, catalog) -> None:
+        self.catalog = catalog
+        self.error: Exception | None = None
+
+    def __call__(self):
+        if self.error is not None:
+            raise self.error
+        return self.catalog
+
+
 class LifecycleClickHouseClient:
     def __init__(self, query_handler=None) -> None:
         self.close_calls = 0
@@ -92,6 +103,29 @@ def empty_state() -> ChatState:
 
 
 class StructuredAnswerServiceTest(unittest.TestCase):
+    @staticmethod
+    def _catalog_with_aggregate_field(field_name: str):
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        aggregate_column = replace(
+            dataset.schema.columns[0],
+            original_name=field_name,
+            display_name=field_name,
+            aliases=(),
+        )
+        return replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(aggregate_column, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+
     def test_default_repository_close_disposes_only_its_owned_database_once(self) -> None:
         owned_database = Database("sqlite+pysqlite:///:memory:")
         with patch.object(
@@ -781,29 +815,103 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             "什么是算术平均值",
             "算术平均值是什么",
             "什么是加权平均值",
+            "加权平均值是什么",
             "什么是移动平均值",
             "什么是几何平均值",
             "什么是调和平均值",
             "我想了解什么是加权平均值",
             "能帮我讲讲什么是移动平均值",
-            "请问调和平均值是什么",
             "什么是加权平均值呢",
             "我想了解什么是移动平均值吗",
-            "能帮我说说加权平均值是什么",
-            "麻烦告诉我调和平均值是什么",
-            "请介绍加权平均值是什么",
-            "我想请教一下加权平均值是什么",
-            "可否聊聊移动平均值是什么",
-            "请简单说一下调和平均值是什么",
-            "请问平均值是什么",
-            "请问加权平均值是什么",
-            "我想了解移动平均值是什么",
-            "能否说明几何平均值是什么",
         )
 
         for question in questions:
             with self.subTest(question=question):
                 self._assert_catalog_failure_uses_legacy_path(question)
+
+    def test_cold_catalog_failure_prefixed_concept_suffixes_fail_closed(self) -> None:
+        for question in (
+            "请问加权平均值是什么",
+            "产品介绍移动平均值是什么",
+        ):
+            with self.subTest(question=question):
+                self._assert_catalog_failure_is_strong_candidate(question)
+
+    def test_warm_catalog_snapshot_fields_fail_closed_during_outage(self) -> None:
+        cases = (
+            ("产品说明", "产品说明平均值是什么"),
+            ("订单说明", "订单说明加权平均值是什么"),
+            ("产品介绍", "产品介绍移动平均值是什么"),
+        )
+
+        for field_name, question in cases:
+            with self.subTest(question=question):
+                provider = SwitchableCatalogProvider(self._catalog_with_aggregate_field(field_name))
+                gateway = RecordingClickHouseGateway()
+                service = StructuredAnswerService(provider, gateway)
+                self.assertIsNone(service.try_answer("warm", "什么是平均值", "source", ()))
+                provider.error = RuntimeError("catalog down")
+                legacy_provider = RecordingLLMProvider()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=legacy_provider,
+                    structured_service=service,
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                _, _, messages = repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(legacy_provider.calls, 0)
+                self.assertEqual(gateway.calls, [])
+                self.assertIn("不可用", messages[-1].paragraphs[0].text)
+
+    def test_warm_catalog_snapshot_absent_concepts_keep_legacy_path(self) -> None:
+        for question in ("请问加权平均值是什么", "我想了解移动平均值是什么"):
+            with self.subTest(question=question):
+                provider = SwitchableCatalogProvider(sample_catalog())
+                gateway = RecordingClickHouseGateway()
+                service = StructuredAnswerService(provider, gateway)
+                self.assertIsNone(service.try_answer("warm", "什么是平均值", "source", ()))
+                provider.error = RuntimeError("catalog down")
+                legacy_provider = RecordingLLMProvider()
+                repository = InMemoryChatRepository(
+                    empty_state(),
+                    llm_provider=legacy_provider,
+                    structured_service=service,
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                repository.send_message(conversation_id, question, "source")
+
+                self.assertEqual(legacy_provider.calls, 1)
+                self.assertEqual(gateway.calls, [])
+
+    def test_successful_catalog_refresh_replaces_outage_snapshot(self) -> None:
+        provider = SwitchableCatalogProvider(self._catalog_with_aggregate_field("产品说明"))
+        gateway = RecordingClickHouseGateway()
+        service = StructuredAnswerService(provider, gateway)
+        self.assertIsNone(service.try_answer("warm-a", "什么是平均值", "source", ()))
+        provider.catalog = self._catalog_with_aggregate_field("产品介绍")
+        self.assertIsNone(service.try_answer("warm-b", "什么是平均值", "source", ()))
+        provider.error = RuntimeError("catalog down")
+        legacy_provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=legacy_provider,
+            structured_service=service,
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "产品说明平均值是什么", "source")
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "产品介绍平均值是什么",
+            "source",
+        )
+
+        self.assertEqual(legacy_provider.calls, 1)
+        self.assertEqual(gateway.calls, [])
+        self.assertIn("不可用", messages[-1].paragraphs[0].text)
 
     def test_named_average_metric_phrases_route_to_structured_query(self) -> None:
         for question in (

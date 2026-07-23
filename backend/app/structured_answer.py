@@ -5,6 +5,7 @@ import unicodedata
 from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import PurePath
+from threading import Lock
 from typing import Literal
 from uuid import uuid4
 
@@ -96,36 +97,6 @@ _NAMED_AVERAGE_CONCEPT_TERMS = (
     "几何平均值",
     "调和平均值",
 )
-_HIGH_CONFIDENCE_CONCEPT_CUES = (
-    "请问",
-    "请教",
-    "可否",
-    "能否",
-    "麻烦",
-    "帮我",
-    "想了解",
-    "想知道",
-    "告诉",
-    "聊聊",
-    "说说",
-    "说一下",
-    "讲讲",
-    "介绍",
-    "解释",
-    "说明",
-    "科普",
-    "关于",
-)
-_NEUTRAL_CONCEPT_BRIDGE_ATOMS = (
-    "简单地",
-    "通俗地",
-    "一下",
-    "简单",
-    "通俗",
-    "我",
-    "你",
-    "您",
-)
 _NATURAL_QUESTION_PARTICLES = ("呢", "吗", "吧", "呀", "啊")
 _AGGREGATE_CONCEPT_TERMS = tuple(
     sorted((*_NAMED_AVERAGE_CONCEPT_TERMS, *_CHINESE_AGGREGATE_TERMS), key=len, reverse=True)
@@ -142,6 +113,8 @@ class StructuredAnswerService:
     ) -> None:
         self._catalog_provider = catalog_provider
         self._clickhouse_gateway = clickhouse_gateway
+        self._catalog_snapshot: StructuredCatalog | None = None
+        self._catalog_snapshot_lock = Lock()
 
     def close(self) -> None:
         close = getattr(self._clickhouse_gateway, "close", None)
@@ -163,7 +136,11 @@ class StructuredAnswerService:
         try:
             catalog = self._catalog_provider()
         except Exception:
-            if _classify_without_catalog(question) != "strong":
+            catalog_snapshot = self._get_catalog_snapshot()
+            if catalog_snapshot is not None:
+                if not is_structured_candidate(question, catalog_snapshot):
+                    return None
+            elif _classify_without_catalog(question) != "strong":
                 return None
             return _structured_run(
                 conversation_id,
@@ -172,6 +149,7 @@ class StructuredAnswerService:
                 "结构化查询服务不可用：无法读取已发布的数据目录。",
                 "catalog unavailable",
             )
+        self._replace_catalog_snapshot(catalog)
         if not is_structured_candidate(question, catalog):
             return None
 
@@ -231,6 +209,14 @@ class StructuredAnswerService:
             f"structured aggregate completed; audit_id={result.audit_id}",
             source_ids=[result.dataset_id],
         )
+
+    def _replace_catalog_snapshot(self, catalog: StructuredCatalog) -> None:
+        with self._catalog_snapshot_lock:
+            self._catalog_snapshot = catalog
+
+    def _get_catalog_snapshot(self) -> StructuredCatalog | None:
+        with self._catalog_snapshot_lock:
+            return self._catalog_snapshot
 
 
 def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
@@ -421,12 +407,7 @@ def _is_priority_aggregate_concept_shape(normalized: str) -> bool:
     for term in _AGGREGATE_CONCEPT_TERMS:
         for suffix in _CONCEPT_TERM_SUFFIXES:
             phrase = f"{term}{suffix}"
-            if not normalized.endswith(phrase):
-                continue
-            leadin = normalized[: -len(phrase)]
-            if not leadin:
-                return True
-            if _is_conversational_leadin(leadin):
+            if normalized == phrase:
                 return True
     return False
 
@@ -446,31 +427,6 @@ def _strip_concept_question_tail(value: str) -> str:
         if remaining == previous:
             return remaining
     return remaining
-
-
-def _is_conversational_leadin(value: str) -> bool:
-    matches = [
-        (start, len(cue))
-        for cue in _HIGH_CONFIDENCE_CONCEPT_CUES
-        if (start := value.rfind(cue)) >= 0
-    ]
-    if not matches:
-        return False
-    cue_start, cue_length = max(matches, key=lambda item: (item[0], item[1]))
-    return _is_neutral_concept_bridge(value[cue_start + cue_length :])
-
-
-def _is_neutral_concept_bridge(value: str) -> bool:
-    remaining = value
-    while remaining:
-        atom = next(
-            (item for item in _NEUTRAL_CONCEPT_BRIDGE_ATOMS if remaining.startswith(item)),
-            None,
-        )
-        if atom is None:
-            return False
-        remaining = remaining[len(atom) :]
-    return True
 
 
 def _has_metric_qualified_concept_shape(normalized: str) -> bool:
