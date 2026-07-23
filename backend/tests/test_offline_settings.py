@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from app.llm import create_llm_provider
 from app.offline_settings import (
     OfflineSettings,
     OfflineSettingsError,
     parse_bool,
+    read_secret_file,
     require_private_url,
 )
 
@@ -130,6 +132,96 @@ class OfflineSettingsTest(unittest.TestCase):
             with self.subTest(model_slots=model_slots):
                 with self.assertRaisesRegex(OfflineSettingsError, "between 1 and 4"):
                     OfflineSettings.from_environ({"MODEL_SLOTS": model_slots})
+
+    def test_structured_ingest_batch_rows_is_bounded_and_configurable(self) -> None:
+        self.assertEqual(OfflineSettings.from_environ({}).structured_ingest_batch_rows, 50_000)
+        self.assertEqual(
+            OfflineSettings.from_environ(
+                {"STRUCTURED_INGEST_BATCH_ROWS": "2048"}
+            ).structured_ingest_batch_rows,
+            2048,
+        )
+
+        for value in ("0", "50001", "many"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    OfflineSettingsError, "STRUCTURED_INGEST_BATCH_ROWS.*1.*50000"
+                ):
+                    OfflineSettings.from_environ({"STRUCTURED_INGEST_BATCH_ROWS": value})
+
+    def test_structured_clickhouse_settings_parse_password_files_without_loading_secrets(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            query_password = root / "query-password"
+            ingest_password = root / "ingest-password"
+            query_password.write_text("query-secret\n", encoding="utf-8")
+            ingest_password.write_text("ingest-secret", encoding="utf-8")
+
+            settings = OfflineSettings.from_environ(
+                {
+                    "STRUCTURED_QUERY_ENABLED": "true",
+                    "CLICKHOUSE_QUERY_USER": "query-user",
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE": str(query_password),
+                    "CLICKHOUSE_INGEST_USER": "ingest-user",
+                    "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+                    "STRUCTURED_QUERY_TIMEOUT_SECONDS": "4",
+                }
+            )
+            loaded_query_password = read_secret_file(
+                query_password,
+                "CLICKHOUSE_QUERY_PASSWORD_FILE",
+            )
+
+        self.assertEqual(settings.clickhouse_query_user, "query-user")
+        self.assertEqual(settings.clickhouse_query_password_file, query_password)
+        self.assertEqual(settings.clickhouse_ingest_user, "ingest-user")
+        self.assertEqual(settings.clickhouse_ingest_password_file, ingest_password)
+        self.assertEqual(settings.structured_query_timeout_seconds, 4)
+        self.assertFalse(hasattr(settings, "clickhouse_query_password"))
+        self.assertFalse(hasattr(settings, "clickhouse_ingest_password"))
+        self.assertNotIn("query-secret", repr(settings))
+        self.assertNotIn("ingest-secret", repr(settings))
+        self.assertEqual(loaded_query_password, "query-secret")
+
+    def test_structured_clickhouse_passwords_cannot_be_supplied_directly(self) -> None:
+        for key in ("CLICKHOUSE_QUERY_PASSWORD", "CLICKHOUSE_INGEST_PASSWORD"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(OfflineSettingsError, f"{key}.*PASSWORD_FILE"):
+                    OfflineSettings.from_environ({key: "plaintext-secret"})
+
+    def test_structured_query_timeout_is_bounded_and_configurable(self) -> None:
+        self.assertEqual(OfflineSettings.from_environ({}).structured_query_timeout_seconds, 4)
+        self.assertEqual(
+            OfflineSettings.from_environ(
+                {"STRUCTURED_QUERY_TIMEOUT_SECONDS": "12"}
+            ).structured_query_timeout_seconds,
+            12,
+        )
+        for value in ("0", "61", "1.5", "many"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    OfflineSettingsError,
+                    "STRUCTURED_QUERY_TIMEOUT_SECONDS.*1.*60",
+                ):
+                    OfflineSettings.from_environ({"STRUCTURED_QUERY_TIMEOUT_SECONDS": value})
+
+    def test_secret_reader_rejects_missing_or_unsafe_password_files(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            missing = root / "missing"
+            directory = root / "directory"
+            directory.mkdir()
+            oversized = root / "oversized"
+            oversized.write_bytes(b"x" * 4097)
+            for path in (missing, directory, oversized):
+                with self.subTest(path=path.name):
+                    with self.assertRaisesRegex(
+                        OfflineSettingsError,
+                        "CLICKHOUSE_QUERY_PASSWORD_FILE",
+                    ):
+                        read_secret_file(path, "CLICKHOUSE_QUERY_PASSWORD_FILE")
 
     def test_existing_llm_provider_rejects_public_api_in_offline_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "private or loopback"):

@@ -4,7 +4,9 @@ This Compose project is the private, single-server deployment contract for DC-Ag
 
 ## Prepare local configuration
 
-Run `tools/prepare_offline_env.ps1` from the repository root. The script copies `.env.example` only when `.env` is absent and creates the PostgreSQL password/database URL secret pair only when neither file exists. It refuses a partial pair and never prints secret values. Secret files are staged, validated, permission-restricted, and published as a recoverable pair.
+Run `tools/prepare_offline_env.ps1` from the repository root. The script copies `.env.example` only when `.env` is absent and creates the PostgreSQL password/database URL secret pair only when neither file exists. It also preserves valid existing ClickHouse role passwords or generates missing 43-character URL-safe passwords at the fixed repository-managed paths. It refuses partial path configuration and never prints secret values. Secret files are staged, validated, permission-restricted, and published without allowing `.env` to redirect them outside `artifacts/secrets`.
+
+An older `.env` with neither ClickHouse password-file key is upgraded in place with the two fixed relative paths while `STRUCTURED_QUERY_ENABLED` remains unchanged (and therefore remains `false` for legacy deployments). If exactly one key exists, preparation fails closed instead of guessing. Existing valid secret files are never overwritten.
 
 The supported production host contract is **local rootful Linux Compose v2**. The same non-root deployment account must prepare configuration, build the three Python images, and start Compose. `tools/invoke_offline_compose.ps1` is the only supported Compose entry point; do not invoke `docker compose` directly. The wrapper removes every `.env` key and Compose model-selector variable from the child process environment, fixes and inspects the local `default` Docker context, renders every profile with `config --format json`, validates the fixed project name, internal digest-pinned images, approved bind/secret paths, and only then executes the requested Compose arguments. For example, run `& tools/invoke_offline_compose.ps1 up -d`. Configuration/project overrides, one-off `run`, `create`, `start`, `restart`, build-argument overrides, and `up` flags that skip recreation, builds, dependencies, or alter scale are rejected; use `up` to reconcile stopped services with the validated model. On first generation the preparation script records the account's `id -u` and `id -g` as `DCAGENT_UID` and `DCAGENT_GID`; an existing `.env` and any shell overrides must match those exact non-zero numeric values. The locked `PYTHON_BASE_IMAGE` must be a Debian-family image that provides `groupadd` and `useradd`, with the `dcagent` name and selected IDs unused. The Dockerfiles create and verify `dcagent` with those IDs and still finish as `USER dcagent`; rebuild these host-bound images when the deployment UID/GID changes. Host secret files remain mode `0600`; the secret directory and writable `raw`/`parquet` directories remain owned by the deployment account at mode `0700`.
 
@@ -26,7 +28,81 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 
 - The default topology starts data services, schema migration, the embedding service, and API.
 - `--profile generation` enables the private llama.cpp service after its locked local model is installed.
-- `--profile indexing` is reserved for the Phase 2 ingestion worker. The image command intentionally points to the future `app.ingestion_worker` module, so leave this profile disabled until Phase 2 lands.
+- `--profile indexing` enables the structured spreadsheet worker (`app.structured_worker`). Keep it disabled while `STRUCTURED_QUERY_ENABLED=false`.
+
+## Structured aggregation rollout and rollback
+
+Structured Excel/CSV aggregation is disabled by default. Keep
+`STRUCTURED_QUERY_ENABLED=false` until all of the following gates are complete:
+
+1. Back up PostgreSQL, verify restore, and let the one-shot `schema-migration` service apply the
+   structured metadata migration.
+2. Run `tools/prepare_offline_env.ps1`. It fixes `CLICKHOUSE_QUERY_PASSWORD_FILE` and
+   `CLICKHOUSE_INGEST_PASSWORD_FILE` to repository-managed files under `artifacts/secrets`, creates
+   missing values with a CSPRNG, preserves valid existing values, and restricts them to mode `0600`
+   under the deployment account. Never put either password directly in `.env`.
+3. The version-controlled `clickhouse-init.sh` creates or updates separate least-privilege accounts
+   named by `CLICKHOUSE_QUERY_USER` and `CLICKHOUSE_INGEST_USER`. The query account receives only
+   `SELECT` on `default.*`; the ingestion account receives the table publication privileges,
+   including `SHOW COLUMNS` for governed `DESCRIBE TABLE`, plus read access to `system.tables`. A
+   fresh ClickHouse data directory runs the bootstrap through
+   `/docker-entrypoint-initdb.d`. For an existing data directory, reconcile the same idempotent
+   bootstrap before enabling structured queries:
+
+   ```powershell
+   & tools/invoke_offline_compose.ps1 up -d clickhouse
+   & tools/invoke_offline_compose.ps1 exec -T clickhouse /bin/sh /docker-entrypoint-initdb.d/010-dcagent-structured-users.sh
+   ```
+
+   Do not enable the feature if this command fails. `-RotateSecrets` deliberately does not rotate
+   ClickHouse passwords because changing a file without updating an initialized account would break
+   authentication. Each container receives only its own role-specific password file under
+   `/run/secrets`.
+4. Start the default topology once so migration succeeds:
+
+   ```powershell
+   & tools/invoke_offline_compose.ps1 up -d
+   ```
+
+5. In the administrator UI, upload the XLSX/CSV file, inspect inferred types and aliases, and save a
+   confirmed schema. Unconfirmed datasets cannot be published or queried.
+6. Set `STRUCTURED_QUERY_ENABLED=true`, then reconcile the API and start the worker with the
+   indexing profile:
+
+   ```powershell
+   & tools/invoke_offline_compose.ps1 --profile indexing up -d
+   ```
+
+Wait for the selected publication to reach `published` before exposing aggregate questions. A
+confirmed schema by itself is not queryable; the indexing worker profile must successfully promote
+an immutable ClickHouse publication.
+
+For the smoke aggregate gate, use a small reviewed worksheet with known values and nulls. Confirm
+its schema, publish it, ask for `avg`, `sum`, `count`, `min`, and `max`, and compare the answer value,
+source file, worksheet, total/valid/null counts, schema version, and publication ID with the known
+fixture. The gate fails if an aggregate invokes Physoc/template generation or is calculated from
+document slices.
+
+If ClickHouse is unavailable or a structured query times out, the API must return an explicit
+structured-data unavailable response. It must not fall back to slice arithmetic or the legacy RAG
+path for that aggregate question. `STRUCTURED_QUERY_TIMEOUT_SECONDS=4` applies only to the API's
+ClickHouse connect/read path. The indexing worker does not inherit that limit; publication retains
+the storage gateway's independent 30-second execution default until a dedicated publish setting is
+introduced.
+
+Rollback is configuration-only and preserves published data. Set
+`STRUCTURED_QUERY_ENABLED=false`, stop the current topology, and restart without the indexing
+profile. The worker refuses to start while the feature flag is false, so rollback cannot continue
+publishing in the background:
+
+```powershell
+& tools/invoke_offline_compose.ps1 down
+& tools/invoke_offline_compose.ps1 up -d
+```
+
+Verify ordinary document questions still use the legacy/template path and structured upload routes
+are no longer active. Do not delete Parquet parts, ClickHouse tables, or structured metadata during
+rollback; retaining them permits a reviewed re-enable.
 
 ## Current development gates
 

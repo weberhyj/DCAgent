@@ -329,6 +329,7 @@ function Assert-RenderedOfflineCompose {
         }
         "clickhouse" = [ordered]@{
             "/var/lib/clickhouse" = Join-Path $dataRoot "clickhouse"
+            "/docker-entrypoint-initdb.d/010-dcagent-structured-users.sh" = Join-Path $repo "deploy/offline/clickhouse-init.sh"
         }
         "qdrant" = [ordered]@{
             "/qdrant/storage" = Join-Path $dataRoot "qdrant"
@@ -400,6 +401,14 @@ function Assert-RenderedOfflineCompose {
         "database_url" = [ordered]@{
             EnvName = "DATABASE_URL_SECRET_FILE"
             Path = Join-Path $repo "artifacts/secrets/database-url"
+        }
+        "clickhouse_query_password" = [ordered]@{
+            EnvName = "CLICKHOUSE_QUERY_PASSWORD_FILE"
+            Path = Join-Path $repo "artifacts/secrets/clickhouse-query-password"
+        }
+        "clickhouse_ingest_password" = [ordered]@{
+            EnvName = "CLICKHOUSE_INGEST_PASSWORD_FILE"
+            Path = Join-Path $repo "artifacts/secrets/clickhouse-ingest-password"
         }
     }
     $secrets = Get-JsonPropertyValue -Object $Rendered -Name "secrets"

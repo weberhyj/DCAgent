@@ -14,6 +14,13 @@ import type {
   KnowledgeChunk,
   KnowledgeSource,
 } from '@/types/chat'
+import type {
+  StructuredPreview,
+  StructuredPublicationEnqueueResponse,
+  StructuredSchemaConfirmationResponse,
+  StructuredSchemaSubmission,
+  StructuredStatus,
+} from '@/types/chat'
 
 const http = axios.create({
   baseURL: '/api',
@@ -110,6 +117,53 @@ export async function compareEvaluationBatches(leftBatchId: string, rightBatchId
 export async function fetchKnowledgeChunks(sourceId: string) {
   const encodedSourceId = encodeURIComponent(sourceId)
   const { data } = await http.get<KnowledgeChunk[]>(`/knowledge/sources/${encodedSourceId}/chunks`)
+  return data
+}
+
+export async function fetchStructuredPreview(sourceId: string) {
+  const encodedSourceId = encodeURIComponent(sourceId)
+  const { data } = await http.get<StructuredPreview>(
+    `/knowledge/sources/${encodedSourceId}/structured-preview`,
+  )
+  return data
+}
+
+export async function confirmStructuredSchema(
+  sourceId: string,
+  submission: StructuredSchemaSubmission,
+) {
+  const encodedSourceId = encodeURIComponent(sourceId)
+  const { data } = await http.put<StructuredSchemaConfirmationResponse>(
+    `/knowledge/sources/${encodedSourceId}/structured-schema`,
+    submission,
+  )
+  return data
+}
+
+export async function enqueueStructuredPublication(
+  sourceId: string,
+  datasetId: string,
+  signal?: AbortSignal,
+) {
+  const encodedSourceId = encodeURIComponent(sourceId)
+  const { data } = await http.post<StructuredPublicationEnqueueResponse>(
+    `/knowledge/sources/${encodedSourceId}/structured-publications`,
+    undefined,
+    { params: { datasetId }, signal },
+  )
+  return data
+}
+
+export async function fetchStructuredStatus(
+  sourceId: string,
+  jobId: string,
+  signal?: AbortSignal,
+) {
+  const encodedSourceId = encodeURIComponent(sourceId)
+  const { data } = await http.get<StructuredStatus>(
+    `/knowledge/sources/${encodedSourceId}/structured-status`,
+    { params: { jobId }, signal },
+  )
   return data
 }
 

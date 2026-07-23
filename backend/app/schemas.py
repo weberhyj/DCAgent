@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from .agent import AgentRunAudit as AgentRunAuditModel
 from .agent import AgentStep as AgentStepModel
@@ -44,7 +53,44 @@ from .models import (
     TableArtifactModel,
     VideoArtifactModel,
 )
+from .spreadsheet_schema import MAX_COLUMNS_PER_DATASET, MAX_WORKSHEETS
+from .structured_models import (
+    MAX_STRUCTURED_ALIAS_LENGTH,
+    MAX_STRUCTURED_ALIASES_PER_COLUMN,
+    StructuredColumnType,
+    StructuredConfirmationResult,
+)
+from .structured_models import (
+    SpreadsheetPreview as SpreadsheetPreviewModel,
+)
+from .structured_models import (
+    StructuredColumnPreview as StructuredColumnPreviewModel,
+)
+from .structured_models import (
+    StructuredColumnSchema as StructuredColumnSchemaModel,
+)
+from .structured_models import (
+    StructuredDatasetPreview as StructuredDatasetPreviewModel,
+)
+from .structured_models import (
+    StructuredDatasetSchema as StructuredDatasetSchemaModel,
+)
+from .structured_models import StructuredDiagnostic as StructuredDiagnosticModel
+from .structured_models import StructuredPublication as StructuredPublicationModel
+from .structured_repository import (
+    StructuredPublicationJob as StructuredPublicationJobModel,
+)
+from .structured_repository import StructuredStatus as StructuredStatusModel
 from .time_utils import normalize_display_timestamp
+
+StructuredAlias = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_STRUCTURED_ALIAS_LENGTH,
+    ),
+]
 
 
 class ApiModel(BaseModel):
@@ -276,7 +322,14 @@ class KnowledgeSource(ApiModel):
     name: str
     source_type: str = Field(alias="sourceType")
     records: int
-    status: Literal["已索引", "解析中", "待复核", "解析失败"]
+    status: Literal[
+        "已索引",
+        "解析中",
+        "待复核",
+        "解析失败",
+        "待确认表结构",
+        "结构化导入中",
+    ]
     updated_at: str = Field(alias="updatedAt")
     classification: str
     file_size: int | None = Field(default=None, alias="fileSize")
@@ -314,6 +367,246 @@ class KnowledgeChunk(ApiModel):
             chunkIndex=chunk.chunk_index,
             text=chunk.text,
             tokenCount=chunk.token_count,
+        )
+
+
+class StructuredDiagnostic(ApiModel):
+    code: str
+    message: str
+    worksheet_name: str = Field(alias="worksheetName")
+    column_name: str | None = Field(default=None, alias="columnName")
+    row_number: int | None = Field(default=None, alias="rowNumber")
+
+    @classmethod
+    def from_model(cls, diagnostic: StructuredDiagnosticModel) -> StructuredDiagnostic:
+        return cls(
+            code=diagnostic.code,
+            message=diagnostic.message,
+            worksheetName=diagnostic.worksheet_name,
+            columnName=diagnostic.column_name,
+            rowNumber=diagnostic.row_number,
+        )
+
+
+class StructuredColumnPreview(ApiModel):
+    physical_name: str = Field(alias="physicalName")
+    original_name: str = Field(alias="originalName")
+    display_name: str = Field(alias="displayName")
+    data_type: StructuredColumnType = Field(alias="dataType")
+    aliases: list[str]
+    examples: list[str]
+    sampled_rows: int = Field(alias="sampledRows")
+    null_count: int = Field(alias="nullCount")
+
+    @classmethod
+    def from_model(cls, column: StructuredColumnPreviewModel) -> StructuredColumnPreview:
+        return cls(
+            physicalName=column.physical_name,
+            originalName=column.original_name,
+            displayName=column.display_name,
+            dataType=column.data_type,
+            aliases=list(column.aliases),
+            examples=list(column.examples),
+            sampledRows=column.sampled_rows,
+            nullCount=column.null_count,
+        )
+
+
+class StructuredDatasetPreview(ApiModel):
+    dataset_id: str = Field(alias="datasetId")
+    source_id: str = Field(alias="sourceId")
+    worksheet_name: str = Field(alias="worksheetName")
+    columns: list[StructuredColumnPreview]
+    sampled_rows: int = Field(alias="sampledRows")
+    schema_hash: str = Field(alias="schemaHash")
+
+    @classmethod
+    def from_model(cls, dataset: StructuredDatasetPreviewModel) -> StructuredDatasetPreview:
+        return cls(
+            datasetId=dataset.dataset_id,
+            sourceId=dataset.source_id,
+            worksheetName=dataset.worksheet_name,
+            columns=[StructuredColumnPreview.from_model(column) for column in dataset.columns],
+            sampledRows=dataset.sampled_rows,
+            schemaHash=dataset.schema_hash,
+        )
+
+
+class SpreadsheetPreview(ApiModel):
+    source_id: str = Field(alias="sourceId")
+    datasets: list[StructuredDatasetPreview]
+    diagnostics: list[StructuredDiagnostic]
+
+    @classmethod
+    def from_model(cls, preview: SpreadsheetPreviewModel) -> SpreadsheetPreview:
+        return cls(
+            sourceId=preview.source_id,
+            datasets=[StructuredDatasetPreview.from_model(item) for item in preview.datasets],
+            diagnostics=[StructuredDiagnostic.from_model(item) for item in preview.diagnostics],
+        )
+
+
+class StructuredColumnConfirmationRequest(ApiModel):
+    physical_name: str = Field(alias="physicalName", min_length=1, max_length=160)
+    display_name: str = Field(alias="displayName", max_length=240)
+    data_type: StructuredColumnType = Field(alias="dataType")
+    aliases: list[StructuredAlias] = Field(max_length=MAX_STRUCTURED_ALIASES_PER_COLUMN)
+    allow_aggregate: StrictBool = Field(alias="allowAggregate")
+    allow_filter: StrictBool = Field(alias="allowFilter")
+    null_policy: str = Field(alias="nullPolicy", min_length=1, max_length=40)
+
+
+class StructuredDatasetConfirmationRequest(ApiModel):
+    dataset_id: str = Field(alias="datasetId", min_length=1, max_length=128)
+    columns: list[StructuredColumnConfirmationRequest] = Field(
+        min_length=1,
+        max_length=MAX_COLUMNS_PER_DATASET,
+    )
+
+
+class StructuredSchemaConfirmationRequest(ApiModel):
+    datasets: list[StructuredDatasetConfirmationRequest] = Field(
+        min_length=1,
+        max_length=MAX_WORKSHEETS,
+    )
+
+
+class StructuredColumnSchema(ApiModel):
+    physical_name: str = Field(alias="physicalName")
+    original_name: str = Field(alias="originalName")
+    display_name: str = Field(alias="displayName")
+    data_type: StructuredColumnType = Field(alias="dataType")
+    aliases: list[str]
+    allow_aggregate: bool = Field(alias="allowAggregate")
+    allow_filter: bool = Field(alias="allowFilter")
+    null_policy: str = Field(alias="nullPolicy")
+
+    @classmethod
+    def from_model(cls, column: StructuredColumnSchemaModel) -> StructuredColumnSchema:
+        return cls(
+            physicalName=column.physical_name,
+            originalName=column.original_name,
+            displayName=column.display_name,
+            dataType=column.data_type,
+            aliases=list(column.aliases),
+            allowAggregate=column.allow_aggregate,
+            allowFilter=column.allow_filter,
+            nullPolicy=column.null_policy,
+        )
+
+
+class StructuredDatasetSchema(ApiModel):
+    dataset_id: str = Field(alias="datasetId")
+    source_id: str = Field(alias="sourceId")
+    worksheet_name: str = Field(alias="worksheetName")
+    schema_version: int = Field(alias="schemaVersion")
+    columns: list[StructuredColumnSchema]
+    schema_hash: str = Field(alias="schemaHash")
+
+    @classmethod
+    def from_model(cls, dataset: StructuredDatasetSchemaModel) -> StructuredDatasetSchema:
+        return cls(
+            datasetId=dataset.dataset_id,
+            sourceId=dataset.source_id,
+            worksheetName=dataset.worksheet_name,
+            schemaVersion=dataset.schema_version,
+            columns=[StructuredColumnSchema.from_model(column) for column in dataset.columns],
+            schemaHash=dataset.schema_hash,
+        )
+
+
+class StructuredSchemaConfirmationResponse(ApiModel):
+    status: str
+    datasets: list[StructuredDatasetSchema]
+
+    @classmethod
+    def from_model(
+        cls, result: StructuredConfirmationResult
+    ) -> StructuredSchemaConfirmationResponse:
+        return cls(
+            status=result.status,
+            datasets=[StructuredDatasetSchema.from_model(item) for item in result.datasets],
+        )
+
+
+class StructuredPublication(ApiModel):
+    publication_id: str = Field(alias="publicationId")
+    dataset_id: str = Field(alias="datasetId")
+    schema_version: int = Field(alias="schemaVersion")
+    physical_table_name: str = Field(alias="physicalTableName")
+    row_count: int = Field(alias="rowCount")
+    content_hash: str = Field(alias="contentHash")
+
+    @classmethod
+    def from_model(cls, publication: StructuredPublicationModel) -> StructuredPublication:
+        return cls(
+            publicationId=publication.publication_id,
+            datasetId=publication.dataset_id,
+            schemaVersion=publication.schema_version,
+            physicalTableName=publication.physical_table_name,
+            rowCount=publication.row_count,
+            contentHash=publication.content_hash,
+        )
+
+
+class StructuredPublicationJob(ApiModel):
+    id: str
+    source_id: str = Field(alias="sourceId")
+    dataset_id: str = Field(alias="datasetId")
+    schema_version: int = Field(alias="schemaVersion")
+    sequence: int
+    publication_id: str = Field(alias="publicationId")
+    status: Literal["queued", "running", "published", "failed"]
+    lease_expires_at: datetime | None = Field(alias="leaseExpiresAt")
+    checkpoint_row: int = Field(alias="checkpointRow")
+    attempt: int
+    next_attempt_at: datetime | None = Field(alias="nextAttemptAt")
+    error_message: str | None = Field(alias="errorMessage")
+
+    @classmethod
+    def from_model(cls, job: StructuredPublicationJobModel) -> StructuredPublicationJob:
+        return cls(
+            id=job.id,
+            sourceId=job.source_id,
+            datasetId=job.dataset_id,
+            schemaVersion=job.schema_version,
+            sequence=job.sequence,
+            publicationId=job.publication_id,
+            status=job.status,
+            leaseExpiresAt=job.lease_expires_at,
+            checkpointRow=job.checkpoint_row,
+            attempt=job.attempt,
+            nextAttemptAt=job.next_attempt_at,
+            errorMessage=job.error_message,
+        )
+
+
+class StructuredPublicationEnqueueResponse(ApiModel):
+    job_id: str = Field(alias="jobId")
+    status: Literal["queued"]
+
+    @classmethod
+    def from_model(cls, job: StructuredPublicationJobModel) -> StructuredPublicationEnqueueResponse:
+        return cls(jobId=job.id, status="queued")
+
+
+class StructuredStatusResponse(ApiModel):
+    source_id: str = Field(alias="sourceId")
+    source_status: str = Field(alias="sourceStatus")
+    job: StructuredPublicationJob
+    active_publication: StructuredPublication | None = Field(alias="activePublication")
+
+    @classmethod
+    def from_model(cls, status: StructuredStatusModel) -> StructuredStatusResponse:
+        return cls(
+            sourceId=status.source_id,
+            sourceStatus=status.source_status,
+            job=StructuredPublicationJob.from_model(status.job),
+            activePublication=(
+                None
+                if status.active_publication is None
+                else StructuredPublication.from_model(status.active_publication)
+            ),
         )
 
 

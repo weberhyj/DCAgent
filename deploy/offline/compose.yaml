@@ -27,10 +27,23 @@ services:
   clickhouse:
     image: ${CLICKHOUSE_IMAGE:?CLICKHOUSE_IMAGE is required}
     restart: unless-stopped
+    environment:
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_QUERY_USER: ${CLICKHOUSE_QUERY_USER:?CLICKHOUSE_QUERY_USER is required}
+      CLICKHOUSE_INGEST_USER: ${CLICKHOUSE_INGEST_USER:?CLICKHOUSE_INGEST_USER is required}
+    secrets:
+      - clickhouse_query_password
+      - clickhouse_ingest_password
     volumes:
       - type: bind
         source: ${DATA_ROOT:?DATA_ROOT is required}/clickhouse
         target: /var/lib/clickhouse
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./clickhouse-init.sh
+        target: /docker-entrypoint-initdb.d/010-dcagent-structured-users.sh
+        read_only: true
         bind:
           create_host_path: false
     networks:
@@ -151,7 +164,11 @@ services:
     environment:
       OFFLINE_MODE: "true"
       DATABASE_URL_FILE: /run/secrets/database_url
-      CLICKHOUSE_URL: http://clickhouse:8123
+      STRUCTURED_QUERY_ENABLED: ${STRUCTURED_QUERY_ENABLED:?STRUCTURED_QUERY_ENABLED is required}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:?CLICKHOUSE_URL is required}
+      CLICKHOUSE_QUERY_USER: ${CLICKHOUSE_QUERY_USER:?CLICKHOUSE_QUERY_USER is required}
+      CLICKHOUSE_QUERY_PASSWORD_FILE: /run/secrets/clickhouse_query_password
+      STRUCTURED_QUERY_TIMEOUT_SECONDS: ${STRUCTURED_QUERY_TIMEOUT_SECONDS:?STRUCTURED_QUERY_TIMEOUT_SECONDS is required}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       CLAMAV_HOST: clamav
@@ -174,6 +191,7 @@ services:
       PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
     secrets:
       - database_url
+      - clickhouse_query_password
     volumes:
       - type: bind
         source: ${DATA_ROOT:?DATA_ROOT is required}/raw
@@ -220,10 +238,15 @@ services:
         DCAGENT_UID: ${DCAGENT_UID:?DCAGENT_UID is required}
         DCAGENT_GID: ${DCAGENT_GID:?DCAGENT_GID is required}
     restart: unless-stopped
+    command: ["python", "-m", "app.structured_worker"]
     environment:
       OFFLINE_MODE: "true"
       DATABASE_URL_FILE: /run/secrets/database_url
-      CLICKHOUSE_URL: http://clickhouse:8123
+      STRUCTURED_QUERY_ENABLED: ${STRUCTURED_QUERY_ENABLED:?STRUCTURED_QUERY_ENABLED is required}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:?CLICKHOUSE_URL is required}
+      CLICKHOUSE_INGEST_USER: ${CLICKHOUSE_INGEST_USER:?CLICKHOUSE_INGEST_USER is required}
+      CLICKHOUSE_INGEST_PASSWORD_FILE: /run/secrets/clickhouse_ingest_password
+      STRUCTURED_INGEST_BATCH_ROWS: ${STRUCTURED_INGEST_BATCH_ROWS:?STRUCTURED_INGEST_BATCH_ROWS is required}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       CLAMAV_HOST: clamav
@@ -240,6 +263,7 @@ services:
       PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
     secrets:
       - database_url
+      - clickhouse_ingest_password
     volumes:
       - type: bind
         source: ${DATA_ROOT:?DATA_ROOT is required}/raw
@@ -301,3 +325,7 @@ secrets:
     file: ${POSTGRES_PASSWORD_FILE:?POSTGRES_PASSWORD_FILE is required}
   database_url:
     file: ${DATABASE_URL_SECRET_FILE:?DATABASE_URL_SECRET_FILE is required}
+  clickhouse_query_password:
+    file: ${CLICKHOUSE_QUERY_PASSWORD_FILE:?CLICKHOUSE_QUERY_PASSWORD_FILE is required}
+  clickhouse_ingest_password:
+    file: ${CLICKHOUSE_INGEST_PASSWORD_FILE:?CLICKHOUSE_INGEST_PASSWORD_FILE is required}

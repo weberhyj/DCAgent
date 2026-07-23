@@ -3,21 +3,38 @@ import { ArrowLeft, Database, FileText, ShieldCheck } from 'lucide-vue-next'
 import { computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import AdminPageHeader from '@/components/layout/AdminPageHeader.vue'
+import StructuredSchemaPanel from '@/components/knowledge/StructuredSchemaPanel.vue'
 import { useChatKnowledgeManagement } from '@/composables/useChatKnowledgeManagement'
+import type { StructuredSchemaSubmission } from '@/types/chat'
+import { isStructuredKnowledgeSource } from '@/utils/knowledgeSources'
 
 const route = useRoute()
 const {
   knowledgeSources,
   knowledgeChunks,
+  structuredPreview,
+  structuredSchemaConfirmation,
+  structuredPublicationStatus,
   knowledgeSourcesLoading,
   knowledgeChunksLoading,
+  structuredPreviewLoading,
+  structuredSchemaConfirming,
+  structuredPublishing,
+  error,
   loadKnowledgeSources,
   inspectKnowledgeSource,
+  loadStructuredPreview,
+  confirmStructuredSchema,
+  publishStructuredSource,
 } = useChatKnowledgeManagement()
 
 const sourceId = computed(() => String(route.params.sourceId ?? ''))
 const activeSource = computed(() => knowledgeSources.value.find((source) => source.id === sourceId.value) ?? null)
-const loading = computed(() => knowledgeSourcesLoading.value || knowledgeChunksLoading.value)
+const structuredSource = computed(() => isStructuredKnowledgeSource(activeSource.value ?? undefined))
+const structuredConfirmationStatus = computed(() => structuredSchemaConfirmation.value?.status ?? null)
+const structuredConfirmed = computed(() => structuredConfirmationStatus.value === 'confirmed')
+const loading = computed(() => knowledgeSourcesLoading.value
+  || (structuredSource.value ? structuredPreviewLoading.value : knowledgeChunksLoading.value))
 
 onMounted(() => {
   void loadDetail()
@@ -30,7 +47,19 @@ watch(sourceId, () => {
 async function loadDetail() {
   if (!sourceId.value) return
   await loadKnowledgeSources()
+  if (structuredSource.value) {
+    await loadStructuredPreview(sourceId.value)
+    return
+  }
   await inspectKnowledgeSource(sourceId.value)
+}
+
+async function handleStructuredConfirm(submission: StructuredSchemaSubmission) {
+  await confirmStructuredSchema(sourceId.value, submission)
+}
+
+async function handleStructuredPublish(datasetId: string) {
+  await publishStructuredSource(sourceId.value, datasetId)
 }
 </script>
 
@@ -56,7 +85,22 @@ async function loadDetail() {
     </div>
 
     <div v-if="loading" class="module-state">正在读取资料解析结果...</div>
+    <div v-else-if="error" class="module-state">{{ error }}</div>
     <div v-else-if="!activeSource" class="module-state">没有找到该资料，可能已被删除。</div>
+    <StructuredSchemaPanel
+      v-else-if="structuredSource && structuredPreview"
+      :preview="structuredPreview"
+      :confirming="structuredSchemaConfirming"
+      :confirmed="structuredConfirmed"
+      :confirmation-status="structuredConfirmationStatus"
+      :publishing="structuredPublishing"
+      :publication-status="structuredPublicationStatus"
+      @confirm="handleStructuredConfirm"
+      @publish="handleStructuredPublish"
+    />
+    <div v-else-if="structuredSource" class="module-state">
+      No structured schema preview is available.
+    </div>
     <div v-else-if="!knowledgeChunks.length" class="module-state">该资料暂无可预览片段。</div>
 
     <section v-else class="chunk-panel">

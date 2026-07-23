@@ -12,10 +12,12 @@ from sqlalchemy import (
     Boolean,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     inspect,
     select,
@@ -299,6 +301,145 @@ class KnowledgeChunkRecord(Base):
     embedding: Mapped[list[float] | None] = mapped_column(JSON)
 
     source: Mapped[KnowledgeSourceRecord] = relationship(back_populates="chunks")
+
+
+class StructuredPreviewRecord(Base):
+    __tablename__ = "structured_previews"
+
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+
+
+class StructuredDatasetRecord(Base):
+    __tablename__ = "structured_datasets"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_id",
+            "worksheet_name",
+            "schema_version",
+            name="uq_structured_datasets_source_worksheet_version",
+        ),
+    )
+
+    dataset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    worksheet_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    schema_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+
+    columns: Mapped[list[StructuredColumnRecord]] = relationship(
+        back_populates="dataset",
+        cascade="all, delete-orphan",
+        order_by="StructuredColumnRecord.sort_order",
+    )
+    ingestion_jobs: Mapped[list[StructuredIngestionJobRecord]] = relationship(
+        back_populates="dataset",
+        cascade="all, delete-orphan",
+    )
+    publications: Mapped[list[StructuredPublicationRecord]] = relationship(
+        back_populates="dataset",
+        cascade="all, delete-orphan",
+    )
+
+
+class StructuredColumnRecord(Base):
+    __tablename__ = "structured_columns"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["dataset_id", "schema_version"],
+            ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "dataset_id",
+            "schema_version",
+            "physical_name",
+            name="uq_structured_columns_dataset_physical_name",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    physical_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    original_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    data_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    aliases: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    allow_aggregate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    allow_filter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    null_policy: Mapped[str] = mapped_column(String(40), nullable=False, default="ignore")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    dataset: Mapped[StructuredDatasetRecord] = relationship(back_populates="columns")
+
+
+class StructuredIngestionJobRecord(Base):
+    __tablename__ = "structured_ingestion_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["dataset_id", "schema_version"],
+            ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
+            ondelete="CASCADE",
+        ),
+        Index(
+            "uq_structured_ingestion_jobs_source_sequence",
+            "source_id",
+            "sequence",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    publication_id: Mapped[str | None] = mapped_column(
+        ForeignKey("structured_publications.publication_id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[str | None] = mapped_column(String(40))
+    checkpoint_row: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[str | None] = mapped_column(String(40))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+    dataset: Mapped[StructuredDatasetRecord] = relationship(back_populates="ingestion_jobs")
+
+
+class StructuredPublicationRecord(Base):
+    __tablename__ = "structured_publications"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["dataset_id", "schema_version"],
+            ["structured_datasets.dataset_id", "structured_datasets.schema_version"],
+            ondelete="CASCADE",
+        ),
+    )
+
+    publication_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    physical_table_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    row_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+
+    dataset: Mapped[StructuredDatasetRecord] = relationship(back_populates="publications")
 
 
 class Database:

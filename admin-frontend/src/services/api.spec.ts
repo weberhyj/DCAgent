@@ -5,6 +5,7 @@ const httpMock = vi.hoisted(() => ({
   delete: vi.fn(),
   get: vi.fn(),
   post: vi.fn(),
+  put: vi.fn(),
 }))
 
 vi.mock('axios', () => ({
@@ -49,6 +50,7 @@ describe('knowledge api service', () => {
     httpMock.delete.mockReset()
     httpMock.get.mockReset()
     httpMock.post.mockReset()
+    httpMock.put.mockReset()
     vi.resetModules()
   })
 
@@ -311,6 +313,69 @@ describe('knowledge api service', () => {
     )
     expect(httpMock.get).toHaveBeenCalledWith(
       `/admin/evaluations/batches/${encodeURIComponent(batchId)}`,
+    )
+  })
+
+  it('loads and confirms structured schemas through encoded camelCase contracts', async () => {
+    const preview = {
+      sourceId: 'source/with space',
+      datasets: [],
+      diagnostics: [],
+    }
+    const confirmation = { status: 'confirmed', datasets: [] }
+    const submission = {
+      datasets: [{
+        datasetId: 'dataset-1',
+        columns: [{
+          physicalName: 'amount',
+          displayName: 'Order amount',
+          dataType: 'decimal' as const,
+          aliases: ['revenue'],
+          allowAggregate: true,
+          allowFilter: false,
+          nullPolicy: 'ignore' as const,
+        }],
+      }],
+    }
+    httpMock.get.mockResolvedValue({ data: preview })
+    httpMock.put.mockResolvedValue({ data: confirmation })
+    const api = await loadApi()
+
+    expect(await api.fetchStructuredPreview('source/with space')).toEqual(preview)
+    expect(await api.confirmStructuredSchema('source/with space', submission)).toEqual(confirmation)
+
+    expect(httpMock.get).toHaveBeenCalledWith(
+      '/knowledge/sources/source%2Fwith%20space/structured-preview',
+    )
+    expect(httpMock.put).toHaveBeenCalledWith(
+      '/knowledge/sources/source%2Fwith%20space/structured-schema',
+      submission,
+    )
+  })
+
+  it('publishes one dataset and fetches the exact returned job status', async () => {
+    const controller = new AbortController()
+    const enqueue = { jobId: 'job/1', status: 'queued' as const }
+    const status = { sourceId: 'source/1', job: { id: 'job/1' } }
+    httpMock.post.mockResolvedValue({ data: enqueue })
+    httpMock.get.mockResolvedValue({ data: status })
+    const api = await loadApi()
+
+    expect(
+      await api.enqueueStructuredPublication('source/1', 'dataset/1', controller.signal),
+    ).toEqual(enqueue)
+    expect(
+      await api.fetchStructuredStatus('source/1', 'job/1', controller.signal),
+    ).toEqual(status)
+
+    expect(httpMock.post).toHaveBeenCalledWith(
+      '/knowledge/sources/source%2F1/structured-publications',
+      undefined,
+      { params: { datasetId: 'dataset/1' }, signal: controller.signal },
+    )
+    expect(httpMock.get).toHaveBeenCalledWith(
+      '/knowledge/sources/source%2F1/structured-status',
+      { params: { jobId: 'job/1' }, signal: controller.signal },
     )
   })
 })

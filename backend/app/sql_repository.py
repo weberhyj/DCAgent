@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from threading import Lock
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -80,6 +81,9 @@ from .repository import (
     today_label,
 )
 from .retrieval import is_reliable_knowledge_score, resolve_effective_retrieval_min_score
+
+if TYPE_CHECKING:
+    from .structured_answer import StructuredAnswerService
 
 
 def citation_to_dict(citation: CitationModel) -> dict[str, Any]:
@@ -393,9 +397,20 @@ def evaluation_run_sequence_allocation_statement(count: int) -> Update:
 
 
 class SqlChatRepository:
-    def __init__(self, database: Database, llm_provider: LLMProvider | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        llm_provider: LLMProvider | None = None,
+        structured_service: StructuredAnswerService | None = None,
+        *,
+        owns_database: bool = False,
+    ) -> None:
         self._database = database
         self._llm_provider = llm_provider or TemplateLLMProvider()
+        self._structured_service = structured_service
+        self._owns_database = owns_database
+        self._close_lock = Lock()
+        self._closed = False
         self._agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
                 search_knowledge=self.search_knowledge_chunks,
@@ -403,6 +418,20 @@ class SqlChatRepository:
             ),
             llm_provider=self._llm_provider,
         )
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        try:
+            close = getattr(self._structured_service, "close", None)
+            if callable(close):
+                close()
+        finally:
+            if self._owns_database:
+                self._database.engine.dispose()
 
     def seed_if_empty(self, state: ChatState) -> None:
         with self._database.session() as session:
@@ -511,12 +540,23 @@ class SqlChatRepository:
             ).all()
             previous_messages = [message_from_record(record) for record in previous_records]
 
-        agent_result = self._agent.run(
-            conversation_id=conversation_id,
-            content=clean_content,
-            mode=mode,
-            previous_messages=previous_messages,
+        agent_result = (
+            None
+            if self._structured_service is None
+            else self._structured_service.try_answer(
+                conversation_id=conversation_id,
+                content=clean_content,
+                mode=mode,
+                previous_messages=previous_messages,
+            )
         )
+        if agent_result is None:
+            agent_result = self._agent.run(
+                conversation_id=conversation_id,
+                content=clean_content,
+                mode=mode,
+                previous_messages=previous_messages,
+            )
         user_message = ChatMessageModel(
             id=f"msg-{uuid4().hex[:8]}",
             role="user",
