@@ -3,11 +3,74 @@ from __future__ import annotations
 import io
 import json
 from contextlib import redirect_stderr, redirect_stdout
+from decimal import Decimal
+from pathlib import Path
 from threading import Event, Lock
+import tempfile
 import unittest
 
 
 class StructuredAggregationBenchmarkTest(unittest.TestCase):
+    def test_target_builds_separate_file_secret_ingest_and_query_clients(self) -> None:
+        from tools.structured_aggregation_benchmark import build_clickhouse_clients
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ingest_secret = root / "ingest-password"
+            query_secret = root / "query-password"
+            ingest_secret.write_text("ingest-file-secret\n", encoding="utf-8")
+            query_secret.write_text("query-file-secret\n", encoding="utf-8")
+            calls = []
+
+            def factory(**kwargs):
+                calls.append(kwargs)
+                return object()
+
+            ingest, query = build_clickhouse_clients(
+                {
+                    "CLICKHOUSE_HOST": "clickhouse.local",
+                    "CLICKHOUSE_PORT": "8123",
+                    "CLICKHOUSE_INGEST_USER": "benchmark-ingest",
+                    "CLICKHOUSE_QUERY_USER": "benchmark-query",
+                    "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_secret),
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE": str(query_secret),
+                    "CLICKHOUSE_INGEST_PASSWORD": "must-not-be-read",
+                    "CLICKHOUSE_QUERY_PASSWORD": "must-not-be-read",
+                },
+                client_factory=factory,
+            )
+
+        self.assertIsNot(ingest, query)
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "host": "clickhouse.local",
+                    "port": 8123,
+                    "username": "benchmark-ingest",
+                    "password": "ingest-file-secret",
+                },
+                {
+                    "host": "clickhouse.local",
+                    "port": 8123,
+                    "username": "benchmark-query",
+                    "password": "query-file-secret",
+                    "autogenerate_session_id": False,
+                },
+            ],
+        )
+
+    def test_target_requires_both_secret_files_before_creating_clients(self) -> None:
+        from tools.structured_aggregation_benchmark import build_clickhouse_clients
+
+        calls = []
+        with self.assertRaisesRegex(ValueError, "PASSWORD_FILE"):
+            build_clickhouse_clients(
+                {"CLICKHOUSE_HOST": "clickhouse.local"},
+                client_factory=lambda **kwargs: calls.append(kwargs),
+            )
+        self.assertEqual(calls, [])
+
     def test_percentile_uses_nearest_rank_and_rejects_invalid_samples(self) -> None:
         from tools.structured_aggregation_benchmark import percentile
 
@@ -52,7 +115,7 @@ class StructuredAggregationBenchmarkTest(unittest.TestCase):
             execute_workload,
         )
 
-        rss_values = iter([100, 120, 125, 150])
+        rss_values = iter([100, 110, 120, 125, 150, 160])
         published = []
         report = execute_workload(
             BenchmarkConfig(rows=4, concurrency=1, requests=2),
@@ -69,6 +132,105 @@ class StructuredAggregationBenchmarkTest(unittest.TestCase):
         self.assertGreater(report["peakRssGrowthMb"], 0)
         with self.assertRaises(StopIteration):
             next(rss_values)
+
+    def test_rss_baseline_precedes_generator_and_samples_publication_completion(
+        self,
+    ) -> None:
+        from tools.structured_aggregation_benchmark import (
+            BenchmarkConfig,
+            MEBIBYTE,
+            execute_workload,
+        )
+
+        events = []
+        readings = iter([100, 110, 130, 140, 170, 190])
+
+        class Batches:
+            def __iter__(self):
+                events.append("iterate")
+                yield [1]
+                yield [2]
+
+        def rss() -> int:
+            events.append("rss")
+            return next(readings)
+
+        report = execute_workload(
+            BenchmarkConfig(rows=2, concurrency=1, requests=1),
+            ingestion_batches=Batches(),
+            publish_batch=lambda batch: events.append(f"publish-{batch[0]}"),
+            finish_publication=lambda: events.append("finish"),
+            execute_query=lambda _index: None,
+            rss_reader=rss,
+            clock=iter([0.0, 0.1]).__next__,
+        )
+
+        self.assertEqual(
+            events[:10],
+            [
+                "rss",
+                "iterate",
+                "rss",
+                "publish-1",
+                "rss",
+                "rss",
+                "publish-2",
+                "rss",
+                "finish",
+                "rss",
+            ],
+        )
+        self.assertEqual(report["peakRssGrowthMb"], round(90 / MEBIBYTE, 6))
+
+    def test_empty_ingestion_fails_before_publication_or_queries(self) -> None:
+        from tools.structured_aggregation_benchmark import (
+            BenchmarkConfig,
+            execute_workload,
+        )
+
+        events = []
+        with self.assertRaisesRegex(ValueError, "no batches"):
+            execute_workload(
+                BenchmarkConfig(rows=1, concurrency=1, requests=1),
+                ingestion_batches=(),
+                publish_batch=lambda _batch: events.append("publish"),
+                finish_publication=lambda: events.append("finish"),
+                execute_query=lambda _index: events.append("query"),
+                rss_reader=lambda: 100,
+            )
+        self.assertEqual(events, [])
+
+    def test_fixed_query_references_cover_every_aggregate_and_reject_wrong_results(
+        self,
+    ) -> None:
+        from tools.structured_aggregation_benchmark import (
+            AGGREGATE_QUERIES,
+            _ClickHouseTarget,
+            expected_aggregate_values,
+        )
+
+        expected = expected_aggregate_values(1_000)
+        self.assertEqual(len(expected), len(AGGREGATE_QUERIES))
+        self.assertTrue(all(value is not None for value in expected))
+        self.assertIsInstance(expected[0], Decimal)
+        self.assertIsInstance(expected[1], Decimal)
+        self.assertIsInstance(expected[2], int)
+
+        class Client:
+            def __init__(self, values):
+                self.values = list(values)
+
+            def query(self, _statement):
+                return type("Result", (), {"result_rows": [(self.values.pop(0),)]})()
+
+        ingest = type("Ingest", (), {})()
+        correct = _ClickHouseTarget(ingest, Client(expected), "benchmark", 1_000)
+        for index in range(len(AGGREGATE_QUERIES)):
+            correct.query(index)
+
+        wrong = _ClickHouseTarget(ingest, Client([Decimal("999")]), "benchmark", 1_000)
+        with self.assertRaisesRegex(RuntimeError, "mismatch"):
+            wrong.query(0)
 
     def test_workload_uses_requested_concurrency_and_counts_query_errors(self) -> None:
         from tools.structured_aggregation_benchmark import (

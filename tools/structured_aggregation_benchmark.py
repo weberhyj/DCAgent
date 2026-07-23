@@ -15,6 +15,7 @@ from decimal import Decimal
 import json
 import math
 import os
+from pathlib import Path
 import sys
 import time
 from typing import Any
@@ -124,6 +125,63 @@ def _rss_bytes() -> int:
     return int(psutil.Process().memory_info().rss)
 
 
+def _secret_from_file(environ: Mapping[str, str], name: str) -> str:
+    raw_path = environ.get(name, "").strip()
+    if not raw_path:
+        raise ValueError(f"{name} must reference a readable secret file")
+    path = Path(raw_path)
+    if not path.is_file():
+        raise ValueError(f"{name} must reference a readable secret file")
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ValueError(f"{name} must reference a readable secret file") from error
+    if not value:
+        raise ValueError(f"{name} secret file must not be empty")
+    return value
+
+
+def build_clickhouse_clients(
+    environ: Mapping[str, str],
+    *,
+    client_factory: Callable[..., Any],
+) -> tuple[Any, Any]:
+    ingest_password = _secret_from_file(environ, "CLICKHOUSE_INGEST_PASSWORD_FILE")
+    query_password = _secret_from_file(environ, "CLICKHOUSE_QUERY_PASSWORD_FILE")
+    host = environ.get("CLICKHOUSE_HOST", "").strip()
+    if not host:
+        raise ValueError("CLICKHOUSE_HOST is required")
+    try:
+        port = int(environ.get("CLICKHOUSE_PORT", "8123"))
+    except ValueError as error:
+        raise ValueError("CLICKHOUSE_PORT must be an integer") from error
+    if not 1 <= port <= 65_535:
+        raise ValueError("CLICKHOUSE_PORT must be between 1 and 65535")
+
+    ingest = client_factory(
+        host=host,
+        port=port,
+        username=environ.get("CLICKHOUSE_INGEST_USER", "structured_ingest"),
+        password=ingest_password,
+    )
+    try:
+        query = client_factory(
+            host=host,
+            port=port,
+            username=environ.get("CLICKHOUSE_QUERY_USER", "structured_query"),
+            password=query_password,
+            autogenerate_session_id=False,
+        )
+        if query is ingest:
+            raise RuntimeError("benchmark requires separate ingest and query clients")
+    except Exception:
+        close = getattr(ingest, "close", None)
+        if callable(close):
+            close()
+        raise
+    return ingest, query
+
+
 def _iter_rows(
     total: int, batch_rows: int = INGEST_BATCH_ROWS
 ) -> Iterable[list[list[object]]]:
@@ -147,6 +205,46 @@ def _iter_rows(
         yield batch
 
 
+def expected_aggregate_values(
+    total: int,
+) -> tuple[Decimal, Decimal, int, Decimal, Decimal]:
+    if isinstance(total, bool) or not isinstance(total, int) or total <= 0:
+        raise ValueError("total must be a positive integer")
+    regions = ("华东", "华南", "华北", "西部")
+    epoch = date(2025, 1, 1)
+    average_sum = Decimal(0)
+    average_count = 0
+    east_sum = Decimal(0)
+    count_at_least_100 = 0
+    date_min: Decimal | None = None
+    date_max: Decimal | None = None
+    for index in range(total):
+        if index % 97 == 0:
+            continue
+        amount = Decimal(index % 100_000) / Decimal(100)
+        region = regions[index % len(regions)]
+        order_date = epoch + timedelta(days=index % 365)
+        average_sum += amount
+        average_count += 1
+        if region == "华东":
+            east_sum += amount
+        if amount >= Decimal(100):
+            count_at_least_100 += 1
+        if order_date >= date(2025, 4, 1):
+            date_min = amount if date_min is None else min(date_min, amount)
+        if order_date <= date(2025, 9, 30):
+            date_max = amount if date_max is None else max(date_max, amount)
+    if average_count == 0 or date_min is None or date_max is None:
+        raise ValueError("fixture does not cover every fixed aggregate query")
+    return (
+        average_sum / average_count,
+        east_sum,
+        count_at_least_100,
+        date_min,
+        date_max,
+    )
+
+
 def execute_workload(
     config: BenchmarkConfig,
     *,
@@ -157,7 +255,8 @@ def execute_workload(
     rss_reader: Callable[[], int] = _rss_bytes,
     clock: Callable[[], float] = time.perf_counter,
 ) -> dict[str, int | float]:
-    rss_samples: list[int] = []
+    baseline = int(rss_reader())
+    rss_samples: list[int] = [baseline]
     published_rows = 0
     for batch in ingestion_batches:
         rss_samples.append(int(rss_reader()))
@@ -178,9 +277,10 @@ def execute_workload(
             raise ValueError("ingestion batch row counts must be positive integers")
         published_rows += batch_rows
         rss_samples.append(int(rss_reader()))
-    if not rss_samples:
+    if published_rows == 0:
         raise ValueError("ingestion produced no batches")
     finish_publication()
+    rss_samples.append(int(rss_reader()))
 
     latencies: list[float] = []
     errors = 0
@@ -200,7 +300,6 @@ def execute_workload(
             except Exception:
                 errors += 1
 
-    baseline = rss_samples[0]
     peak_growth_mb = max(0, max(rss_samples) - baseline) / MEBIBYTE
     return build_report(
         row_count=published_rows,
@@ -212,15 +311,23 @@ def execute_workload(
 
 
 class _ClickHouseTarget:
-    def __init__(self, client: Any, table: str) -> None:
-        self.client = client
+    def __init__(
+        self,
+        ingest_client: Any,
+        query_client: Any,
+        table: str,
+        row_count: int,
+    ) -> None:
+        self.ingest_client = ingest_client
+        self.query_client = query_client
         self.table = table
         self.staging_table = f"{table}_staging"
+        self.expected_values = expected_aggregate_values(row_count)
 
     def prepare(self) -> None:
-        self.client.command(f"DROP TABLE IF EXISTS {self.staging_table}")
-        self.client.command(f"DROP TABLE IF EXISTS {self.table}")
-        self.client.command(
+        self.ingest_client.command(f"DROP TABLE IF EXISTS {self.staging_table}")
+        self.ingest_client.command(f"DROP TABLE IF EXISTS {self.table}")
+        self.ingest_client.command(
             f"CREATE TABLE {self.staging_table} ("
             "row_id UInt64, "
             "order_amount Nullable(Decimal(38, 9)), "
@@ -230,27 +337,45 @@ class _ClickHouseTarget:
         )
 
     def insert_batch(self, batch: object) -> None:
-        self.client.insert(
+        self.ingest_client.insert(
             self.staging_table,
             batch,
             column_names=("row_id", "order_amount", "region", "order_date"),
         )
 
     def publish(self) -> None:
-        self.client.command(f"RENAME TABLE {self.staging_table} TO {self.table}")
+        self.ingest_client.command(f"RENAME TABLE {self.staging_table} TO {self.table}")
 
     def query(self, request_index: int) -> None:
-        statement = AGGREGATE_QUERIES[request_index % len(AGGREGATE_QUERIES)].format(
-            table=self.table
-        )
-        self.client.query(statement)
+        query_index = request_index % len(AGGREGATE_QUERIES)
+        statement = AGGREGATE_QUERIES[query_index].format(table=self.table)
+        result = self.query_client.query(statement)
+        rows = getattr(result, "result_rows", None)
+        if not rows or not rows[0] or len(rows[0]) != 1:
+            raise RuntimeError(
+                "structured benchmark aggregate returned an invalid result"
+            )
+        actual = rows[0][0]
+        expected = self.expected_values[query_index]
+        if isinstance(expected, int):
+            matches = not isinstance(actual, bool) and int(actual) == expected
+        else:
+            try:
+                matches = abs(Decimal(str(actual)) - expected) <= Decimal("0.000000001")
+            except Exception:
+                matches = False
+        if not matches:
+            raise RuntimeError(
+                f"structured benchmark aggregate mismatch for query {query_index}"
+            )
 
     def close(self) -> None:
         try:
-            self.client.command(f"DROP TABLE IF EXISTS {self.staging_table}")
-            self.client.command(f"DROP TABLE IF EXISTS {self.table}")
+            self.ingest_client.command(f"DROP TABLE IF EXISTS {self.staging_table}")
+            self.ingest_client.command(f"DROP TABLE IF EXISTS {self.table}")
         finally:
-            self.client.close()
+            self.query_client.close()
+            self.ingest_client.close()
 
 
 def run_benchmark(config: BenchmarkConfig) -> dict[str, int | float]:
@@ -260,14 +385,16 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, int | float]:
         )
     import clickhouse_connect
 
-    client = clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
-        username=os.getenv("CLICKHOUSE_INGEST_USER", "default"),
-        password=os.getenv("CLICKHOUSE_INGEST_PASSWORD", ""),
-        autogenerate_session_id=False,
+    ingest_client, query_client = build_clickhouse_clients(
+        os.environ,
+        client_factory=clickhouse_connect.get_client,
     )
-    target = _ClickHouseTarget(client, f"structured_benchmark_{uuid.uuid4().hex[:16]}")
+    target = _ClickHouseTarget(
+        ingest_client,
+        query_client,
+        f"structured_benchmark_{uuid.uuid4().hex[:16]}",
+        config.rows,
+    )
     try:
         target.prepare()
         return execute_workload(

@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import unittest
+import uuid
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -15,6 +16,7 @@ from openpyxl import Workbook
 from app.database import Database
 from app.main import create_app
 from app.models import ChatMessageModel, ResponseParagraphModel
+from app.offline_settings import require_secret_file
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
 from app.structured_ingestion import ArrowParquetSink, SpreadsheetPublisher
@@ -317,6 +319,25 @@ class StructuredAggregationEndToEndTest(unittest.TestCase):
                                 response.json()["messages"][-1]["paragraphs"][0]["text"],
                             )
 
+                    count_all_conversation = client.post("/api/conversations").json()[
+                        "activeConversationId"
+                    ]
+                    count_all = client.post(
+                        f"/api/conversations/{count_all_conversation}/messages",
+                        json={"content": "总共有多少条记录", "mode": "source"},
+                    )
+                    self.assertEqual(count_all.status_code, 200, count_all.text)
+                    self.assertEqual(
+                        gateway.last_result,
+                        {
+                            "aggregate_value": ROW_COUNT,
+                            "total_count": ROW_COUNT,
+                            "valid_count": ROW_COUNT,
+                            "null_count": 0,
+                        },
+                    )
+                    self.assertIn("count() AS aggregate_value", gateway.query_calls[-1][0])
+
                     document_conversation = client.post("/api/conversations").json()[
                         "activeConversationId"
                     ]
@@ -377,13 +398,77 @@ class StructuredAggregationEndToEndTest(unittest.TestCase):
                 database.engine.dispose()
 
 
+def _target_host_missing_configuration() -> tuple[str, ...]:
+    required = (
+        "RUN_OFFLINE_INTEGRATION",
+        "CLICKHOUSE_HOST",
+        "CLICKHOUSE_INGEST_PASSWORD_FILE",
+        "CLICKHOUSE_QUERY_PASSWORD_FILE",
+    )
+    missing = []
+    for name in required:
+        value = os.getenv(name, "").strip()
+        if not value or (name == "RUN_OFFLINE_INTEGRATION" and value != "1"):
+            missing.append(name)
+        elif name.endswith("_FILE") and not Path(value).is_file():
+            missing.append(name)
+    return tuple(missing)
+
+
+_TARGET_HOST_MISSING = _target_host_missing_configuration()
+
+
 @unittest.skipUnless(
-    os.getenv("RUN_OFFLINE_INTEGRATION") == "1" and bool(os.getenv("CLICKHOUSE_HOST")),
-    "target-host gate requires RUN_OFFLINE_INTEGRATION=1 and CLICKHOUSE_HOST",
+    not _TARGET_HOST_MISSING,
+    "target-host gate missing explicit configuration: " + ", ".join(_TARGET_HOST_MISSING),
 )
 class StructuredAggregationTargetHostGateTest(unittest.TestCase):
-    def test_clickhouse_target_is_explicitly_available(self) -> None:
-        self.assertTrue(os.environ["CLICKHOUSE_HOST"].strip())
+    def test_clickhouse_target_publishes_and_queries_with_separate_identities(self) -> None:
+        import clickhouse_connect
+
+        table = f"structured_e2e_gate_{uuid.uuid4().hex[:16]}"
+        staging = f"{table}_staging"
+        host = os.environ["CLICKHOUSE_HOST"]
+        port = int(os.getenv("CLICKHOUSE_PORT", "8123"))
+        ingest = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=os.getenv("CLICKHOUSE_INGEST_USER", "structured_ingest"),
+            password=require_secret_file(
+                Path(os.environ["CLICKHOUSE_INGEST_PASSWORD_FILE"]),
+                "CLICKHOUSE_INGEST_PASSWORD_FILE",
+            ),
+        )
+        query = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=os.getenv("CLICKHOUSE_QUERY_USER", "structured_query"),
+            password=require_secret_file(
+                Path(os.environ["CLICKHOUSE_QUERY_PASSWORD_FILE"]),
+                "CLICKHOUSE_QUERY_PASSWORD_FILE",
+            ),
+            autogenerate_session_id=False,
+        )
+        try:
+            ingest.command(f"DROP TABLE IF EXISTS {staging}")
+            ingest.command(f"DROP TABLE IF EXISTS {table}")
+            ingest.command(
+                f"CREATE TABLE {staging} (amount Nullable(Decimal(38, 9))) "
+                "ENGINE = MergeTree ORDER BY tuple()"
+            )
+            ingest.insert(
+                staging,
+                [[Decimal("10")], [None], [Decimal("30")]],
+                column_names=("amount",),
+            )
+            ingest.command(f"RENAME TABLE {staging} TO {table}")
+            result = query.query(f"SELECT count(), avg(amount) FROM {table}").result_rows[0]
+            self.assertEqual(result, (3, Decimal("20")))
+        finally:
+            ingest.command(f"DROP TABLE IF EXISTS {staging}")
+            ingest.command(f"DROP TABLE IF EXISTS {table}")
+            ingest.close()
+            query.close()
 
 
 if __name__ == "__main__":
