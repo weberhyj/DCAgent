@@ -86,7 +86,7 @@ def run_physoc_probe(
     )
     started_at = clock()
     message = provider.generate_reply(request)
-    elapsed_ms = (clock() - started_at) * 1000
+    elapsed_ms = round((clock() - started_at) * 1000, 3)
 
     answer = " ".join(paragraph.text for paragraph in message.paragraphs).strip()
     citations = [citation for paragraph in message.paragraphs for citation in paragraph.citations]

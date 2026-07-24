@@ -105,6 +105,17 @@ class PhysocProbeTests(unittest.TestCase):
                 clock_values=iter([10.0, 10.25]),
             )
 
+    def test_probe_rounds_elapsed_ms_to_three_decimal_places(self) -> None:
+        provider = FakePhysocProvider()
+
+        result = run_physoc_probe(
+            {"LLM_PROVIDER": "physoc_deepseek"},
+            provider_factory=lambda environ: provider,
+            clock_values=iter([10.0, 10.1234567]),
+        )
+
+        self.assertEqual(result["elapsedMs"], 123.457)
+
     def test_probe_propagates_safe_provider_error_without_result(self) -> None:
         provider = FailingPhysocProvider()
 
