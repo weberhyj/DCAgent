@@ -40,6 +40,13 @@ def physoc_readme_section(text: str) -> str:
     return match.group(1)
 
 
+def physoc_offline_runbook_section(text: str) -> str:
+    match = re.search(r"(?ms)^## Physoc production gate\s*$\n(.*?)(?=^##\s|\Z)", text)
+    if match is None:
+        return ""
+    return match.group(1)
+
+
 def active_assignments(text: str) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in text.splitlines():
@@ -115,18 +122,34 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         self.assertFalse(base_address.is_loopback)
 
     def test_physoc_examples_do_not_contain_sensitive_or_dns_values(self) -> None:
-        for path in (*ENV_EXAMPLES, REPO_ROOT / "README.md"):
-            text = path.read_text(encoding="utf-8")
-            physoc_lines = (
-                physoc_readme_section(text)
-                if path.name == "README.md"
-                else physoc_env_block(text)
-            )
+        readme_path = REPO_ROOT / "README.md"
+        offline_runbook_path = REPO_ROOT / "deploy" / "offline" / "README.md"
+        documented_sections = [
+            *(
+                (path, physoc_env_block(path.read_text(encoding="utf-8")))
+                for path in ENV_EXAMPLES
+            ),
+            (
+                readme_path,
+                physoc_readme_section(readme_path.read_text(encoding="utf-8")),
+            ),
+            (
+                offline_runbook_path,
+                physoc_offline_runbook_section(
+                    offline_runbook_path.read_text(encoding="utf-8")
+                ),
+            ),
+        ]
+
+        for path, physoc_lines in documented_sections:
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertTrue(physoc_lines)
                 self.assertNotIn("physoc.internal", physoc_lines.lower())
                 for hostname in re.findall(r"https?://([^/:\s`]+)", physoc_lines):
-                    address = ipaddress.ip_address(hostname)
+                    try:
+                        address = ipaddress.ip_address(hostname)
+                    except ValueError:
+                        self.fail(f"Physoc URL host must be a literal IP: {hostname}")
                     self.assertTrue(address.is_private or address.is_loopback)
                 self.assertIsNone(SENSITIVE_ASSIGNMENT.search(physoc_lines))
 
@@ -160,6 +183,15 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "message/response/done",
             "timeout and interrupted-stream behavior",
             "生产入口禁止 template 和 mock",
+            "LLM_PROVIDER=physoc_deepseek",
+            "LLM_API_BASE=http://172.16.0.10:8090",
+            "LLM_STREAM_PATH=/api/physoc/deepseek/stream",
+            "LLM_MODEL=my_deepseek_r1_7b",
+            "容器可达的批准 private address",
+            "且后端不在容器内运行的开发场景",
+            "容器内不得把 `127.0.0.1` 当作宿主机 Physoc 地址",
+            "核心 `offline` 网络仍为 `internal`",
+            "只有 API 同时连接 `physoc-egress`",
             "python -m app.physoc_probe",
             "artifacts/benchmarks/physoc-probe.json",
             "不会输出提示词、证据正文或模型回答正文",
@@ -171,12 +203,20 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         runbook = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
             encoding="utf-8"
         )
+        section = physoc_offline_runbook_section(runbook)
+        self.assertTrue(section)
 
         for required_text in (
-            "## Physoc production gate",
             "LLM_PROVIDER=physoc_deepseek",
+            "LLM_API_BASE=http://172.16.0.10:8090",
             "LLM_STREAM_PATH=/api/physoc/deepseek/stream",
-            "python -m app.physoc_probe",
+            "LLM_MODEL=my_deepseek_r1_7b",
+            "Copy-Item deploy/offline/.env.example deploy/offline/.env",
+            "# Edit LLM_API_BASE to the approved private Physoc address.",
+            "& tools/invoke_offline_compose.ps1 config",
+            "& tools/invoke_offline_compose.ps1 up -d",
+            "python -m app.physoc_probe --report /tmp/physoc-probe.json",
+            'python -c \'import json, pathlib; print(json.dumps(json.loads(pathlib.Path("/tmp/physoc-probe.json").read_text(encoding="utf-8")), indent=2, sort_keys=True))\'',
             "physoc-probe.json",
             '"answerChars": 12',
             '"citationCount": 1',
@@ -197,11 +237,24 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "model mismatch",
             "missing done=true",
             "empty answer",
-            "ClickHouse",
-            "physoc-egress",
+            "报告只包含路由、耗时、回答字符数和引用数量，不含",
+            "提示词、证据正文或模型回答正文",
+            "纯 ClickHouse 结构化统计是确定性计算",
+            "不属于 model-route rollback",
+            "恢复为最后已知可用的 Physoc host/model",
+            "`& tools/invoke_offline_compose.ps1 up -d` 重启并重新执行 probe",
+            "禁止把生产环境回滚到",
+            "核心 `offline` 网络保持 `internal`",
+            "仅 API 连接 `physoc-egress`",
+            "目标主机和防火墙",
+            "限制到批准的 private Physoc 地址",
         ):
             with self.subTest(required_text=required_text):
-                self.assertIn(required_text, runbook)
+                self.assertIn(required_text, section)
+
+        self.assertGreaterEqual(
+            section.count("& tools/invoke_offline_compose.ps1 exec -T api"), 2
+        )
 
     def test_design_documents_bounded_raw_sse_parsing(self) -> None:
         decoder_source = (REPO_ROOT / "backend" / "app" / "physoc_sse.py").read_text(
