@@ -85,6 +85,25 @@ Physoc 模式无需 LLM_API_KEY。后端向 `LLM_API_BASE` 与 `LLM_STREAM_PATH`
 
 两个前端项目都支持通过 `VITE_API_PROXY_TARGET` 覆盖本地 API 代理目标，默认代理到 `http://127.0.0.1:8000`。
 
+生产入口禁止 template 和 mock；它们仅用于本地开发和固定测试数据。公司内网部署应设置：
+
+```text
+LLM_PROVIDER=physoc_deepseek
+LLM_API_BASE=http://172.16.0.10:8090
+LLM_STREAM_PATH=/api/physoc/deepseek/stream
+LLM_MODEL=my_deepseek_r1_7b
+```
+
+上面的 `172.16.0.10` 是不含凭据的私网示例，实际容器必须使用容器可达的批准 private address。核心 `offline` 网络仍为 `internal`；只有 API 同时连接 `physoc-egress` 以访问 Physoc。`physoc-egress` 是受控出口，不使其他核心服务获得外部网络能力，也不表示 `internal` 网络可访问外部。目标主机和防火墙必须把该出口限制到批准的 private Physoc 地址。前面的 loopback 配置仅保留用于后端和 Physoc 在同一主机、且后端不在容器内运行的开发场景；容器内不得把 `127.0.0.1` 当作宿主机 Physoc 地址。
+
+部署后必须在 API 的同一运行环境执行：
+
+```powershell
+python -m app.physoc_probe --report artifacts/benchmarks/physoc-probe.json
+```
+
+探针成功报告只记录 provider、model、streamPath、elapsedMs、answerChars 和 citationCount 等运行元数据，不会输出提示词、证据正文或模型回答正文。将 `artifacts/benchmarks/physoc-probe.json` 作为切换门禁证据保存；探针失败时不得启用该生产路由。
+
 ## Structured spreadsheet aggregation
 
 Exact Excel/CSV aggregation is an opt-in local feature. The shipped default is

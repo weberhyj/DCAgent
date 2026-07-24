@@ -125,9 +125,9 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertTrue(physoc_lines)
                 self.assertNotIn("physoc.internal", physoc_lines.lower())
-                self.assertNotRegex(
-                    physoc_lines, r"https?://(?!127\.0\.0\.1(?::|/|$))[^\s`]+"
-                )
+                for hostname in re.findall(r"https?://([^/:\s`]+)", physoc_lines):
+                    address = ipaddress.ip_address(hostname)
+                    self.assertTrue(address.is_private or address.is_loopback)
                 self.assertIsNone(SENSITIVE_ASSIGNMENT.search(physoc_lines))
 
     def test_readme_documents_the_physoc_streaming_contract(self) -> None:
@@ -159,9 +159,49 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "Content-Type",
             "message/response/done",
             "timeout and interrupted-stream behavior",
+            "生产入口禁止 template 和 mock",
+            "python -m app.physoc_probe",
+            "artifacts/benchmarks/physoc-probe.json",
+            "不会输出提示词、证据正文或模型回答正文",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, section)
+
+    def test_offline_runbook_documents_physoc_cutover_and_rollback(self) -> None:
+        runbook = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
+            encoding="utf-8"
+        )
+
+        for required_text in (
+            "## Physoc production gate",
+            "LLM_PROVIDER=physoc_deepseek",
+            "LLM_STREAM_PATH=/api/physoc/deepseek/stream",
+            "python -m app.physoc_probe",
+            "physoc-probe.json",
+            '"answerChars": 12',
+            '"citationCount": 1',
+            '"elapsedMs": 250.0',
+            '"model": "my_deepseek_r1_7b"',
+            '"passed": true',
+            '"provider": "physoc_deepseek"',
+            '"streamPath": "/api/physoc/deepseek/stream"',
+            "HTTP 502",
+            "不得返回检索切片",
+            "回滚",
+            "template",
+            "mock",
+            "timeout",
+            "non-2xx",
+            "wrong content-type",
+            "malformed event JSON",
+            "model mismatch",
+            "missing done=true",
+            "empty answer",
+            "ClickHouse",
+            "physoc-egress",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, runbook)
 
     def test_design_documents_bounded_raw_sse_parsing(self) -> None:
         decoder_source = (REPO_ROOT / "backend" / "app" / "physoc_sse.py").read_text(

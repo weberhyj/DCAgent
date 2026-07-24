@@ -30,6 +30,61 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 - `--profile generation` enables the private llama.cpp service after its locked local model is installed.
 - `--profile indexing` enables the structured spreadsheet worker (`app.structured_worker`). Keep it disabled while `STRUCTURED_QUERY_ENABLED=false`.
 
+## Physoc production gate
+
+生产入口禁止 `template` 和 `mock`；它们只允许用于本地开发和固定测试数据。生产环境的
+`deploy/offline/.env` 必须包含经审核的路由值：
+
+```text
+LLM_PROVIDER=physoc_deepseek
+LLM_API_BASE=http://172.16.0.10:8090
+LLM_STREAM_PATH=/api/physoc/deepseek/stream
+LLM_MODEL=my_deepseek_r1_7b
+```
+
+`172.16.0.10` 仅为不含凭据的 private IP 示例。将 `LLM_API_BASE` 改为容器可达、已批准的
+private Physoc 地址后，从仓库根目录执行以下切换门禁：
+
+```powershell
+Copy-Item deploy/offline/.env.example deploy/offline/.env
+# Edit LLM_API_BASE to the approved private Physoc address.
+& tools/invoke_offline_compose.ps1 config
+& tools/invoke_offline_compose.ps1 up -d
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -m app.physoc_probe --report /tmp/physoc-probe.json
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -c 'import json, pathlib; print(json.dumps(json.loads(pathlib.Path("/tmp/physoc-probe.json").read_text(encoding="utf-8")), indent=2, sort_keys=True))'
+```
+
+通过的 `physoc-probe.json` 形状如下；报告只包含路由、耗时、回答字符数和引用数量，不含
+提示词、证据正文或模型回答正文：
+
+```json
+{
+  "answerChars": 12,
+  "citationCount": 1,
+  "elapsedMs": 250.0,
+  "model": "my_deepseek_r1_7b",
+  "passed": true,
+  "provider": "physoc_deepseek",
+  "streamPath": "/api/physoc/deepseek/stream"
+}
+```
+
+只有探针退出成功且报告中的 provider、model 和 streamPath 与部署配置一致时，才允许开放
+普通文档问答流量。以下任一情况都必须使探针失败：timeout、non-2xx、wrong content-type、
+malformed event JSON、model mismatch、missing done=true 或 empty answer。生产启动若配置为
+`template` 或 `mock` 也必须直接失败。
+
+当 Physoc 不可用时，普通文档问题必须返回 HTTP 502，且不得返回检索切片或把切片内容伪装成
+模型回答。纯 ClickHouse 结构化统计是确定性计算，不依赖模型路由，不属于 model-route rollback；
+ClickHouse 自身失败时仍按结构化统计的显式失败规则处理。
+
+回滚时，把 `LLM_API_BASE` 和 `LLM_MODEL` 恢复为最后已知可用的 Physoc host/model，然后用
+`& tools/invoke_offline_compose.ps1 up -d` 重启并重新执行 probe。禁止把生产环境回滚到
+`template`。核心 `offline` 网络保持 `internal`，仅 API 连接 `physoc-egress`；目标主机和防火墙
+必须把此出口限制到批准的 private Physoc 地址，不能据此声称核心 internal-only 网络可以访问外部。
+
 ## Structured aggregation rollout and rollback
 
 Structured Excel/CSV aggregation is disabled by default. Keep
