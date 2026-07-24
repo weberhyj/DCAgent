@@ -57,6 +57,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "Physoc 模式无需 LLM_API_KEY",
             "容器可达的批准 private IP",
             "生产启动会拒绝 template 和 mock",
+            "127.0.0.1 仅为语法示例，容器部署不可直接使用",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, offline)
