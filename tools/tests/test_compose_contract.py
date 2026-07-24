@@ -43,6 +43,18 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn("wget -qO- http://127.0.0.1:6333", text)
         self.assertNotIn("/var/lib/clamav:ro", text)
 
+    def test_compose_supports_keyless_physoc_stream_configuration(self) -> None:
+        text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "LLM_STREAM_PATH: ${LLM_STREAM_PATH:-/api/physoc/deepseek/stream}",
+            text,
+        )
+        self.assertIn("LLM_API_KEY: ${LLM_API_KEY:-}", text)
+        self.assertNotIn("LLM_API_KEY: ${LLM_API_KEY:?", text)
+
     def test_compose_keeps_only_api_port_published(self) -> None:
         text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
             encoding="utf-8"
@@ -544,9 +556,16 @@ class ComposeContractTest(unittest.TestCase):
             compose_text,
         )
         self.assertTrue(expansions)
+        optional_expansions = {
+            "LLM_STREAM_PATH": ":-/api/physoc/deepseek/stream",
+            "LLM_API_KEY": ":-",
+        }
         for name, suffix in expansions:
             with self.subTest(name=name, suffix=suffix):
-                self.assertTrue(suffix.startswith(":?"))
+                if name in optional_expansions:
+                    self.assertEqual(optional_expansions[name], suffix)
+                else:
+                    self.assertTrue(suffix.startswith(":?"))
         for required_name in (
             "DATA_ROOT",
             "MODEL_ROOT",
@@ -705,6 +724,8 @@ class ComposeContractTest(unittest.TestCase):
                 "MODEL_ROOT=../../artifacts/models\n"
                 "POSTGRES_PASSWORD_FILE=../../artifacts/secrets/postgres-password\n"
                 "DATABASE_URL_SECRET_FILE=../../artifacts/secrets/database-url\n"
+                "CLICKHOUSE_QUERY_PASSWORD_FILE=../../artifacts/secrets/clickhouse-query-password\n"
+                "CLICKHOUSE_INGEST_PASSWORD_FILE=../../artifacts/secrets/clickhouse-ingest-password\n"
                 "CUSTOM=kept\n"
             )
             if identity_lines:

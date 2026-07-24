@@ -177,7 +177,8 @@ services:
       MODEL_SLOTS: ${MODEL_SLOTS:?MODEL_SLOTS is required}
       LLM_PROVIDER: ${LLM_PROVIDER:?LLM_PROVIDER is required}
       LLM_API_BASE: ${LLM_API_BASE:?LLM_API_BASE is required}
-      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY is required}
+      LLM_STREAM_PATH: ${LLM_STREAM_PATH:-/api/physoc/deepseek/stream}
+      LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:?LLM_MODEL is required}
       RAW_DATA_ROOT: /data/raw
       PARQUET_ROOT: /data/parquet

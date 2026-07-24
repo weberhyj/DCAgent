@@ -49,31 +49,43 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
                     self.assertRegex(
                         physoc_env_block(text), rf"(?m)^\s*#\s*{re.escape(setting)}\s*$"
                     )
-                self.assertIn("Physoc 模式无需 LLM_API_KEY。", physoc_env_block(text))
+                self.assertIn("Physoc 模式无需 LLM_API_KEY", physoc_env_block(text))
 
         offline = physoc_env_block(ENV_EXAMPLES[-1].read_text(encoding="utf-8"))
         for required_text in (
-            "当前 offline Compose 拓扑不可直接启用",
-            "请勿直接取消注释",
-            "Compose 未透传 LLM_STREAM_PATH",
-            "仍要求 LLM_API_KEY",
-            "接入同一隔离网络",
+            "当前 offline Compose 已透传 LLM_STREAM_PATH",
+            "Physoc 模式无需 LLM_API_KEY",
             "容器可达的批准 private IP",
-            "补齐 Compose 接线",
+            "生产启动会拒绝 template 和 mock",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, offline)
-        self.assertNotIn("取消注释即可", offline)
-        self.assertNotIn("当前可用", offline)
 
-    def test_env_examples_keep_template_as_the_active_default(self) -> None:
-        for path in ENV_EXAMPLES:
+    def test_development_examples_keep_template_and_offline_deployment_uses_physoc(
+        self,
+    ) -> None:
+        for path in ENV_EXAMPLES[:2]:
             text = path.read_text(encoding="utf-8")
             active_providers = re.findall(
                 r"(?m)^\s*LLM_PROVIDER\s*=\s*([^#\s]+)\s*$", text
             )
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertEqual(["template"], active_providers)
+                self.assertIn("development only", text.casefold())
+
+        offline_text = ENV_EXAMPLES[-1].read_text(encoding="utf-8")
+        self.assertRegex(
+            offline_text,
+            r"(?m)^LLM_PROVIDER=physoc_deepseek\s*$",
+        )
+        self.assertRegex(
+            offline_text,
+            r"(?m)^LLM_STREAM_PATH=/api/physoc/deepseek/stream\s*$",
+        )
+        self.assertNotRegex(
+            offline_text,
+            r"(?m)^\s*LLM_API_KEY\s*=\s*\S+\s*$",
+        )
 
     def test_physoc_examples_do_not_contain_sensitive_or_dns_values(self) -> None:
         for path in (*ENV_EXAMPLES, REPO_ROOT / "README.md"):
