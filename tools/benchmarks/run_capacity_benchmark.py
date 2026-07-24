@@ -27,6 +27,7 @@ from tools.benchmarks.report import (
 
 
 MODES = ("phase1-smoke", "phase4-online", "phase4-batch")
+_AUTO_PSUTIL = object()
 VERSION_COMMANDS: Mapping[str, tuple[str, ...]] = {
     "python": (sys.executable, "--version"),
     "docker": ("docker", "--version"),
@@ -151,22 +152,25 @@ def _disk_device(path: Path, partitions: Sequence[object]) -> str:
 def collect_hardware(
     disk_path: Path,
     *,
-    psutil_module: object | None = None,
+    psutil_module: object | None = _AUTO_PSUTIL,
     platform_module: object = platform,
 ) -> dict[str, object]:
-    if psutil_module is None:
+    if psutil_module is _AUTO_PSUTIL:
         try:
             import psutil as psutil_module  # type: ignore[no-redef]
         except ModuleNotFoundError:
-            cpu_model = str(platform_module.processor()).strip()  # type: ignore[attr-defined]
-            return {
-                "cpuModel": cpu_model or "not_available",
-                "physicalCores": "not_available",
-                "logicalCores": os.cpu_count() or "not_available",
-                "totalRamBytes": "not_available",
-                "availableRamBytes": "not_available",
-                "diskDevice": "not_available",
-            }
+            psutil_module = None
+
+    if psutil_module is None:
+        cpu_model = str(platform_module.processor()).strip()  # type: ignore[attr-defined]
+        return {
+            "cpuModel": cpu_model or "not_available",
+            "physicalCores": "not_available",
+            "logicalCores": os.cpu_count() or "not_available",
+            "totalRamBytes": "not_available",
+            "availableRamBytes": "not_available",
+            "diskDevice": "not_available",
+        }
 
     memory = psutil_module.virtual_memory()  # type: ignore[attr-defined]
     partitions = psutil_module.disk_partitions(all=False)  # type: ignore[attr-defined]
