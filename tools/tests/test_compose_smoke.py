@@ -162,6 +162,49 @@ class ComposeSmokeTest(unittest.TestCase):
             postgres["alembicRevision"], compose_smoke._discover_migration_head()
         )
 
+    def test_stale_postgres_migration_revision_fails_smoke_and_still_cleans_up(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        stale_revision = "20260715_00"
+        expected_revision = compose_smoke._discover_migration_head()
+        self.assertNotEqual(stale_revision, expected_revision)
+        runner = FakeRunner(
+            outputs={
+                "postgres": json.dumps(
+                    {
+                        "selectOne": 1,
+                        "alembicRevision": stale_revision,
+                        "version": "16.3",
+                    }
+                )
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = compose_smoke.run_compose_smoke(
+                report_path=Path(directory) / "report.json",
+                runner=runner,
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("check:postgres", report["failures"])
+        self.assertEqual(report["migrationHead"], expected_revision)
+        self.assertEqual(
+            report["readyResults"]["postgres"],
+            {
+                "passed": False,
+                "selectOne": 1,
+                "alembicRevision": stale_revision,
+            },
+        )
+        keys = [runner._key(command) for command, _ in runner.calls]
+        self.assertEqual(keys[-1], "down")
+        self.assertEqual(report["commandExitCodes"]["down"], 0)
+
     def test_atomic_report_cleanup_preserves_original_write_error(self) -> None:
         compose_smoke = _module()
         with tempfile.TemporaryDirectory() as directory:
