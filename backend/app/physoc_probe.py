@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -106,10 +107,14 @@ def run_physoc_probe(
     }
 
 
+def sanitize_probe_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    return {field: report[field] for field in _REPORT_FIELDS}
+
+
 def write_probe_report(path: str | Path, report: Mapping[str, Any]) -> None:
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    safe_report = {field: report[field] for field in _REPORT_FIELDS}
+    safe_report = sanitize_probe_report(report)
     temporary_path: Path | None = None
     try:
         with NamedTemporaryFile(
@@ -130,7 +135,7 @@ def write_probe_report(path: str | Path, report: Mapping[str, Any]) -> None:
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
         temporary_path.replace(target)
-    except Exception:
+    except BaseException:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
         raise
@@ -145,9 +150,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    load_runtime_environment()
-    report = run_physoc_probe(os.environ)
-    write_probe_report(args.report, report)
+    try:
+        load_runtime_environment()
+        report = sanitize_probe_report(run_physoc_probe(os.environ))
+        write_probe_report(args.report, report)
+    except Exception:
+        print(
+            "Physoc probe failed; sensitive details were suppressed.",
+            file=sys.stderr,
+        )
+        return 1
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0
 

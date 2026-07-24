@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,7 +15,25 @@ from app.llm import (
     TemplateLLMProvider,
 )
 from app.models import ChatMessageModel, CitationModel, ResponseParagraphModel
-from app.physoc_probe import run_physoc_probe, write_probe_report
+from app.physoc_probe import main, run_physoc_probe, write_probe_report
+
+SAFE_REPORT = {
+    "passed": True,
+    "provider": "physoc_deepseek",
+    "model": "my_deepseek_r1_7b",
+    "streamPath": "/api/physoc/deepseek/stream",
+    "elapsedMs": 250.0,
+    "answerChars": 12,
+    "citationCount": 1,
+}
+SENSITIVE_REPORT_FIELDS = {
+    "apiBase": "http://10.20.30.40:8090",
+    "prompt": "SECRET_PROMPT_SENTINEL",
+    "evidence": "SECRET_EVIDENCE_SENTINEL",
+    "answer": "SECRET_ANSWER_SENTINEL",
+    "events": "data: SECRET_SSE_EVENT_SENTINEL",
+    "exception": "SECRET_UPSTREAM_DETAILS",
+}
 
 
 class FakePhysocProvider(PhysocDeepSeekLLMProvider):
@@ -150,15 +170,7 @@ class PhysocProbeTests(unittest.TestCase):
             )
 
     def test_write_probe_report_atomically_writes_only_safe_fields(self) -> None:
-        report = {
-            "passed": True,
-            "provider": "physoc_deepseek",
-            "model": "my_deepseek_r1_7b",
-            "streamPath": "/api/physoc/deepseek/stream",
-            "elapsedMs": 250.0,
-            "answerChars": 12,
-            "citationCount": 1,
-        }
+        report = {**SAFE_REPORT, **SENSITIVE_REPORT_FIELDS}
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "nested" / "physoc-probe.json"
 
@@ -178,31 +190,94 @@ class PhysocProbeTests(unittest.TestCase):
                     "streamPath",
                 },
             )
-            self.assertEqual(written, report)
+            self.assertEqual(written, SAFE_REPORT)
             self.assertNotIn("prompt", written)
             self.assertNotIn("answer", written)
             self.assertNotIn("Physoc 链路正常。", raw_report)
+            for sensitive_value in SENSITIVE_REPORT_FIELDS.values():
+                self.assertNotIn(sensitive_value, raw_report)
             self.assertEqual(list(report_path.parent.iterdir()), [report_path])
 
     def test_write_probe_report_removes_temp_file_when_replace_fails(self) -> None:
-        report = {
-            "passed": True,
-            "provider": "physoc_deepseek",
-            "model": "my_deepseek_r1_7b",
-            "streamPath": "/api/physoc/deepseek/stream",
-            "elapsedMs": 250.0,
-            "answerChars": 12,
-            "citationCount": 1,
-        }
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "nested" / "physoc-probe.json"
             with (
                 patch("app.physoc_probe.Path.replace", side_effect=OSError("replace failed")),
                 self.assertRaisesRegex(OSError, "replace failed"),
             ):
-                write_probe_report(report_path, report)
+                write_probe_report(report_path, SAFE_REPORT)
 
             self.assertEqual(list(report_path.parent.iterdir()), [])
+
+    def test_write_probe_report_cleans_temp_file_for_base_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "nested" / "physoc-probe.json"
+            with (
+                patch("app.physoc_probe.Path.replace", side_effect=KeyboardInterrupt),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                write_probe_report(report_path, SAFE_REPORT)
+
+            self.assertEqual(list(report_path.parent.iterdir()), [])
+
+    def test_main_redacts_chained_failure_and_preserves_existing_report(self) -> None:
+        upstream = RuntimeError(" ".join(SENSITIVE_REPORT_FIELDS.values()))
+        failure = LLMProviderError("probe failed")
+        failure.__cause__ = upstream
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "physoc-probe.json"
+            original_report = b"existing report remains unchanged"
+            report_path.write_bytes(original_report)
+
+            with (
+                patch("app.physoc_probe.run_physoc_probe", side_effect=failure),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                code = main(["--report", str(report_path)])
+
+            self.assertEqual(code, 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(
+                stderr.getvalue(),
+                "Physoc probe failed; sensitive details were suppressed.\n",
+            )
+            for sensitive_value in SENSITIVE_REPORT_FIELDS.values():
+                self.assertNotIn(sensitive_value, stdout.getvalue())
+                self.assertNotIn(sensitive_value, stderr.getvalue())
+            self.assertEqual(report_path.read_bytes(), original_report)
+            self.assertEqual(list(report_path.parent.iterdir()), [report_path])
+
+    def test_main_success_prints_and_writes_only_sanitized_report(self) -> None:
+        raw_report = {**SAFE_REPORT, **SENSITIVE_REPORT_FIELDS}
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "physoc-probe.json"
+
+            with (
+                patch("app.physoc_probe.load_runtime_environment"),
+                patch("app.physoc_probe.run_physoc_probe", return_value=raw_report),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                code = main(["--report", str(report_path)])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(json.loads(stdout.getvalue()), SAFE_REPORT)
+            self.assertEqual(
+                json.loads(report_path.read_text(encoding="utf-8")),
+                SAFE_REPORT,
+            )
+            for sensitive_value in SENSITIVE_REPORT_FIELDS.values():
+                self.assertNotIn(sensitive_value, stdout.getvalue())
+                self.assertNotIn(
+                    sensitive_value,
+                    report_path.read_text(encoding="utf-8"),
+                )
 
 
 if __name__ == "__main__":
