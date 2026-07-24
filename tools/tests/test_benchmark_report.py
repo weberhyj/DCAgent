@@ -89,7 +89,11 @@ class BenchmarkReportTest(unittest.TestCase):
             kwargs = {
                 "path": path,
                 "manifest": {"virtual_users": 15},
-                "profile": {"name": "acceptance", "vector_dimensions": 768, "model_slots": 2},
+                "profile": {
+                    "name": "acceptance",
+                    "vector_dimensions": 768,
+                    "model_slots": 2,
+                },
                 "mode": "phase4-online",
                 "cache_label": "warm",
                 "gates": gates,
@@ -139,7 +143,9 @@ class CapacityRunnerTest(unittest.TestCase):
         self.assertEqual(profile.name, "service-round-trip")
         self.assertEqual(profile.gates[0].name, "postgresql_round_trip_ms")
 
-        acceptance = BenchmarkManifest.load(ROOT / "benchmarks/manifests/acceptance-30m-5m.json")
+        acceptance = BenchmarkManifest.load(
+            ROOT / "benchmarks/manifests/acceptance-30m-5m.json"
+        )
         warm = select_profile(acceptance, "online-warm", "phase4-online")
         self.assertEqual(warm.gates[-1].name, "error_rate")
         with self.assertRaises(ValueError):
@@ -150,24 +156,35 @@ class CapacityRunnerTest(unittest.TestCase):
         batch = select_profile(acceptance, "batch-initial", "phase4-batch")
         self.assertEqual(derive_benchmark_timeout_seconds(acceptance, batch), 86_700)
 
-    def test_rejects_missing_and_non_numeric_metrics_before_reporting_pass(self) -> None:
+    def test_rejects_missing_and_non_numeric_metrics_before_reporting_pass(
+        self,
+    ) -> None:
         from tools.benchmarks.report import MetricGate
         from tools.benchmarks.run_capacity_benchmark import validate_metrics
 
         gates = (MetricGate("latency", "lte", 10),)
-        for metrics in ({}, {"latency": "not_available"}, {"latency": None}, {"latency": math.inf}):
+        for metrics in (
+            {},
+            {"latency": "not_available"},
+            {"latency": None},
+            {"latency": math.inf},
+        ):
             with self.subTest(metrics=metrics):
                 self.assertEqual(validate_metrics(gates, metrics), ["latency"])
         self.assertEqual(validate_metrics(gates, {"latency": 8}), [])
 
-    def test_create_report_serializes_non_finite_metric_as_failed_not_available(self) -> None:
+    def test_create_report_serializes_non_finite_metric_as_failed_not_available(
+        self,
+    ) -> None:
         from tools.benchmarks.run_capacity_benchmark import create_report
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             metrics_path = root / "metrics.json"
             report_path = root / "report.json"
-            metrics_path.write_text('{"postgresql_round_trip_ms": NaN}', encoding="utf-8")
+            metrics_path.write_text(
+                '{"postgresql_round_trip_ms": NaN}', encoding="utf-8"
+            )
 
             passed = create_report(
                 manifest_path=ROOT / "benchmarks/manifests/smoke.json",
@@ -187,7 +204,9 @@ class CapacityRunnerTest(unittest.TestCase):
 
             self.assertFalse(passed)
             payload = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["metrics"]["postgresql_round_trip_ms"], "not_available")
+            self.assertEqual(
+                payload["metrics"]["postgresql_round_trip_ms"], "not_available"
+            )
             self.assertEqual(
                 set(payload["metrics"]),
                 {
@@ -204,7 +223,9 @@ class CapacityRunnerTest(unittest.TestCase):
             )
             self.assertFalse(payload["gateResult"]["passed"])
 
-    def test_create_report_ignores_stale_metrics_and_requires_fresh_generation(self) -> None:
+    def test_create_report_ignores_stale_metrics_and_requires_fresh_generation(
+        self,
+    ) -> None:
         from tools.benchmarks.run_capacity_benchmark import create_report
 
         with tempfile.TemporaryDirectory() as directory:
@@ -212,14 +233,16 @@ class CapacityRunnerTest(unittest.TestCase):
             metrics_path = root / "metrics.json"
             report_path = root / "report.json"
             metrics_path.write_text(
-                json.dumps({
-                    "postgresql_round_trip_ms": 1,
-                    "clickhouse_round_trip_ms": 1,
-                    "qdrant_round_trip_ms": 1,
-                    "redis_round_trip_ms": 1,
-                    "clamav_round_trip_ms": 1,
-                    "embedding_round_trip_ms": 1,
-                }),
+                json.dumps(
+                    {
+                        "postgresql_round_trip_ms": 1,
+                        "clickhouse_round_trip_ms": 1,
+                        "qdrant_round_trip_ms": 1,
+                        "redis_round_trip_ms": 1,
+                        "clamav_round_trip_ms": 1,
+                        "embedding_round_trip_ms": 1,
+                    }
+                ),
                 encoding="utf-8",
             )
             passed = create_report(
@@ -239,9 +262,13 @@ class CapacityRunnerTest(unittest.TestCase):
             )
             payload = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertFalse(passed)
-            self.assertTrue(all(value == "not_available" for value in payload["metrics"].values()))
+            self.assertTrue(
+                all(value == "not_available" for value in payload["metrics"].values())
+            )
 
-    def test_create_report_accepts_only_metrics_generated_at_injected_path(self) -> None:
+    def test_create_report_accepts_only_metrics_generated_at_injected_path(
+        self,
+    ) -> None:
         from tools.benchmarks.run_capacity_benchmark import create_report
 
         with tempfile.TemporaryDirectory() as directory:
@@ -259,7 +286,9 @@ class CapacityRunnerTest(unittest.TestCase):
 
             def popen(_command, **kwargs):
                 generated_path = Path(kwargs["env"]["BENCHMARK_METRICS_PATH"])
-                generated_path.write_text(json.dumps(expected_metrics), encoding="utf-8")
+                generated_path.write_text(
+                    json.dumps(expected_metrics), encoding="utf-8"
+                )
                 self.assertEqual(
                     kwargs["env"]["BENCHMARK_MANIFEST"],
                     str((ROOT / "benchmarks/manifests/smoke.json").resolve()),
@@ -288,7 +317,10 @@ class CapacityRunnerTest(unittest.TestCase):
             )
 
     def test_hardware_inventory_and_checksums_are_reproducible(self) -> None:
-        from tools.benchmarks.run_capacity_benchmark import collect_hardware, sha256_file
+        from tools.benchmarks.run_capacity_benchmark import (
+            collect_hardware,
+            sha256_file,
+        )
 
         class Memory:
             total = 64 * 1024**3
@@ -316,7 +348,9 @@ class CapacityRunnerTest(unittest.TestCase):
             def processor():
                 return "Offline CPU"
 
-        hardware = collect_hardware(Path("C:/data"), psutil_module=Psutil, platform_module=Platform)
+        hardware = collect_hardware(
+            Path("C:/data"), psutil_module=Psutil, platform_module=Platform
+        )
         self.assertEqual(hardware["cpuModel"], "Offline CPU")
         self.assertEqual(hardware["physicalCores"], 8)
         self.assertEqual(hardware["logicalCores"], 16)
@@ -333,7 +367,9 @@ class CapacityRunnerTest(unittest.TestCase):
             def disk_partitions(all=False):
                 return [Partition(), RootPartition()]
 
-        bounded = collect_hardware(Path("C:/database"), psutil_module=BothPsutil, platform_module=Platform)
+        bounded = collect_hardware(
+            Path("C:/database"), psutil_module=BothPsutil, platform_module=Platform
+        )
         self.assertEqual(bounded["diskDevice"], "DiskRoot")
 
         with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
@@ -347,16 +383,23 @@ class CapacityRunnerTest(unittest.TestCase):
     def test_hardware_inventory_degrades_without_optional_psutil(self) -> None:
         from tools.benchmarks.run_capacity_benchmark import collect_hardware
 
-        hardware = collect_hardware(Path.cwd(), psutil_module=None, platform_module=type(
-            "Platform", (), {"processor": staticmethod(lambda: "Offline CPU")}
-        ))
+        hardware = collect_hardware(
+            Path.cwd(),
+            psutil_module=None,
+            platform_module=type(
+                "Platform", (), {"processor": staticmethod(lambda: "Offline CPU")}
+            ),
+        )
         self.assertEqual(hardware["cpuModel"], "Offline CPU")
         self.assertIn("physicalCores", hardware)
         self.assertEqual(hardware["totalRamBytes"], "not_available")
         self.assertEqual(hardware["diskDevice"], "not_available")
 
     def test_subprocess_wrapper_uses_argument_vector_and_shell_false(self) -> None:
-        from tools.benchmarks.run_capacity_benchmark import run_benchmark_command, run_fixed_command
+        from tools.benchmarks.run_capacity_benchmark import (
+            run_benchmark_command,
+            run_fixed_command,
+        )
 
         calls = []
 
@@ -373,7 +416,9 @@ class CapacityRunnerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             run_fixed_command("tool --version", popen_factory=popen)  # type: ignore[arg-type]
 
-        self.assertEqual(run_benchmark_command(("benchmark", "--run"), popen_factory=popen), 0)
+        self.assertEqual(
+            run_benchmark_command(("benchmark", "--run"), popen_factory=popen), 0
+        )
         self.assertEqual(calls[1][0], ["benchmark", "--run"])
         self.assertIs(calls[1][1]["shell"], False)
         self.assertIs(calls[1][1]["stdout"], __import__("subprocess").DEVNULL)
@@ -386,7 +431,9 @@ class CapacityRunnerTest(unittest.TestCase):
             7,
         )
 
-    def test_benchmark_timeout_kills_process_tree_without_unbounded_capture(self) -> None:
+    def test_benchmark_timeout_kills_process_tree_without_unbounded_capture(
+        self,
+    ) -> None:
         from tools.benchmarks.run_capacity_benchmark import run_benchmark_command
 
         calls = []
@@ -427,14 +474,16 @@ class CapacityRunnerTest(unittest.TestCase):
             metrics_path = root / "metrics.json"
             report_path = root / "report.json"
             metrics_path.write_text(
-                json.dumps({
-                    "postgresql_round_trip_ms": 1,
-                    "clickhouse_round_trip_ms": 1,
-                    "qdrant_round_trip_ms": 1,
-                    "redis_round_trip_ms": 1,
-                    "clamav_round_trip_ms": 1,
-                    "embedding_round_trip_ms": 1,
-                }),
+                json.dumps(
+                    {
+                        "postgresql_round_trip_ms": 1,
+                        "clickhouse_round_trip_ms": 1,
+                        "qdrant_round_trip_ms": 1,
+                        "redis_round_trip_ms": 1,
+                        "clamav_round_trip_ms": 1,
+                        "embedding_round_trip_ms": 1,
+                    }
+                ),
                 encoding="utf-8",
             )
             passed = create_report(
@@ -450,7 +499,9 @@ class CapacityRunnerTest(unittest.TestCase):
                 hardware_collector=lambda _path: {},
                 version_collector=lambda: ({}, {}),
                 benchmark_command=("benchmark", "--run"),
-                benchmark_popen_factory=lambda _command, **_kwargs: _ImmediateProcess(9),
+                benchmark_popen_factory=lambda _command, **_kwargs: _ImmediateProcess(
+                    9
+                ),
             )
             payload = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertFalse(passed)
@@ -509,7 +560,9 @@ class CapacityRunnerTest(unittest.TestCase):
                         version_collector=lambda: ({}, {}),
                     )
 
-    def test_locust_contract_is_import_safe_and_scoped_by_trusted_identity(self) -> None:
+    def test_locust_contract_is_import_safe_and_scoped_by_trusted_identity(
+        self,
+    ) -> None:
         source = (ROOT / "benchmarks/locustfile.py").read_text(encoding="utf-8")
         self.assertIn("@task(4)", source)
         self.assertIn("@task(2)", source)
@@ -525,24 +578,34 @@ class CapacityRunnerTest(unittest.TestCase):
         self.assertIn('"mode"', source)
         from tools.benchmarks.locustfile import parse_sse_events, record_sse_timings
 
-        events = list(parse_sse_events([
-            "event: accepted\n",
-            'data: {"requestId":"r1"}\n',
-            "\n",
-            "event: queued\n",
-            'data: {"position":1}\n',
-            "\n",
-            "event: delta\n",
-            'data: {"text":"答"}\n',
-            "\n",
-        ]))
-        self.assertEqual([item["event"] for item in events], ["accepted", "queued", "delta"])
-        multiline = list(parse_sse_events([
-            "event: delta\n",
-            'data: {"text":\n',
-            'data: "答案"}\n',
-            "\n",
-        ]))
+        events = list(
+            parse_sse_events(
+                [
+                    "event: accepted\n",
+                    'data: {"requestId":"r1"}\n',
+                    "\n",
+                    "event: queued\n",
+                    'data: {"position":1}\n',
+                    "\n",
+                    "event: delta\n",
+                    'data: {"text":"答"}\n',
+                    "\n",
+                ]
+            )
+        )
+        self.assertEqual(
+            [item["event"] for item in events], ["accepted", "queued", "delta"]
+        )
+        multiline = list(
+            parse_sse_events(
+                [
+                    "event: delta\n",
+                    'data: {"text":\n',
+                    'data: "答案"}\n',
+                    "\n",
+                ]
+            )
+        )
         self.assertEqual(multiline, [{"event": "delta", "data": {"text": "答案"}}])
         context: dict[str, object] = {}
         record_sse_timings(events, context, elapsed_ms=[10, 25, 80])
@@ -552,10 +615,17 @@ class CapacityRunnerTest(unittest.TestCase):
         from tools.benchmarks.locustfile import stream_failure_reason
 
         self.assertEqual(stream_failure_reason([], 200), "empty_stream")
-        self.assertEqual(stream_failure_reason([{"event": "accepted", "data": {}}], 200), "missing_terminal_event")
-        self.assertEqual(stream_failure_reason([{"event": "error", "data": {}}], 200), "sse_error")
+        self.assertEqual(
+            stream_failure_reason([{"event": "accepted", "data": {}}], 200),
+            "missing_terminal_event",
+        )
+        self.assertEqual(
+            stream_failure_reason([{"event": "error", "data": {}}], 200), "sse_error"
+        )
 
-    def test_locust_metrics_are_atomically_persisted_from_full_stream_contexts(self) -> None:
+    def test_locust_metrics_are_atomically_persisted_from_full_stream_contexts(
+        self,
+    ) -> None:
         from tools.benchmarks import locustfile
 
         with tempfile.TemporaryDirectory() as directory:
@@ -563,10 +633,34 @@ class CapacityRunnerTest(unittest.TestCase):
             locustfile.RECORDED_REQUESTS.clear()
             locustfile.RECORDED_REQUESTS.extend(
                 [
-                    {"request_kind": "structured", "full_stream_ms": 100.0, "failed": False, "queue_feedback_ms": 10.0, "first_token_ms": 60.0},
-                    {"request_kind": "structured", "full_stream_ms": 200.0, "failed": False, "queue_feedback_ms": 20.0, "first_token_ms": 80.0, "cache_hit": True},
-                    {"request_kind": "document", "full_stream_ms": 300.0, "failed": True},
-                    {"request_kind": "mixed", "full_stream_ms": 400.0, "failed": False, "queue_feedback_ms": 30.0, "first_token_ms": 100.0, "cache_hit": True},
+                    {
+                        "request_kind": "structured",
+                        "full_stream_ms": 100.0,
+                        "failed": False,
+                        "queue_feedback_ms": 10.0,
+                        "first_token_ms": 60.0,
+                    },
+                    {
+                        "request_kind": "structured",
+                        "full_stream_ms": 200.0,
+                        "failed": False,
+                        "queue_feedback_ms": 20.0,
+                        "first_token_ms": 80.0,
+                        "cache_hit": True,
+                    },
+                    {
+                        "request_kind": "document",
+                        "full_stream_ms": 300.0,
+                        "failed": True,
+                    },
+                    {
+                        "request_kind": "mixed",
+                        "full_stream_ms": 400.0,
+                        "failed": False,
+                        "queue_feedback_ms": 30.0,
+                        "first_token_ms": 100.0,
+                        "cache_hit": True,
+                    },
                 ]
             )
             locustfile.RECORDED_REQUESTS[0]["cache_hit"] = True
@@ -606,27 +700,31 @@ class CapacityRunnerTest(unittest.TestCase):
     def test_partial_success_timing_or_cache_coverage_omits_metric(self) -> None:
         from tools.benchmarks.locustfile import build_metrics
 
-        metrics = build_metrics([
-            {
-                "request_kind": "structured",
-                "full_stream_ms": 100.0,
-                "failed": False,
-                "queue_feedback_ms": 10.0,
-                "first_token_ms": 50.0,
-                "cache_hit": True,
-            },
-            {
-                "request_kind": "document",
-                "full_stream_ms": 200.0,
-                "failed": False,
-            },
-        ])
+        metrics = build_metrics(
+            [
+                {
+                    "request_kind": "structured",
+                    "full_stream_ms": 100.0,
+                    "failed": False,
+                    "queue_feedback_ms": 10.0,
+                    "first_token_ms": 50.0,
+                    "cache_hit": True,
+                },
+                {
+                    "request_kind": "document",
+                    "full_stream_ms": 200.0,
+                    "failed": False,
+                },
+            ]
+        )
         self.assertEqual(metrics["error_rate"], 0.0)
         self.assertNotIn("queue_feedback_p95_ms", metrics)
         self.assertNotIn("first_token_p95_ms", metrics)
         self.assertNotIn("warm_cache_hit_rate", metrics)
         module = importlib.import_module("tools.benchmarks.locustfile")
-        self.assertEqual(module.REQUEST_WEIGHTS, {"structured": 4, "document": 4, "mixed": 2})
+        self.assertEqual(
+            module.REQUEST_WEIGHTS, {"structured": 4, "document": 4, "mixed": 2}
+        )
 
 
 if __name__ == "__main__":

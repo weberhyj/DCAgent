@@ -635,7 +635,14 @@ class LLMProviderTest(unittest.TestCase):
             model="deepseek-r1",
         )
 
-        with patch("app.llm.httpx.Client", return_value=client):
+        with (
+            patch("app.llm.httpx.Client", return_value=client),
+            patch.object(
+                TemplateLLMProvider,
+                "generate_reply",
+                side_effect=AssertionError("template fallback must not run"),
+            ) as template_reply,
+        ):
             with self.assertRaises(LLMProviderError) as error:
                 provider.generate_reply(
                     LLMRequest(
@@ -645,6 +652,7 @@ class LLMProviderTest(unittest.TestCase):
                     )
                 )
 
+        template_reply.assert_not_called()
         message = str(error.exception)
         self.assertIn("大模型服务暂时不可用", message)
         for sensitive in (upstream_url, "secret", "payload"):

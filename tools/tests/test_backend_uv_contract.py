@@ -99,7 +99,9 @@ class BackendUvContractTest(unittest.TestCase):
         self.assert_exact_requirements(
             project["dependencies"],
             {
+                "asynctor>=0.13.2",
                 "fastapi>=0.116.0",
+                "gunicorn>=26.0.0",
                 "httpx>=0.28.0",
                 "langgraph>=0.2.0,<2.0.0",
                 "openpyxl>=3.1.0",
@@ -156,7 +158,7 @@ class BackendUvContractTest(unittest.TestCase):
 
         self.assert_exact_requirements(
             dependency_groups["dev"],
-            {"alembic>=1.16,<2", "ruff==0.15.22"},
+            {"alembic>=1.16,<2", "fastapi-cli>=0.0.32"},
         )
 
     def test_uv_lock_matches_project_dependency_metadata(self) -> None:

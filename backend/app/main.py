@@ -27,6 +27,7 @@ from .infra.health import (
 )
 from .ingestion import KnowledgeIngestionQueue
 from .llm import LLMProvider, create_llm_provider
+from .llm_runtime import validate_production_llm_provider
 from .offline_settings import OfflineSettings, parse_bool, require_secret_file
 from .repository import ChatRepository
 from .routes import router
@@ -237,6 +238,7 @@ def create_production_app(
             else:
                 source = environment_override
 
+            validate_production_llm_provider(source)
             settings = OfflineSettings.from_environ(source)
             query_password = (
                 require_secret_file(

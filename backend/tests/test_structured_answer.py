@@ -19,6 +19,7 @@ from app.database import (
     StructuredPublicationRecord,
 )
 from app.infra.health import DependencyHealthRegistry
+from app.llm import TemplateLLMProvider
 from app.main import (
     _LazyStructuredQueryGateway,
     create_app,
@@ -587,9 +588,14 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         client_calls: list[object] = []
 
         app = create_production_app(
-            environ={"OFFLINE_MODE": "true", "STRUCTURED_QUERY_ENABLED": "false"},
+            environ={
+                "OFFLINE_MODE": "true",
+                "STRUCTURED_QUERY_ENABLED": "false",
+                "LLM_PROVIDER": "physoc_deepseek",
+            },
             database_factory=lambda _url: database,
             repository_factory=lambda: repository,
+            llm_provider_factory=lambda _environment: TemplateLLMProvider(),
             health_registry_factory=lambda: DependencyHealthRegistry([]),
             ingestion_queue_factory=lambda _repository: object(),
             storage_factory=lambda _root: object(),
@@ -638,9 +644,11 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                     "OFFLINE_MODE": "true",
                     "STRUCTURED_QUERY_ENABLED": "true",
                     "CLICKHOUSE_QUERY_PASSWORD_FILE": str(password_file),
+                    "LLM_PROVIDER": "physoc_deepseek",
                 },
                 database_factory=lambda _url: database,
                 repository_factory=lambda: repository,
+                llm_provider_factory=lambda _environment: TemplateLLMProvider(),
                 health_registry_factory=lambda: DependencyHealthRegistry([]),
                 ingestion_queue_factory=lambda **_kwargs: object(),
                 storage_factory=lambda _root: object(),

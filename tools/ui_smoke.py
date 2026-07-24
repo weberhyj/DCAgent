@@ -6,8 +6,22 @@ from pathlib import Path
 from time import sleep
 
 import httpx
-from PIL import Image, ImageChops, ImageStat
-from playwright.sync_api import FilePayload, Page, expect, sync_playwright
+
+try:
+    from PIL import Image, ImageChops, ImageStat
+except ModuleNotFoundError as error:
+    Image = ImageChops = ImageStat = None
+    _PIL_IMPORT_ERROR = error
+else:
+    _PIL_IMPORT_ERROR = None
+
+try:
+    from playwright.sync_api import FilePayload, Page, expect, sync_playwright
+except ModuleNotFoundError as error:
+    FilePayload = Page = expect = sync_playwright = None
+    _PLAYWRIGHT_IMPORT_ERROR = error
+else:
+    _PLAYWRIGHT_IMPORT_ERROR = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +31,20 @@ USER_URL = "http://127.0.0.1:5177"
 ADMIN_URL = "http://127.0.0.1:5178"
 QUALITY_BATCH_BASELINE = "E2E 基线批次"
 QUALITY_BATCH_STRICT = "E2E 严格阈值批次"
+
+
+def _require_ui_smoke_dependencies() -> None:
+    missing: list[str] = []
+    if _PIL_IMPORT_ERROR is not None:
+        missing.append("Pillow")
+    if _PLAYWRIGHT_IMPORT_ERROR is not None:
+        missing.append("playwright")
+    if missing:
+        packages = " and ".join(missing)
+        raise RuntimeError(
+            f"UI smoke requires optional dependencies {packages}; install Pillow and playwright "
+            "before running tools/ui_smoke.py"
+        )
 
 
 def build_evaluation_import_csv() -> bytes:
@@ -61,14 +89,20 @@ def build_evaluation_import_csv() -> bytes:
 
 
 def assert_image_has_detail(path: Path, min_colors: int = 32) -> None:
+    _require_ui_smoke_dependencies()
     image = Image.open(path).convert("RGB").resize((160, 90))
     colors = image.getcolors(maxcolors=160 * 90)
     color_count = 0 if colors is None else len(colors)
     if color_count < min_colors:
-        raise AssertionError(f"{path.name} looks blank; only {color_count} colors found")
+        raise AssertionError(
+            f"{path.name} looks blank; only {color_count} colors found"
+        )
 
 
-def assert_images_changed(before: Path, after: Path, min_mean_delta: float = 0.05) -> None:
+def assert_images_changed(
+    before: Path, after: Path, min_mean_delta: float = 0.05
+) -> None:
+    _require_ui_smoke_dependencies()
     first = Image.open(before).convert("RGB").resize((160, 90))
     second = Image.open(after).convert("RGB").resize((160, 90))
     diff = ImageChops.difference(first, second)
@@ -103,13 +137,18 @@ def seed_knowledge_base() -> None:
         response = client.post(
             f"{BACKEND_URL}/api/knowledge/uploads",
             data={"classification": "内部·机密"},
-            files={"files": ("travel-policy.txt", content.encode("utf-8"), "text/plain")},
+            files={
+                "files": ("travel-policy.txt", content.encode("utf-8"), "text/plain")
+            },
         )
         response.raise_for_status()
 
         for _ in range(20):
             sources = client.get(f"{BACKEND_URL}/api/knowledge/sources").json()
-            if any(source["status"] == "已索引" and source["records"] > 0 for source in sources):
+            if any(
+                source["status"] == "已索引" and source["records"] > 0
+                for source in sources
+            ):
                 return
             sleep(0.2)
 
@@ -117,13 +156,17 @@ def seed_knowledge_base() -> None:
 
 
 def verify_quantum_canvas(page: Page, prefix: str) -> None:
+    _require_ui_smoke_dependencies()
     canvas = page.locator("canvas").first
     expect(canvas).to_be_visible(timeout=20_000)
     box = canvas.bounding_box()
     if box is None:
         raise AssertionError(f"{prefix} canvas has no bounding box")
     viewport = page.viewport_size or {"width": 0, "height": 0}
-    if box["width"] < viewport["width"] * 0.9 or box["height"] < viewport["height"] * 0.9:
+    if (
+        box["width"] < viewport["width"] * 0.9
+        or box["height"] < viewport["height"] * 0.9
+    ):
         raise AssertionError(f"{prefix} canvas does not cover the viewport: {box}")
 
     before = SCREENSHOT_DIR / f"runtime-{prefix}-canvas-before.png"
@@ -137,6 +180,7 @@ def verify_quantum_canvas(page: Page, prefix: str) -> None:
 
 
 def verify_user_app() -> None:
+    _require_ui_smoke_dependencies()
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         for prefix, viewport in (
@@ -152,7 +196,9 @@ def verify_user_app() -> None:
                 "欢迎来到DC智识中枢",
             )
             verify_quantum_canvas(page, prefix)
-            page.screenshot(path=str(SCREENSHOT_DIR / f"runtime-{prefix}.png"), full_page=True)
+            page.screenshot(
+                path=str(SCREENSHOT_DIR / f"runtime-{prefix}.png"), full_page=True
+            )
             if errors:
                 raise AssertionError("\n".join(errors))
         page.close()
@@ -175,8 +221,12 @@ def verify_user_app() -> None:
         expect(answer).to_contain_text("发票", timeout=10_000)
         expect(answer).to_contain_text("行程单")
         if "未检索到足够依据" in answer.text_content():
-            raise AssertionError("User flow fell back to no-evidence answer after seeding knowledge")
-        page.screenshot(path=str(SCREENSHOT_DIR / "runtime-user-answer-panel.png"), full_page=True)
+            raise AssertionError(
+                "User flow fell back to no-evidence answer after seeding knowledge"
+            )
+        page.screenshot(
+            path=str(SCREENSHOT_DIR / "runtime-user-answer-panel.png"), full_page=True
+        )
         if errors:
             raise AssertionError("\n".join(errors))
         page.close()
@@ -184,24 +234,35 @@ def verify_user_app() -> None:
 
 
 def verify_admin_app() -> None:
+    _require_ui_smoke_dependencies()
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 900})
         errors = watch_errors(page, "admin")
         page.goto(ADMIN_URL, wait_until="networkidle")
-        expect(page.locator('[data-testid="overview-page"]')).to_be_visible(timeout=20_000)
+        expect(page.locator('[data-testid="overview-page"]')).to_be_visible(
+            timeout=20_000
+        )
         expect(page.get_by_text("管理概览", exact=True).first).to_be_visible()
-        page.screenshot(path=str(SCREENSHOT_DIR / "runtime-admin-overview.png"), full_page=True)
+        page.screenshot(
+            path=str(SCREENSHOT_DIR / "runtime-admin-overview.png"), full_page=True
+        )
 
         page.goto(f"{ADMIN_URL}/knowledge", wait_until="networkidle")
-        expect(page.locator('[data-testid="knowledge-management-page"]')).to_be_visible(timeout=20_000)
+        expect(page.locator('[data-testid="knowledge-management-page"]')).to_be_visible(
+            timeout=20_000
+        )
         expect(page.get_by_text("资料投喂")).to_be_visible()
         expect(page.get_by_text("已接入资料")).to_be_visible()
-        page.screenshot(path=str(SCREENSHOT_DIR / "runtime-admin-knowledge.png"), full_page=True)
+        page.screenshot(
+            path=str(SCREENSHOT_DIR / "runtime-admin-knowledge.png"), full_page=True
+        )
         page.locator('[data-testid="open-knowledge-upload"]').click()
         expect(page.locator('[data-testid="knowledge-upload-form"]')).to_be_visible()
         expect(page.get_by_role("dialog", name="资料投喂")).to_be_visible()
-        page.screenshot(path=str(SCREENSHOT_DIR / "runtime-admin-upload-dialog.png"), full_page=True)
+        page.screenshot(
+            path=str(SCREENSHOT_DIR / "runtime-admin-upload-dialog.png"), full_page=True
+        )
         page.locator('[data-testid="base-dialog-close"]').click()
         expect(page.locator('[data-testid="knowledge-upload-form"]')).to_be_hidden()
 
@@ -209,16 +270,26 @@ def verify_admin_app() -> None:
             sources = client.get(f"{BACKEND_URL}/api/knowledge/sources").json()
         source_id = sources[0]["id"]
         page.goto(f"{ADMIN_URL}/knowledge/{source_id}", wait_until="networkidle")
-        expect(page.locator('[data-testid="knowledge-source-detail-page"]')).to_be_visible(timeout=20_000)
+        expect(
+            page.locator('[data-testid="knowledge-source-detail-page"]')
+        ).to_be_visible(timeout=20_000)
         expect(page.locator(".chunk-panel > header strong")).to_have_text("解析片段")
-        page.screenshot(path=str(SCREENSHOT_DIR / "runtime-admin-source-detail.png"), full_page=True)
+        page.screenshot(
+            path=str(SCREENSHOT_DIR / "runtime-admin-source-detail.png"), full_page=True
+        )
 
         page.goto(f"{ADMIN_URL}/agent-runs", wait_until="networkidle")
-        expect(page.locator('[data-testid="agent-audit-page"]')).to_be_visible(timeout=20_000)
-        expect(page.get_by_role("heading", name="Agent 执行审计", level=1)).to_be_visible()
+        expect(page.locator('[data-testid="agent-audit-page"]')).to_be_visible(
+            timeout=20_000
+        )
+        expect(
+            page.get_by_role("heading", name="Agent 执行审计", level=1)
+        ).to_be_visible()
         expect(page.get_by_text("差旅票据材料需要什么")).to_be_visible()
         expect(page.get_by_text("检索知识库").first).to_be_visible()
-        page.screenshot(path=str(SCREENSHOT_DIR / "runtime-admin-agent-audit.png"), full_page=True)
+        page.screenshot(
+            path=str(SCREENSHOT_DIR / "runtime-admin-agent-audit.png"), full_page=True
+        )
         if errors:
             raise AssertionError("\n".join(errors))
         page.close()
@@ -226,12 +297,22 @@ def verify_admin_app() -> None:
         mobile = browser.new_page(viewport={"width": 390, "height": 844})
         mobile_errors = watch_errors(mobile, "admin-mobile")
         mobile.goto(f"{ADMIN_URL}/overview", wait_until="networkidle")
-        expect(mobile.locator('[data-testid="overview-page"]')).to_be_visible(timeout=20_000)
+        expect(mobile.locator('[data-testid="overview-page"]')).to_be_visible(
+            timeout=20_000
+        )
         expect(mobile.locator(".admin-nav")).to_be_visible()
-        mobile.screenshot(path=str(SCREENSHOT_DIR / "runtime-admin-mobile-overview.png"), full_page=True)
+        mobile.screenshot(
+            path=str(SCREENSHOT_DIR / "runtime-admin-mobile-overview.png"),
+            full_page=True,
+        )
         mobile.goto(f"{ADMIN_URL}/knowledge", wait_until="networkidle")
-        expect(mobile.locator('[data-testid="knowledge-management-page"]')).to_be_visible(timeout=20_000)
-        mobile.screenshot(path=str(SCREENSHOT_DIR / "runtime-admin-mobile-knowledge.png"), full_page=True)
+        expect(
+            mobile.locator('[data-testid="knowledge-management-page"]')
+        ).to_be_visible(timeout=20_000)
+        mobile.screenshot(
+            path=str(SCREENSHOT_DIR / "runtime-admin-mobile-knowledge.png"),
+            full_page=True,
+        )
         if mobile_errors:
             raise AssertionError("\n".join(mobile_errors))
         mobile.close()
@@ -239,17 +320,22 @@ def verify_admin_app() -> None:
 
 
 def verify_quality_app() -> None:
+    _require_ui_smoke_dependencies()
     with httpx.Client(timeout=10.0) as client:
         dashboard_response = client.get(f"{BACKEND_URL}/api/admin/evaluations")
         dashboard_response.raise_for_status()
         dashboard = dashboard_response.json()
         if dashboard.get("cases") != [] or dashboard.get("runs") != []:
-            raise AssertionError("Quality evaluations must be empty before the smoke flow starts")
+            raise AssertionError(
+                "Quality evaluations must be empty before the smoke flow starts"
+            )
 
         batches_response = client.get(f"{BACKEND_URL}/api/admin/evaluations/batches")
         batches_response.raise_for_status()
         if batches_response.json():
-            raise AssertionError("Quality evaluation batches must be empty before the smoke flow starts")
+            raise AssertionError(
+                "Quality evaluation batches must be empty before the smoke flow starts"
+            )
 
         def wait_for_batch(name: str, existing_ids: set[str]) -> dict:
             for _ in range(150):
@@ -270,7 +356,9 @@ def verify_quality_app() -> None:
                         detail = batch.get("errorMessage") or "unknown error"
                         raise AssertionError(f"Quality batch {name!r} failed: {detail}")
                 sleep(0.2)
-            raise AssertionError(f"Quality batch {name!r} did not complete within 30 seconds")
+            raise AssertionError(
+                f"Quality batch {name!r} did not complete within 30 seconds"
+            )
 
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
@@ -285,9 +373,13 @@ def verify_quality_app() -> None:
                 existing_ids = {batch["id"] for batch in response.json()}
 
                 page.locator('[data-testid="run-evaluation-batch"]').click()
-                expect(page.locator('[data-testid="evaluation-batch-form"]')).to_be_visible()
+                expect(
+                    page.locator('[data-testid="evaluation-batch-form"]')
+                ).to_be_visible()
                 page.locator('[data-testid="evaluation-batch-name"]').fill(name)
-                page.locator('[data-testid="evaluation-retrieval-min-score"]').fill(str(threshold))
+                page.locator('[data-testid="evaluation-retrieval-min-score"]').fill(
+                    str(threshold)
+                )
                 page.locator('[data-testid="submit-evaluation-batch"]').click()
                 expect(
                     page.get_by_text(
@@ -312,13 +404,17 @@ def verify_quality_app() -> None:
 
             try:
                 page.goto(f"{ADMIN_URL}/quality/cases", wait_until="networkidle")
-                expect(page.locator('[data-testid="quality-cases-page"]')).to_be_visible(
+                expect(
+                    page.locator('[data-testid="quality-cases-page"]')
+                ).to_be_visible(
                     timeout=20_000,
                 )
                 expect(page.get_by_text("评测集为空", exact=True)).to_be_visible()
 
                 page.locator('[data-testid="open-evaluation-import"]').click()
-                expect(page.locator('[data-testid="evaluation-import-dialog"]')).to_be_visible()
+                expect(
+                    page.locator('[data-testid="evaluation-import-dialog"]')
+                ).to_be_visible()
                 page.locator('[data-testid="evaluation-import-file"]').set_input_files(
                     FilePayload(
                         name="evaluation-cases.csv",
@@ -331,19 +427,30 @@ def verify_quality_app() -> None:
                     timeout=20_000,
                 )
 
-                preview_dashboard_response = client.get(f"{BACKEND_URL}/api/admin/evaluations")
+                preview_dashboard_response = client.get(
+                    f"{BACKEND_URL}/api/admin/evaluations"
+                )
                 preview_dashboard_response.raise_for_status()
                 preview_dashboard = preview_dashboard_response.json()
-                if preview_dashboard.get("cases") != [] or preview_dashboard.get("runs") != []:
-                    raise AssertionError("Evaluation import preview persisted cases or runs")
+                if (
+                    preview_dashboard.get("cases") != []
+                    or preview_dashboard.get("runs") != []
+                ):
+                    raise AssertionError(
+                        "Evaluation import preview persisted cases or runs"
+                    )
 
                 page.locator('[data-testid="confirm-evaluation-import"]').click()
-                expect(page.get_by_text("导入完成", exact=True)).to_be_visible(timeout=20_000)
+                expect(page.get_by_text("导入完成", exact=True)).to_be_visible(
+                    timeout=20_000
+                )
                 expect(
                     page.get_by_text("成功创建 2 条，重复 0 条。", exact=True),
                 ).to_be_visible()
                 page.get_by_role("button", name="完成", exact=True).click()
-                expect(page.locator('[data-testid="evaluation-case-counts"]')).to_contain_text(
+                expect(
+                    page.locator('[data-testid="evaluation-case-counts"]')
+                ).to_contain_text(
                     "共 2 项",
                 )
 
@@ -352,16 +459,24 @@ def verify_quality_app() -> None:
                 strict_batch = start_batch(QUALITY_BATCH_STRICT, 100)
 
                 page.goto(f"{ADMIN_URL}/quality/reports", wait_until="networkidle")
-                expect(page.locator('[data-testid="quality-reports-page"]')).to_be_visible(
+                expect(
+                    page.locator('[data-testid="quality-reports-page"]')
+                ).to_be_visible(
                     timeout=20_000,
                 )
-                expect(page.get_by_text(QUALITY_BATCH_BASELINE, exact=True).first).to_be_visible()
-                expect(page.get_by_text(QUALITY_BATCH_STRICT, exact=True).first).to_be_visible()
+                expect(
+                    page.get_by_text(QUALITY_BATCH_BASELINE, exact=True).first
+                ).to_be_visible()
+                expect(
+                    page.get_by_text(QUALITY_BATCH_STRICT, exact=True).first
+                ).to_be_visible()
 
                 page.locator(
                     f'[data-testid="view-evaluation-batch-{strict_batch["id"]}"]',
                 ).click()
-                expect(page.locator('[data-testid="quality-report-detail-page"]')).to_be_visible(
+                expect(
+                    page.locator('[data-testid="quality-report-detail-page"]')
+                ).to_be_visible(
                     timeout=20_000,
                 )
                 expect(page.get_by_text("整体通过率", exact=True)).to_be_visible()
@@ -381,7 +496,9 @@ def verify_quality_app() -> None:
                 page.locator(
                     f'[data-testid="base-select-option-{strict_batch["id"]}"]',
                 ).click()
-                expect(page.locator(".comparison-results")).to_be_visible(timeout=20_000)
+                expect(page.locator(".comparison-results")).to_be_visible(
+                    timeout=20_000
+                )
                 expect(page.get_by_text("共享案例 2", exact=True)).to_be_visible()
                 page.screenshot(
                     path=str(SCREENSHOT_DIR / "runtime-quality-reports.png"),
@@ -391,7 +508,9 @@ def verify_quality_app() -> None:
                 mobile = browser.new_page(viewport={"width": 390, "height": 844})
                 mobile_errors = watch_errors(mobile, "quality-mobile")
                 mobile.goto(f"{ADMIN_URL}/quality/cases", wait_until="networkidle")
-                expect(mobile.locator('[data-testid="quality-cases-page"]')).to_be_visible(
+                expect(
+                    mobile.locator('[data-testid="quality-cases-page"]')
+                ).to_be_visible(
                     timeout=20_000,
                 )
                 assert_no_horizontal_overflow(mobile, "Quality cases mobile page")
@@ -401,7 +520,9 @@ def verify_quality_app() -> None:
                 )
 
                 mobile.goto(f"{ADMIN_URL}/quality/reports", wait_until="networkidle")
-                expect(mobile.locator('[data-testid="quality-reports-page"]')).to_be_visible(
+                expect(
+                    mobile.locator('[data-testid="quality-reports-page"]')
+                ).to_be_visible(
                     timeout=20_000,
                 )
                 assert_no_horizontal_overflow(mobile, "Quality reports mobile page")
@@ -422,6 +543,7 @@ def verify_quality_app() -> None:
 
 
 def main() -> None:
+    _require_ui_smoke_dependencies()
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     verify_user_app()
     verify_admin_app()

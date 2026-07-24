@@ -112,7 +112,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertIn('profiles: ["indexing"]', worker)
         self.assertIn('command: ["python", "-m", "app.structured_worker"]', worker)
 
-    def test_compose_keeps_legacy_generation_default_and_declares_password_secrets(
+    def test_compose_uses_physoc_default_and_declares_generation_password_secrets(
         self,
     ) -> None:
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
@@ -121,7 +121,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         env = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
             encoding="utf-8"
         )
-        self.assertIn("LLM_PROVIDER=template", env)
+        self.assertIn("LLM_PROVIDER=physoc_deepseek", env)
         self.assertIn('profiles: ["indexing"]', compose)
         self.assertIn('profiles: ["generation"]', compose)
         self.assertIn("clickhouse_query_password:", compose)

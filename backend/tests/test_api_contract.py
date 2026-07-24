@@ -189,7 +189,23 @@ class ApiContractTest(unittest.TestCase):
             def generate_reply(self, request: LLMRequest) -> ChatMessageModel:
                 raise LLMProviderError("大模型服务暂时不可用，请稍后重试。")
 
-        repository = InMemoryChatRepository(build_seed_state(), llm_provider=FailingLLMProvider())
+        state = build_seed_state()
+        state.knowledge_chunks_by_source["kb-001"] = [
+            KnowledgeChunkModel(
+                id="chunk-travel-policy",
+                source_id="kb-001",
+                chunk_index=0,
+                text="差旅申请报销时必须提交发票和行程单。",
+                token_count=18,
+            )
+        ]
+        repository = InMemoryChatRepository(state, llm_provider=FailingLLMProvider())
+        seeded_hits = repository.search_knowledge_chunks("请查询差旅制度")
+        self.assertGreaterEqual(len(seeded_hits), 1)
+        self.assertEqual(seeded_hits[0].chunk.id, "chunk-travel-policy")
+        for evidence_sentinel in ("差旅申请", "发票", "行程单"):
+            self.assertIn(evidence_sentinel, seeded_hits[0].chunk.text)
+
         client = TestClient(create_app(repository=repository), raise_server_exceptions=False)
         conversation_id = client.post("/api/conversations").json()["activeConversationId"]
 
@@ -200,9 +216,17 @@ class ApiContractTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(
-            response.json()["detail"],
-            "大模型服务暂时不可用，请稍后重试。",
+            response.json(),
+            {"detail": "大模型服务暂时不可用，请稍后重试。"},
         )
+        for leaked_slice_content in (
+            "已检索到知识库中的相关依据",
+            "差旅申请",
+            "发票",
+            "行程单",
+            "chunk",
+        ):
+            self.assertNotIn(leaked_slice_content, response.text)
 
     def test_deletes_conversation_and_returns_next_active_bundle(self) -> None:
         created_id = self.client.post("/api/conversations").json()["activeConversationId"]

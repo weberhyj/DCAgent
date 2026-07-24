@@ -21,7 +21,7 @@ from app.infra.health import (
     create_redis_health_client,
     postgres_schema_revision_check,
 )
-from app.main import _database_url_with_connect_timeout
+from app.main import _database_url_with_connect_timeout, create_app
 from app.offline_settings import OfflineSettings
 
 
@@ -44,7 +44,10 @@ def private_environment(**changes: str) -> dict[str, str]:
         "CLAMAV_HOST": "127.0.0.1",
         "EMBEDDING_SERVICE_URL": "http://127.0.0.1:8081",
         "LLAMA_SERVER_URL": "http://127.0.0.1:8080",
-        "LLM_PROVIDER": "template",
+        "LLM_PROVIDER": "physoc_deepseek",
+        "LLM_API_BASE": "http://127.0.0.1:8090",
+        "LLM_STREAM_PATH": "/api/physoc/deepseek/stream",
+        "LLM_MODEL": "my_deepseek_r1_7b",
     }
     values.update(changes)
     return values
@@ -91,6 +94,34 @@ class LazyStartupTest(unittest.TestCase):
         client = TestClient(app)
         self.assertEqual(client.get("/api/healthz").status_code, 200)
         self.assertEqual(client.get("/api/readyz").status_code, 503)
+
+    def test_production_startup_rejects_template_before_resource_factories(
+        self,
+    ) -> None:
+        module = importlib.import_module("app.main")
+        calls: list[str] = []
+        app = module.create_production_app(
+            environ=private_environment(LLM_PROVIDER="template"),
+            database_factory=lambda _url: calls.append("database"),
+            llm_provider_factory=lambda _environment: calls.append("llm"),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Production runtime requires a real LLM provider",
+        ):
+            with TestClient(app):
+                pass
+
+        self.assertEqual(calls, [])
+
+    def test_development_app_still_allows_injected_template_repository(self) -> None:
+        repository = ClosableFake("development-repository")
+
+        with TestClient(create_app(repository=repository)) as client:
+            response = client.get("/api/healthz")
+
+        self.assertEqual(response.status_code, 200)
 
     def test_production_lifespan_sets_resources_once_and_closes_them(self) -> None:
         module = importlib.import_module("app.main")

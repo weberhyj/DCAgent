@@ -112,7 +112,9 @@ class BenchmarkManifest:
             raise ValueError("filter_selectivity must not be empty")
         for value in self.filter_selectivity:
             if not _is_finite_number(value) or not 0 < float(value) <= 1:
-                raise ValueError("filter_selectivity values must be finite and in (0, 1]")
+                raise ValueError(
+                    "filter_selectivity values must be finite and in (0, 1]"
+                )
 
         if not isinstance(self.include_sparse_vectors, bool):
             raise ValueError("include_sparse_vectors must be a boolean")

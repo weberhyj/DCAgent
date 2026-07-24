@@ -433,6 +433,7 @@ class StructuredWiringTest(unittest.TestCase):
             "OFFLINE_MODE": "false",
             "STRUCTURED_QUERY_ENABLED": "true",
             "CLICKHOUSE_QUERY_PASSWORD_FILE": str(self.query_password),
+            "LLM_PROVIDER": "physoc_deepseek",
         }
 
     def test_offline_settings_parse_structured_query_flag_defaulting_false(self) -> None:
@@ -447,7 +448,11 @@ class StructuredWiringTest(unittest.TestCase):
         database = Database("sqlite+pysqlite:///:memory:")
         custom_queue = SimpleNamespace(close=lambda: None)
         production = create_production_app(
-            environ={"OFFLINE_MODE": "false", "STRUCTURED_QUERY_ENABLED": "false"},
+            environ={
+                "OFFLINE_MODE": "false",
+                "STRUCTURED_QUERY_ENABLED": "false",
+                "LLM_PROVIDER": "physoc_deepseek",
+            },
             repository_factory=lambda: InMemoryChatRepository(build_seed_state()),
             database_factory=lambda _url: database,
             llm_provider_factory=lambda _environment: TemplateLLMProvider(),
