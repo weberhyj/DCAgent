@@ -950,7 +950,7 @@ git commit -m "docs: add physoc production cutover gate"
 
 ```powershell
 Push-Location backend
-uv run --project . python -m unittest `
+uv run --project . --group offline python -m unittest `
   tests.test_llm_runtime `
   tests.test_lazy_startup `
   tests.test_physoc_sse `
@@ -977,9 +977,9 @@ Expected: all tests pass.
 
 ```powershell
 Push-Location backend
-uv run --project . python -m unittest discover -s tests -p "test_*.py" -v
+uv run --project . --group offline python -m unittest discover -s tests -p "test_*.py" -v
 Pop-Location
-uv run --project backend python -m unittest discover -s tools/tests -p "test_*.py" -v
+uv run --project backend --group offline python -m unittest discover -s tools/tests -p "test_*.py" -v
 ```
 
 Expected: both suites pass. Tests that require Docker or target-only artifacts may skip with their documented reason; they must not be reported as locally passed.
@@ -989,7 +989,7 @@ Expected: both suites pass. Tests that require Docker or target-only artifacts m
 ```powershell
 ruff check backend tools
 ruff format --check backend tools
-uv run --project backend python -m compileall -q backend/app tools
+uv run --project backend --group offline python -m compileall -q backend/app tools
 git diff --check
 ```
 
