@@ -42,19 +42,26 @@ LLM_STREAM_PATH=/api/physoc/deepseek/stream
 LLM_MODEL=my_deepseek_r1_7b
 ```
 
-`172.16.0.10` 仅为不含凭据的 private IP 示例。将 `LLM_API_BASE` 改为容器可达、已批准的
-private Physoc 地址后，从仓库根目录执行以下切换门禁：
+`172.16.0.10` 仅为不含凭据的 private IP 示例。先从仓库根目录运行
+`& tools/prepare_offline_env.ps1`。该脚本只在 `deploy/offline/.env` 不存在时创建配置；已有 `deploy/offline/.env` 不得覆盖。之后操作者只编辑或审核以下 4 个 LLM 路由键：
+`LLM_PROVIDER`、`LLM_API_BASE`、`LLM_STREAM_PATH`、`LLM_MODEL`。其他 digest、UID/GID、path 和 secret settings 必须保持原批准值。将 `LLM_API_BASE` 改为容器可达、已批准的 private Physoc
+地址后，执行以下切换门禁：
 
 ```powershell
-Copy-Item deploy/offline/.env.example deploy/offline/.env
+& tools/prepare_offline_env.ps1
 # Edit LLM_API_BASE to the approved private Physoc address.
 & tools/invoke_offline_compose.ps1 config
 & tools/invoke_offline_compose.ps1 up -d
 & tools/invoke_offline_compose.ps1 exec -T api `
   python -m app.physoc_probe --report /tmp/physoc-probe.json
+if ($LASTEXITCODE -ne 0) { throw "Physoc probe failed; do not print or persist evidence." }
 & tools/invoke_offline_compose.ps1 exec -T api `
   python -c 'import json, pathlib; print(json.dumps(json.loads(pathlib.Path("/tmp/physoc-probe.json").read_text(encoding="utf-8")), indent=2, sort_keys=True))'
+New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null
+& tools/invoke_offline_compose.ps1 cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json
 ```
+
+只有上一条 probe exit 0 才能执行打印和持久化步骤。复制完成后的 host evidence 为 `artifacts/benchmarks/physoc-probe.json`；不要把容器内 `/tmp` 文件当作持久化审计证据。
 
 通过的 `physoc-probe.json` 形状如下；报告只包含路由、耗时、回答字符数和引用数量，不含
 提示词、证据正文或模型回答正文：

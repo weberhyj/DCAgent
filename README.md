@@ -96,13 +96,18 @@ LLM_MODEL=my_deepseek_r1_7b
 
 上面的 `172.16.0.10` 是不含凭据的私网示例，实际容器必须使用容器可达的批准 private address。核心 `offline` 网络仍为 `internal`；只有 API 同时连接 `physoc-egress` 以访问 Physoc。`physoc-egress` 是受控出口，不使其他核心服务获得外部网络能力，也不表示 `internal` 网络可访问外部。目标主机和防火墙必须把该出口限制到批准的 private Physoc 地址。前面的 loopback 配置仅保留用于后端和 Physoc 在同一主机、且后端不在容器内运行的开发场景；容器内不得把 `127.0.0.1` 当作宿主机 Physoc 地址。
 
-部署后必须在 API 的同一运行环境执行：
+部署后必须从仓库根目录通过受支持的 Compose wrapper 在 API 容器内执行。probe 成功后再把
+脱敏报告复制到 host：
 
 ```powershell
-python -m app.physoc_probe --report artifacts/benchmarks/physoc-probe.json
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -m app.physoc_probe --report /tmp/physoc-probe.json
+if ($LASTEXITCODE -ne 0) { throw "Physoc probe failed; do not persist evidence." }
+New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null
+& tools/invoke_offline_compose.ps1 cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json
 ```
 
-探针成功报告只记录 provider、model、streamPath、elapsedMs、answerChars 和 citationCount 等运行元数据，不会输出提示词、证据正文或模型回答正文。将 `artifacts/benchmarks/physoc-probe.json` 作为切换门禁证据保存；探针失败时不得启用该生产路由。
+探针成功报告只记录 provider、model、streamPath、elapsedMs、answerChars 和 citationCount 等运行元数据，不会输出提示词、证据正文或模型回答正文。只有容器内 probe exit 0 后才创建 host 目录并执行 `cp`；将 `artifacts/benchmarks/physoc-probe.json` 作为切换门禁证据保存。探针失败时不得复制旧报告或启用该生产路由。
 
 ## Structured spreadsheet aggregation
 

@@ -21,6 +21,12 @@ PHYSOC_SETTINGS = (
 )
 PHYSOC_BEGIN = "# BEGIN PHYSOC DEEPSEEK EXAMPLE"
 PHYSOC_END = "# END PHYSOC DEEPSEEK EXAMPLE"
+PHYSOC_DOCUMENTATION_ALLOWED_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("fc00::/7"),
+)
 SENSITIVE_ASSIGNMENT = re.compile(
     r"(?im)^\s*#?\s*[A-Z0-9_]*(?:TOKEN|COOKIE|PASSWORD|SECRET|AUTHORIZATION|API_KEY)[A-Z0-9_]*\s*=\s*\S+"
 )
@@ -45,6 +51,35 @@ def physoc_offline_runbook_section(text: str) -> str:
     if match is None:
         return ""
     return match.group(1)
+
+
+def is_allowed_physoc_documentation_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or (port is not None and not 1 <= port <= 65535)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return address.is_loopback or any(
+        address.version == network.version and address in network
+        for network in PHYSOC_DOCUMENTATION_ALLOWED_NETWORKS
+    )
 
 
 def active_assignments(text: str) -> dict[str, str]:
@@ -145,13 +180,32 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertTrue(physoc_lines)
                 self.assertNotIn("physoc.internal", physoc_lines.lower())
-                for hostname in re.findall(r"https?://([^/:\s`]+)", physoc_lines):
-                    try:
-                        address = ipaddress.ip_address(hostname)
-                    except ValueError:
-                        self.fail(f"Physoc URL host must be a literal IP: {hostname}")
-                    self.assertTrue(address.is_private or address.is_loopback)
+                for url in re.findall(r"https?://[^\s`]+", physoc_lines):
+                    self.assertTrue(
+                        is_allowed_physoc_documentation_url(url),
+                        f"Physoc URL must target the runtime allowlist: {url}",
+                    )
                 self.assertIsNone(SENSITIVE_ASSIGNMENT.search(physoc_lines))
+
+    def test_physoc_documentation_url_allowlist_matches_runtime_networks(self) -> None:
+        for url in (
+            "http://localhost:8090",
+            "http://127.0.0.1:8090",
+            "http://10.0.0.8:8090",
+            "http://172.16.0.10:8090",
+            "http://192.168.1.8:8090",
+            "http://[fd12:3456::1]:8090",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(is_allowed_physoc_documentation_url(url))
+
+        for url in (
+            "http://physoc.internal:8090",
+            "http://192.0.2.1:8090",
+            "http://[fe80::1]:8090",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(is_allowed_physoc_documentation_url(url))
 
     def test_readme_documents_the_physoc_streaming_contract(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -192,12 +246,21 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "容器内不得把 `127.0.0.1` 当作宿主机 Physoc 地址",
             "核心 `offline` 网络仍为 `internal`",
             "只有 API 同时连接 `physoc-egress`",
+            "& tools/invoke_offline_compose.ps1 exec -T api `",
+            "python -m app.physoc_probe --report /tmp/physoc-probe.json",
+            'if ($LASTEXITCODE -ne 0) { throw "Physoc probe failed; do not persist evidence." }',
+            "New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null",
+            "& tools/invoke_offline_compose.ps1 cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json",
             "python -m app.physoc_probe",
             "artifacts/benchmarks/physoc-probe.json",
             "不会输出提示词、证据正文或模型回答正文",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, section)
+        self.assertNotIn(
+            "python -m app.physoc_probe --report artifacts/benchmarks/physoc-probe.json",
+            section,
+        )
 
     def test_offline_runbook_documents_physoc_cutover_and_rollback(self) -> None:
         runbook = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
@@ -211,12 +274,21 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "LLM_API_BASE=http://172.16.0.10:8090",
             "LLM_STREAM_PATH=/api/physoc/deepseek/stream",
             "LLM_MODEL=my_deepseek_r1_7b",
-            "Copy-Item deploy/offline/.env.example deploy/offline/.env",
+            "& tools/prepare_offline_env.ps1",
+            "只在 `deploy/offline/.env` 不存在时创建",
+            "已有 `deploy/offline/.env` 不得覆盖",
+            "只编辑或审核以下 4 个 LLM 路由键",
+            "其他 digest、UID/GID、path 和 secret settings 必须保持原批准值",
             "# Edit LLM_API_BASE to the approved private Physoc address.",
             "& tools/invoke_offline_compose.ps1 config",
             "& tools/invoke_offline_compose.ps1 up -d",
             "python -m app.physoc_probe --report /tmp/physoc-probe.json",
+            'if ($LASTEXITCODE -ne 0) { throw "Physoc probe failed; do not print or persist evidence." }',
             'python -c \'import json, pathlib; print(json.dumps(json.loads(pathlib.Path("/tmp/physoc-probe.json").read_text(encoding="utf-8")), indent=2, sort_keys=True))\'',
+            "只有上一条 probe exit 0 才能执行打印和持久化步骤",
+            "New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null",
+            "& tools/invoke_offline_compose.ps1 cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json",
+            "host evidence 为 `artifacts/benchmarks/physoc-probe.json`",
             "physoc-probe.json",
             '"answerChars": 12',
             '"citationCount": 1',
@@ -254,6 +326,9 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
 
         self.assertGreaterEqual(
             section.count("& tools/invoke_offline_compose.ps1 exec -T api"), 2
+        )
+        self.assertNotIn(
+            "Copy-Item deploy/offline/.env.example deploy/offline/.env", section
         )
 
     def test_design_documents_bounded_raw_sse_parsing(self) -> None:
