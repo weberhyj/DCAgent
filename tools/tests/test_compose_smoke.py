@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from functools import cache
 import hashlib
 import io
 import json
@@ -14,7 +15,6 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "tools" / "compose_smoke.py"
-MIGRATION_HEAD = "20260715_00"
 MODEL_SHA256 = "a" * 64
 ENCODING_SHA256 = "b" * 64
 
@@ -26,6 +26,11 @@ def _module():
     from tools import compose_smoke
 
     return compose_smoke
+
+
+@cache
+def _migration_head() -> str:
+    return _module()._discover_migration_head()
 
 
 def _embedding_payload(**overrides: object) -> str:
@@ -119,14 +124,15 @@ class FakeRunner:
             "postgres": json.dumps(
                 {
                     "selectOne": 1,
-                    "alembicRevision": MIGRATION_HEAD,
+                    "alembicRevision": _migration_head(),
                     "version": "16.3",
                 }
             ),
             "clickhouse_ping": "Ok.\n",
             "clickhouse_version": "25.3.1.2703\n",
             "qdrant_ready": "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhealthz check passed\n",
-            "qdrant_version": "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + json.dumps({"version": "1.14.0"}),
+            "qdrant_version": "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+            + json.dumps({"version": "1.14.0"}),
             "redis_ping": "PONG\n",
             "redis_version": "# Server\r\nredis_version:7.4.2\r\n",
             "clamav_ping": "PONG\n",
@@ -148,6 +154,14 @@ class FakeRunner:
 
 
 class ComposeSmokeTest(unittest.TestCase):
+    def test_default_postgres_fixture_uses_discovered_migration_head(self) -> None:
+        compose_smoke = _module()
+        postgres = json.loads(FakeRunner._default_output("postgres"))
+
+        self.assertEqual(
+            postgres["alembicRevision"], compose_smoke._discover_migration_head()
+        )
+
     def test_atomic_report_cleanup_preserves_original_write_error(self) -> None:
         compose_smoke = _module()
         with tempfile.TemporaryDirectory() as directory:
@@ -187,7 +201,8 @@ class ComposeSmokeTest(unittest.TestCase):
         )
         self.assertEqual(
             compose_smoke.build_compose_command("up", wrapper_path=wrapper),
-            prefix + [
+            prefix
+            + [
                 "up",
                 "-d",
                 "--build",
@@ -224,7 +239,9 @@ class ComposeSmokeTest(unittest.TestCase):
                     software_collector=lambda: {},
                 )
 
-    def test_runner_uses_argument_vectors_shell_false_and_never_direct_compose(self) -> None:
+    def test_runner_uses_argument_vectors_shell_false_and_never_direct_compose(
+        self,
+    ) -> None:
         compose_smoke = _module()
         runner = FakeRunner()
         with tempfile.TemporaryDirectory() as directory:
@@ -241,7 +258,9 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertTrue(
             all(command[0] in {"pwsh", sys.executable} for command, _ in runner.calls)
         )
-        host_calls = [command for command, _ in runner.calls if command[0] == sys.executable]
+        host_calls = [
+            command for command, _ in runner.calls if command[0] == sys.executable
+        ]
         self.assertEqual(len(host_calls), 1)
         self.assertIn("http://127.0.0.1:8000/api/readyz", " ".join(host_calls[0]))
         self.assertFalse(any(command[0] == "docker" for command, _ in runner.calls))
@@ -341,7 +360,8 @@ class ComposeSmokeTest(unittest.TestCase):
         compose_smoke = _module()
         cases = {
             "qdrant_ready": "HTTP/1.1 503 Service Unavailable\r\n\r\nhealthz check passed\n",
-            "qdrant_version": "HTTP/1.1 503 Service Unavailable\r\n\r\n" + json.dumps({"version": "1.14.0"}),
+            "qdrant_version": "HTTP/1.1 503 Service Unavailable\r\n\r\n"
+            + json.dumps({"version": "1.14.0"}),
         }
         for key, output in cases.items():
             with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
@@ -354,7 +374,9 @@ class ComposeSmokeTest(unittest.TestCase):
                 self.assertFalse(report["passed"])
                 self.assertIn(f"check:{key}", report["failures"])
 
-    def test_embedding_metadata_rejects_malformed_checksums_and_non_loopback_network(self) -> None:
+    def test_embedding_metadata_rejects_malformed_checksums_and_non_loopback_network(
+        self,
+    ) -> None:
         compose_smoke = _module()
         cases = {
             "malformed": "not-json",
@@ -372,9 +394,7 @@ class ComposeSmokeTest(unittest.TestCase):
             "network": _embedding_payload(
                 network={"endpoint": "https://public.example", "loopback": False}
             ),
-            "configured_checksum": _embedding_payload(
-                checksumMatchesConfigured=False
-            ),
+            "configured_checksum": _embedding_payload(checksumMatchesConfigured=False),
         }
         for label, output in cases.items():
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
@@ -409,7 +429,9 @@ class ComposeSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report = compose_smoke.run_compose_smoke(
                 report_path=Path(directory) / "report.json",
-                runner=FakeRunner(outputs={"clamav_ping": "ERROR: daemon unavailable\n"}),
+                runner=FakeRunner(
+                    outputs={"clamav_ping": "ERROR: daemon unavailable\n"}
+                ),
                 hardware_collector=lambda: {},
                 software_collector=lambda: {},
             )
@@ -436,16 +458,17 @@ class ComposeSmokeTest(unittest.TestCase):
                 ["pwsh"], 1, output=b"partial timeout output"
             ),
         ):
-            timeout = compose_smoke._default_runner(
-                ["pwsh", "--version"], shell=False
-            )
+            timeout = compose_smoke._default_runner(["pwsh", "--version"], shell=False)
         self.assertEqual(timeout.exit_code, 124)
         self.assertEqual(timeout.stdout, "partial timeout output")
 
     def test_success_cli_prints_sorted_component_versions_before_pass(self) -> None:
         compose_smoke = _module()
         output = io.StringIO()
-        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(output):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            contextlib.redirect_stdout(output),
+        ):
             exit_code = compose_smoke.main(
                 ["--report", str(Path(directory) / "report.json")],
                 runner=FakeRunner(),
@@ -459,10 +482,15 @@ class ComposeSmokeTest(unittest.TestCase):
         names = [line.split(":", 1)[0] for line in version_lines]
         self.assertEqual(names, sorted(names))
 
-    def test_down_preserves_volumes_by_default_and_removes_only_when_explicit(self) -> None:
+    def test_down_preserves_volumes_by_default_and_removes_only_when_explicit(
+        self,
+    ) -> None:
         compose_smoke = _module()
         for remove_volumes in (False, True):
-            with self.subTest(remove_volumes=remove_volumes), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(remove_volumes=remove_volumes),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 runner = FakeRunner()
                 compose_smoke.run_compose_smoke(
                     report_path=Path(directory) / "report.json",
@@ -495,7 +523,9 @@ class ComposeSmokeTest(unittest.TestCase):
                     software_collector=lambda: {},
                 )
 
-    def test_report_is_atomic_deterministic_auditable_and_contains_no_secrets(self) -> None:
+    def test_report_is_atomic_deterministic_auditable_and_contains_no_secrets(
+        self,
+    ) -> None:
         compose_smoke = _module()
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "nested" / "compose-smoke.json"
@@ -565,7 +595,11 @@ class ComposeSmokeTest(unittest.TestCase):
     def test_cli_without_docker_returns_nonzero_and_never_claims_pass(self) -> None:
         compose_smoke = _module()
         output = io.StringIO()
-        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(output),
+        ):
             exit_code = compose_smoke.main(
                 ["--report", str(Path(directory) / "report.json")],
                 runner=FakeRunner(exit_codes={"config": 127, "down": 127}),

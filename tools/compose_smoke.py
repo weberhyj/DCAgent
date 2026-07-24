@@ -92,7 +92,13 @@ def build_compose_command(
 ) -> list[str]:
     """Build one fixed argv invocation of the offline Compose wrapper."""
 
-    if not isinstance(action, str) or action not in {"config", "up", "down", "version", "exec"}:
+    if not isinstance(action, str) or action not in {
+        "config",
+        "up",
+        "down",
+        "version",
+        "exec",
+    }:
         raise ValueError("unsupported Compose action")
     prefix = _wrapper_prefix(Path(wrapper_path))
     if action == "config":
@@ -110,7 +116,11 @@ def build_compose_command(
     if action == "down":
         if arguments:
             raise ValueError("down does not accept extra arguments")
-        return prefix + ["down", "--remove-orphans", *( ["--volumes"] if remove_volumes else [])]
+        return prefix + [
+            "down",
+            "--remove-orphans",
+            *(["--volumes"] if remove_volumes else []),
+        ]
     if len(arguments) < 2:
         raise ValueError("exec requires a service and command")
     service = arguments[0]
@@ -126,8 +136,12 @@ def _discover_migration_head() -> str:
         text = path.read_text(encoding="utf-8")
         revision = re.search(r"^revision\s*=\s*[\"']([^\"']+)[\"']", text, re.MULTILINE)
         if revision:
-            parent = re.search(r"^down_revision\s*=\s*(?:None|[\"']([^\"']+)[\"'])", text, re.MULTILINE)
-            revisions[revision.group(1)] = parent.group(1) if parent and parent.group(1) else None
+            parent = re.search(
+                r"^down_revision\s*=\s*(?:None|[\"']([^\"']+)[\"'])", text, re.MULTILINE
+            )
+            revisions[revision.group(1)] = (
+                parent.group(1) if parent and parent.group(1) else None
+            )
     if not revisions:
         raise ValueError("no Alembic revisions found")
     children = {parent for parent in revisions.values() if parent}
@@ -152,7 +166,7 @@ exec 3<>/dev/tcp/127.0.0.1/6333
 printf 'GET / HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3
 cat <&3
 """
-HTTP_HELPER_SCRIPT = r'''
+HTTP_HELPER_SCRIPT = r"""
 import json, os, urllib.error, urllib.request
 def get(url):
     try:
@@ -174,8 +188,8 @@ print(json.dumps({"readyStatus": ready_status, "ready": ready,
                                                metadata.get("modelChecksum") == configured_checksum,
                   "network": {"endpoint": "http://127.0.0.1:8081", "loopback": True}},
                  sort_keys=True))
-'''.strip()
-API_HELPER_SCRIPT = r'''
+""".strip()
+API_HELPER_SCRIPT = r"""
 import json, urllib.error, urllib.request
 url = "http://127.0.0.1:8000/api/readyz"
 try:
@@ -187,7 +201,7 @@ try: body = json.loads(raw)
 except Exception: body = {"raw": raw[:256]}
 print(json.dumps({"statusCode": status, "body": body,
                   "network": {"endpoint": url, "loopback": True}}, sort_keys=True))
-'''.strip()
+""".strip()
 
 
 @dataclass(frozen=True)
@@ -199,16 +213,155 @@ class _Check:
 
 def _checks(wrapper_path: Path) -> tuple[_Check, ...]:
     return (
-        _Check("postgres", "postgres", tuple(build_compose_command("exec", "postgres", "psql", "--no-psqlrc", "--set", "ON_ERROR_STOP=1", "-U", "dc_agent", "-d", "dc_agent", "-Atqc", POSTGRES_SQL, wrapper_path=wrapper_path))),
-        _Check("clickhouse_ping", "clickhouse", tuple(build_compose_command("exec", "clickhouse", "wget", "-qO-", "http://127.0.0.1:8123/ping", wrapper_path=wrapper_path))),
-        _Check("clickhouse_version", "clickhouse", tuple(build_compose_command("exec", "clickhouse", "clickhouse-client", "--query", "SELECT version()", "--format", "Raw", wrapper_path=wrapper_path))),
-        _Check("qdrant_ready", "qdrant", tuple(build_compose_command("exec", "qdrant", "bash", "-ec", QDRANT_READY_SCRIPT, wrapper_path=wrapper_path))),
-        _Check("qdrant_version", "qdrant", tuple(build_compose_command("exec", "qdrant", "bash", "-ec", QDRANT_VERSION_SCRIPT, wrapper_path=wrapper_path))),
-        _Check("redis_ping", "redis", tuple(build_compose_command("exec", "redis", "redis-cli", "--raw", "PING", wrapper_path=wrapper_path))),
-        _Check("redis_version", "redis", tuple(build_compose_command("exec", "redis", "redis-cli", "--raw", "INFO", "server", wrapper_path=wrapper_path))),
-        _Check("clamav_ping", "clamav", tuple(build_compose_command("exec", "clamav", "clamdscan", "--ping", "1", wrapper_path=wrapper_path))),
-        _Check("clamav_version", "clamav", tuple(build_compose_command("exec", "clamav", "clamdscan", "--version", wrapper_path=wrapper_path))),
-        _Check("embedding", "embedding", tuple(build_compose_command("exec", "embedding-service", "python", "-c", HTTP_HELPER_SCRIPT, wrapper_path=wrapper_path))),
+        _Check(
+            "postgres",
+            "postgres",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "postgres",
+                    "psql",
+                    "--no-psqlrc",
+                    "--set",
+                    "ON_ERROR_STOP=1",
+                    "-U",
+                    "dc_agent",
+                    "-d",
+                    "dc_agent",
+                    "-Atqc",
+                    POSTGRES_SQL,
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "clickhouse_ping",
+            "clickhouse",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "clickhouse",
+                    "wget",
+                    "-qO-",
+                    "http://127.0.0.1:8123/ping",
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "clickhouse_version",
+            "clickhouse",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "clickhouse",
+                    "clickhouse-client",
+                    "--query",
+                    "SELECT version()",
+                    "--format",
+                    "Raw",
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "qdrant_ready",
+            "qdrant",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "qdrant",
+                    "bash",
+                    "-ec",
+                    QDRANT_READY_SCRIPT,
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "qdrant_version",
+            "qdrant",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "qdrant",
+                    "bash",
+                    "-ec",
+                    QDRANT_VERSION_SCRIPT,
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "redis_ping",
+            "redis",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "redis",
+                    "redis-cli",
+                    "--raw",
+                    "PING",
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "redis_version",
+            "redis",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "redis",
+                    "redis-cli",
+                    "--raw",
+                    "INFO",
+                    "server",
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "clamav_ping",
+            "clamav",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "clamav",
+                    "clamdscan",
+                    "--ping",
+                    "1",
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "clamav_version",
+            "clamav",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "clamav",
+                    "clamdscan",
+                    "--version",
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
+        _Check(
+            "embedding",
+            "embedding",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "embedding-service",
+                    "python",
+                    "-c",
+                    HTTP_HELPER_SCRIPT,
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
         # The API is published on the host loopback interface.  Probe that
         # binding directly so a container-internal loopback cannot mask a bad
         # port publication or an accidental non-loopback bind.
@@ -218,7 +371,9 @@ def _checks(wrapper_path: Path) -> tuple[_Check, ...]:
 
 def _json_object(text: str, label: str) -> dict[str, object]:
     try:
-        value = json.loads(text, parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)))
+        value = json.loads(
+            text, parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item))
+        )
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise ValueError(f"{label} output must be valid JSON") from error
     if not isinstance(value, dict):
@@ -228,7 +383,11 @@ def _json_object(text: str, label: str) -> dict[str, object]:
 
 def _version(text: str, label: str) -> str:
     value = text.strip()
-    if not value or len(value) > 256 or any(ord(char) < 32 and char not in "\r\n\t" for char in value):
+    if (
+        not value
+        or len(value) > 256
+        or any(ord(char) < 32 and char not in "\r\n\t" for char in value)
+    ):
         raise ValueError(f"{label} version output is invalid")
     return value.splitlines()[0].strip()
 
@@ -249,20 +408,40 @@ def _http_response(text: str, label: str) -> tuple[int, str]:
     return int(match.group(1)), _http_body(text)
 
 
-def _validate_check(check: _Check, output: str, *, migration_head: str) -> tuple[bool, str | None, dict[str, object]]:
+def _validate_check(
+    check: _Check, output: str, *, migration_head: str
+) -> tuple[bool, str | None, dict[str, object]]:
     if check.name == "postgres":
         payload = _json_object(output, "postgres")
-        ok = payload.get("selectOne") == 1 and payload.get("alembicRevision") == migration_head
-        return ok, str(payload.get("version")) if payload.get("version") else None, {"selectOne": payload.get("selectOne"), "alembicRevision": payload.get("alembicRevision")}
+        ok = (
+            payload.get("selectOne") == 1
+            and payload.get("alembicRevision") == migration_head
+        )
+        return (
+            ok,
+            str(payload.get("version")) if payload.get("version") else None,
+            {
+                "selectOne": payload.get("selectOne"),
+                "alembicRevision": payload.get("alembicRevision"),
+            },
+        )
     if check.name == "clickhouse_ping":
-        return output.strip().casefold() in {"ok", "ok."}, None, {"response": output.strip()[:64]}
+        return (
+            output.strip().casefold() in {"ok", "ok."},
+            None,
+            {"response": output.strip()[:64]},
+        )
     if check.name == "clickhouse_version":
         value = _version(output, check.name)
         return True, value, {}
     if check.name == "qdrant_ready":
         status, body = _http_response(output, "qdrant ready")
         normalized = body.strip().casefold()
-        return status == 200 and normalized in {"healthz check passed", "ok"}, None, {"statusCode": status, "response": body.strip()[:64]}
+        return (
+            status == 200 and normalized in {"healthz check passed", "ok"},
+            None,
+            {"statusCode": status, "response": body.strip()[:64]},
+        )
     if check.name == "qdrant_version":
         status, body = _http_response(output, "qdrant version")
         payload = _json_object(body, "qdrant")
@@ -271,7 +450,11 @@ def _validate_check(check: _Check, output: str, *, migration_head: str) -> tuple
             raise ValueError("qdrant version output is invalid")
         return status == 200, value.strip(), {"statusCode": status}
     if check.name == "redis_ping":
-        return output.strip().casefold() == "pong", None, {"response": output.strip()[:32]}
+        return (
+            output.strip().casefold() == "pong",
+            None,
+            {"response": output.strip()[:32]},
+        )
     if check.name == "redis_version":
         match = re.search(r"(?im)^redis_version:([^\r\n]+)", output)
         if not match:
@@ -287,23 +470,74 @@ def _validate_check(check: _Check, output: str, *, migration_head: str) -> tuple
         payload = _json_object(output, "embedding")
         metadata = payload.get("metadata")
         network = payload.get("network")
-        valid_metadata = isinstance(metadata, Mapping) and all(
-            isinstance(metadata.get(field), expected)
-            for field, expected in (
-                ("modelName", str), ("modelVersion", str), ("modelChecksum", str),
-                ("dimensions", int), ("normalized", bool),
-                ("encodingProfileSha256", str), ("protocolVersion", str),
+        valid_metadata = (
+            isinstance(metadata, Mapping)
+            and all(
+                isinstance(metadata.get(field), expected)
+                for field, expected in (
+                    ("modelName", str),
+                    ("modelVersion", str),
+                    ("modelChecksum", str),
+                    ("dimensions", int),
+                    ("normalized", bool),
+                    ("encodingProfileSha256", str),
+                    ("protocolVersion", str),
+                )
             )
-        ) and SHA256_PATTERN.fullmatch(str(metadata.get("modelChecksum", ""))) is not None and SHA256_PATTERN.fullmatch(str(metadata.get("encodingProfileSha256", ""))) is not None
-        valid_network = isinstance(network, Mapping) and network.get("loopback") is True and str(network.get("endpoint", "")).startswith("http://127.0.0.1:")
-        ok = payload.get("readyStatus") == 200 and payload.get("metadataStatus") == 200 and payload.get("checksumMatchesConfigured") is True and valid_metadata and valid_network
-        version = str(metadata.get("modelVersion")) if isinstance(metadata, Mapping) and metadata.get("modelVersion") else None
-        return ok, version, {"readyStatus": payload.get("readyStatus"), "metadataStatus": payload.get("metadataStatus"), "checksumMatchesConfigured": payload.get("checksumMatchesConfigured") is True, "network": {"loopback": valid_network}}
+            and SHA256_PATTERN.fullmatch(str(metadata.get("modelChecksum", "")))
+            is not None
+            and SHA256_PATTERN.fullmatch(str(metadata.get("encodingProfileSha256", "")))
+            is not None
+        )
+        valid_network = (
+            isinstance(network, Mapping)
+            and network.get("loopback") is True
+            and str(network.get("endpoint", "")).startswith("http://127.0.0.1:")
+        )
+        ok = (
+            payload.get("readyStatus") == 200
+            and payload.get("metadataStatus") == 200
+            and payload.get("checksumMatchesConfigured") is True
+            and valid_metadata
+            and valid_network
+        )
+        version = (
+            str(metadata.get("modelVersion"))
+            if isinstance(metadata, Mapping) and metadata.get("modelVersion")
+            else None
+        )
+        return (
+            ok,
+            version,
+            {
+                "readyStatus": payload.get("readyStatus"),
+                "metadataStatus": payload.get("metadataStatus"),
+                "checksumMatchesConfigured": payload.get("checksumMatchesConfigured")
+                is True,
+                "network": {"loopback": valid_network},
+            },
+        )
     if check.name == "api":
         payload = _json_object(output, "api")
         network = payload.get("network")
-        ok = payload.get("statusCode") == 200 and isinstance(network, Mapping) and network.get("loopback") is True and str(network.get("endpoint", "")).startswith("http://127.0.0.1:")
-        return ok, None, {"statusCode": payload.get("statusCode"), "network": {"loopback": bool(isinstance(network, Mapping) and network.get("loopback") is True)}}
+        ok = (
+            payload.get("statusCode") == 200
+            and isinstance(network, Mapping)
+            and network.get("loopback") is True
+            and str(network.get("endpoint", "")).startswith("http://127.0.0.1:")
+        )
+        return (
+            ok,
+            None,
+            {
+                "statusCode": payload.get("statusCode"),
+                "network": {
+                    "loopback": bool(
+                        isinstance(network, Mapping) and network.get("loopback") is True
+                    )
+                },
+            },
+        )
     raise ValueError(f"unknown smoke check {check.name}")
 
 
@@ -337,10 +571,23 @@ def _software() -> dict[str, object]:
 def _write_atomic(path: Path, payload: Mapping[str, object]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    encoded = (
+        json.dumps(
+            payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
+        )
+        + "\n"
+    )
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp", delete=False) as handle:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
             temporary = Path(handle.name)
             handle.write(encoded)
             handle.flush()
@@ -385,13 +632,19 @@ def run_compose_smoke(
     failures: list[str] = []
     component_versions: dict[str, str] = {}
     ready_results: dict[str, object] = {}
-    command_exit_codes: dict[str, int | None] = {"config": None, "up": None, "version": None}
+    command_exit_codes: dict[str, int | None] = {
+        "config": None,
+        "up": None,
+        "version": None,
+    }
     for check in _checks(wrapper):
         command_exit_codes[check.name] = None
     command_exit_codes["down"] = None
     active_exception: BaseException | None = None
     try:
-        config = runner(build_compose_command("config", wrapper_path=wrapper), shell=False)
+        config = runner(
+            build_compose_command("config", wrapper_path=wrapper), shell=False
+        )
         command_exit_codes["config"] = config.exit_code
         if config.exit_code != 0:
             failures.append("command:config")
@@ -401,13 +654,17 @@ def run_compose_smoke(
             if up.exit_code != 0:
                 failures.append("command:up")
             else:
-                version = runner(build_compose_command("version", wrapper_path=wrapper), shell=False)
+                version = runner(
+                    build_compose_command("version", wrapper_path=wrapper), shell=False
+                )
                 command_exit_codes["version"] = version.exit_code
                 if version.exit_code != 0:
                     failures.append("command:version")
                 else:
                     try:
-                        component_versions["compose"] = _version(version.stdout, "compose")
+                        component_versions["compose"] = _version(
+                            version.stdout, "compose"
+                        )
                     except ValueError:
                         failures.append("version:compose")
                 for check in _checks(wrapper):
@@ -417,7 +674,9 @@ def run_compose_smoke(
                         failures.append(f"command:{check.name}")
                         continue
                     try:
-                        ok, version_value, details = _validate_check(check, result.stdout, migration_head=migration_head)
+                        ok, version_value, details = _validate_check(
+                            check, result.stdout, migration_head=migration_head
+                        )
                     except ValueError:
                         ok, version_value, details = False, None, {"invalid": True}
                     ready_results[check.name] = {"passed": ok, **details}
@@ -428,12 +687,19 @@ def run_compose_smoke(
     finally:
         active_exception = sys.exc_info()[1]
         try:
-            down = runner(build_compose_command("down", wrapper_path=wrapper, remove_volumes=remove_volumes), shell=False)
+            down = runner(
+                build_compose_command(
+                    "down", wrapper_path=wrapper, remove_volumes=remove_volumes
+                ),
+                shell=False,
+            )
         except BaseException as cleanup_error:
             if active_exception is None:
                 raise
             if hasattr(active_exception, "add_note"):
-                active_exception.add_note(f"compose smoke cleanup also failed: {cleanup_error}")
+                active_exception.add_note(
+                    f"compose smoke cleanup also failed: {cleanup_error}"
+                )
         else:
             command_exit_codes["down"] = down.exit_code
             if down.exit_code != 0:
@@ -451,7 +717,9 @@ def run_compose_smoke(
         "commandExitCodes": command_exit_codes,
         "readyResults": ready_results,
         "checksums": {
-            "composeYamlSha256": _sha256(REPO_ROOT / "deploy" / "offline" / "compose.yaml"),
+            "composeYamlSha256": _sha256(
+                REPO_ROOT / "deploy" / "offline" / "compose.yaml"
+            ),
             "wrapperSha256": _sha256(wrapper),
         },
         "migrationHead": migration_head,

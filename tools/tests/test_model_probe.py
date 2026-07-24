@@ -261,7 +261,9 @@ class ModelProbeTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("dc-agent-model-probe", source)
 
-    def test_fixed_python_helpers_compile_and_generation_measures_throughput(self) -> None:
+    def test_fixed_python_helpers_compile_and_generation_measures_throughput(
+        self,
+    ) -> None:
         from tools.benchmarks import model_probe
 
         scripts = (
@@ -293,10 +295,14 @@ class ModelProbeTest(unittest.TestCase):
         self.assertIn("AutoTokenizer", model_probe.EMBEDDING_BENCHMARK_SCRIPT)
         self.assertIn("timed_post", model_probe.EMBEDDING_BENCHMARK_SCRIPT)
         self.assertNotIn('"family": "BGE"', model_probe.EMBEDDING_BENCHMARK_SCRIPT)
-        self.assertNotIn('"variant": os.environ', model_probe.EMBEDDING_BENCHMARK_SCRIPT)
+        self.assertNotIn(
+            '"variant": os.environ', model_probe.EMBEDDING_BENCHMARK_SCRIPT
+        )
         self.assertIn("actualTokenRange", model_probe.EMBEDDING_BENCHMARK_SCRIPT)
 
-    def test_generation_helper_uses_real_tokenizer_and_fifteen_way_concurrency(self) -> None:
+    def test_generation_helper_uses_real_tokenizer_and_fifteen_way_concurrency(
+        self,
+    ) -> None:
         from tools.benchmarks import model_probe
 
         script = model_probe.GENERATION_BENCHMARK_SCRIPT
@@ -326,7 +332,12 @@ class ModelProbeTest(unittest.TestCase):
 
         with self._probe_files("generation-model") as fixture:
             runner = FakeRunner(
-                probe_outcomes("generation-model", fixture["checksum"], fixture["artifact"], generation_metrics())
+                probe_outcomes(
+                    "generation-model",
+                    fixture["checksum"],
+                    fixture["artifact"],
+                    generation_metrics(),
+                )
             )
             result = run_model_probe(
                 compose_file=fixture["compose"],
@@ -480,7 +491,9 @@ class ModelProbeTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.failures, ["first_token_p95_ms"])
 
-    def test_gate_fails_closed_for_missing_non_numeric_and_non_finite_metrics(self) -> None:
+    def test_gate_fails_closed_for_missing_non_numeric_and_non_finite_metrics(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import ModelGate, evaluate_model_probe
 
         gate = ModelGate(1500, 2000, 10000)
@@ -506,7 +519,9 @@ class ModelProbeTest(unittest.TestCase):
             ).passed
         )
 
-    def test_candidate_entry_requires_strict_checksum_and_bounded_local_path(self) -> None:
+    def test_candidate_entry_requires_strict_checksum_and_bounded_local_path(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import load_candidate_artifact
 
         with tempfile.TemporaryDirectory() as directory:
@@ -542,10 +557,15 @@ class ModelProbeTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 load_candidate_artifact(entry, artifact_root=root)
 
-    def test_candidate_entry_allows_an_absolute_local_path_outside_lock_root(self) -> None:
+    def test_candidate_entry_allows_an_absolute_local_path_outside_lock_root(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import load_candidate_artifact
 
-        with tempfile.TemporaryDirectory() as lock_directory, tempfile.TemporaryDirectory() as artifact_directory:
+        with (
+            tempfile.TemporaryDirectory() as lock_directory,
+            tempfile.TemporaryDirectory() as artifact_directory,
+        ):
             artifact = Path(artifact_directory) / "candidate.gguf"
             write_minimal_gguf(artifact, name="qwen-local")
             checksum = hashlib.sha256(artifact.read_bytes()).hexdigest()
@@ -562,13 +582,17 @@ class ModelProbeTest(unittest.TestCase):
             )
             self.assertEqual(candidate.path, artifact.resolve())
 
-    def test_candidate_load_rejects_replacement_after_hasher_returns_old_digest(self) -> None:
+    def test_candidate_load_rejects_replacement_after_hasher_returns_old_digest(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import load_candidate_artifact
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifact = root / "candidate.gguf"
-            write_minimal_gguf(artifact, name="local-candidate", irrelevant_value="original")
+            write_minimal_gguf(
+                artifact, name="local-candidate", irrelevant_value="original"
+            )
             original_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
 
             def replacing_hasher(path: Path) -> str:
@@ -596,8 +620,13 @@ class ModelProbeTest(unittest.TestCase):
                     artifact_hasher=replacing_hasher,
                 )
 
-    def test_directory_candidate_rejects_same_stat_nested_file_replacement(self) -> None:
-        from tools.benchmarks.model_probe import load_candidate_artifact, sha256_artifact
+    def test_directory_candidate_rejects_same_stat_nested_file_replacement(
+        self,
+    ) -> None:
+        from tools.benchmarks.model_probe import (
+            load_candidate_artifact,
+            sha256_artifact,
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -758,13 +787,23 @@ class ModelProbeTest(unittest.TestCase):
             up = runner.calls[1][0]
             self.assertEqual(
                 up[up.index("up") : up.index("up") + 7],
-                ["up", "-d", "--wait", "--no-build", "--pull", "never", "embedding-service"],
+                [
+                    "up",
+                    "-d",
+                    "--wait",
+                    "--no-build",
+                    "--pull",
+                    "never",
+                    "embedding-service",
+                ],
             )
             self.assertEqual(runner.calls[0][0][:4], prefix)
             self.assertIn("python", runner.calls[2][0])
             self.assertIn("-c", runner.calls[2][0])
             self.assertNotIn("dc-agent-model-probe", runner.calls[2][0])
-            self.assertEqual(runner.calls[-1][0][-2:], ["--remove-orphans", "--volumes"])
+            self.assertEqual(
+                runner.calls[-1][0][-2:], ["--remove-orphans", "--volumes"]
+            )
             self.assertTrue(all(shell is False for _, shell in runner.calls))
 
             with self.assertRaises(ValueError):
@@ -779,7 +818,9 @@ class ModelProbeTest(unittest.TestCase):
                     runner=FakeRunner([]),
                 )
 
-    def test_runtime_candidate_replacement_fails_closed_and_still_cleans_up(self) -> None:
+    def test_runtime_candidate_replacement_fails_closed_and_still_cleans_up(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         with self._probe_files("generation-model") as fixture:
@@ -834,6 +875,7 @@ class ModelProbeTest(unittest.TestCase):
         from tools.benchmarks.model_probe import run_model_probe
 
         with self._probe_files("generation-model") as fixture:
+
             def replace_during_config(_command):
                 replacement = fixture["artifact"].with_suffix(".config.gguf")
                 write_minimal_gguf(
@@ -865,7 +907,9 @@ class ModelProbeTest(unittest.TestCase):
                 )
             self.assertFalse(any("up" in command for command, _shell in runner.calls))
 
-    def test_candidate_replacement_during_benchmark_is_rejected_before_pass(self) -> None:
+    def test_candidate_replacement_during_benchmark_is_rejected_before_pass(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         with self._probe_files("generation-model") as fixture:
@@ -916,7 +960,9 @@ class ModelProbeTest(unittest.TestCase):
                 )
             self.assertIn("down", runner.calls[-1][0])
 
-    def test_override_injects_each_locked_candidate_into_real_image_commands(self) -> None:
+    def test_override_injects_each_locked_candidate_into_real_image_commands(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         cases = (
@@ -955,7 +1001,9 @@ class ModelProbeTest(unittest.TestCase):
                 )
                 self.assertTrue(runner.override_snapshots)
                 if os.name != "nt":
-                    self.assertTrue(all(mode & 0o077 == 0 for mode in runner.override_modes))
+                    self.assertTrue(
+                        all(mode & 0o077 == 0 for mode in runner.override_modes)
+                    )
                 override = runner.override_snapshots[0]
                 encoded = json.dumps(override, sort_keys=True)
                 sources = {
@@ -979,7 +1027,9 @@ class ModelProbeTest(unittest.TestCase):
                     self.assertIn("sys.addaudithook", command[2])
                     self.assertIn("public-network-attempted", command[2])
 
-    def test_config_preflight_rejects_non_internal_or_published_probe_services_before_up(self) -> None:
+    def test_config_preflight_rejects_non_internal_or_published_probe_services_before_up(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         invalid_configs = (
@@ -1002,9 +1052,10 @@ class ModelProbeTest(unittest.TestCase):
             },
         )
         for rendered in invalid_configs:
-            with self.subTest(rendered=rendered), self._probe_files(
-                "embedding-model"
-            ) as fixture:
+            with (
+                self.subTest(rendered=rendered),
+                self._probe_files("embedding-model") as fixture,
+            ):
                 runner = FakeRunner([(0, rendered)])
                 result = run_model_probe(
                     compose_file=fixture["compose"],
@@ -1021,7 +1072,9 @@ class ModelProbeTest(unittest.TestCase):
                 self.assertEqual(len(runner.calls), 1)
                 self.assertNotIn("up", runner.calls[0][0])
 
-    def test_config_preflight_requires_candidate_injection_in_final_rendered_services(self) -> None:
+    def test_config_preflight_requires_candidate_injection_in_final_rendered_services(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         with self._probe_files("embedding-model") as fixture:
@@ -1043,8 +1096,11 @@ class ModelProbeTest(unittest.TestCase):
     def test_probe_rejects_remote_docker_context_before_compose(self) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
-        with self._probe_files("embedding-model") as fixture, patch.dict(
-            os.environ, {"DOCKER_HOST": "tcp://public.example:2375"}, clear=False
+        with (
+            self._probe_files("embedding-model") as fixture,
+            patch.dict(
+                os.environ, {"DOCKER_HOST": "tcp://public.example:2375"}, clear=False
+            ),
         ):
             with self.assertRaisesRegex(ValueError, "local Docker"):
                 run_model_probe(
@@ -1058,7 +1114,9 @@ class ModelProbeTest(unittest.TestCase):
                     runner=FakeRunner([]),
                 )
 
-    def test_cross_process_mutex_rejects_a_second_candidate_and_releases_afterward(self) -> None:
+    def test_cross_process_mutex_rejects_a_second_candidate_and_releases_afterward(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import ProbeMutex, run_model_probe
 
         with self._probe_files("embedding-model") as fixture:
@@ -1094,7 +1152,9 @@ class ModelProbeTest(unittest.TestCase):
                     pass
             self.assertEqual(victim.read_bytes(), b"victim")
 
-    def test_kind_specific_gate_reports_non_applicable_metrics_without_zeroes(self) -> None:
+    def test_kind_specific_gate_reports_non_applicable_metrics_without_zeroes(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import ModelGate, evaluate_candidate_gate
 
         gate = ModelGate(1500, 2000, 10000)
@@ -1117,7 +1177,9 @@ class ModelProbeTest(unittest.TestCase):
             all(value == "not_applicable" for value in reranker.metrics.values())
         )
 
-    def test_candidate_service_is_stopped_in_finally_after_probe_exception(self) -> None:
+    def test_candidate_service_is_stopped_in_finally_after_probe_exception(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         with self._probe_files("embedding-model") as fixture:
@@ -1151,12 +1213,15 @@ class ModelProbeTest(unittest.TestCase):
             commands = [call[0] for call in runner.calls]
             self.assertIn("config", commands[0])
             self.assertIn("down", commands[-1])
-            self.assertNotIn("llama", [item for command in commands for item in command])
+            self.assertNotIn(
+                "llama", [item for command in commands for item in command]
+            )
             override_paths = [
                 Path(command[index + 1])
                 for command in commands
                 for index, value in enumerate(command[:-1])
-                if value == "-f" and command[index + 1] != str(fixture["compose"].resolve())
+                if value == "-f"
+                and command[index + 1] != str(fixture["compose"].resolve())
             ]
             self.assertTrue(override_paths)
             self.assertTrue(all(not path.exists() for path in override_paths))
@@ -1194,7 +1259,9 @@ class ModelProbeTest(unittest.TestCase):
                     runner=runner,
                 )
 
-    def test_override_cleanup_failure_does_not_replace_original_probe_exception(self) -> None:
+    def test_override_cleanup_failure_does_not_replace_original_probe_exception(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         original_unlink = Path.unlink
@@ -1238,7 +1305,9 @@ class ModelProbeTest(unittest.TestCase):
             notes = getattr(caught.exception, "__notes__", [])
             self.assertTrue(any("override cleanup" in note for note in notes))
 
-    def test_metadata_checksum_mismatch_and_public_network_attempt_fail_closed(self) -> None:
+    def test_metadata_checksum_mismatch_and_public_network_attempt_fail_closed(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         for metadata, expected_failure in (
@@ -1248,9 +1317,12 @@ class ModelProbeTest(unittest.TestCase):
                 "public_network_attempt",
             ),
         ):
-            with self.subTest(expected_failure=expected_failure), self._probe_files(
-                "embedding-model", forced_checksum="a" * 64
-            ) as fixture:
+            with (
+                self.subTest(expected_failure=expected_failure),
+                self._probe_files(
+                    "embedding-model", forced_checksum="a" * 64
+                ) as fixture,
+            ):
                 runner = FakeRunner(
                     probe_outcomes(
                         "embedding-model",
@@ -1338,7 +1410,9 @@ class ModelProbeTest(unittest.TestCase):
                 "top20_to10_p95_ms_exceeds_1500",
             )
 
-    def test_generation_probe_uses_fixed_contexts_output_cap_and_preserves_metrics(self) -> None:
+    def test_generation_probe_uses_fixed_contexts_output_cap_and_preserves_metrics(
+        self,
+    ) -> None:
         from tools.benchmarks.model_probe import run_model_probe
 
         with self._probe_files("generation-model") as fixture:
@@ -1381,7 +1455,10 @@ class ModelProbeTest(unittest.TestCase):
         cases.append((missing, 0, "resident_memory_bytes"))
         cases.append((embedding_metrics(), 9, "command:benchmark"))
         for metrics, exit_code, expected in cases:
-            with self.subTest(expected=expected), self._probe_files("embedding-model") as fixture:
+            with (
+                self.subTest(expected=expected),
+                self._probe_files("embedding-model") as fixture,
+            ):
                 runner = FakeRunner(
                     probe_outcomes(
                         "embedding-model",
@@ -1449,13 +1526,16 @@ class ModelProbeTest(unittest.TestCase):
                 },
             )
             self.assertEqual(payload["candidate"]["sha256"], fixture["checksum"])
-            self.assertEqual(payload["commandExitCodes"], {
-                "benchmark": 0,
-                "config": 0,
-                "down": 0,
-                "metadata": 0,
-                "up": 0,
-            })
+            self.assertEqual(
+                payload["commandExitCodes"],
+                {
+                    "benchmark": 0,
+                    "config": 0,
+                    "down": 0,
+                    "metadata": 0,
+                    "up": 0,
+                },
+            )
             self.assertTrue(payload["gateResult"]["passed"])
             self.assertEqual(list(fixture["report"].parent.glob("*.tmp")), [])
 
@@ -1539,7 +1619,9 @@ class ModelProbeTest(unittest.TestCase):
                 (self.artifact / "embedding-metadata.json").write_text(
                     json.dumps(
                         {
-                            "modelName": "bge-small" if kind == "embedding-model" else "local-candidate",
+                            "modelName": "bge-small"
+                            if kind == "embedding-model"
+                            else "local-candidate",
                             "modelVersion": "1",
                             "dimensions": 8,
                         }
@@ -1548,7 +1630,9 @@ class ModelProbeTest(unittest.TestCase):
                 )
                 actual = sha256_artifact(self.artifact)
             self.checksum = forced_checksum or actual
-            candidate_name = "bge-small" if kind == "embedding-model" else "local-candidate"
+            candidate_name = (
+                "bge-small" if kind == "embedding-model" else "local-candidate"
+            )
             self.values = {
                 "root": self.root,
                 "artifact": self.artifact,

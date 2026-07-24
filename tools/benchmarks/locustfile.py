@@ -21,7 +21,10 @@ from tools.benchmarks.manifest import BenchmarkManifest
 
 try:
     from locust import HttpUser, between, events, task
-except ModuleNotFoundError:  # pragma: no cover - exercised by environments without Locust
+except (
+    ModuleNotFoundError
+):  # pragma: no cover - exercised by environments without Locust
+
     class _Hook:
         def add_listener(self, function):
             return function
@@ -65,9 +68,7 @@ _REQUEST_SEQUENCE = itertools.count()
 RECORDED_TIMINGS: deque[dict[str, float | str]] = deque(maxlen=100_000)
 RECORDED_REQUESTS: deque[dict[str, object]] = deque(maxlen=100_000)
 METRICS_PATH = Path(
-    os.environ.get(
-        "BENCHMARK_METRICS_PATH", "artifacts/benchmarks/locust-metrics.json"
-    )
+    os.environ.get("BENCHMARK_METRICS_PATH", "artifacts/benchmarks/locust-metrics.json")
 )
 
 
@@ -103,21 +104,22 @@ def record_stream_timings(
         RECORDED_TIMINGS.append(timing)
 
     full_stream_ms = context.get("full_stream_ms") if context is not None else None
-    has_full_stream_ms = (
-        isinstance(full_stream_ms, (int, float))
-        and math.isfinite(float(full_stream_ms))
+    has_full_stream_ms = isinstance(full_stream_ms, (int, float)) and math.isfinite(
+        float(full_stream_ms)
     )
     if not has_full_stream_ms:
         full_stream_ms = response_time
-    if not isinstance(full_stream_ms, (int, float)) or not math.isfinite(float(full_stream_ms)):
+    if not isinstance(full_stream_ms, (int, float)) or not math.isfinite(
+        float(full_stream_ms)
+    ):
         full_stream_ms = 0.0
     failed = (
         exception is not None
         or (context is not None and context.get("failed") is True)
         or not has_full_stream_ms
     )
-    if (
-        isinstance(full_stream_ms, (int, float)) and math.isfinite(float(full_stream_ms))
+    if isinstance(full_stream_ms, (int, float)) and math.isfinite(
+        float(full_stream_ms)
     ):
         record: dict[str, object] = {
             "request_kind": request_kind,
@@ -245,7 +247,9 @@ def build_metrics(records) -> dict[str, float]:
         metrics["error_rate"] = sum(
             1 for record in samples if record.get("failed") is True
         ) / len(samples)
-    if successful and all(isinstance(record.get("cache_hit"), bool) for record in successful):
+    if successful and all(
+        isinstance(record.get("cache_hit"), bool) for record in successful
+    ):
         cache_samples = [record["cache_hit"] for record in successful]
         metrics["warm_cache_hit_rate"] = sum(cache_samples) / len(cache_samples)
     return metrics
@@ -308,9 +312,7 @@ class CapacityUser(HttpUser):
             "request_kind": query_kind,
             "failed": False,
         }
-        idempotency_key = (
-            f"{IDEMPOTENCY_PREFIX}-{WORKER_ID}-{next(_REQUEST_SEQUENCE)}"
-        )
+        idempotency_key = f"{IDEMPOTENCY_PREFIX}-{WORKER_ID}-{next(_REQUEST_SEQUENCE)}"
         headers = {
             "X-Identity": TRUSTED_PRINCIPAL,
             "Idempotency-Key": idempotency_key,

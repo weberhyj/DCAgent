@@ -18,7 +18,12 @@ import tempfile
 from typing import Any
 
 from tools.benchmarks.manifest import BenchmarkManifest
-from tools.benchmarks.report import CapacityResult, MetricGate, evaluate_capacity, write_report
+from tools.benchmarks.report import (
+    CapacityResult,
+    MetricGate,
+    evaluate_capacity,
+    write_report,
+)
 
 
 MODES = ("phase1-smoke", "phase4-online", "phase4-batch")
@@ -116,7 +121,11 @@ def sha256_file(path: Path) -> str:
 
 def _sha256_json(payload: Mapping[str, object]) -> str:
     encoded = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -223,7 +232,9 @@ def _validated_command(command: Sequence[str]) -> list[str]:
     if isinstance(command, (str, bytes)) or not command:
         raise ValueError("command must be a non-empty argument vector")
     arguments = list(command)
-    if any(not isinstance(item, str) or not item or "\x00" in item for item in arguments):
+    if any(
+        not isinstance(item, str) or not item or "\x00" in item for item in arguments
+    ):
         raise ValueError("command arguments must be non-empty strings")
     return arguments
 
@@ -268,7 +279,11 @@ def _execute_process(
     environment: Mapping[str, str] | None,
 ) -> int:
     arguments = _validated_command(command)
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds <= 0:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or timeout_seconds <= 0
+    ):
         raise ValueError("benchmark timeout must be a positive integer")
     try:
         popen_kwargs: dict[str, object] = {
@@ -355,14 +370,20 @@ def create_report(
     benchmark_popen_factory: Callable[..., Any] = subprocess.Popen,
     benchmark_kill_strategy: Callable[[Any], None] | None = None,
     hardware_collector: Callable[[Path], dict[str, object]] = collect_hardware,
-    version_collector: Callable[[], tuple[dict[str, str], dict[str, int]]] = collect_software_versions,
+    version_collector: Callable[
+        [], tuple[dict[str, str], dict[str, int]]
+    ] = collect_software_versions,
 ) -> bool:
     manifest = BenchmarkManifest.load(manifest_path)
     selected = select_profile(manifest, profile_name, mode)
     _validate_run_labels(profile_name, mode, cache_label)
     if vector_dimension not in manifest.vector_dimension_candidates:
         raise ValueError("selected vector dimension is not allowed by the manifest")
-    if isinstance(model_slots, bool) or not isinstance(model_slots, int) or model_slots <= 0:
+    if (
+        isinstance(model_slots, bool)
+        or not isinstance(model_slots, int)
+        or model_slots <= 0
+    ):
         raise ValueError("model slots must be a positive integer")
 
     if benchmark_timeout_seconds is None:
@@ -448,7 +469,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", required=True)
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument(
-        "--cache-label", choices=("cold", "warm", "not-applicable"), default="not-applicable"
+        "--cache-label",
+        choices=("cold", "warm", "not-applicable"),
+        default="not-applicable",
     )
     parser.add_argument("--vector-dimension", type=int, required=True)
     parser.add_argument("--model-slots", type=int, required=True)
