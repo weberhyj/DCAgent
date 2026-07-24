@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+import ipaddress
 import re
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENV_EXAMPLES = (
@@ -36,6 +38,16 @@ def physoc_readme_section(text: str) -> str:
     if match is None:
         return ""
     return match.group(1)
+
+
+def active_assignments(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
 
 
 class PhysocLlmDocumentationContractTests(unittest.TestCase):
@@ -75,6 +87,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
                 self.assertIn("development only", text.casefold())
 
         offline_text = ENV_EXAMPLES[-1].read_text(encoding="utf-8")
+        offline_values = active_assignments(offline_text)
         self.assertRegex(
             offline_text,
             r"(?m)^LLM_PROVIDER=physoc_deepseek\s*$",
@@ -87,6 +100,19 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             offline_text,
             r"(?m)^\s*LLM_API_KEY\s*=\s*\S+\s*$",
         )
+        self.assertEqual("http://172.16.0.10:8090", offline_values["LLM_API_BASE"])
+        self.assertEqual("my_deepseek_r1_7b", offline_values["LLM_MODEL"])
+
+        parsed_base = urlsplit(offline_values["LLM_API_BASE"])
+        self.assertEqual("http", parsed_base.scheme)
+        self.assertIsNone(parsed_base.username)
+        self.assertIsNone(parsed_base.password)
+        self.assertFalse(parsed_base.query)
+        self.assertFalse(parsed_base.fragment)
+        self.assertTrue(parsed_base.hostname)
+        base_address = ipaddress.ip_address(parsed_base.hostname)
+        self.assertTrue(base_address.is_private)
+        self.assertFalse(base_address.is_loopback)
 
     def test_physoc_examples_do_not_contain_sensitive_or_dns_values(self) -> None:
         for path in (*ENV_EXAMPLES, REPO_ROOT / "README.md"):

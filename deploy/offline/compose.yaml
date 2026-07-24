@@ -229,6 +229,7 @@ services:
         condition: service_healthy
     networks:
       - offline
+      - physoc-egress
 
   ingestion-worker:
     build:
@@ -320,6 +321,8 @@ services:
 networks:
   offline:
     internal: true
+  physoc-egress:
+    internal: false
 
 secrets:
   postgres_password:

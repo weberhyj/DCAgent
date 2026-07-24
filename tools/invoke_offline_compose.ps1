@@ -257,6 +257,24 @@ function Assert-RenderedOfflineCompose {
     if ($null -eq $services) {
         throw "Rendered Compose configuration has no services"
     }
+    $networks = Get-JsonPropertyValue -Object $Rendered -Name "networks"
+    if ($null -eq $networks) {
+        throw "Rendered Compose configuration has no networks"
+    }
+    $offlineNetwork = Get-JsonPropertyValue -Object $networks -Name "offline"
+    if ($null -eq $offlineNetwork) {
+        throw "Rendered Compose configuration is missing the offline network"
+    }
+    if ((Get-JsonPropertyValue -Object $offlineNetwork -Name "internal") -ne $true) {
+        throw "Rendered Compose offline network must be internal"
+    }
+    $physocEgressNetwork = Get-JsonPropertyValue -Object $networks -Name "physoc-egress"
+    if ($null -eq $physocEgressNetwork) {
+        throw "Rendered Compose configuration is missing the physoc-egress network"
+    }
+    if ((Get-JsonPropertyValue -Object $physocEgressNetwork -Name "internal") -eq $true) {
+        throw "Rendered Compose physoc-egress network must not be internal"
+    }
     foreach ($requiredService in @(
         "postgres",
         "clickhouse",
@@ -271,6 +289,29 @@ function Assert-RenderedOfflineCompose {
     )) {
         if ($null -eq (Get-JsonPropertyValue -Object $services -Name $requiredService)) {
             throw "Rendered Compose configuration is missing required service $requiredService"
+        }
+    }
+
+    foreach ($serviceProperty in $services.PSObject.Properties) {
+        $serviceName = $serviceProperty.Name
+        $serviceNetworks = Get-JsonPropertyValue -Object $serviceProperty.Value -Name "networks"
+        if ($null -eq $serviceNetworks) {
+            throw "$serviceName must declare an explicit network set"
+        }
+        $actualNetworks = @(
+            $serviceNetworks.PSObject.Properties |
+                ForEach-Object { $_.Name } |
+                Sort-Object -Unique
+        )
+        $expectedNetworks = @("offline")
+        if ($serviceName -ceq "api") {
+            $expectedNetworks = @("offline", "physoc-egress")
+        }
+        if (
+            $actualNetworks.Count -ne $expectedNetworks.Count -or
+            @(Compare-Object -ReferenceObject $expectedNetworks -DifferenceObject $actualNetworks).Count -ne 0
+        ) {
+            throw "$serviceName network set must be exactly $($expectedNetworks -join ', ')"
         }
     }
 

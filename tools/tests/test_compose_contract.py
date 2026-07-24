@@ -43,6 +43,46 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn("wget -qO- http://127.0.0.1:6333", text)
         self.assertNotIn("/var/lib/clamav:ro", text)
 
+    def test_compose_limits_physoc_egress_to_api(self) -> None:
+        compose_text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        networks = compose_text.split("\nnetworks:\n", 1)[1]
+        self.assertRegex(networks, r"(?ms)^  offline:\n\s+internal: true(?:\n|$)")
+        self.assertRegex(
+            networks,
+            r"(?ms)^  physoc-egress:\n\s+internal: false(?:\n|$)",
+        )
+
+        def service_block(service_name: str) -> str:
+            match = re.search(
+                rf"(?ms)^  {re.escape(service_name)}:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|^networks:)",
+                compose_text,
+            )
+            self.assertIsNotNone(match)
+            return match.group("body")
+
+        self.assertRegex(
+            service_block("api"),
+            r"(?ms)^    networks:\n      - offline\n      - physoc-egress(?:\n|$)",
+        )
+        for service_name in (
+            "postgres",
+            "clickhouse",
+            "qdrant",
+            "redis",
+            "clamav",
+            "schema-migration",
+            "embedding-service",
+            "ingestion-worker",
+            "llama",
+        ):
+            with self.subTest(service_name=service_name):
+                block = service_block(service_name)
+                self.assertIn("      - offline", block)
+                self.assertNotIn("physoc-egress", block)
+
     def test_compose_supports_keyless_physoc_stream_configuration(self) -> None:
         text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
             encoding="utf-8"
@@ -185,17 +225,22 @@ class ComposeContractTest(unittest.TestCase):
                     "bind": {"create_host_path": False},
                 }
 
+            def service_networks(*names: str) -> dict[str, None]:
+                return dict.fromkeys(names)
+
             rendered = {
                 "name": "dc-agent-offline",
                 "services": {
                     "postgres": {
                         "image": safe_image,
+                        "networks": service_networks("offline"),
                         "volumes": [
                             bind(data_root / "postgres", "/var/lib/postgresql/data")
                         ],
                     },
                     "clickhouse": {
                         "image": safe_image,
+                        "networks": service_networks("offline"),
                         "volumes": [
                             bind(data_root / "clickhouse", "/var/lib/clickhouse"),
                             bind(
@@ -206,22 +251,30 @@ class ComposeContractTest(unittest.TestCase):
                     },
                     "qdrant": {
                         "image": safe_image,
+                        "networks": service_networks("offline"),
                         "volumes": [bind(data_root / "qdrant", "/qdrant/storage")],
                     },
                     "redis": {
                         "image": safe_image,
+                        "networks": service_networks("offline"),
                         "volumes": [bind(data_root / "redis", "/data")],
                     },
-                    "clamav": {"image": safe_image},
+                    "clamav": {
+                        "image": safe_image,
+                        "networks": service_networks("offline"),
+                    },
                     "schema-migration": {
-                        "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}}
+                        "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "networks": service_networks("offline"),
                     },
                     "embedding-service": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "networks": service_networks("offline"),
                         "volumes": [bind(model_root, "/models")],
                     },
                     "api": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "networks": service_networks("offline", "physoc-egress"),
                         "ports": [
                             {
                                 "host_ip": "127.0.0.1",
@@ -238,6 +291,7 @@ class ComposeContractTest(unittest.TestCase):
                     },
                     "ingestion-worker": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "networks": service_networks("offline"),
                         "volumes": [
                             bind(data_root / "raw", "/data/raw"),
                             bind(data_root / "parquet", "/data/parquet"),
@@ -246,8 +300,13 @@ class ComposeContractTest(unittest.TestCase):
                     },
                     "llama": {
                         "image": safe_image,
+                        "networks": service_networks("offline"),
                         "volumes": [bind(model_root, "/models")],
                     },
+                },
+                "networks": {
+                    "offline": {"internal": True},
+                    "physoc-egress": {"internal": False},
                 },
                 "secrets": {
                     "postgres_password": {"file": str(password_path)},
@@ -348,6 +407,61 @@ class ComposeContractTest(unittest.TestCase):
                 config_arguments.index("config"),
             )
             self.assertEqual(["up", "-d"], records[1]["args"][-2:])
+
+            missing_api_egress = json.loads(json.dumps(rendered))
+            del missing_api_egress["services"]["api"]["networks"]["physoc-egress"]
+            rejected_missing_api_egress = run(missing_api_egress)
+            self.assertNotEqual(0, rejected_missing_api_egress.returncode)
+            self.assertIn(
+                "network",
+                (
+                    rejected_missing_api_egress.stdout
+                    + rejected_missing_api_egress.stderr
+                ).lower(),
+            )
+
+            non_api_egress = json.loads(json.dumps(rendered))
+            non_api_egress["services"]["postgres"]["networks"]["physoc-egress"] = None
+            rejected_non_api_egress = run(non_api_egress)
+            self.assertNotEqual(0, rejected_non_api_egress.returncode)
+            self.assertIn(
+                "network",
+                (
+                    rejected_non_api_egress.stdout + rejected_non_api_egress.stderr
+                ).lower(),
+            )
+
+            public_core_network = json.loads(json.dumps(rendered))
+            public_core_network["networks"]["offline"]["internal"] = False
+            rejected_public_core = run(public_core_network)
+            self.assertNotEqual(0, rejected_public_core.returncode)
+            self.assertIn(
+                "network",
+                (rejected_public_core.stdout + rejected_public_core.stderr).lower(),
+            )
+
+            internal_egress_network = json.loads(json.dumps(rendered))
+            internal_egress_network["networks"]["physoc-egress"]["internal"] = True
+            rejected_internal_egress = run(internal_egress_network)
+            self.assertNotEqual(0, rejected_internal_egress.returncode)
+            self.assertIn(
+                "network",
+                (
+                    rejected_internal_egress.stdout + rejected_internal_egress.stderr
+                ).lower(),
+            )
+
+            extra_api_network = json.loads(json.dumps(rendered))
+            extra_api_network["services"]["api"]["networks"]["unexpected"] = None
+            rejected_extra_api_network = run(extra_api_network)
+            self.assertNotEqual(0, rejected_extra_api_network.returncode)
+            self.assertIn(
+                "network",
+                (
+                    rejected_extra_api_network.stdout
+                    + rejected_extra_api_network.stderr
+                ).lower(),
+            )
 
             for safe_arguments in (
                 ("logs", "-f", "api"),
