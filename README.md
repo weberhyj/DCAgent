@@ -127,6 +127,148 @@ dataset and the offline `--profile indexing` worker has published that schema ve
 [`deploy/offline/README.md`](deploy/offline/README.md) for migration, worker startup, smoke aggregate,
 rollback, and ClickHouse failure handling.
 
+## 当前真实架构与能力边界
+
+> 本节描述 `main` 分支当前已经接入的运行链路，不代表路线图中的后续目标架构已经完成。
+
+```mermaid
+flowchart TD
+    A["管理端上传文件"] --> B["FastAPI API"]
+    B --> C["本地原始文件目录"]
+    B --> D{"是否启用结构化 Excel/CSV"}
+
+    D -->|"否或普通文档"| E["基础文件解析器"]
+    E --> F["600 字符切片 / 120 字符重叠"]
+    F --> G["PostgreSQL 文档、切片和轻量哈希向量"]
+
+    D -->|"是"| H["推断并人工确认表结构"]
+    H --> I["结构化 indexing worker"]
+    I --> J["Parquet 暂存"]
+    I --> K["ClickHouse 不可变发布表"]
+
+    L["用户提问"] --> M{"是否为已发布数据集的统计问题"}
+    M -->|"avg / sum / count / min / max"| K
+    K --> N["确定性统计答案，不调用大模型"]
+    K -.->|"不可用或超时"| X["显式失败，不回退到切片计算"]
+
+    M -->|"普通文档问题"| O["LangGraph 只读检索 Agent"]
+    O --> G
+    G --> P["最多 5 个证据切片"]
+    P -.->|"无可靠证据"| Y["拒绝回答，不调用模型"]
+    P --> Q["Physoc DeepSeek POST/SSE"]
+    Q --> R["基于证据归纳的最终答案"]
+    Q -.->|"超时、非 2xx 或异常 SSE"| Z["HTTP 502"]
+```
+
+### 普通文档问答链路
+
+当前普通文档问答属于检索增强生成（RAG）：
+
+1. 上传文件保存在 API 主机的受控原始文件目录中。
+2. 解析器提取文本，并按 600 个字符切片、保留 120 个字符重叠。
+3. 切片和 48 维轻量哈希向量保存在 PostgreSQL。
+4. 查询时从 PostgreSQL 读取已索引切片，在 Python 中计算关键词和向量分数。
+5. LangGraph Agent 最多保留 5 个证据切片、深入检查 3 个资料来源，并把证据、调查摘要和最近 6 条消息组成完整 RAG 提示词。
+6. `physoc_deepseek` Provider 将完整提示词通过 `POST /api/physoc/deepseek/stream` 发送给私有 Physoc 服务，收集 SSE `message` 事件中的 `response`，再返回归纳后的答案。
+
+没有可靠证据时不会调用模型。Physoc 超时、返回非 2xx、SSE 格式异常或答案为空时，API
+返回 HTTP 502；系统不得把检索切片或模板文本伪装成模型答案。
+
+这条链路是“检索少量相关证据后回答”，不是“读取整个知识库后进行全库总结”。跨章节、
+跨文档和全库 Map-Reduce 汇总仍属于后续阶段。
+
+### Excel/CSV 的两条处理路线
+
+- `STRUCTURED_QUERY_ENABLED=false`（默认）：XLSX/CSV 被展开为普通文本并进入切片 RAG。
+  这种模式适合查找某行或某项说明，不适合计算整列平均值、总和等全量统计。
+- `STRUCTURED_QUERY_ENABLED=true`：管理员必须确认字段类型、别名和统计权限，随后由
+  `--profile indexing` worker 分批写入 Parquet 并发布到 ClickHouse。对于已成功发布且已通过
+  行数和内容校验的 ClickHouse publication，`avg`、`sum`、`count`、`min`、`max` 由
+  ClickHouse 对该 publication 的数据确定性计算，不调用 Physoc，也不会从文档切片估算结果。
+
+这里的“精确统计”只承诺覆盖通过校验的 publication，不等同于无条件覆盖原工作簿中的每个
+单元格。空值、错误值、公式结果、隐藏行、多 Sheet 合并方式和类型转换规则仍需在目标业务
+数据集上冻结口径并验收。
+
+如果 ClickHouse 不可用或查询超时，结构化问题必须显式失败，不得回退到普通 RAG 做切片
+算术。
+
+### 当前文件支持情况
+
+| 文件类型 | 当前处理方式 | 当前限制 |
+| --- | --- | --- |
+| `.txt`、`.md` | UTF-8/GB18030 文本读取后切片 | 加密、损坏或超大文件未形成生产验收口径；不保留复杂结构 |
+| `.docx` | 提取段落和表格文本 | 密码保护、损坏或超大文件未形成生产验收口径；不保留完整章节层级、页码和复杂布局 |
+| 文本型 `.pdf` | 使用 `pypdf` 提取页面文字 | 密码保护、损坏、扫描页、字体映射异常和超大文件未形成生产验收口径 |
+| `.xlsx`、`.csv` | 默认展开为文本；启用结构化功能后可发布到 ClickHouse | XLSX 多 Sheet、公式、合并单元格，以及 CSV 编码和分隔符规则需按数据集验收 |
+| `.doc`、`.xls` | 上传入口兼容，但当前生产解析不支持 | 解析器会退化为不可靠的二进制文本读取，生产环境不得使用 |
+| `.ppt`、`.pptx` | 当前上传入口和主解析链路不支持 | 计划在统一 Docling/PaddleOCR 阶段实现 |
+| 图片 | 当前上传入口会拒绝 | 图片 OCR 尚未接入主解析链路 |
+
+当前主解析器尚未接入 Docling 和 PaddleOCR。扫描 PDF、图片文字、PPTX、页码、章节、幻灯片、
+表格范围、单元格范围及 OCR 置信度等结构化定位信息尚未进入普通问答链路。
+
+当前回答中的引用主要用于标识资料来源和证据切片，并不保证定位到页码、章节、幻灯片或
+单元格范围；这些细粒度引用尚未进入 API 和前端展示契约。
+
+### Compose 服务与实际接入状态
+
+离线 Compose 声明 PostgreSQL、ClickHouse、Qdrant、Redis、ClamAV、Embedding Service、API，
+以及可选的 indexing worker 和 llama.cpp profile。当前实际状态如下：
+
+- PostgreSQL 已用于会话、文档、切片、Agent 审计和结构化元数据。
+- ClickHouse 已用于启用后的 Excel/CSV 精确统计。
+- Physoc 是独立部署的公司内网模型服务，不包含在本 Compose 项目中。
+- Qdrant、Redis 和独立 Embedding Service 当前主要完成了离线部署与健康检查契约，普通文档
+  问答仍未迁移到 Qdrant/BGE 检索。
+- ClamAV 服务当前进入了部署健康检查，但文件上传路由尚未调用病毒扫描。
+
+Compose 会把 Qdrant、Redis、ClamAV 和 Embedding Service 的健康状态作为部署启动门禁；这只
+表示这些容器必须成功启动并通过健康检查。它们尚未成为普通问答业务主链路，因此不能据此
+认为混合向量检索、异步任务队列和上传安全扫描已经启用。
+
+### 安全与开放范围
+
+当前 FastAPI 路由没有接入身份认证、用户主体、角色或知识库级权限校验，CORS 目前也配置为
+`allow_origins=["*"]`。管理端和用户端之间尚无管理员隔离、部门隔离或文档授权边界。
+
+因此，当前版本只能部署在网络和人员范围均受控的隔离验收环境，不得直接面向公司全员或其他
+不受信任客户端开放。身份认证、管理员隔离、知识库授权、审计闭环和安全加固属于升级路线的
+Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应用层权限控制。
+
+### 搬入公司内网前的条件
+
+项目运行时可以不调用公共 API，但不能只复制仓库目录后直接开放使用。目标环境至少需要：
+
+1. 一台符合运行手册要求的 Linux 主机、rootful Docker 和 Compose v2。
+2. 已审核并预置的内部基础镜像、Python wheelhouse、Embedding/解析模型文件和镜像 digest。
+   两个前端还需要预构建静态产物，或可用的 npm 离线缓存/公司内部 npm 源；仓库本身不包含
+   所有运行所需 artifact。
+3. PostgreSQL、ClickHouse、Qdrant、Redis、ClamAV 和 Embedding Service 所需的数据目录、权限和 Secret 文件。
+4. API 容器可以访问的私有 Physoc 地址，以及正确的 `LLM_PROVIDER`、`LLM_API_BASE`、
+   `LLM_STREAM_PATH` 和 `LLM_MODEL`。
+5. 同机反向代理。离线 Compose 只将 API 发布到 `127.0.0.1:8000`，内网客户端不应直接访问
+   容器端口。
+6. 在目标服务器完成 Compose smoke、Physoc probe、真实文档问答、模型故障 HTTP 502、
+   配置恢复和结构化统计验收。
+
+当前开发机没有执行真实目标服务器门禁，因此仓库具备内网部署路线，但不能据此声明任意内网
+服务器均可“复制后立即使用”。
+
+需要明确区分三个状态：本节所述功能已有代码实现；仓库中的相关自动化契约可在本地运行并
+验证；真实目标服务器上的镜像、模型、网络、权限、数据和并发仍必须单独完成部署验收。前两项
+不能替代第三项。
+
+### 当前规模限制与升级路线
+
+普通文档检索目前会从 PostgreSQL 读取已索引切片，并在 Python 中逐条计算分数。该实现适合
+功能验证和中小规模知识库，不适合数百万或数千万普通文档切片。
+
+面向大规模企业知识库的后续顺序是：统一 Docling/PaddleOCR 解析、BGE-M3 Dense/Sparse
+Embedding、Qdrant 混合检索、BGE Reranker、相邻上下文扩展、分层 Map-Reduce 汇总，最后补齐
+Redis/Celery 异步任务、ClamAV 上传扫描、权限、引用和千万级验收。详细阶段和退出门禁见
+[`企业知识库升级路线`](docs/superpowers/plans/2026-07-24-enterprise-knowledge-base-qa-rollout.md)。
+
 ## 启动
 
 后端：
@@ -224,7 +366,7 @@ py tools\ui_smoke.py
 完整冒烟建议：
 
 1. 启动后端。
-2. 启动知识库管理端，上传一份 `.txt`、`.md`、`.pdf`、`.docx`、`.xlsx` 或 `.csv` 文档。
+2. 启动知识库管理端，上传一份 `.txt`、`.md`、`.docx`、`.xlsx`、`.csv`，或文本型、未加密且在已验收大小内的 `.pdf` 文档。
 3. 等待资料源状态从 `解析中` 变为 `已索引`。
 4. 启动用户检索端，询问文档中的制度、合同或业务问题。
 5. 确认 DCAgent 回答只基于知识库内容，不在用户侧暴露资料原文管理入口。
