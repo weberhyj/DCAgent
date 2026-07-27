@@ -267,11 +267,14 @@ class ComposeContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def bind(source: Path, target: str) -> dict[str, object]:
+            def bind(
+                source: Path, target: str, *, read_only: bool = False
+            ) -> dict[str, object]:
                 return {
                     "type": "bind",
                     "source": str(source),
                     "target": target,
+                    "read_only": read_only,
                     "bind": {"create_host_path": False},
                 }
 
@@ -320,7 +323,12 @@ class ComposeContractTest(unittest.TestCase):
                     "embedding-service": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
                         "networks": service_networks("offline"),
-                        "volumes": [bind(model_root, "/models")],
+                        "volumes": [bind(model_root, "/models", read_only=True)],
+                    },
+                    "reranker-service": {
+                        "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
+                        "networks": service_networks("offline"),
+                        "volumes": [bind(model_root, "/models", read_only=True)],
                     },
                     "api": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
@@ -336,7 +344,7 @@ class ComposeContractTest(unittest.TestCase):
                         "volumes": [
                             bind(data_root / "raw", "/data/raw"),
                             bind(data_root / "parquet", "/data/parquet"),
-                            bind(model_root, "/models"),
+                            bind(model_root, "/models", read_only=True),
                         ],
                     },
                     "ingestion-worker": {
@@ -345,13 +353,13 @@ class ComposeContractTest(unittest.TestCase):
                         "volumes": [
                             bind(data_root / "raw", "/data/raw"),
                             bind(data_root / "parquet", "/data/parquet"),
-                            bind(model_root, "/models"),
+                            bind(model_root, "/models", read_only=True),
                         ],
                     },
                     "llama": {
                         "image": safe_image,
                         "networks": service_networks("offline"),
-                        "volumes": [bind(model_root, "/models")],
+                        "volumes": [bind(model_root, "/models", read_only=True)],
                     },
                 },
                 "networks": {
@@ -657,6 +665,61 @@ class ComposeContractTest(unittest.TestCase):
             rejected_bind = run(unsafe_bind)
             self.assertNotEqual(0, rejected_bind.returncode)
             self.assertIn("bind", (rejected_bind.stdout + rejected_bind.stderr).lower())
+
+            wrong_reranker_source = json.loads(json.dumps(rendered))
+            wrong_reranker_source["services"]["reranker-service"]["volumes"][0][
+                "source"
+            ] = str(root / "external-models")
+            rejected_reranker_source = run(wrong_reranker_source)
+            self.assertNotEqual(0, rejected_reranker_source.returncode)
+            self.assertIn(
+                "bind",
+                (
+                    rejected_reranker_source.stdout + rejected_reranker_source.stderr
+                ).lower(),
+            )
+
+            extra_reranker_bind = json.loads(json.dumps(rendered))
+            extra_reranker_bind["services"]["reranker-service"]["volumes"].append(
+                bind(model_root, "/unexpected", read_only=True)
+            )
+            rejected_extra_reranker_bind = run(extra_reranker_bind)
+            self.assertNotEqual(0, rejected_extra_reranker_bind.returncode)
+            self.assertIn(
+                "bind",
+                (
+                    rejected_extra_reranker_bind.stdout
+                    + rejected_extra_reranker_bind.stderr
+                ).lower(),
+            )
+
+            writable_reranker_bind = json.loads(json.dumps(rendered))
+            writable_reranker_bind["services"]["reranker-service"]["volumes"][0][
+                "read_only"
+            ] = False
+            rejected_writable_reranker_bind = run(writable_reranker_bind)
+            self.assertNotEqual(0, rejected_writable_reranker_bind.returncode)
+            self.assertIn(
+                "read-only",
+                (
+                    rejected_writable_reranker_bind.stdout
+                    + rejected_writable_reranker_bind.stderr
+                ).lower(),
+            )
+
+            creating_reranker_bind = json.loads(json.dumps(rendered))
+            creating_reranker_bind["services"]["reranker-service"]["volumes"][0][
+                "bind"
+            ]["create_host_path"] = True
+            rejected_creating_reranker_bind = run(creating_reranker_bind)
+            self.assertNotEqual(0, rejected_creating_reranker_bind.returncode)
+            self.assertIn(
+                "create_host_path",
+                (
+                    rejected_creating_reranker_bind.stdout
+                    + rejected_creating_reranker_bind.stderr
+                ).lower(),
+            )
 
             unsafe_secret = json.loads(json.dumps(rendered))
             unsafe_secret["secrets"]["postgres_password"]["file"] = str(

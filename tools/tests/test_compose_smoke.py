@@ -18,6 +18,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "tools" / "compose_smoke.py"
 MODEL_SHA256 = "a" * 64
 ENCODING_SHA256 = "b" * 64
+RERANKER_SHA256 = "c" * 64
+PROMPT_SHA256 = "d" * 64
 
 
 def _module():
@@ -51,6 +53,28 @@ def _embedding_payload(**overrides: object) -> str:
         },
         "network": {
             "endpoint": "http://127.0.0.1:8081",
+            "loopback": True,
+        },
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def _reranker_payload(**overrides: object) -> str:
+    payload: dict[str, object] = {
+        "readyStatus": 200,
+        "ready": {"status": "ready"},
+        "metadataStatus": 200,
+        "metadataMatchesConfigured": True,
+        "metadata": {
+            "modelName": "Qwen/Qwen3-Reranker-0.6B",
+            "modelVersion": "1.0.0",
+            "modelChecksum": RERANKER_SHA256,
+            "promptProfileSha256": PROMPT_SHA256,
+            "protocolVersion": "v1",
+        },
+        "network": {
+            "endpoint": "http://127.0.0.1:8082",
             "loopback": True,
         },
     }
@@ -112,6 +136,8 @@ class FakeRunner:
             return "clamav_ping" if "--ping" in arguments else "clamav_version"
         if service == "embedding-service":
             return "embedding"
+        if service == "reranker-service":
+            return "reranker"
         if service == "api":
             return "api"
         raise AssertionError(f"unexpected command: {argv!r}")
@@ -139,6 +165,7 @@ class FakeRunner:
             "clamav_ping": "PONG\n",
             "clamav_version": "ClamAV 1.4.2/27650/Fri Jul 17 00:00:00 2026\n",
             "embedding": _embedding_payload(),
+            "reranker": _reranker_payload(),
             "api": json.dumps(
                 {
                     "statusCode": 200,
@@ -252,6 +279,8 @@ class ComposeSmokeTest(unittest.TestCase):
                 "--build",
                 "--wait",
                 "--remove-orphans",
+                "embedding-service",
+                "reranker-service",
                 "api",
             ],
         )
@@ -271,20 +300,33 @@ class ComposeSmokeTest(unittest.TestCase):
                 compose_smoke.build_compose_command("up", wrapper_path=wrapper),
             )
 
-    def test_standard_api_smoke_starts_both_private_model_dependencies(self) -> None:
+    def test_standard_stack_starts_models_without_consumer_health_dependencies(
+        self,
+    ) -> None:
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
             encoding="utf-8"
         )
-        api = re.search(
-            r"(?ms)^  api:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|^networks:)",
-            compose,
-        )
-        self.assertIsNotNone(api)
-        assert api is not None
+
+        def block(service: str) -> str:
+            match = re.search(
+                rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|^networks:)",
+                compose,
+            )
+            self.assertIsNotNone(match)
+            assert match is not None
+            return match.group("body")
+
         for service in ("embedding-service", "reranker-service"):
-            self.assertRegex(
-                api.group("body"),
-                rf"(?ms)^\s+{re.escape(service)}:\n\s+condition: service_healthy",
+            self.assertNotRegex(block(service), r"(?m)^\s+profiles:")
+        for consumer in ("api", "ingestion-worker"):
+            depends_on = re.search(
+                r"(?ms)^    depends_on:\n(?P<body>.*?)(?=^    [a-z_]+:|\Z)",
+                block(consumer),
+            )
+            self.assertIsNotNone(depends_on)
+            assert depends_on is not None
+            self.assertNotRegex(
+                depends_on.group("body"), r"(?m)^\s+(?:embedding|reranker)-service:"
             )
 
     def test_production_runner_rejects_non_repository_wrapper(self) -> None:
@@ -378,6 +420,7 @@ class ComposeSmokeTest(unittest.TestCase):
             "exec -T redis redis-cli --raw PING",
             "exec -T clamav clamdscan --ping 1",
             "exec -T embedding-service python -c",
+            "exec -T reranker-service python -c",
             "/v1/metadata",
             "http://127.0.0.1:8000/api/readyz",
         ):
@@ -466,6 +509,41 @@ class ComposeSmokeTest(unittest.TestCase):
                 )
                 self.assertFalse(report["passed"])
                 self.assertIn("check:embedding", report["failures"])
+
+    def test_reranker_metadata_rejects_mismatch_malformed_checksums_and_network(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        valid_metadata = {
+            "modelName": "Qwen/Qwen3-Reranker-0.6B",
+            "modelVersion": "1.0.0",
+            "modelChecksum": RERANKER_SHA256,
+            "promptProfileSha256": PROMPT_SHA256,
+            "protocolVersion": "v1",
+        }
+        cases = {
+            "malformed": "not-json",
+            "checksum": _reranker_payload(
+                metadata={**valid_metadata, "modelChecksum": "not-a-checksum"}
+            ),
+            "prompt": _reranker_payload(
+                metadata={**valid_metadata, "promptProfileSha256": "invalid"}
+            ),
+            "network": _reranker_payload(
+                network={"endpoint": "https://public.example", "loopback": False}
+            ),
+            "configured_metadata": _reranker_payload(metadataMatchesConfigured=False),
+        }
+        for label, output in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                report = compose_smoke.run_compose_smoke(
+                    report_path=Path(directory) / "report.json",
+                    runner=FakeRunner(outputs={"reranker": output}),
+                    hardware_collector=lambda: {},
+                    software_collector=lambda: {},
+                )
+                self.assertFalse(report["passed"])
+                self.assertIn("check:reranker", report["failures"])
 
     def test_invalid_qdrant_json_and_missing_native_output_fail_closed(self) -> None:
         compose_smoke = _module()
@@ -631,6 +709,13 @@ class ComposeSmokeTest(unittest.TestCase):
                 "failures",
             ):
                 self.assertIn(field, payload)
+            self.assertIn("reranker", payload["readyResults"])
+            reranker = payload["readyResults"]["reranker"]
+            self.assertTrue(reranker["passed"])
+            self.assertTrue(reranker["metadataMatchesConfigured"])
+            self.assertNotIn("metadata", reranker)
+            self.assertNotIn("ready", reranker)
+            self.assertEqual(payload["componentVersions"]["reranker"], "1.0.0")
             self.assertEqual(
                 payload["checksums"]["composeYamlSha256"],
                 hashlib.sha256(

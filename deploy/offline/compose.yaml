@@ -316,10 +316,6 @@ services:
         condition: service_healthy
       clamav:
         condition: service_healthy
-      embedding-service:
-        condition: service_healthy
-      reranker-service:
-        condition: service_healthy
     networks:
       - offline
       - physoc-egress
@@ -416,10 +412,6 @@ services:
       redis:
         condition: service_healthy
       clamav:
-        condition: service_healthy
-      embedding-service:
-        condition: service_healthy
-      reranker-service:
         condition: service_healthy
     networks:
       - offline

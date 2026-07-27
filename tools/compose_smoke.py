@@ -108,7 +108,16 @@ def build_compose_command(
     if action == "up":
         if arguments:
             raise ValueError("up does not accept extra arguments")
-        return prefix + ["up", "-d", "--build", "--wait", "--remove-orphans", "api"]
+        return prefix + [
+            "up",
+            "-d",
+            "--build",
+            "--wait",
+            "--remove-orphans",
+            "embedding-service",
+            "reranker-service",
+            "api",
+        ]
     if action == "version":
         if arguments:
             raise ValueError("version does not accept extra arguments")
@@ -187,6 +196,35 @@ print(json.dumps({"readyStatus": ready_status, "ready": ready,
                   "checksumMatchesConfigured": bool(configured_checksum) and
                                                metadata.get("modelChecksum") == configured_checksum,
                   "network": {"endpoint": "http://127.0.0.1:8081", "loopback": True}},
+                 sort_keys=True))
+""".strip()
+RERANKER_HTTP_HELPER_SCRIPT = r"""
+import json, os, urllib.error, urllib.request
+def get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=15) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8", "replace")
+        try: body = json.loads(raw)
+        except Exception: body = {"raw": raw[:256]}
+        return error.code, body
+    except Exception as error:
+        return 0, {"error": type(error).__name__}
+ready_status, ready = get("http://127.0.0.1:8082/readyz")
+metadata_status, metadata = get("http://127.0.0.1:8082/v1/metadata")
+configured = {
+    "modelName": os.environ.get("RERANKER_MODEL_NAME", ""),
+    "modelVersion": os.environ.get("RERANKER_MODEL_VERSION", ""),
+    "modelChecksum": os.environ.get("RERANKER_MODEL_SHA256", ""),
+    "promptProfileSha256": os.environ.get("RERANKER_PROMPT_PROFILE_SHA256", ""),
+    "protocolVersion": os.environ.get("RERANKER_PROTOCOL_VERSION", ""),
+}
+print(json.dumps({"readyStatus": ready_status, "ready": ready,
+                  "metadataStatus": metadata_status, "metadata": metadata,
+                  "metadataMatchesConfigured": all(configured.values()) and
+                                               metadata == configured,
+                  "network": {"endpoint": "http://127.0.0.1:8082", "loopback": True}},
                  sort_keys=True))
 """.strip()
 API_HELPER_SCRIPT = r"""
@@ -362,6 +400,20 @@ def _checks(wrapper_path: Path) -> tuple[_Check, ...]:
                 )
             ),
         ),
+        _Check(
+            "reranker",
+            "reranker",
+            tuple(
+                build_compose_command(
+                    "exec",
+                    "reranker-service",
+                    "python",
+                    "-c",
+                    RERANKER_HTTP_HELPER_SCRIPT,
+                    wrapper_path=wrapper_path,
+                )
+            ),
+        ),
         # The API is published on the host loopback interface.  Probe that
         # binding directly so a container-internal loopback cannot mask a bad
         # port publication or an accidental non-loopback bind.
@@ -513,6 +565,57 @@ def _validate_check(
                 "readyStatus": payload.get("readyStatus"),
                 "metadataStatus": payload.get("metadataStatus"),
                 "checksumMatchesConfigured": payload.get("checksumMatchesConfigured")
+                is True,
+                "network": {"loopback": valid_network},
+            },
+        )
+    if check.name == "reranker":
+        payload = _json_object(output, "reranker")
+        metadata = payload.get("metadata")
+        network = payload.get("network")
+        string_fields = (
+            "modelName",
+            "modelVersion",
+            "modelChecksum",
+            "promptProfileSha256",
+            "protocolVersion",
+        )
+        valid_metadata = (
+            isinstance(metadata, Mapping)
+            and all(
+                isinstance(metadata.get(field), str)
+                and bool(str(metadata.get(field)).strip())
+                for field in string_fields
+            )
+            and SHA256_PATTERN.fullmatch(str(metadata.get("modelChecksum", "")))
+            is not None
+            and SHA256_PATTERN.fullmatch(str(metadata.get("promptProfileSha256", "")))
+            is not None
+        )
+        valid_network = (
+            isinstance(network, Mapping)
+            and network.get("loopback") is True
+            and str(network.get("endpoint", "")).startswith("http://127.0.0.1:")
+        )
+        ok = (
+            payload.get("readyStatus") == 200
+            and payload.get("metadataStatus") == 200
+            and payload.get("metadataMatchesConfigured") is True
+            and valid_metadata
+            and valid_network
+        )
+        version = (
+            str(metadata.get("modelVersion"))
+            if isinstance(metadata, Mapping) and metadata.get("modelVersion")
+            else None
+        )
+        return (
+            ok,
+            version,
+            {
+                "readyStatus": payload.get("readyStatus"),
+                "metadataStatus": payload.get("metadataStatus"),
+                "metadataMatchesConfigured": payload.get("metadataMatchesConfigured")
                 is True,
                 "network": {"loopback": valid_network},
             },

@@ -106,6 +106,26 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertRegex(api, rf"(?m)^\s+{key}:")
 
+    def test_model_readiness_is_mode_aware_in_application_not_compose_dependencies(
+        self,
+    ) -> None:
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        for service in ("embedding-service", "reranker-service"):
+            self.assertNotRegex(service_block(compose, service), r"(?m)^\s+profiles:")
+        for consumer in ("api", "ingestion-worker"):
+            block = service_block(compose, consumer)
+            depends_on = re.search(
+                r"(?ms)^    depends_on:\n(?P<body>.*?)(?=^    [a-z_]+:|\Z)",
+                block,
+            )
+            self.assertIsNotNone(depends_on)
+            assert depends_on is not None
+            self.assertNotRegex(
+                depends_on.group("body"), r"(?m)^\s+(?:embedding|reranker)-service:"
+            )
+
     def test_env_examples_do_not_embed_password_values(self) -> None:
         for path in ENV_EXAMPLES:
             text = path.read_text(encoding="utf-8")

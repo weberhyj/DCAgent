@@ -283,6 +283,7 @@ function Assert-RenderedOfflineCompose {
         "clamav",
         "schema-migration",
         "embedding-service",
+        "reranker-service",
         "api",
         "ingestion-worker",
         "llama"
@@ -381,6 +382,9 @@ function Assert-RenderedOfflineCompose {
         "embedding-service" = [ordered]@{
             "/models" = $modelRoot
         }
+        "reranker-service" = [ordered]@{
+            "/models" = $modelRoot
+        }
         "api" = [ordered]@{
             "/data/raw" = Join-Path $dataRoot "raw"
             "/data/parquet" = Join-Path $dataRoot "parquet"
@@ -422,6 +426,13 @@ function Assert-RenderedOfflineCompose {
             $createHostPath = Get-JsonPropertyValue -Object $bind -Name "create_host_path"
             if ($createHostPath -ne $false) {
                 throw "$serviceName bind mount for $target must disable create_host_path"
+            }
+            if (
+                $serviceName -ceq "reranker-service" -and
+                $target -ceq "/models" -and
+                (Get-JsonPropertyValue -Object $volume -Name "read_only") -ne $true
+            ) {
+                throw "reranker-service bind mount for /models must be read-only"
             }
             $seenTargets[$target] = $true
         }
