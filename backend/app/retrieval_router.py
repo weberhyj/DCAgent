@@ -205,6 +205,9 @@ class ShadowQueue:
             if not self._closing:
                 self._closing = True
                 self._dropped_count += self._discard_pending_locked()
+                if not self.worker.is_alive():
+                    self._closed = True
+                    return
                 self._queue.put_nowait(_STOP)
         self.worker.join(self._close_timeout_seconds)
         if self.worker.is_alive():
@@ -248,7 +251,7 @@ class ShadowQueue:
             if not outcome.hits and task.legacy_hits:
                 status = "fallback"
                 fallback_reason = "qwen_empty_legacy_nonempty"
-        except BaseException as error:
+        except Exception as error:
             status = "failed"
             fallback_reason = _fallback_code(error)
         qwen_ms = _elapsed_ms(started, self._monotonic())
@@ -266,7 +269,7 @@ class ShadowQueue:
                 status=status,
                 fallback_reason=fallback_reason,
             )
-        except BaseException:
+        except Exception:
             return
 
 
@@ -299,21 +302,28 @@ class RetrievalRouter:
         self._shadow_percent = _percentage(shadow_percent, "shadow_percent")
         self._canary_percent = _percentage(canary_percent, "canary_percent")
         self._monotonic = monotonic
+        if self.mode is RetrievalMode.SHADOW and audit is None:
+            raise ValueError("shadow mode requires an audit repository")
         self._circuit = _CircuitBreaker(
             failure_threshold=failure_threshold,
             reset_interval_seconds=reset_interval_seconds,
             monotonic=monotonic,
         )
-        self.shadow_queue = ShadowQueue(
-            hybrid=hybrid,
-            audit=audit,
-            max_size=shadow_queue_size,
-            close_timeout_seconds=close_timeout_seconds,
-            monotonic=monotonic,
+        self.shadow_queue = (
+            ShadowQueue(
+                hybrid=hybrid,
+                audit=audit,
+                max_size=shadow_queue_size,
+                close_timeout_seconds=close_timeout_seconds,
+                monotonic=monotonic,
+            )
+            if self.mode is RetrievalMode.SHADOW
+            else None
         )
 
     def close(self) -> None:
-        self.shadow_queue.close()
+        if self.shadow_queue is not None:
+            self.shadow_queue.close()
 
     def uses_qwen(self, routing_key: str) -> bool:
         percentage = (
@@ -329,6 +339,7 @@ class RetrievalRouter:
         if self.mode is RetrievalMode.SHADOW:
             legacy = self._legacy(request)
             if self.uses_qwen(request.routing_key):
+                assert self.shadow_queue is not None
                 self.shadow_queue.submit(request, legacy.hits, legacy.stage_ms["legacy"])
             return legacy
         if not self.uses_qwen(request.routing_key):
@@ -339,7 +350,7 @@ class RetrievalRouter:
             return self._legacy(request, fallback_reason="circuit_open")
         try:
             qwen = self._hybrid.retrieve(request)
-        except BaseException as error:
+        except Exception as error:
             self._circuit.record_failure(permit)
             return self._legacy(request, fallback_reason=_fallback_code(error))
         self._circuit.record_success(permit)
@@ -403,7 +414,7 @@ def _elapsed_ms(started: float, completed: float) -> float:
     return max(0.0, (completed - started) * 1000.0)
 
 
-def _fallback_code(error: BaseException) -> str:
+def _fallback_code(error: Exception) -> str:
     if isinstance(error, HybridRetrievalTimeout):
         return "qwen_timeout"
     if isinstance(error, EmbeddingServiceError):

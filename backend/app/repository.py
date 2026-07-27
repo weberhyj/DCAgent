@@ -448,6 +448,10 @@ class InMemoryChatRepository:
         retrieval_router: RetrievalRouter | None = None,
         retrieval_scope: RetrievalScope | None = None,
     ) -> None:
+        if (retrieval_router is None) != (retrieval_scope is None):
+            raise ValueError(
+                "retrieval_router and retrieval_scope must be configured together"
+            )
         self._state = state
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service

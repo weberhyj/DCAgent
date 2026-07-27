@@ -331,6 +331,45 @@ class RetrievalRouterTest(unittest.TestCase):
         self.assertEqual(timeout_router.search(request()).fallback_reason, "qwen_timeout")
         self.assertEqual(busy_router.search(request()).fallback_reason, "reranker_unavailable")
 
+    def test_keyboard_interrupt_propagates_from_foreground_qwen_retrieval(self) -> None:
+        router = self.build_router(
+            mode="qwen3",
+            hybrid=RecordingHybrid([KeyboardInterrupt("operator interrupt")]),
+            canary_percent=100,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            router.search(request())
+
+    def test_shadow_system_exit_terminates_worker_instead_of_becoming_audit_failure(
+        self,
+    ) -> None:
+        audit = RecordingAudit()
+        router = self.build_router(
+            mode="shadow",
+            hybrid=RecordingHybrid([SystemExit(3)]),
+            audit=audit,
+            shadow_percent=100,
+        )
+
+        router.search(request("terminate worker"))
+        router.shadow_queue.drain_for_test()
+
+        self.assertFalse(router.shadow_queue.worker.is_alive())
+        self.assertEqual(audit.records, [])
+
+    def test_ordinary_exception_still_uses_sanitized_fallback(self) -> None:
+        router = self.build_router(
+            mode="qwen3",
+            hybrid=RecordingHybrid([RuntimeError("secret internal URL http://qdrant:6333")]),
+            canary_percent=100,
+        )
+
+        result = router.search(request())
+
+        self.assertEqual(result.mode, RetrievalMode.LEGACY)
+        self.assertEqual(result.fallback_reason, "hybrid_unavailable")
+
     def test_half_open_allows_exactly_one_concurrent_probe_and_closes_on_success(self) -> None:
         clock = FakeClock()
         hybrid = BlockingHybrid(RuntimeError("initial failure"))
@@ -426,6 +465,35 @@ class RetrievalRouterTest(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(router.shadow_queue.submit(request(), (), 0.0))
+
+    def test_legacy_and_qwen_modes_do_not_create_unused_shadow_workers(self) -> None:
+        legacy = self.build_router(mode="legacy")
+        qwen = self.build_router(mode="qwen3", canary_percent=100)
+
+        self.assertIsNone(legacy.shadow_queue)
+        self.assertIsNone(qwen.shadow_queue)
+        legacy.close()
+        legacy.close()
+        qwen.close()
+        qwen.close()
+
+    def test_shadow_mode_requires_an_audit_repository(self) -> None:
+        router = None
+        try:
+            router = RetrievalRouter(
+                mode="shadow",
+                legacy_search=lambda query, limit: [],
+                hybrid=RecordingHybrid(),
+                audit=None,
+                shadow_percent=100,
+            )
+        except ValueError as error:
+            self.assertEqual(str(error), "shadow mode requires an audit repository")
+        else:
+            self.fail("shadow mode accepted a missing audit repository")
+        finally:
+            if router is not None:
+                router.close()
 
     def test_full_queue_close_discards_queued_work_and_never_blocks_on_stop_signal(self) -> None:
         hybrid = BlockingHybrid()

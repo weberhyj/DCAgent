@@ -431,6 +431,48 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertEqual(router.calls, 0)
         self.assertEqual(messages[-1].content, "42")
 
+    def test_repositories_reject_partial_retrieval_router_configuration(self) -> None:
+        scope = RetrievalScope("default", ("internal",), "v1")
+        cases = (
+            (
+                "sql-router-only",
+                lambda: SqlChatRepository(self.database, retrieval_router=object()),
+            ),
+            (
+                "sql-scope-only",
+                lambda: SqlChatRepository(self.database, retrieval_scope=scope),
+            ),
+            (
+                "memory-router-only",
+                lambda: InMemoryChatRepository(
+                    build_seed_state(), retrieval_router=object()
+                ),
+            ),
+            (
+                "memory-scope-only",
+                lambda: InMemoryChatRepository(
+                    build_seed_state(), retrieval_scope=scope
+                ),
+            ),
+        )
+
+        for name, construct in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "retrieval_router and retrieval_scope must be configured together",
+                ):
+                    construct()
+
+    def test_repositories_preserve_both_none_legacy_configuration(self) -> None:
+        memory = InMemoryChatRepository(build_seed_state())
+        sql = SqlChatRepository(self.database)
+
+        self.assertIsNone(memory.retrieval_router)
+        self.assertIsNone(sql.retrieval_router)
+        self.assertIsInstance(memory.search_knowledge_chunks("policy"), list)
+        self.assertIsInstance(sql.search_knowledge_chunks("policy"), list)
+
 
 if __name__ == "__main__":
     unittest.main()
