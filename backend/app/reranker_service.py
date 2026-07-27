@@ -115,6 +115,7 @@ def _create_batched_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await run_in_threadpool(_validate_reranker_backend_startup, backend)
         await batcher.start()
         app.state.reranker_ready = True
         try:
@@ -245,6 +246,8 @@ def _invoke_backend_pairs(
     if callable(pair_method):
         try:
             raw_scores = pair_method(list(pairs))
+        except (TypeError, ValueError):
+            raise
         except Exception as error:
             raise _RerankerBackendFailure("reranker backend failed") from error
         return _materialize_scores(raw_scores)
@@ -252,6 +255,8 @@ def _invoke_backend_pairs(
     for query, passage in pairs:
         try:
             raw_scores = backend.rerank(query, [passage])
+        except (TypeError, ValueError):
+            raise
         except Exception as error:
             raise _RerankerBackendFailure("reranker backend failed") from error
         results.extend(_materialize_scores(raw_scores))
