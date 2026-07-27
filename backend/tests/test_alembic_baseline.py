@@ -269,7 +269,10 @@ class AlembicBaselineTest(unittest.TestCase):
                     )
 
                 expected_indexes = {
-                    "retrieval_publications": {"ix_retrieval_publications_status"},
+                    "retrieval_publications": {
+                        "ix_retrieval_publications_status",
+                        "uq_retrieval_publications_active_alias",
+                    },
                     "retrieval_source_indexes": {"ix_retrieval_source_indexes_status"},
                     "retrieval_shadow_comparisons": {
                         "ix_retrieval_shadow_comparisons_created_at",
@@ -281,6 +284,17 @@ class AlembicBaselineTest(unittest.TestCase):
                         index_names,
                         {index["name"] for index in inspector.get_indexes(table_name)},
                     )
+                publication_indexes = {
+                    index["name"]: index
+                    for index in inspector.get_indexes("retrieval_publications")
+                }
+                active_alias_index = publication_indexes["uq_retrieval_publications_active_alias"]
+                self.assertTrue(active_alias_index["unique"])
+                self.assertEqual(active_alias_index["column_names"], ["alias_name"])
+                self.assertIn(
+                    "status = 'active'",
+                    str(active_alias_index["dialect_options"]["sqlite_where"]),
+                )
 
                 source_foreign_keys = {
                     (

@@ -312,6 +312,15 @@ class KnowledgeChunkRecord(Base):
 
 class RetrievalPublicationRecord(Base):
     __tablename__ = "retrieval_publications"
+    __table_args__ = (
+        Index(
+            "uq_retrieval_publications_active_alias",
+            "alias_name",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     collection_name: Mapped[str] = mapped_column(String(240), nullable=False, unique=True)
@@ -514,7 +523,6 @@ class Database:
         Base.metadata.create_all(self.engine)
         self._ensure_knowledge_source_upload_columns()
         self._ensure_knowledge_chunk_embedding_column()
-        self._ensure_knowledge_chunk_metadata_column()
         self._ensure_evaluation_columns()
         self._ensure_evaluation_run_counter()
 
@@ -552,20 +560,6 @@ class Database:
 
         with self.engine.begin() as connection:
             connection.execute(text("ALTER TABLE knowledge_chunks ADD COLUMN embedding JSON"))
-
-    def _ensure_knowledge_chunk_metadata_column(self) -> None:
-        inspector = inspect(self.engine)
-        if not inspector.has_table("knowledge_chunks"):
-            return
-
-        columns = {column["name"] for column in inspector.get_columns("knowledge_chunks")}
-        if "metadata" in columns:
-            return
-
-        with self.engine.begin() as connection:
-            connection.execute(
-                text("ALTER TABLE knowledge_chunks ADD COLUMN metadata JSON NOT NULL DEFAULT '{}'")
-            )
 
     def _ensure_evaluation_columns(self) -> None:
         inspector = inspect(self.engine)

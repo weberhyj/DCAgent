@@ -47,6 +47,14 @@ def upgrade() -> None:
         ["status"],
         unique=False,
     )
+    op.create_index(
+        "uq_retrieval_publications_active_alias",
+        "retrieval_publications",
+        ["alias_name"],
+        unique=True,
+        postgresql_where=sa.text("status = 'active'"),
+        sqlite_where=sa.text("status = 'active'"),
+    )
     op.create_table(
         "retrieval_source_indexes",
         sa.Column("source_id", sa.String(length=64), nullable=False),
@@ -106,6 +114,10 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("retrieval_shadow_comparisons")
     op.drop_table("retrieval_source_indexes")
+    op.drop_index(
+        "uq_retrieval_publications_active_alias",
+        table_name="retrieval_publications",
+    )
     op.drop_table("retrieval_publications")
     with op.batch_alter_table("knowledge_chunks") as batch:
         batch.drop_column("metadata")

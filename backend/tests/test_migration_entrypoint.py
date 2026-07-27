@@ -12,7 +12,7 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import command
 from app import migration_entrypoint
-from app.database import Database
+from app.database import Base, Database
 from app.migration_entrypoint import BaselineSchemaMismatch, run_migrations
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -1115,6 +1115,41 @@ class FingerprintNormalizationTest(unittest.TestCase):
 
 
 class MigrationEntrypointTest(unittest.TestCase):
+    def test_previous_head_compatibility_checks_do_not_precreate_retrieval_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = sqlite_url(Path(temp_dir) / "previous-head.db")
+            config = Config(str(BACKEND_ROOT / "alembic.ini"))
+            config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+            config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+            command.upgrade(config, "20260722_03")
+            database = Database(database_url)
+            try:
+                with patch.object(Base.metadata, "create_all") as create_all:
+                    database.create_schema()
+                create_all.assert_called_once_with(database.engine)
+                self.assertNotIn(
+                    "metadata",
+                    {
+                        column["name"]
+                        for column in inspect(database.engine).get_columns("knowledge_chunks")
+                    },
+                )
+            finally:
+                database.engine.dispose()
+
+            run_migrations(database_url=database_url, config_path=BACKEND_ROOT / "alembic.ini")
+            engine = create_engine(database_url)
+            try:
+                self.assertIn(
+                    "metadata",
+                    {column["name"] for column in inspect(engine).get_columns("knowledge_chunks")},
+                )
+                self.assertEqual(current_revision(database_url), CURRENT_REVISION)
+            finally:
+                engine.dispose()
+
     def _create_version_table(
         self,
         database_url: str,

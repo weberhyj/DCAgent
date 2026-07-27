@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from app.database import Database
-from app.retrieval_audit import RetrievalAuditRepository, RetrievalAuditValidationError
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+import app.retrieval_audit as retrieval_audit
+from app.database import Database, RetrievalPublicationRecord
+from app.retrieval_audit import (
+    RetrievalAuditError,
+    RetrievalAuditRepository,
+    RetrievalAuditValidationError,
+)
 
 
 class RetrievalAuditRepositoryTest(unittest.TestCase):
@@ -91,6 +100,130 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         self.assertEqual(
             self.repository.active_publication("knowledge_chunks_current").id, second.id
         )
+
+    def test_database_constraint_rejects_two_active_publications_for_one_alias(self) -> None:
+        first = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v1",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-1",
+            sparse_profile_sha256="a" * 64,
+            dimensions=1024,
+        )
+        second = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v2",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-2",
+            sparse_profile_sha256="b" * 64,
+            dimensions=1024,
+        )
+        self.repository.mark_publication_validated(first.id, point_count=12)
+        self.repository.mark_publication_validated(second.id, point_count=13)
+
+        with self.assertRaises(IntegrityError):
+            with self.database.session() as session:
+                session.get(RetrievalPublicationRecord, first.id).status = "active"
+                session.get(RetrievalPublicationRecord, second.id).status = "active"
+                session.flush()
+
+        self.assertEqual(self.repository.get_publication(first.id).status, "validated")
+        self.assertEqual(self.repository.get_publication(second.id).status, "validated")
+
+    def test_activation_requests_an_alias_transaction_lock(self) -> None:
+        publication = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v1",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-1",
+            sparse_profile_sha256="a" * 64,
+            dimensions=1024,
+        )
+        self.repository.mark_publication_validated(publication.id, point_count=12)
+
+        with patch(
+            "app.retrieval_audit._acquire_alias_transaction_lock",
+        ) as alias_lock:
+            self.repository.mark_publication_active(publication.id, point_count=12)
+
+        alias_lock.assert_called_once()
+        self.assertEqual(alias_lock.call_args.args[1], "knowledge_chunks_current")
+
+    def test_postgres_alias_lock_uses_stable_transaction_advisory_lock(self) -> None:
+        class FakeDialect:
+            name = "postgresql"
+
+        class FakeBind:
+            dialect = FakeDialect()
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, dict[str, int]]] = []
+
+            def get_bind(self) -> FakeBind:
+                return FakeBind()
+
+            def execute(self, statement: object, parameters: dict[str, int]) -> None:
+                self.calls.append((statement, parameters))
+
+        first_session = FakeSession()
+        second_session = FakeSession()
+
+        retrieval_audit._acquire_alias_transaction_lock(first_session, "knowledge_chunks_current")
+        retrieval_audit._acquire_alias_transaction_lock(second_session, "knowledge_chunks_current")
+
+        self.assertEqual(len(first_session.calls), 1)
+        statement, parameters = first_session.calls[0]
+        self.assertIn("pg_advisory_xact_lock", str(statement))
+        self.assertEqual(parameters, second_session.calls[0][1])
+
+    def test_activation_integrity_failure_is_sanitized_and_rolls_back_retirement(self) -> None:
+        first = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v1",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-1",
+            sparse_profile_sha256="a" * 64,
+            dimensions=1024,
+        )
+        self.repository.mark_publication_validated(first.id, point_count=12)
+        self.repository.mark_publication_active(first.id, point_count=12)
+        second = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v2",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-2",
+            sparse_profile_sha256="b" * 64,
+            dimensions=1024,
+        )
+        self.repository.mark_publication_validated(second.id, point_count=13)
+        integrity_error = IntegrityError(
+            "INSERT secret publication",
+            {"secret": "value"},
+            RuntimeError("duplicate active alias with internal details"),
+        )
+
+        original_flush = Session.flush
+
+        def fail_target_activation(session: Session, *args: object, **kwargs: object) -> None:
+            if any(
+                isinstance(record, RetrievalPublicationRecord)
+                and record.id == second.id
+                and record.status == "active"
+                for record in session.dirty
+            ):
+                raise integrity_error
+            original_flush(session, *args, **kwargs)
+
+        with patch(
+            "sqlalchemy.orm.Session.flush",
+            autospec=True,
+            side_effect=fail_target_activation,
+        ):
+            with self.assertRaisesRegex(
+                RetrievalAuditError,
+                "Retrieval publication activation conflict",
+            ) as raised:
+                self.repository.mark_publication_active(second.id, point_count=13)
+
+        self.assertNotIn("secret", str(raised.exception).lower())
+        self.assertEqual(self.repository.get_publication(first.id).status, "active")
+        self.assertEqual(self.repository.get_publication(second.id).status, "validated")
 
     def test_rejects_raw_or_malformed_shadow_audit_values(self) -> None:
         valid = {

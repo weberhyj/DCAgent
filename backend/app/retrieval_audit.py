@@ -6,9 +6,12 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from .database import (
     Database,
@@ -155,27 +158,39 @@ class RetrievalAuditRepository:
         self, publication_id: str, *, point_count: int
     ) -> RetrievalPublication:
         point_count = _count("point_count", point_count)
-        with self._database.session() as session:
-            target = _locked_publication(session, publication_id)
-            _validate_transition(target.status, "active")
-            active_records = session.scalars(
-                select(RetrievalPublicationRecord)
-                .where(
-                    RetrievalPublicationRecord.alias_name == target.alias_name,
-                    RetrievalPublicationRecord.status == "active",
-                    RetrievalPublicationRecord.id != target.id,
+        try:
+            with self._database.session() as session:
+                alias_name = session.scalar(
+                    select(RetrievalPublicationRecord.alias_name).where(
+                        RetrievalPublicationRecord.id == publication_id
+                    )
                 )
-                .with_for_update()
-            ).all()
-            for active in active_records:
-                active.status = "retired"
-            target.status = "active"
-            target.point_count = point_count
-            target.error_message = None
-            if target.completed_at is None:
-                target.completed_at = _timestamp()
-            session.flush()
-            return _publication_from_record(target)
+                if alias_name is None:
+                    raise RetrievalAuditNotFoundError("Retrieval publication not found")
+                _acquire_alias_transaction_lock(session, alias_name)
+                target = _locked_publication(session, publication_id)
+                _validate_transition(target.status, "active")
+                active_records = session.scalars(
+                    select(RetrievalPublicationRecord)
+                    .where(
+                        RetrievalPublicationRecord.alias_name == target.alias_name,
+                        RetrievalPublicationRecord.status == "active",
+                        RetrievalPublicationRecord.id != target.id,
+                    )
+                    .with_for_update()
+                ).all()
+                for active in active_records:
+                    active.status = "retired"
+                session.flush()
+                target.status = "active"
+                target.point_count = point_count
+                target.error_message = None
+                if target.completed_at is None:
+                    target.completed_at = _timestamp()
+                session.flush()
+                return _publication_from_record(target)
+        except IntegrityError as error:
+            raise RetrievalAuditError("Retrieval publication activation conflict") from error
 
     def mark_publication_retired(self, publication_id: str) -> RetrievalPublication:
         return self._transition_publication(publication_id, target_status="retired")
@@ -276,6 +291,20 @@ def _locked_publication(session, publication_id: str) -> RetrievalPublicationRec
     if record is None:
         raise RetrievalAuditNotFoundError("Retrieval publication not found")
     return record
+
+
+def _acquire_alias_transaction_lock(session: Session, alias_name: str) -> None:
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    lock_key = int.from_bytes(
+        sha256(alias_name.encode("utf-8")).digest()[:8],
+        byteorder="big",
+        signed=True,
+    )
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+        {"lock_key": lock_key},
+    )
 
 
 def _validate_transition(current_status: str, target_status: str) -> None:

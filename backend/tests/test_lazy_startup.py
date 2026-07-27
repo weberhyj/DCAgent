@@ -123,7 +123,7 @@ class LazyStartupTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
-    def test_production_lifespan_sets_resources_once_and_closes_them(self) -> None:
+    def test_production_lifespan_does_not_precreate_migration_owned_schema(self) -> None:
         module = importlib.import_module("app.main")
         resources = {
             "repository": ClosableFake("repository"),
