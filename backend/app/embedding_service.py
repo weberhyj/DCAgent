@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 from .embedding_contracts import (
     MAX_EMBEDDING_REQUEST_BYTES,
+    MAX_EMBEDDING_TEXTS,
     SHA256_PATTERN,
     EmbeddingMetadataResponse,
     EmbeddingModelMetadata,
@@ -28,7 +29,9 @@ from .embedding_contracts import (
     EmbeddingRequest,
     EmbeddingResponse,
 )
+from .inference_batching import DynamicBatcher, InferenceQueueFull
 from .offline_artifacts import is_local_filesystem_path
+from .qwen3_embedding_runtime import load_qwen3_embedding_backend
 
 EMBEDDING_METADATA_FILENAME = "embedding-metadata.json"
 OFFLINE_EMBEDDING_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
@@ -115,6 +118,42 @@ def create_embedding_app(
     return app
 
 
+def create_batched_embedding_app(
+    backend: EmbeddingBackend,
+    metadata: EmbeddingModelMetadata,
+    *,
+    max_items: int = MAX_EMBEDDING_TEXTS,
+    max_queue_items: int = 256,
+    wait_ms: float = 10,
+) -> FastAPI:
+    """Create an app with independent query and document batch workers."""
+
+    if not isinstance(metadata, EmbeddingModelMetadata):
+        raise ValueError("metadata must be EmbeddingModelMetadata")
+    batchers = _create_embedding_batchers(
+        backend,
+        max_items=max_items,
+        max_queue_items=max_queue_items,
+        wait_ms=wait_ms,
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await _start_embedding_batchers(batchers)
+        app.state.embedding_ready = True
+        try:
+            yield
+        finally:
+            app.state.embedding_ready = False
+            await _close_embedding_batchers(batchers)
+
+    app = _build_embedding_app(lifespan=lifespan)
+    app.state.embedding_backend = backend
+    app.state.embedding_metadata = metadata
+    app.state.embedding_batchers = batchers
+    return app
+
+
 def _build_embedding_app(*, lifespan: Any | None = None) -> FastAPI:
     app = FastAPI(
         title="DC-Agent Private Embedding Service",
@@ -158,13 +197,22 @@ def _build_embedding_app(*, lifespan: Any | None = None) -> FastAPI:
         payload: Annotated[EmbeddingRequest, Depends(_bounded_embedding_request)],
     ) -> EmbeddingResponse:
         backend, metadata = require_runtime()
+        batchers = getattr(app.state, "embedding_batchers", None)
         try:
-            raw_vectors = await run_in_threadpool(
-                _invoke_backend,
-                backend,
-                list(payload.texts),
-                payload.purpose,
-            )
+            if isinstance(batchers, dict):
+                batcher = batchers.get(payload.purpose)
+                if not isinstance(batcher, DynamicBatcher):
+                    raise RuntimeError("embedding batcher is unavailable")
+                raw_vectors = await batcher.submit(list(payload.texts))
+            else:
+                raw_vectors = await run_in_threadpool(
+                    _invoke_backend,
+                    backend,
+                    list(payload.texts),
+                    payload.purpose,
+                )
+        except InferenceQueueFull as error:
+            raise HTTPException(status_code=429, detail="embedding queue is full") from error
         except Exception as error:
             raise HTTPException(
                 status_code=503,
@@ -278,28 +326,105 @@ def create_production_app(
     """Create an app whose one local model is loaded only during startup."""
 
     target = os.environ if environ is None else environ
-    loader = load_flag_embedding_backend if backend_loader is None else backend_loader
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         model_root, metadata = _load_pinned_model_configuration(target)
         target.update(OFFLINE_EMBEDDING_ENVIRONMENT)
+        runtime = _embedding_runtime(target.get("EMBEDDING_RUNTIME", "openvino"))
+        max_items = _positive_int(target, "EMBEDDING_BATCH_MAX_ITEMS", MAX_EMBEDDING_TEXTS)
+        max_queue_items = _positive_int(target, "EMBEDDING_QUEUE_MAX_ITEMS", 256)
+        wait_ms = _nonnegative_float(target, "EMBEDDING_BATCH_WAIT_MS", 10.0)
+
+        def default_loader(root: Path, pinned: EmbeddingModelMetadata) -> EmbeddingBackend:
+            return load_qwen3_embedding_backend(root, pinned, runtime=runtime)
+
+        loader = default_loader if backend_loader is None else backend_loader
         backend = await run_in_threadpool(loader, model_root, metadata)
         await run_in_threadpool(
             _validate_embedding_backend_startup,
             backend,
             metadata,
         )
+        batchers = _create_embedding_batchers(
+            backend,
+            max_items=max_items,
+            max_queue_items=max_queue_items,
+            wait_ms=wait_ms,
+        )
+        await _start_embedding_batchers(batchers)
         app.state.embedding_backend = backend
         app.state.embedding_metadata = metadata
+        app.state.embedding_batchers = batchers
         app.state.embedding_ready = True
         try:
             yield
         finally:
             app.state.embedding_ready = False
+            await _close_embedding_batchers(batchers)
+            app.state.embedding_batchers = None
             app.state.embedding_backend = None
 
     return _build_embedding_app(lifespan=lifespan)
+
+
+def _create_embedding_batchers(
+    backend: EmbeddingBackend,
+    *,
+    max_items: int,
+    max_queue_items: int,
+    wait_ms: float,
+) -> dict[EmbeddingPurpose, DynamicBatcher[str, list[float]]]:
+    return {
+        purpose: DynamicBatcher(
+            lambda texts, selected=purpose: _invoke_backend(backend, texts, selected),
+            max_items=max_items,
+            max_queue_items=max_queue_items,
+            wait_ms=wait_ms,
+        )
+        for purpose in ("query", "document")
+    }
+
+
+async def _start_embedding_batchers(
+    batchers: Mapping[EmbeddingPurpose, DynamicBatcher[str, list[float]]],
+) -> None:
+    for batcher in batchers.values():
+        await batcher.start()
+
+
+async def _close_embedding_batchers(
+    batchers: Mapping[EmbeddingPurpose, DynamicBatcher[str, list[float]]],
+) -> None:
+    for batcher in batchers.values():
+        await batcher.close()
+
+
+def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
+    try:
+        value = int(environ.get(name, str(default)))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _nonnegative_float(environ: Mapping[str, str], name: str, default: float) -> float:
+    try:
+        value = float(environ.get(name, str(default)))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be non-negative") from error
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
+
+
+def _embedding_runtime(value: object) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in {"openvino", "onnxruntime", "torch"}:
+        raise ValueError("EMBEDDING_RUNTIME must be openvino, onnxruntime, or torch")
+    return normalized
 
 
 def _load_pinned_model_configuration(
@@ -506,6 +631,7 @@ __all__ = [
     "EmbeddingBackend",
     "FlagEmbeddingBackend",
     "compute_model_directory_sha256",
+    "create_batched_embedding_app",
     "create_embedding_app",
     "create_production_app",
     "load_flag_embedding_backend",

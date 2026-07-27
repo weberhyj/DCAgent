@@ -22,6 +22,7 @@ from app.embedding_contracts import (
 from app.embedding_service import (
     EMBEDDING_METADATA_FILENAME,
     compute_model_directory_sha256,
+    create_batched_embedding_app,
     create_embedding_app,
     create_production_app,
     load_flag_embedding_backend,
@@ -493,6 +494,26 @@ class EmbeddingRequestStreamingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response_start["status"], 413)
                 self.assertEqual(receive_calls, 3)
                 self.assertEqual(backend.calls, [])
+
+
+class BatchedEmbeddingServiceTest(unittest.TestCase):
+    def test_query_and_document_requests_use_separate_batchers(self) -> None:
+        backend = FakeEmbeddingBackend()
+        app = create_batched_embedding_app(
+            backend,
+            metadata(),
+            max_items=8,
+            max_queue_items=16,
+            wait_ms=1,
+        )
+        with TestClient(app) as client:
+            for purpose in ("query", "document"):
+                response = client.post(
+                    "/v1/embeddings",
+                    json={"texts": [purpose], "purpose": purpose},
+                )
+                self.assertEqual(response.status_code, 200)
+        self.assertEqual([purpose for _, purpose in backend.calls], ["query", "document"])
 
 
 if __name__ == "__main__":
