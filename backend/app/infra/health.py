@@ -1258,13 +1258,6 @@ def build_dependency_checks(
             )
         )
         if retrieval_settings.mode is RetrievalMode.SHADOW:
-            retrieval_names = {"qdrant", "embedding", "reranker"}
-            raw_checks = [
-                DependencyCheck(item.name, _degraded_dependency(item.check))
-                if item.name in retrieval_names
-                else item
-                for item in raw_checks
-            ]
             raw_checks.append(DependencyCheck("retrieval_shadow", lambda: (True, "ready")))
     if _generation_enabled(environ):
         raw_checks.append(
@@ -1279,7 +1272,7 @@ def build_dependency_checks(
                 ),
             )
         )
-    return [
+    bounded_checks = [
         DependencyCheck(
             item.name,
             _hard_timeout_check(
@@ -1290,6 +1283,15 @@ def build_dependency_checks(
         )
         for item in raw_checks
     ]
+    if retrieval_enabled and retrieval_settings.mode is RetrievalMode.SHADOW:
+        retrieval_names = {"qdrant", "embedding", "reranker"}
+        bounded_checks = [
+            DependencyCheck(item.name, _degraded_dependency(item.check))
+            if item.name in retrieval_names
+            else item
+            for item in bounded_checks
+        ]
+    return bounded_checks
 
 
 __all__ = [

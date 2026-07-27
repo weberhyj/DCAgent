@@ -276,6 +276,62 @@ class InfraHealthTest(unittest.TestCase):
 
         self.assertTrue(check.cancelled)
 
+    def test_retrieval_dependency_timeouts_degrade_only_in_shadow_mode(self) -> None:
+        class BlockingCancellableCheck:
+            def __init__(self) -> None:
+                self.cancelled = Event()
+
+            def __call__(self) -> tuple[bool, str]:
+                self.cancelled.wait(1.0)
+                return False, "unavailable"
+
+            def cancel(self) -> None:
+                self.cancelled.set()
+
+        for mode, expected in (
+            ("shadow", (True, "degraded")),
+            ("qwen3", (False, "unavailable")),
+        ):
+            with self.subTest(mode=mode):
+                environ = retrieval_health_environment(mode)
+                environ["DEPENDENCY_TIMEOUT_SECONDS"] = "0.01"
+                blockers = {
+                    name: BlockingCancellableCheck() for name in ("qdrant", "embedding", "reranker")
+                }
+                with (
+                    patch.object(
+                        health_module,
+                        "_qdrant_retrieval_check",
+                        return_value=blockers["qdrant"],
+                    ),
+                    patch.object(
+                        health_module,
+                        "_embedding_metadata_check",
+                        return_value=blockers["embedding"],
+                    ),
+                    patch.object(
+                        health_module,
+                        "_reranker_metadata_check",
+                        return_value=blockers["reranker"],
+                    ),
+                ):
+                    checks = build_dependency_checks(
+                        OfflineSettings.from_environ(environ),
+                        database=object(),
+                        environ=environ,
+                        retrieval_settings=RetrievalSettings.from_environ(environ),
+                    )
+
+                retrieval_checks = {
+                    check.name: check.check() for check in checks if check.name in blockers
+                }
+
+                self.assertEqual(
+                    retrieval_checks,
+                    dict.fromkeys(blockers, expected),
+                )
+                self.assertTrue(all(blocker.cancelled.is_set() for blocker in blockers.values()))
+
     def test_retrieval_health_fails_closed_when_alias_and_audit_diverge(self) -> None:
         environ = retrieval_health_environment()
         gateway = RetrievalHealthGateway(alias="knowledge_chunks_qwen3_v2")
