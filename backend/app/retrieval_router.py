@@ -42,6 +42,10 @@ class ShadowAuditProtocol(Protocol):
 LegacySearch = Callable[[str, int], Sequence[KnowledgeSearchHitModel]]
 
 
+class ShadowQueueCloseError(RuntimeError):
+    """The daemon Shadow worker did not stop within the bounded close interval."""
+
+
 @dataclass(frozen=True, slots=True)
 class RoutedRetrievalOutcome:
     mode: RetrievalMode
@@ -145,15 +149,20 @@ class ShadowQueue:
         hybrid: HybridRetrieverProtocol,
         audit: ShadowAuditProtocol | None,
         max_size: int,
+        close_timeout_seconds: float,
         monotonic: Callable[[], float],
     ) -> None:
         if isinstance(max_size, bool) or not isinstance(max_size, int) or max_size <= 0:
             raise ValueError("shadow queue size must be a positive integer")
+        if not math.isfinite(close_timeout_seconds) or close_timeout_seconds <= 0:
+            raise ValueError("close_timeout_seconds must be positive and finite")
         self._hybrid = hybrid
         self._audit = audit
         self._monotonic = monotonic
+        self._close_timeout_seconds = float(close_timeout_seconds)
         self._queue: queue.Queue[_ShadowTask | object] = queue.Queue(maxsize=max_size)
         self._lock = Lock()
+        self._closing = False
         self._closed = False
         self._dropped_count = 0
         self.worker = Thread(
@@ -176,7 +185,8 @@ class ShadowQueue:
     ) -> bool:
         task = _ShadowTask(request, tuple(legacy_hits), float(legacy_ms))
         with self._lock:
-            if self._closed:
+            if self._closing or self._closed:
+                self._dropped_count += 1
                 return False
             try:
                 self._queue.put_nowait(task)
@@ -192,9 +202,29 @@ class ShadowQueue:
         with self._lock:
             if self._closed:
                 return
+            if not self._closing:
+                self._closing = True
+                self._dropped_count += self._discard_pending_locked()
+                self._queue.put_nowait(_STOP)
+        self.worker.join(self._close_timeout_seconds)
+        if self.worker.is_alive():
+            raise ShadowQueueCloseError(
+                "shadow worker did not stop before close timeout"
+            ) from None
+        with self._lock:
             self._closed = True
-        self._queue.put(_STOP)
-        self.worker.join()
+
+    def _discard_pending_locked(self) -> int:
+        discarded = 0
+        while True:
+            try:
+                task = self._queue.get_nowait()
+            except queue.Empty:
+                return discarded
+            else:
+                self._queue.task_done()
+                if task is not _STOP:
+                    discarded += 1
 
     def _run(self) -> None:
         while True:
@@ -253,6 +283,7 @@ class RetrievalRouter:
         failure_threshold: int = 3,
         reset_interval_seconds: float = 30.0,
         shadow_queue_size: int = 32,
+        close_timeout_seconds: float = 1.0,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         try:
@@ -277,6 +308,7 @@ class RetrievalRouter:
             hybrid=hybrid,
             audit=audit,
             max_size=shadow_queue_size,
+            close_timeout_seconds=close_timeout_seconds,
             monotonic=monotonic,
         )
 
@@ -385,5 +417,6 @@ __all__ = [
     "RetrievalRouter",
     "RoutedRetrievalOutcome",
     "ShadowQueue",
+    "ShadowQueueCloseError",
     "stable_percentage_bucket",
 ]

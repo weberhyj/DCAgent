@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 import unittest
 
+import app.retrieval_router as retrieval_router_module
 from app.hybrid_retriever import HybridRetrievalOutcome, HybridRetrievalTimeout
 from app.models import KnowledgeChunkModel, KnowledgeSearchHitModel, KnowledgeSourceModel
 from app.reranker_client import RerankerBusy
@@ -424,6 +426,123 @@ class RetrievalRouterTest(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(router.shadow_queue.submit(request(), (), 0.0))
+
+    def test_full_queue_close_discards_queued_work_and_never_blocks_on_stop_signal(self) -> None:
+        hybrid = BlockingHybrid()
+        router = self.build_router(
+            mode="shadow",
+            hybrid=hybrid,
+            audit=RecordingAudit(),
+            shadow_percent=100,
+            shadow_queue_size=1,
+            close_timeout_seconds=1.0,
+        )
+        router.search(request("running"))
+        self.assertTrue(hybrid.started.wait(1.0))
+        router.search(request("queued"))
+        errors: list[BaseException] = []
+
+        closer = threading.Thread(target=lambda: self._capture_close(router, errors))
+        closer.start()
+        try:
+            deadline = time.monotonic() + 0.5
+            while router.shadow_queue.dropped_count < 1 and time.monotonic() < deadline:
+                threading.Event().wait(0.005)
+            self.assertEqual(router.shadow_queue.dropped_count, 1)
+        finally:
+            hybrid.release.set()
+            closer.join(2.0)
+
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(hybrid.calls, 1)
+
+    def test_stuck_worker_close_raises_sanitized_error_within_bound(self) -> None:
+        hybrid = BlockingHybrid()
+        router = self.build_router(
+            mode="shadow",
+            hybrid=hybrid,
+            audit=RecordingAudit(),
+            shadow_percent=100,
+            close_timeout_seconds=0.05,
+        )
+        router.search(request("secret stuck query"))
+        self.assertTrue(hybrid.started.wait(1.0))
+        errors: list[BaseException] = []
+
+        started = time.monotonic()
+        closer = threading.Thread(target=lambda: self._capture_close(router, errors))
+        closer.start()
+        closer.join(0.5)
+        elapsed = time.monotonic() - started
+        try:
+            self.assertFalse(closer.is_alive())
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(
+                errors[0], retrieval_router_module.ShadowQueueCloseError
+            )
+            self.assertEqual(
+                str(errors[0]),
+                "shadow worker did not stop before close timeout",
+            )
+            self.assertNotIn("secret", str(errors[0]))
+            self.assertFalse(router.shadow_queue.submit(request(), (), 0.0))
+        finally:
+            hybrid.release.set()
+            closer.join(2.0)
+
+        router.close()
+        self.assertFalse(router.shadow_queue.worker.is_alive())
+
+    def test_normal_close_is_idempotent_after_shadow_queue_drains(self) -> None:
+        router = self.build_router(
+            mode="shadow",
+            audit=RecordingAudit(),
+            shadow_percent=100,
+            close_timeout_seconds=0.5,
+        )
+        router.search(request("normal"))
+        router.shadow_queue.drain_for_test()
+
+        router.close()
+        router.close()
+
+        self.assertFalse(router.shadow_queue.worker.is_alive())
+
+    def test_concurrent_close_callers_finish_safely(self) -> None:
+        hybrid = BlockingHybrid()
+        router = self.build_router(
+            mode="shadow",
+            hybrid=hybrid,
+            audit=RecordingAudit(),
+            shadow_percent=100,
+            close_timeout_seconds=1.0,
+        )
+        router.search(request("running"))
+        self.assertTrue(hybrid.started.wait(1.0))
+        errors: list[BaseException] = []
+        closers = [
+            threading.Thread(target=lambda: self._capture_close(router, errors))
+            for _ in range(4)
+        ]
+
+        for closer in closers:
+            closer.start()
+        hybrid.release.set()
+        for closer in closers:
+            closer.join(2.0)
+
+        self.assertTrue(all(not closer.is_alive() for closer in closers))
+        self.assertEqual(errors, [])
+        self.assertFalse(router.shadow_queue.worker.is_alive())
+
+    @staticmethod
+    def _capture_close(router: RetrievalRouter, errors: list[BaseException]) -> None:
+        try:
+            router.close()
+        except BaseException as error:
+            errors.append(error)
 
 
 if __name__ == "__main__":
