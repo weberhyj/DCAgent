@@ -373,8 +373,9 @@ class ApiContractTest(unittest.TestCase):
             def enqueue(self, source_id: str, file_path: str, source_type: str) -> None:
                 self.jobs.append((source_id, file_path, source_type))
 
-            def discard_source(self, source_id: str) -> None:
+            def discard_source(self, source_id: str, *, finalize=None):
                 self.jobs = [job for job in self.jobs if job[0] != source_id]
+                return None if finalize is None else finalize()
 
             def drain(self) -> None:
                 return None

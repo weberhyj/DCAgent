@@ -351,6 +351,29 @@ class RetrievalSourceIndexRecord(Base):
     updated_at: Mapped[str] = mapped_column(String(40), nullable=False)
 
 
+class StructuredRetrievalIndexRecord(Base):
+    __tablename__ = "structured_retrieval_indexes"
+
+    structured_publication_id: Mapped[str] = mapped_column(
+        ForeignKey("structured_publications.publication_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieval_publication_id: Mapped[str | None] = mapped_column(
+        ForeignKey("retrieval_publications.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    indexed_point_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[str] = mapped_column(String(40), nullable=False)
+
+
 class RetrievalShadowComparisonRecord(Base):
     __tablename__ = "retrieval_shadow_comparisons"
 

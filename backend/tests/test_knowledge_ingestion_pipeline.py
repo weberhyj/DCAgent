@@ -153,8 +153,8 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
 
     def test_delete_endpoint_returns_503_and_preserves_source_when_qdrant_fails(self) -> None:
         class FailingDeleteLifecycle:
-            def delete_source(self, source_id):
-                raise RuntimeError("qdrant unavailable")
+            def delete_source(self, source_id, *, finalize=None):
+                raise RuntimeError("retrieval index reconciliation required")
 
         source_id = "source-api-delete"
         self.repository.add_knowledge_source("delete.txt", "TXT", "internal")
@@ -174,9 +174,95 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         response = client.delete(f"/api/knowledge/sources/{source_id}")
 
         self.assertEqual(response.status_code, 503)
+        self.assertIn("reconciliation", response.json()["detail"])
         self.assertTrue(
             any(source.id == source_id for source in self.repository.list_knowledge_sources())
         )
+
+    def test_delete_endpoint_commits_postgres_inside_source_maintenance_fence(self) -> None:
+        events: list[str] = []
+
+        class FencedDeleteLifecycle:
+            def delete_source(inner_self, source_id, *, finalize=None):
+                events.append("qdrant-delete")
+                self.assertIsNotNone(finalize)
+                result = finalize()
+                events.append("fence-release")
+                return result
+
+        source_id = "source-api-fenced-delete"
+        self.repository.add_knowledge_source("delete.txt", "TXT", "internal")
+        self.repository._state.knowledge_sources[0].id = source_id
+        original_delete = self.repository.delete_knowledge_source
+
+        def delete_from_postgres(target_source_id):
+            events.append("postgres-delete")
+            return original_delete(target_source_id)
+
+        self.repository.delete_knowledge_source = delete_from_postgres
+        queue = KnowledgeIngestionQueue(
+            self.repository,
+            index_lifecycle=FencedDeleteLifecycle(),
+        )
+        client = TestClient(
+            create_app(
+                repository=self.repository,
+                upload_dir=Path(self.temp_dir.name),
+                ingestion_queue=queue,
+            )
+        )
+
+        response = client.delete(f"/api/knowledge/sources/{source_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events, ["qdrant-delete", "postgres-delete", "fence-release"])
+
+    def test_reindex_qdrant_failure_preserves_old_postgres_chunks(self) -> None:
+        class FailingReindexLifecycle:
+            def delete_source(self, source_id, *, finalize=None):
+                raise RuntimeError("qdrant unavailable")
+
+        source_id = "source-api-reindex"
+        path = Path(self.temp_dir.name) / "reindex.txt"
+        path.write_text("replacement content", encoding="utf-8")
+        self.repository.add_uploaded_knowledge_source(
+            source_id,
+            "reindex.txt",
+            "TXT",
+            "internal",
+            0,
+            str(path),
+            19,
+            "text/plain",
+        )
+        self.repository.complete_knowledge_source_indexing(
+            source_id,
+            parse_knowledge_file(path, source_id, "TXT"),
+        )
+        old_chunks = self.repository.list_knowledge_chunks(source_id)
+        old_status = next(
+            item.status for item in self.repository.list_knowledge_sources() if item.id == source_id
+        )
+        queue = KnowledgeIngestionQueue(
+            self.repository,
+            index_lifecycle=FailingReindexLifecycle(),
+        )
+        client = TestClient(
+            create_app(
+                repository=self.repository,
+                upload_dir=Path(self.temp_dir.name),
+                ingestion_queue=queue,
+            )
+        )
+
+        response = client.post(f"/api/knowledge/sources/{source_id}/reindex")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.repository.list_knowledge_chunks(source_id), old_chunks)
+        source = next(
+            item for item in self.repository.list_knowledge_sources() if item.id == source_id
+        )
+        self.assertEqual(source.status, old_status)
 
 
 if __name__ == "__main__":

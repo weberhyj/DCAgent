@@ -82,6 +82,52 @@ def upgrade() -> None:
         unique=False,
     )
     op.create_table(
+        "structured_retrieval_indexes",
+        sa.Column("structured_publication_id", sa.String(length=64), nullable=False),
+        sa.Column("source_id", sa.String(length=64), nullable=False),
+        sa.Column("dataset_id", sa.String(length=128), nullable=False),
+        sa.Column("schema_version", sa.Integer(), nullable=False),
+        sa.Column("retrieval_publication_id", sa.String(length=64), nullable=True),
+        sa.Column("status", sa.String(length=40), nullable=False),
+        sa.Column("indexed_point_count", sa.Integer(), nullable=False),
+        sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column("updated_at", sa.String(length=40), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["retrieval_publication_id"],
+            ["retrieval_publications.id"],
+            ondelete="SET NULL",
+        ),
+        sa.ForeignKeyConstraint(
+            ["source_id"],
+            ["knowledge_sources.id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["structured_publication_id"],
+            ["structured_publications.publication_id"],
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("structured_publication_id"),
+    )
+    op.create_index(
+        "ix_structured_retrieval_indexes_dataset_id",
+        "structured_retrieval_indexes",
+        ["dataset_id"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_structured_retrieval_indexes_source_id",
+        "structured_retrieval_indexes",
+        ["source_id"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_structured_retrieval_indexes_status",
+        "structured_retrieval_indexes",
+        ["status"],
+        unique=False,
+    )
+    op.create_table(
         "retrieval_shadow_comparisons",
         sa.Column("id", sa.String(length=64), nullable=False),
         sa.Column("request_id", sa.String(length=128), nullable=False),
@@ -113,6 +159,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("retrieval_shadow_comparisons")
+    op.drop_table("structured_retrieval_indexes")
     op.drop_table("retrieval_source_indexes")
     op.drop_index(
         "uq_retrieval_publications_active_alias",

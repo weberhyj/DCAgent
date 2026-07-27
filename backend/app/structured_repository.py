@@ -7,6 +7,7 @@ import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -21,6 +22,7 @@ from .database import (
     StructuredIngestionJobRecord,
     StructuredPreviewRecord,
     StructuredPublicationRecord,
+    StructuredRetrievalIndexRecord,
 )
 from .structured_models import (
     MAX_STRUCTURED_ALIAS_LENGTH,
@@ -820,6 +822,162 @@ class StructuredRepository:
                 record.error_message = message
                 record.updated_at = _timestamp(_utc_now())
 
+    def complete_retrieval_dataset_indexing(
+        self,
+        schema: StructuredDatasetSchema,
+        result: StructuredPublicationResult,
+        retrieval_publication_id: str | None,
+        indexed_point_count: int,
+    ) -> None:
+        if (
+            isinstance(indexed_point_count, bool)
+            or not isinstance(indexed_point_count, int)
+            or indexed_point_count < 0
+        ):
+            raise ValueError("indexed_point_count must be a non-negative integer")
+        with self._database.session() as session:
+            self._record_retrieval_dataset_outcome(
+                session,
+                schema,
+                result,
+                retrieval_publication_id=retrieval_publication_id,
+                status="indexed",
+                indexed_point_count=indexed_point_count,
+                error_message=None,
+            )
+
+    def fail_retrieval_dataset_indexing(
+        self,
+        schema: StructuredDatasetSchema,
+        result: StructuredPublicationResult,
+        error_message: str,
+    ) -> None:
+        message = (error_message.strip() or "retrieval_index_failed")[:2000]
+        with self._database.session() as session:
+            self._record_retrieval_dataset_outcome(
+                session,
+                schema,
+                result,
+                retrieval_publication_id=None,
+                status="failed",
+                indexed_point_count=0,
+                error_message=message,
+            )
+
+    def _record_retrieval_dataset_outcome(
+        self,
+        session: Session,
+        schema: StructuredDatasetSchema,
+        result: StructuredPublicationResult,
+        *,
+        retrieval_publication_id: str | None,
+        status: str,
+        indexed_point_count: int,
+        error_message: str | None,
+    ) -> None:
+        source = session.get(KnowledgeSourceRecord, schema.source_id)
+        publication = session.get(StructuredPublicationRecord, result.publication_id)
+        if source is None or publication is None:
+            raise StructuredNotFoundError("Structured publication not found")
+        if (
+            publication.dataset_id != schema.dataset_id
+            or publication.schema_version != schema.schema_version
+            or publication.status != "published"
+        ):
+            raise StructuredConflictError("Structured publication is not active")
+        outcome = session.get(StructuredRetrievalIndexRecord, result.publication_id)
+        if outcome is None:
+            outcome = StructuredRetrievalIndexRecord(
+                structured_publication_id=result.publication_id,
+                source_id=schema.source_id,
+                dataset_id=schema.dataset_id,
+                schema_version=schema.schema_version,
+                retrieval_publication_id=retrieval_publication_id,
+                status=status,
+                indexed_point_count=indexed_point_count,
+                error_message=error_message,
+                updated_at=_timestamp(_utc_now()),
+            )
+            session.add(outcome)
+        else:
+            outcome.retrieval_publication_id = retrieval_publication_id
+            outcome.status = status
+            outcome.indexed_point_count = indexed_point_count
+            outcome.error_message = error_message
+            outcome.updated_at = _timestamp(_utc_now())
+        self._refresh_structured_retrieval_source_index(session, source)
+
+    def _refresh_structured_retrieval_source_index(
+        self,
+        session: Session,
+        source: KnowledgeSourceRecord,
+    ) -> None:
+        datasets = session.scalars(
+            select(StructuredDatasetRecord).where(
+                StructuredDatasetRecord.source_id == source.id,
+                StructuredDatasetRecord.schema_version > PREVIEW_SCHEMA_VERSION,
+            )
+        ).all()
+        latest_by_dataset: dict[str, StructuredDatasetRecord] = {}
+        for dataset in datasets:
+            current = latest_by_dataset.get(dataset.dataset_id)
+            if current is None or dataset.schema_version > current.schema_version:
+                latest_by_dataset[dataset.dataset_id] = dataset
+        outcomes: list[StructuredRetrievalIndexRecord | None] = []
+        for dataset in latest_by_dataset.values():
+            publication = session.scalar(
+                select(StructuredPublicationRecord).where(
+                    StructuredPublicationRecord.dataset_id == dataset.dataset_id,
+                    StructuredPublicationRecord.schema_version == dataset.schema_version,
+                    StructuredPublicationRecord.status == "published",
+                )
+            )
+            outcomes.append(
+                None
+                if publication is None
+                else session.get(
+                    StructuredRetrievalIndexRecord,
+                    publication.publication_id,
+                )
+            )
+        failed = next(
+            (outcome for outcome in outcomes if outcome is not None and outcome.status == "failed"),
+            None,
+        )
+        complete = bool(outcomes) and all(
+            outcome is not None and outcome.status == "indexed" for outcome in outcomes
+        )
+        indexed_outcomes = [
+            outcome for outcome in outcomes if outcome is not None and outcome.status == "indexed"
+        ]
+        source_index = session.get(RetrievalSourceIndexRecord, source.id)
+        if source_index is None:
+            source_index = RetrievalSourceIndexRecord(
+                source_id=source.id,
+                publication_id=None,
+                status="indexing",
+                indexed_chunk_count=0,
+                error_message=None,
+                updated_at=_timestamp(_utc_now()),
+            )
+            session.add(source_index)
+        retrieval_publication_ids = {
+            outcome.retrieval_publication_id
+            for outcome in indexed_outcomes
+            if outcome.retrieval_publication_id is not None
+        }
+        source_index.publication_id = (
+            next(iter(retrieval_publication_ids)) if len(retrieval_publication_ids) == 1 else None
+        )
+        source_index.indexed_chunk_count = sum(
+            outcome.indexed_point_count for outcome in indexed_outcomes
+        )
+        source_index.status = (
+            "failed" if failed is not None else ("indexed" if complete else "indexing")
+        )
+        source_index.error_message = None if failed is None else failed.error_message
+        source_index.updated_at = _timestamp(_utc_now())
+
     def get_source_index_status(self, source_id: str) -> str | None:
         with self._database.session() as session:
             if session.get(KnowledgeSourceRecord, source_id) is None:
@@ -1505,8 +1663,8 @@ def _schema_from_record(record: StructuredDatasetRecord) -> StructuredDatasetSch
 _UNIT_SUFFIX_PATTERN = re.compile(
     r"(?:\(|（|\[|【)\s*([A-Za-z%‰]+|[\u4e00-\u9fff]{1,8})\s*(?:\)|）|\]|】)\s*$"
 )
-_EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-_LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)\d{7,}(?!\d)")
+_INTEGER_SAMPLE_PATTERN = re.compile(r"^[+-]?\d+$")
+_LONG_INTEGER_SAMPLE_PATTERN = re.compile(r"^[+-]?\d{7,}$")
 _MAX_SAFE_SAMPLES = 5
 _MAX_SAFE_SAMPLE_LENGTH = 120
 
@@ -1533,7 +1691,10 @@ def _retrieval_column_profiles(
     for column in dataset.columns:
         preview = preview_columns.get(column.physical_name, {})
         examples = preview.get("examples", ())
-        safe_samples = _safe_sample_values(examples)
+        safe_samples = _safe_sample_values(
+            examples,
+            StructuredColumnType(column.data_type),
+        )
         sample_rows = _safe_nonnegative_integer(preview.get("sampled_rows"))
         sample_null_count = _safe_nonnegative_integer(preview.get("null_count"))
         null_count = None if null_counts is None else null_counts.get(column.physical_name)
@@ -1589,27 +1750,65 @@ def _preview_profile_columns(
     return {}
 
 
-def _safe_sample_values(raw_values: object) -> tuple[str, ...]:
+def _safe_sample_values(
+    raw_values: object,
+    data_type: StructuredColumnType,
+) -> tuple[str, ...]:
     if isinstance(raw_values, (str, bytes, bytearray)) or not isinstance(raw_values, Sequence):
         return ()
     samples: list[str] = []
     for raw_value in raw_values:
-        if not isinstance(raw_value, (str, int, float, bool)):
+        value = _safe_typed_sample(raw_value, data_type)
+        if value is None:
             continue
-        value = str(raw_value).strip()
-        if not value:
-            continue
-        if _EMAIL_PATTERN.fullmatch(value):
-            redacted = "[redacted-email]"
-        elif _LONG_NUMBER_PATTERN.search(value):
-            redacted = "[redacted-number]"
-        else:
-            redacted = value[:_MAX_SAFE_SAMPLE_LENGTH]
-        if redacted not in samples:
-            samples.append(redacted)
+        if value not in samples:
+            samples.append(value)
         if len(samples) == _MAX_SAFE_SAMPLES:
             break
     return tuple(samples)
+
+
+def _safe_typed_sample(
+    raw_value: object,
+    data_type: StructuredColumnType,
+) -> str | None:
+    if data_type is StructuredColumnType.STRING:
+        return None
+    if isinstance(raw_value, bool):
+        value = "true" if raw_value else "false"
+    elif isinstance(raw_value, (str, int, float)):
+        value = str(raw_value).strip()
+    else:
+        return None
+    if not value or len(value) > _MAX_SAFE_SAMPLE_LENGTH:
+        return None
+    if data_type is StructuredColumnType.INTEGER:
+        if _LONG_INTEGER_SAMPLE_PATTERN.fullmatch(value) is not None:
+            return None
+        return value if _INTEGER_SAMPLE_PATTERN.fullmatch(value) is not None else None
+    if data_type is StructuredColumnType.DECIMAL:
+        if _LONG_INTEGER_SAMPLE_PATTERN.fullmatch(value) is not None:
+            return None
+        try:
+            decimal_value = Decimal(value)
+        except InvalidOperation:
+            return None
+        return value if decimal_value.is_finite() else None
+    if data_type is StructuredColumnType.BOOLEAN:
+        return value.lower() if value.lower() in {"true", "false", "0", "1"} else None
+    if data_type is StructuredColumnType.DATE:
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            return None
+        return value
+    if data_type is StructuredColumnType.DATETIME:
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return value
+    return None
 
 
 def _column_unit(*names: str) -> str | None:

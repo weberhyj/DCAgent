@@ -58,6 +58,7 @@ class RetrievalCandidate:
     parent_chunk_id: str | None = None
     previous_chunk_id: str | None = None
     next_chunk_id: str | None = None
+    point_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -23,14 +24,19 @@ class KnowledgeIngestionJob:
 class KnowledgeIndexLifecycle(Protocol):
     def upsert_source(self, source_id: str): ...
 
-    def delete_source(self, source_id: str) -> None: ...
+    def delete_source(
+        self,
+        source_id: str,
+        *,
+        finalize: Callable[[], object] | None = None,
+    ) -> object | None: ...
 
 
 class KnowledgeIndexUnavailableError(HTTPException):
     def __init__(self) -> None:
         super().__init__(
             status_code=503,
-            detail="Hybrid retrieval index is temporarily unavailable; source was not deleted",
+            detail="Hybrid retrieval index reconciliation is required; source was not changed",
         )
 
 
@@ -58,14 +64,27 @@ class KnowledgeIngestionQueue:
         with self._lock:
             self._pending.append(job)
 
-    def discard_source(self, source_id: str) -> None:
+    def discard_source(
+        self,
+        source_id: str,
+        *,
+        finalize: Callable[[], object] | None = None,
+    ) -> object | None:
+        def finalize_deletion() -> object | None:
+            result = None if finalize is None else finalize()
+            with self._lock:
+                self._pending = [job for job in self._pending if job.source_id != source_id]
+            return result
+
         if self._index_lifecycle is not None:
             try:
-                self._index_lifecycle.delete_source(source_id)
+                return self._index_lifecycle.delete_source(
+                    source_id,
+                    finalize=finalize_deletion,
+                )
             except Exception as error:
                 raise KnowledgeIndexUnavailableError() from error
-        with self._lock:
-            self._pending = [job for job in self._pending if job.source_id != source_id]
+        return finalize_deletion()
 
     def drain(self) -> None:
         while True:

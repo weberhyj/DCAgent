@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
@@ -17,7 +18,7 @@ from .embedding_contracts import (
 )
 from .models import KnowledgeChunkModel, KnowledgeSourceModel
 from .qdrant_retrieval import IndexMaintenanceScope
-from .retrieval_audit import RetrievalPublication
+from .retrieval_audit import AliasPublicationFence, RetrievalPublication
 from .retrieval_models import RetrievalScope
 from .sparse_embedding import SparseVector
 from .structured_models import (
@@ -56,6 +57,7 @@ _SAFE_STATISTICS_FIELDS = frozenset(
         "maximum",
     }
 )
+VALIDATION_TOP_K = 10
 
 
 class RetrievalPublicationError(RuntimeError):
@@ -67,6 +69,10 @@ class IndexValidationError(RetrievalPublicationError):
 
 
 class ActiveIndexUnavailableError(RetrievalPublicationError):
+    pass
+
+
+class RetrievalReconciliationRequiredError(RetrievalPublicationError):
     pass
 
 
@@ -88,6 +94,10 @@ class _AliasRestorationError(RuntimeError):
     pass
 
 
+class _AliasGenerationChangedError(RuntimeError):
+    pass
+
+
 class PublicationRepository(Protocol):
     def list_knowledge_sources(self) -> list[KnowledgeSourceModel]: ...
 
@@ -102,14 +112,29 @@ class PublicationAudit(Protocol):
     ) -> RetrievalPublication: ...
 
     def mark_publication_active(
-        self, publication_id: str, *, point_count: int
+        self,
+        publication_id: str,
+        *,
+        point_count: int,
+        fence: AliasPublicationFence | None = None,
     ) -> RetrievalPublication: ...
 
     def mark_publication_failed(
-        self, publication_id: str, error_message: str
+        self,
+        publication_id: str,
+        error_message: str,
+        *,
+        fence: AliasPublicationFence | None = None,
     ) -> RetrievalPublication: ...
 
     def active_publication(self, alias_name: str | None = None) -> RetrievalPublication | None: ...
+
+    def source_maintenance_lock(self, source_id: str) -> AbstractContextManager[None]: ...
+
+    def alias_publication_lock(
+        self,
+        alias_name: str,
+    ) -> AbstractContextManager[AliasPublicationFence]: ...
 
 
 class DenseEmbeddingClient(Protocol):
@@ -215,6 +240,9 @@ class _PointDraft:
 class _ValidationSample:
     point_id: str
     query: str
+    source_id: str
+    chunk_id: str
+    source_type: str
 
 
 class StructuredMetadataPointBuilder:
@@ -363,6 +391,27 @@ class RetrievalIndexPublisher:
         publication_version = collection_publication_version(collection_name)
         batch_limit = _batch_size(batch_size)
         sample_limit = _nonnegative_integer(validation_sample_size, "validation_sample_size")
+        with self.audit.alias_publication_lock(self._alias_name) as alias_fence:
+            self._reconcile_alias_audit()
+            return self._build_with_alias_fence(
+                collection_name,
+                publication_version=publication_version,
+                activate=activate,
+                batch_limit=batch_limit,
+                sample_limit=sample_limit,
+                alias_fence=alias_fence,
+            )
+
+    def _build_with_alias_fence(
+        self,
+        collection_name: str,
+        *,
+        publication_version: str,
+        activate: bool,
+        batch_limit: int,
+        sample_limit: int,
+        alias_fence: AliasPublicationFence,
+    ) -> RetrievalPublication:
         publication = self.audit.create_publication(
             collection_name=collection_name,
             alias_name=self._alias_name,
@@ -420,19 +469,27 @@ class RetrievalIndexPublisher:
             publication = self.audit.mark_publication_active(
                 publication.id,
                 point_count=validated_count,
+                fence=alias_fence,
             )
+            self._verify_activation(publication, collection_name)
             return publication
         except Exception as error:
             recovery_codes: list[str] = []
             if alias_state_known and alias_switch_attempted:
                 try:
-                    self._restore_alias(previous_alias)
+                    self._restore_alias(
+                        previous_alias,
+                        expected_current=collection_name,
+                    )
+                except _AliasGenerationChangedError:
+                    recovery_codes.append("alias_generation_changed")
                 except _AliasRestorationError:
                     recovery_codes.append("alias_restore_failed")
             try:
                 self.audit.mark_publication_failed(
                     publication.id,
                     error.__class__.__name__,
+                    fence=alias_fence,
                 )
             except Exception:
                 recovery_codes.append("audit_mark_failed_failed")
@@ -449,7 +506,11 @@ class RetrievalIndexPublisher:
             raise
 
     def upsert_source(self, source_id: str) -> SourceIndexResult:
-        publication = self._active_publication()
+        with self.audit.source_maintenance_lock(source_id):
+            return self._upsert_source_locked(source_id)
+
+    def _upsert_source_locked(self, source_id: str) -> SourceIndexResult:
+        publication = self._audited_live_publication()
         version = collection_publication_version(publication.collection_name)
         source = self._source(source_id)
         chunks = self.repository.list_knowledge_chunks(source.id)
@@ -470,23 +531,37 @@ class RetrievalIndexPublisher:
             point_count += self._upsert_batch(publication.collection_name, batch, [], 0)
         return SourceIndexResult(publication.id, point_count)
 
-    def delete_source(self, source_id: str) -> None:
-        publication = self._active_publication(required=False)
-        if publication is None:
-            return
-        version = collection_publication_version(publication.collection_name)
-        self.gateway.delete_source(
-            source_id,
-            maintenance_scope=IndexMaintenanceScope(self._knowledge_base_id, version),
-            collection_name=publication.collection_name,
-        )
+    def delete_source(
+        self,
+        source_id: str,
+        *,
+        finalize: Callable[[], object] | None = None,
+    ) -> object | None:
+        with self.audit.source_maintenance_lock(source_id):
+            publication = self._audited_live_publication()
+            version = collection_publication_version(publication.collection_name)
+            self.gateway.delete_source(
+                source_id,
+                maintenance_scope=IndexMaintenanceScope(self._knowledge_base_id, version),
+                collection_name=publication.collection_name,
+            )
+            self._require_live_alias(publication.collection_name)
+            return None if finalize is None else finalize()
 
     def index_publication(
         self,
         schema: StructuredDatasetSchema,
         result: StructuredPublicationResult,
     ) -> SourceIndexResult:
-        publication = self._active_publication()
+        with self.audit.source_maintenance_lock(schema.source_id):
+            return self._index_publication_locked(schema, result)
+
+    def _index_publication_locked(
+        self,
+        schema: StructuredDatasetSchema,
+        result: StructuredPublicationResult,
+    ) -> SourceIndexResult:
+        publication = self._audited_live_publication()
         version = collection_publication_version(publication.collection_name)
         source = self._source(schema.source_id)
         profiles: tuple[StructuredColumnProfile, ...] = ()
@@ -634,14 +709,21 @@ class RetrievalIndexPublisher:
             for draft, dense, sparse in zip(drafts, dense_vectors, sparse_vectors, strict=True)
         ]
         self.gateway.upsert_points(collection_name, points)
-        remaining = max(0, sample_limit - len(validation_samples))
-        validation_samples.extend(
-            _ValidationSample(
-                point_id=str(point.id),
-                query=_validation_query(draft.payload),
+        for point, draft in zip(points, drafts, strict=True):
+            _consider_validation_sample(
+                validation_samples,
+                _ValidationSample(
+                    point_id=str(point.id),
+                    query=_validation_query(draft.payload),
+                    source_id=_required_text(draft.payload.get("source_id"), "source_id"),
+                    chunk_id=_required_text(draft.payload.get("chunk_id"), "chunk_id"),
+                    source_type=_required_text(
+                        draft.payload.get("source_type"),
+                        "source_type",
+                    ),
+                ),
+                sample_limit,
             )
-            for point, draft in zip(points[:remaining], drafts[:remaining], strict=True)
-        )
         return len(points)
 
     def _run_scope_and_query_probes(
@@ -664,6 +746,9 @@ class RetrievalIndexPublisher:
         )
         if len(candidates) != len(samples):
             raise ValueError("validation sample payloads are incomplete")
+        for sample, candidate in zip(samples, candidates, strict=True):
+            if not _candidate_matches(sample, candidate):
+                raise ValueError("validation sample payload identity mismatch")
         queries = [sample.query for sample in samples]
         dense_queries = self.embedding.embed(
             queries,
@@ -673,7 +758,8 @@ class RetrievalIndexPublisher:
         sparse_queries = tuple(self.sparse.embed_query(query) for query in queries)
         if len(dense_queries) != len(samples) or len(sparse_queries) != len(samples):
             raise ValueError("validation query encoders returned an unexpected count")
-        for dense_query, sparse_query in zip(
+        for expected, dense_query, sparse_query in zip(
+            samples,
             dense_queries,
             sparse_queries,
             strict=True,
@@ -681,17 +767,19 @@ class RetrievalIndexPublisher:
             dense_candidates = self.gateway.search_dense(
                 dense_query,
                 scope=scope,
-                limit=1,
+                limit=VALIDATION_TOP_K,
                 collection_name=collection_name,
             )
             sparse_candidates = self.gateway.search_sparse(
                 sparse_query,
                 scope=scope,
-                limit=1,
+                limit=VALIDATION_TOP_K,
                 collection_name=collection_name,
             )
-            if not dense_candidates or not sparse_candidates:
-                raise ValueError("representative retrieval query returned no results")
+            if not any(_candidate_matches(expected, candidate) for candidate in dense_candidates):
+                raise ValueError("dense validation query did not recover expected target")
+            if not any(_candidate_matches(expected, candidate) for candidate in sparse_candidates):
+                raise ValueError("sparse validation query did not recover expected target")
         denied_scope = RetrievalScope(
             knowledge_base_id=self._knowledge_base_id,
             publication_version=publication_version,
@@ -718,6 +806,58 @@ class RetrievalIndexPublisher:
             raise ActiveIndexUnavailableError("no active retrieval publication is available")
         return publication
 
+    def _reconcile_alias_audit(self) -> None:
+        try:
+            live_collection = self.gateway.resolve_alias()
+            active = self.audit.active_publication(self._alias_name)
+        except Exception as error:
+            raise RetrievalReconciliationRequiredError(
+                "retrieval index reconciliation required"
+            ) from error
+        if live_collection is None and active is None:
+            return
+        if active is not None and live_collection == active.collection_name:
+            try:
+                collection_publication_version(active.collection_name)
+            except ValueError as error:
+                raise RetrievalReconciliationRequiredError(
+                    "retrieval index reconciliation required"
+                ) from error
+            return
+        raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+
+    def _verify_activation(
+        self,
+        publication: RetrievalPublication,
+        expected_collection: str,
+    ) -> None:
+        if publication.status != "active" or publication.collection_name != expected_collection:
+            raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+        self._require_live_alias(expected_collection)
+
+    def _audited_live_publication(self) -> RetrievalPublication:
+        publication = self.audit.active_publication(self._alias_name)
+        if publication is None:
+            raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+        self._require_live_alias(publication.collection_name)
+        try:
+            collection_publication_version(publication.collection_name)
+        except ValueError as error:
+            raise RetrievalReconciliationRequiredError(
+                "retrieval index reconciliation required"
+            ) from error
+        return publication
+
+    def _require_live_alias(self, expected_collection: str) -> None:
+        try:
+            live_collection = self.gateway.resolve_alias()
+        except Exception as error:
+            raise RetrievalReconciliationRequiredError(
+                "retrieval index reconciliation required"
+            ) from error
+        if live_collection != expected_collection:
+            raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+
     def _source(self, source_id: str) -> KnowledgeSourceModel:
         source = next(
             (item for item in self.repository.list_knowledge_sources() if item.id == source_id),
@@ -727,9 +867,21 @@ class RetrievalIndexPublisher:
             raise KeyError("knowledge source not found")
         return source
 
-    def _restore_alias(self, previous_alias: str | None) -> None:
+    def _restore_alias(
+        self,
+        previous_alias: str | None,
+        *,
+        expected_current: str,
+    ) -> None:
         for _attempt in range(2):
             try:
+                current_alias = self.gateway.resolve_alias()
+                if current_alias == previous_alias:
+                    return
+                if current_alias != expected_current:
+                    raise _AliasGenerationChangedError(
+                        "retrieval alias generation changed during recovery"
+                    )
                 if previous_alias is not None:
                     self.gateway.activate_alias(previous_alias)
                 else:
@@ -747,6 +899,8 @@ class RetrievalIndexPublisher:
                                 )
                             ]
                         )
+            except _AliasGenerationChangedError:
+                raise
             except Exception:
                 pass
             try:
@@ -806,6 +960,54 @@ def _validation_query(payload: Mapping[str, object]) -> str:
         )
     query = " ".join(str(value).strip() for value in values if str(value).strip())
     return _required_text(query, "validation query")
+
+
+def _consider_validation_sample(
+    samples: list[_ValidationSample],
+    sample: _ValidationSample,
+    limit: int,
+) -> None:
+    if limit <= 0:
+        return
+    if len(samples) < limit:
+        samples.append(sample)
+        return
+    sample_stratum = _validation_stratum(sample)
+    strata = [_validation_stratum(existing) for existing in samples]
+    if sample_stratum in strata:
+        return
+    sample_kind = sample_stratum[0]
+    kinds = [stratum[0] for stratum in strata]
+    replacement: int | None = None
+    if sample_kind not in kinds:
+        duplicate_indexes = [
+            index for index, stratum in enumerate(strata) if strata.count(stratum) > 1
+        ]
+        candidates = duplicate_indexes or list(range(len(samples)))
+        replacement = max(
+            candidates,
+            key=lambda index: (strata.count(strata[index]), index),
+        )
+    else:
+        replacement = next(
+            (index for index in range(len(samples) - 1, -1, -1) if strata.count(strata[index]) > 1),
+            None,
+        )
+    if replacement is not None:
+        samples[replacement] = sample
+
+
+def _validation_stratum(sample: _ValidationSample) -> tuple[str, str]:
+    kind = "structured" if sample.source_type == "structured" else "narrative"
+    return kind, sample.source_id
+
+
+def _candidate_matches(sample: _ValidationSample, candidate: object) -> bool:
+    return (
+        getattr(candidate, "point_id", None) == sample.point_id
+        and getattr(candidate, "source_id", None) == sample.source_id
+        and getattr(candidate, "chunk_id", None) == sample.chunk_id
+    )
 
 
 def collection_publication_version(collection_name: str) -> str:
@@ -954,6 +1156,7 @@ __all__ = [
     "ActiveIndexUnavailableError",
     "IndexValidationError",
     "PublicationRecoveryError",
+    "RetrievalReconciliationRequiredError",
     "RetrievalIndexPublisher",
     "RetrievalPublicationError",
     "SourceIndexResult",

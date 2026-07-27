@@ -459,8 +459,13 @@ def delete_knowledge_source(
     storage: KnowledgeFileStorage = Depends(get_storage),
     ingestion_queue: KnowledgeIngestionQueue = Depends(get_ingestion_queue),
 ) -> list[KnowledgeSource]:
-    ingestion_queue.discard_source(source_id)
-    sources, deleted = repository.delete_knowledge_source(source_id)
+    result = ingestion_queue.discard_source(
+        source_id,
+        finalize=lambda: repository.delete_knowledge_source(source_id),
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError("knowledge source deletion did not finalize")
+    sources, deleted = result
     storage.delete(deleted.file_path)
     return [KnowledgeSource.from_model(source) for source in sources]
 
@@ -481,8 +486,12 @@ def reindex_knowledge_source(
             status_code=400, detail="Knowledge source has no uploaded file to reindex"
         )
 
-    retried = repository.reindex_knowledge_source(source_id)
-    ingestion_queue.discard_source(source_id)
+    retried = ingestion_queue.discard_source(
+        source_id,
+        finalize=lambda: repository.reindex_knowledge_source(source_id),
+    )
+    if retried is None or not hasattr(retried, "id"):
+        raise RuntimeError("knowledge source reindex did not finalize")
     ingestion_queue.enqueue(retried.id, retried.file_path, retried.source_type)
     return [KnowledgeSource.from_model(item) for item in repository.list_knowledge_sources()]
 

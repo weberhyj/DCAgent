@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -11,7 +13,7 @@ from uuid import uuid4
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, SessionTransaction
 
 from .database import (
     Database,
@@ -70,6 +72,14 @@ class RetrievalPublication:
     error_message: str | None
     created_at: str
     completed_at: str | None
+
+
+@dataclass(slots=True)
+class AliasPublicationFence:
+    alias_name: str
+    session: Session
+    activation_transaction: SessionTransaction | None = None
+    activation_publication_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +154,27 @@ class RetrievalAuditRepository:
             )
             return None if record is None else _publication_from_record(record)
 
+    @contextmanager
+    def source_maintenance_lock(self, source_id: str) -> Iterator[None]:
+        source = _identifier("source_id", source_id)
+        with self._database.session() as session:
+            _acquire_transaction_lock(session, f"retrieval-source:{source}")
+            yield
+
+    @contextmanager
+    def alias_publication_lock(self, alias_name: str) -> Iterator[AliasPublicationFence]:
+        alias = _bounded_text("alias_name", alias_name, 240)
+        with self._database.session() as session:
+            _acquire_alias_transaction_lock(session, alias)
+            fence = AliasPublicationFence(alias_name=alias, session=session)
+            try:
+                yield fence
+            except BaseException:
+                _rollback_pending_activation(fence)
+                raise
+            else:
+                _commit_pending_activation(fence)
+
     def mark_publication_validated(
         self, publication_id: str, *, point_count: int
     ) -> RetrievalPublication:
@@ -155,9 +186,29 @@ class RetrievalAuditRepository:
         )
 
     def mark_publication_active(
-        self, publication_id: str, *, point_count: int
+        self,
+        publication_id: str,
+        *,
+        point_count: int,
+        fence: AliasPublicationFence | None = None,
     ) -> RetrievalPublication:
         point_count = _count("point_count", point_count)
+        if fence is not None:
+            if fence.activation_transaction is not None:
+                raise RetrievalAuditValidationError("Alias publication fence is already active")
+            fence.activation_transaction = fence.session.begin_nested()
+            fence.activation_publication_id = publication_id
+            try:
+                target = _locked_publication(fence.session, publication_id)
+                if target.alias_name != fence.alias_name:
+                    raise RetrievalAuditValidationError("Alias publication fence mismatch")
+                return _activate_publication(fence.session, target, point_count)
+            except IntegrityError:
+                _rollback_pending_activation(fence)
+                raise RetrievalAuditError("Retrieval publication activation conflict") from None
+            except Exception:
+                _rollback_pending_activation(fence)
+                raise
         conflict_error: RetrievalAuditError | None = None
         try:
             with self._database.session() as session:
@@ -170,26 +221,7 @@ class RetrievalAuditRepository:
                     raise RetrievalAuditNotFoundError("Retrieval publication not found")
                 _acquire_alias_transaction_lock(session, alias_name)
                 target = _locked_publication(session, publication_id)
-                _validate_transition(target.status, "active")
-                active_records = session.scalars(
-                    select(RetrievalPublicationRecord)
-                    .where(
-                        RetrievalPublicationRecord.alias_name == target.alias_name,
-                        RetrievalPublicationRecord.status == "active",
-                        RetrievalPublicationRecord.id != target.id,
-                    )
-                    .with_for_update()
-                ).all()
-                for active in active_records:
-                    active.status = "retired"
-                session.flush()
-                target.status = "active"
-                target.point_count = point_count
-                target.error_message = None
-                if target.completed_at is None:
-                    target.completed_at = _timestamp()
-                session.flush()
-                return _publication_from_record(target)
+                return _activate_publication(session, target, point_count)
         except IntegrityError:
             conflict_error = RetrievalAuditError("Retrieval publication activation conflict")
         if conflict_error is not None:
@@ -200,12 +232,29 @@ class RetrievalAuditRepository:
         return self._transition_publication(publication_id, target_status="retired")
 
     def mark_publication_failed(
-        self, publication_id: str, error_message: str
+        self,
+        publication_id: str,
+        error_message: str,
+        *,
+        fence: AliasPublicationFence | None = None,
     ) -> RetrievalPublication:
+        bounded_error = _bounded_text("error_message", error_message, 4000)
+        if fence is not None:
+            if fence.activation_transaction is not None:
+                if fence.activation_publication_id != publication_id:
+                    raise RetrievalAuditValidationError("Alias publication fence mismatch")
+                _rollback_pending_activation(fence)
+            return _transition_locked_publication(
+                fence.session,
+                publication_id,
+                target_status="failed",
+                error_message=bounded_error,
+                completed=True,
+            )
         return self._transition_publication(
             publication_id,
             target_status="failed",
-            error_message=_bounded_text("error_message", error_message, 4000),
+            error_message=bounded_error,
             completed=True,
         )
 
@@ -219,16 +268,14 @@ class RetrievalAuditRepository:
         completed: bool = False,
     ) -> RetrievalPublication:
         with self._database.session() as session:
-            record = _locked_publication(session, publication_id)
-            _validate_transition(record.status, target_status)
-            record.status = target_status
-            if point_count is not None:
-                record.point_count = _count("point_count", point_count)
-            record.error_message = error_message
-            if completed:
-                record.completed_at = _timestamp()
-            session.flush()
-            return _publication_from_record(record)
+            return _transition_locked_publication(
+                session,
+                publication_id,
+                target_status=target_status,
+                point_count=point_count,
+                error_message=error_message,
+                completed=completed,
+            )
 
     def record_shadow(
         self,
@@ -297,11 +344,85 @@ def _locked_publication(session, publication_id: str) -> RetrievalPublicationRec
     return record
 
 
+def _transition_locked_publication(
+    session: Session,
+    publication_id: str,
+    *,
+    target_status: str,
+    point_count: int | None = None,
+    error_message: str | None = None,
+    completed: bool = False,
+) -> RetrievalPublication:
+    record = _locked_publication(session, publication_id)
+    _validate_transition(record.status, target_status)
+    record.status = target_status
+    if point_count is not None:
+        record.point_count = _count("point_count", point_count)
+    record.error_message = error_message
+    if completed:
+        record.completed_at = _timestamp()
+    session.flush()
+    return _publication_from_record(record)
+
+
+def _activate_publication(
+    session: Session,
+    target: RetrievalPublicationRecord,
+    point_count: int,
+) -> RetrievalPublication:
+    _validate_transition(target.status, "active")
+    active_records = session.scalars(
+        select(RetrievalPublicationRecord)
+        .where(
+            RetrievalPublicationRecord.alias_name == target.alias_name,
+            RetrievalPublicationRecord.status == "active",
+            RetrievalPublicationRecord.id != target.id,
+        )
+        .with_for_update()
+    ).all()
+    for active in active_records:
+        active.status = "retired"
+    session.flush()
+    target.status = "active"
+    target.point_count = point_count
+    target.error_message = None
+    if target.completed_at is None:
+        target.completed_at = _timestamp()
+    session.flush()
+    return _publication_from_record(target)
+
+
+def _commit_pending_activation(fence: AliasPublicationFence) -> None:
+    transaction = fence.activation_transaction
+    if transaction is None:
+        return
+    try:
+        transaction.commit()
+    finally:
+        fence.activation_transaction = None
+        fence.activation_publication_id = None
+
+
+def _rollback_pending_activation(fence: AliasPublicationFence) -> None:
+    transaction = fence.activation_transaction
+    if transaction is None:
+        return
+    try:
+        transaction.rollback()
+    finally:
+        fence.activation_transaction = None
+        fence.activation_publication_id = None
+
+
 def _acquire_alias_transaction_lock(session: Session, alias_name: str) -> None:
+    _acquire_transaction_lock(session, f"retrieval-alias:{alias_name}")
+
+
+def _acquire_transaction_lock(session: Session, lock_name: str) -> None:
     if session.get_bind().dialect.name != "postgresql":
         return
     lock_key = int.from_bytes(
-        sha256(alias_name.encode("utf-8")).digest()[:8],
+        sha256(lock_name.encode("utf-8")).digest()[:8],
         byteorder="big",
         signed=True,
     )

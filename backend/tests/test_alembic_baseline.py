@@ -220,6 +220,7 @@ class AlembicBaselineTest(unittest.TestCase):
                         if table.startswith("retrieval_")
                     },
                 )
+                self.assertIn("structured_retrieval_indexes", inspector.get_table_names())
                 chunk_columns = {
                     column["name"]: column for column in inspector.get_columns("knowledge_chunks")
                 }
@@ -245,6 +246,17 @@ class AlembicBaselineTest(unittest.TestCase):
                         "publication_id",
                         "status",
                         "indexed_chunk_count",
+                        "error_message",
+                        "updated_at",
+                    ),
+                    "structured_retrieval_indexes": (
+                        "structured_publication_id",
+                        "source_id",
+                        "dataset_id",
+                        "schema_version",
+                        "retrieval_publication_id",
+                        "status",
+                        "indexed_point_count",
                         "error_message",
                         "updated_at",
                     ),
@@ -274,6 +286,11 @@ class AlembicBaselineTest(unittest.TestCase):
                         "uq_retrieval_publications_active_alias",
                     },
                     "retrieval_source_indexes": {"ix_retrieval_source_indexes_status"},
+                    "structured_retrieval_indexes": {
+                        "ix_structured_retrieval_indexes_dataset_id",
+                        "ix_structured_retrieval_indexes_source_id",
+                        "ix_structured_retrieval_indexes_status",
+                    },
                     "retrieval_shadow_comparisons": {
                         "ix_retrieval_shadow_comparisons_created_at",
                         "ix_retrieval_shadow_comparisons_status",
@@ -312,6 +329,33 @@ class AlembicBaselineTest(unittest.TestCase):
                     },
                     source_foreign_keys,
                 )
+                structured_foreign_keys = {
+                    (
+                        tuple(foreign_key["constrained_columns"]),
+                        foreign_key["referred_table"],
+                        tuple(foreign_key["referred_columns"]),
+                        foreign_key["options"].get("ondelete"),
+                    )
+                    for foreign_key in inspector.get_foreign_keys("structured_retrieval_indexes")
+                }
+                self.assertEqual(
+                    {
+                        (("source_id",), "knowledge_sources", ("id",), "CASCADE"),
+                        (
+                            ("retrieval_publication_id",),
+                            "retrieval_publications",
+                            ("id",),
+                            "SET NULL",
+                        ),
+                        (
+                            ("structured_publication_id",),
+                            "structured_publications",
+                            ("publication_id",),
+                            "CASCADE",
+                        ),
+                    },
+                    structured_foreign_keys,
+                )
                 unique_constraints = {
                     (constraint["name"], tuple(constraint["column_names"]))
                     for constraint in inspector.get_unique_constraints("retrieval_publications")
@@ -345,6 +389,7 @@ class AlembicBaselineTest(unittest.TestCase):
                 self.assertFalse(
                     any(table.startswith("retrieval_") for table in inspector.get_table_names())
                 )
+                self.assertNotIn("structured_retrieval_indexes", inspector.get_table_names())
                 self.assertNotIn(
                     "metadata",
                     {column["name"] for column in inspector.get_columns("knowledge_chunks")},

@@ -150,14 +150,16 @@ class StructuredIngestionWorker:
                         publication_input.schema,
                         result,
                     )
-                    self._repository.complete_retrieval_source_indexing(
-                        job.source_id,
+                    self._repository.complete_retrieval_dataset_indexing(
+                        publication_input.schema,
+                        result,
                         publication_id,
                         indexed_point_count,
                     )
                 except Exception as index_error:
-                    self._repository.fail_retrieval_source_indexing(
-                        job.source_id,
+                    self._repository.fail_retrieval_dataset_indexing(
+                        publication_input.schema,
+                        result,
                         index_error.__class__.__name__,
                     )
         except Exception as error:

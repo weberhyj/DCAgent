@@ -175,6 +175,60 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         self.assertIn("pg_advisory_xact_lock", str(statement))
         self.assertEqual(parameters, second_session.calls[0][1])
 
+    def test_failed_transition_can_use_the_held_alias_fence_session(self) -> None:
+        publication = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v1",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-1",
+            sparse_profile_sha256="a" * 64,
+            dimensions=1024,
+        )
+
+        with self.repository.alias_publication_lock("knowledge_chunks_current") as fence:
+            failed = self.repository.mark_publication_failed(
+                publication.id,
+                "IndexValidationError",
+                fence=fence,
+            )
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(self.repository.get_publication(publication.id).status, "failed")
+
+    def test_failed_live_verification_rolls_back_fenced_activation(self) -> None:
+        first = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v1",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-1",
+            sparse_profile_sha256="a" * 64,
+            dimensions=1024,
+        )
+        self.repository.mark_publication_validated(first.id, point_count=12)
+        self.repository.mark_publication_active(first.id, point_count=12)
+        second = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v2",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-2",
+            sparse_profile_sha256="b" * 64,
+            dimensions=1024,
+        )
+        self.repository.mark_publication_validated(second.id, point_count=13)
+
+        with self.repository.alias_publication_lock("knowledge_chunks_current") as fence:
+            self.repository.mark_publication_active(
+                second.id,
+                point_count=13,
+                fence=fence,
+            )
+            failed = self.repository.mark_publication_failed(
+                second.id,
+                "RetrievalReconciliationRequiredError",
+                fence=fence,
+            )
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(self.repository.get_publication(first.id).status, "active")
+        self.assertEqual(self.repository.get_publication(second.id).status, "failed")
+
     def test_activation_integrity_failure_is_sanitized_and_rolls_back_retirement(self) -> None:
         first = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",

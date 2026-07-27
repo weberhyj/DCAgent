@@ -13,6 +13,7 @@ import app.structured_repository as structured_repository_module
 from app.database import (
     Database,
     KnowledgeSourceRecord,
+    RetrievalSourceIndexRecord,
     StructuredColumnRecord,
     StructuredDatasetRecord,
     StructuredIngestionJobRecord,
@@ -558,6 +559,93 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertIsNotNone(active)
         self.assertEqual(active.publication_id, "pub-new")
         self.assertEqual(self.repository.get_source_index_status(self.source_id), "failed")
+
+    def test_multi_worksheet_indexing_aggregates_success_counts(self) -> None:
+        second_dataset_id = self.add_confirmed_dataset()
+        self.enqueue("pub-sales")
+        self.repository.enqueue_publication(
+            self.source_id,
+            second_dataset_id,
+            "pub-summary",
+        )
+
+        class PerPublicationPublisher:
+            def publish(inner_self, path, schema, publication_id, **kwargs):
+                return self.publication_result(publication_id)
+
+        class MetadataIndexer:
+            def index_publication(inner_self, schema, result):
+                return "retrieval-publication-1", 1
+
+        worker = StructuredIngestionWorker(
+            self.repository,
+            PerPublicationPublisher(),
+            metadata_indexer=MetadataIndexer(),
+            worker_id="worker-1",
+            lease_seconds=60,
+        )
+
+        self.assertTrue(worker.run_once())
+        self.assertEqual(self.repository.get_source_index_status(self.source_id), "indexing")
+        self.assertTrue(worker.run_once())
+
+        with self.database.session() as session:
+            source_index = session.get(RetrievalSourceIndexRecord, self.source_id)
+            assert source_index is not None
+            self.assertEqual(source_index.status, "indexed")
+            self.assertEqual(source_index.indexed_chunk_count, 2)
+
+    def test_later_dataset_success_does_not_erase_other_dataset_failure(self) -> None:
+        second_dataset_id = self.add_confirmed_dataset()
+        self.enqueue("pub-sales")
+        self.repository.enqueue_publication(
+            self.source_id,
+            second_dataset_id,
+            "pub-summary",
+        )
+
+        class PerPublicationPublisher:
+            def publish(inner_self, path, schema, publication_id, **kwargs):
+                return self.publication_result(publication_id)
+
+        fail_sales = [True]
+
+        class MetadataIndexer:
+            def index_publication(inner_self, schema, result):
+                if schema.dataset_id == self.dataset_id and fail_sales[0]:
+                    raise RuntimeError("qdrant unavailable")
+                return "retrieval-publication-1", 1
+
+        worker = StructuredIngestionWorker(
+            self.repository,
+            PerPublicationPublisher(),
+            metadata_indexer=MetadataIndexer(),
+            worker_id="worker-1",
+            lease_seconds=60,
+        )
+
+        self.assertTrue(worker.run_once())
+        self.assertTrue(worker.run_once())
+
+        with self.database.session() as session:
+            source_index = session.get(RetrievalSourceIndexRecord, self.source_id)
+            assert source_index is not None
+            self.assertEqual(source_index.status, "failed")
+            self.assertEqual(source_index.indexed_chunk_count, 1)
+
+        fail_sales[0] = False
+        self.repository.enqueue_publication(
+            self.source_id,
+            self.dataset_id,
+            "pub-sales-retry",
+        )
+        self.assertTrue(worker.run_once())
+
+        with self.database.session() as session:
+            source_index = session.get(RetrievalSourceIndexRecord, self.source_id)
+            assert source_index is not None
+            self.assertEqual(source_index.status, "indexed")
+            self.assertEqual(source_index.indexed_chunk_count, 2)
 
     def test_worker_retry_uses_a_new_staging_owner_for_same_publication(self) -> None:
         self.enqueue()

@@ -356,7 +356,22 @@ def _candidate_from_point(point: object, *, scope: RetrievalScope) -> RetrievalC
     payload = getattr(point, "payload", None)
     candidate = _candidate_from_payload(payload)
     _enforce_payload_scope(payload, scope)
-    return candidate
+    point_id = getattr(point, "id", None)
+    if point_id is None:
+        raise ValueError("Qdrant point is missing an id")
+    return RetrievalCandidate(
+        source_id=candidate.source_id,
+        source_name=candidate.source_name,
+        source_type=candidate.source_type,
+        classification=candidate.classification,
+        chunk_id=candidate.chunk_id,
+        chunk_index=candidate.chunk_index,
+        text=candidate.text,
+        parent_chunk_id=candidate.parent_chunk_id,
+        previous_chunk_id=candidate.previous_chunk_id,
+        next_chunk_id=candidate.next_chunk_id,
+        point_id=str(point_id),
+    )
 
 
 def _candidate_from_payload(payload: object) -> RetrievalCandidate:
@@ -444,6 +459,7 @@ def _with_rank(
         parent_chunk_id=candidate.parent_chunk_id,
         previous_chunk_id=candidate.previous_chunk_id,
         next_chunk_id=candidate.next_chunk_id,
+        point_id=candidate.point_id,
     )
 
 

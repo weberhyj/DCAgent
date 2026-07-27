@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 
 from qdrant_client.http import models
@@ -22,6 +24,7 @@ from app.retrieval_publication import (
     IndexValidationError,
     PublicationRecoveryError,
     RetrievalIndexPublisher,
+    RetrievalPublicationError,
     StructuredMetadataPointBuilder,
 )
 from app.sparse_embedding import SparseVector
@@ -112,9 +115,14 @@ class RecordingGateway:
         sample_query_empty: bool = False,
         create_timeout_after_create: bool = False,
         fail_restore: bool = False,
+        crash_after_alias_switch: bool = False,
+        alias_after_activation_failure: str | None = None,
+        unrelated_authorized_hits: bool = False,
+        wrong_point_identity_hits: bool = False,
     ) -> None:
         self.events: list[str] = []
         self.points: list[models.PointStruct] = []
+        self.points_by_collection: dict[str, list[models.PointStruct]] = {}
         self.client = self
         self.alias: str | None = None
         self.other_alias_collections: list[str] = []
@@ -125,19 +133,40 @@ class RecordingGateway:
         self.sample_query_empty = sample_query_empty
         self.create_timeout_after_create = create_timeout_after_create
         self.fail_restore = fail_restore
+        self.crash_after_alias_switch = crash_after_alias_switch
+        self.alias_after_activation_failure = alias_after_activation_failure
+        self.unrelated_authorized_hits = unrelated_authorized_hits
+        self.wrong_point_identity_hits = wrong_point_identity_hits
         self.existing_collections: set[str] = set()
         self.resolve_calls = 0
         self.deleted_scopes: list[IndexMaintenanceScope] = []
+        self.block_upserts = False
+        self.upsert_entered = Event()
+        self.upsert_release = Event()
+        self.block_first_create = False
+        self.create_entered = Event()
+        self.create_release = Event()
+        self.timeline: list[str] = []
 
     def create_collection(self, collection_name, *, dense_dimensions):
         self.events.append("create")
         self.existing_collections.add(collection_name)
+        if self.block_first_create:
+            self.block_first_create = False
+            self.create_entered.set()
+            if not self.create_release.wait(timeout=2):
+                raise TimeoutError("timed out waiting to release create")
         if self.create_timeout_after_create:
             raise TimeoutError("ambiguous create timeout")
 
     def upsert_points(self, collection_name, points):
         self.events.append(f"upsert:{len(points)}")
+        if self.block_upserts:
+            self.upsert_entered.set()
+            if not self.upsert_release.wait(timeout=2):
+                raise TimeoutError("timed out waiting to release upsert")
         self.points.extend(points)
+        self.points_by_collection.setdefault(collection_name, []).extend(points)
 
     def validate_collection(self, collection_name, *, dense_dimensions, expected_point_count):
         self.events.append(f"validate:{expected_point_count}")
@@ -147,15 +176,22 @@ class RecordingGateway:
 
     def activate_alias(self, collection_name):
         self.events.append("activate_alias")
+        self.timeline.append(f"activate:{collection_name}")
         if self.fail_restore and collection_name == "knowledge_chunks_qwen3_v6":
             raise RuntimeError("restore unavailable")
         self.alias = collection_name
+        if self.crash_after_alias_switch:
+            self.crash_after_alias_switch = False
+            raise SystemExit("simulated process crash")
         if self.fail_activation_call:
             self.fail_activation_call = False
+            if self.alias_after_activation_failure is not None:
+                self.alias = self.alias_after_activation_failure
             raise RuntimeError("ambiguous alias update failure")
 
     def resolve_alias(self):
         self.resolve_calls += 1
+        self.timeline.append("resolve")
         if self.fail_initial_alias_resolution:
             self.fail_initial_alias_resolution = False
             raise RuntimeError("qdrant unavailable")
@@ -190,7 +226,15 @@ class RecordingGateway:
 
     def retrieve_points(self, point_ids, *, scope, collection_name=None):
         self.events.append(f"retrieve:{len(point_ids)}")
-        return tuple(SimpleNamespace(chunk_id=point_id) for point_id in point_ids)
+        by_id = {
+            str(point.id): point
+            for point in self.points_by_collection.get(collection_name, self.points)
+        }
+        return tuple(
+            self._candidate(by_id[str(point_id)])
+            for point_id in point_ids
+            if str(point_id) in by_id
+        )
 
     def search_dense(self, vector, *, scope, limit, collection_name=None):
         denied = "__publication_validation_denied__" in scope.permission_tags
@@ -199,7 +243,21 @@ class RecordingGateway:
             return ()
         if self.sample_query_empty and not denied:
             return ()
-        return (SimpleNamespace(chunk_id="sample"),)
+        if self.unrelated_authorized_hits and not denied:
+            return (SimpleNamespace(source_id="unrelated", chunk_id="unrelated"),)
+        if self.wrong_point_identity_hits and not denied:
+            point = self.points_by_collection.get(collection_name, self.points)[0]
+            return (
+                SimpleNamespace(
+                    point_id="wrong-point-id",
+                    source_id=point.payload["source_id"],
+                    chunk_id=point.payload["chunk_id"],
+                ),
+            )
+        return tuple(
+            self._candidate(point)
+            for point in self.points_by_collection.get(collection_name, self.points)
+        )
 
     def search_sparse(self, vector, *, scope, limit, collection_name=None):
         denied = "__publication_validation_denied__" in scope.permission_tags
@@ -208,7 +266,29 @@ class RecordingGateway:
             return ()
         if self.sample_query_empty and not denied:
             return ()
-        return (SimpleNamespace(chunk_id="sample"),)
+        if self.unrelated_authorized_hits and not denied:
+            return (SimpleNamespace(source_id="unrelated", chunk_id="unrelated"),)
+        if self.wrong_point_identity_hits and not denied:
+            point = self.points_by_collection.get(collection_name, self.points)[0]
+            return (
+                SimpleNamespace(
+                    point_id="wrong-point-id",
+                    source_id=point.payload["source_id"],
+                    chunk_id=point.payload["chunk_id"],
+                ),
+            )
+        return tuple(
+            self._candidate(point)
+            for point in self.points_by_collection.get(collection_name, self.points)
+        )
+
+    @staticmethod
+    def _candidate(point):
+        return SimpleNamespace(
+            point_id=str(point.id),
+            source_id=point.payload["source_id"],
+            chunk_id=point.payload["chunk_id"],
+        )
 
 
 class RecordingAudit:
@@ -222,8 +302,37 @@ class RecordingAudit:
         self.previous: RetrievalPublication | None = None
         self.fail_activation = fail_activation
         self.fail_mark_failed = fail_mark_failed
+        self.source_lock = Lock()
+        self.source_lock_events: list[str] = []
+        self.alias_lock = Lock()
+        self.second_alias_wait = Event()
+        self.timeline: list[str] = []
+
+    @contextmanager
+    def source_maintenance_lock(self, source_id):
+        self.source_lock_events.append(f"wait:{source_id}")
+        with self.source_lock:
+            self.source_lock_events.append(f"acquire:{source_id}")
+            try:
+                yield
+            finally:
+                self.source_lock_events.append(f"release:{source_id}")
+
+    @contextmanager
+    def alias_publication_lock(self, alias_name):
+        self.timeline.append("alias-lock-wait")
+        if self.timeline.count("alias-lock-wait") >= 2:
+            self.second_alias_wait.set()
+        with self.alias_lock:
+            self.timeline.append("alias-lock-acquire")
+            try:
+                yield SimpleNamespace(alias_name=alias_name)
+            finally:
+                self.timeline.append("alias-lock-release")
 
     def create_publication(self, **values):
+        if self.publication is not None and self.publication.status == "active":
+            self.previous = self.publication
         self.publication = RetrievalPublication(
             id="publication-1",
             collection_name=values["collection_name"],
@@ -248,14 +357,15 @@ class RecordingAudit:
         )
         return self.publication
 
-    def mark_publication_active(self, publication_id, *, point_count):
+    def mark_publication_active(self, publication_id, *, point_count, fence=None):
+        self.timeline.append("audit-active")
         if self.fail_activation:
             raise RuntimeError("postgres unavailable")
         assert self.publication is not None
         self.publication = replace(self.publication, status="active", point_count=point_count)
         return self.publication
 
-    def mark_publication_failed(self, publication_id, error_message):
+    def mark_publication_failed(self, publication_id, error_message, *, fence=None):
         if self.fail_mark_failed:
             raise RuntimeError("postgres failure state unavailable")
         assert self.publication is not None
@@ -284,6 +394,11 @@ def build_publisher(
     create_timeout_after_create=False,
     fail_restore=False,
     fail_mark_failed=False,
+    crash_after_alias_switch=False,
+    alias_after_activation_failure=None,
+    unrelated_authorized_hits=False,
+    wrong_point_identity_hits=False,
+    repository=None,
     structured_catalog_provider=None,
 ):
     gateway = RecordingGateway(
@@ -294,6 +409,10 @@ def build_publisher(
         sample_query_empty=sample_query_empty,
         create_timeout_after_create=create_timeout_after_create,
         fail_restore=fail_restore,
+        crash_after_alias_switch=crash_after_alias_switch,
+        alias_after_activation_failure=alias_after_activation_failure,
+        unrelated_authorized_hits=unrelated_authorized_hits,
+        wrong_point_identity_hits=wrong_point_identity_hits,
     )
     audit = RecordingAudit(
         fail_activation=fail_activation,
@@ -301,7 +420,7 @@ def build_publisher(
     )
     embedding = RecordingEmbedding()
     publisher = RetrievalIndexPublisher(
-        repository=RecordingRepository(chunks),
+        repository=repository or RecordingRepository(chunks),
         audit=audit,
         gateway=gateway,
         embedding=embedding,
@@ -316,6 +435,7 @@ def build_publisher(
     publisher.gateway = gateway
     publisher.audit = audit
     publisher.embedding = embedding
+    gateway.timeline = audit.timeline
     return publisher
 
 
@@ -357,7 +477,21 @@ def build_real_structured_catalog() -> tuple[Database, StructuredRepository]:
                 allow_filter=True,
                 null_policy="ignore",
                 sort_order=0,
-            )
+            ),
+            StructuredColumnRecord(
+                id="dataset-1:1:1",
+                dataset_id="dataset-1",
+                schema_version=1,
+                physical_name="customer_note",
+                original_name="Customer Note",
+                display_name="Customer Note",
+                data_type=StructuredColumnType.STRING.value,
+                aliases=[],
+                allow_aggregate=False,
+                allow_filter=True,
+                null_policy="ignore",
+                sort_order=1,
+            ),
         ]
         session.add(dataset)
         session.add(
@@ -397,7 +531,23 @@ def build_real_structured_catalog() -> tuple[Database, StructuredRepository]:
                                     ],
                                     "sampled_rows": 3,
                                     "null_count": 1,
-                                }
+                                },
+                                {
+                                    "physical_name": "customer_note",
+                                    "original_name": "Customer Note",
+                                    "display_name": "Customer Note",
+                                    "data_type": "string",
+                                    "aliases": [],
+                                    "examples": [
+                                        "张伟",
+                                        "北京市朝阳区建国路88号",
+                                        "+86 138-0013-8000",
+                                        "ACCT-1234",
+                                        "María García",
+                                    ],
+                                    "sampled_rows": 5,
+                                    "null_count": 0,
+                                },
                             ],
                         }
                     ],
@@ -522,6 +672,103 @@ class RetrievalPublicationTest(unittest.TestCase):
 
         self.assertNotIn("activate_alias", publisher.gateway.events)
 
+    def test_authorized_but_unrelated_probe_hits_fail_before_alias(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(1),
+            unrelated_authorized_hits=True,
+        )
+
+        with self.assertRaises(IndexValidationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_probe_hit_with_wrong_point_identity_fails_before_alias(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(1),
+            wrong_point_identity_hits=True,
+        )
+
+        with self.assertRaises(IndexValidationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_validation_samples_are_stratified_across_sources_and_types(self) -> None:
+        database, structured_repository = build_real_structured_catalog()
+        self.addCleanup(database.engine.dispose)
+
+        class MultiSourceRepository:
+            def __init__(self) -> None:
+                self.sources = [
+                    KnowledgeSourceModel(
+                        id="source-a",
+                        name="alpha.docx",
+                        source_type="DOCX",
+                        records=3,
+                        status="indexed",
+                        updated_at="2026-07-27",
+                        classification="internal",
+                    ),
+                    KnowledgeSourceModel(
+                        id="source-b",
+                        name="beta.pdf",
+                        source_type="PDF",
+                        records=1,
+                        status="indexed",
+                        updated_at="2026-07-27",
+                        classification="internal",
+                    ),
+                    KnowledgeSourceModel(
+                        id="source-1",
+                        name="sales.xlsx",
+                        source_type="XLSX",
+                        records=10,
+                        status="indexed",
+                        updated_at="2026-07-27",
+                        classification="internal",
+                    ),
+                ]
+                self.chunks = {
+                    "source-a": [
+                        replace(chunk, id=f"alpha-{index}", source_id="source-a")
+                        for index, chunk in enumerate(sample_chunks(3))
+                    ],
+                    "source-b": [replace(sample_chunks(1)[0], id="beta-0", source_id="source-b")],
+                    "source-1": [],
+                }
+
+            def list_knowledge_sources(self):
+                return list(self.sources)
+
+            def list_knowledge_chunks(self, source_id):
+                return list(self.chunks[source_id])
+
+        publisher = build_publisher(
+            chunks=[],
+            repository=MultiSourceRepository(),
+            structured_catalog_provider=structured_repository,
+        )
+
+        publisher.build_and_activate(
+            "knowledge_chunks_qwen3_v1",
+            validation_sample_size=3,
+        )
+
+        query_batch = next(
+            batch
+            for batch, purpose in zip(
+                publisher.embedding.batches,
+                publisher.embedding.purposes,
+                strict=True,
+            )
+            if purpose == "query"
+        )
+        self.assertEqual(len(query_batch), 3)
+        self.assertTrue(any("alpha.docx" in query for query in query_batch))
+        self.assertTrue(any("beta.pdf" in query for query in query_batch))
+        self.assertTrue(any("dataset-1" in query for query in query_batch))
+
     def test_build_without_any_validation_sample_never_activates(self) -> None:
         publisher = build_publisher(chunks=[])
 
@@ -559,11 +806,75 @@ class RetrievalPublicationTest(unittest.TestCase):
             [IndexMaintenanceScope("default", "v7")],
         )
 
+    def test_incremental_delete_refuses_live_alias_mismatch(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        publisher.gateway.events.clear()
+        publisher.gateway.alias = "knowledge_chunks_qwen3_v8"
+
+        with self.assertRaisesRegex(RetrievalPublicationError, "reconciliation required"):
+            publisher.delete_source("source-1")
+
+        self.assertNotIn("delete_source:source-1", publisher.gateway.events)
+
+    def test_incremental_delete_refuses_unresolved_live_alias(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        publisher.gateway.events.clear()
+        publisher.gateway.alias = None
+
+        with self.assertRaisesRegex(RetrievalPublicationError, "reconciliation required"):
+            publisher.delete_source("source-1")
+
+        self.assertNotIn("delete_source:source-1", publisher.gateway.events)
+
+    def test_source_maintenance_lock_orders_upsert_before_concurrent_delete(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        publisher.gateway.events.clear()
+        publisher.gateway.block_upserts = True
+        errors: list[Exception] = []
+
+        def upsert() -> None:
+            try:
+                publisher.upsert_source("source-1")
+            except Exception as error:
+                errors.append(error)
+
+        def delete() -> None:
+            try:
+                publisher.delete_source("source-1")
+            except Exception as error:
+                errors.append(error)
+
+        upsert_thread = Thread(target=upsert)
+        delete_thread = Thread(target=delete)
+        upsert_thread.start()
+        self.assertTrue(publisher.gateway.upsert_entered.wait(timeout=1))
+        delete_thread.start()
+
+        self.assertEqual(
+            publisher.gateway.events,
+            ["delete_source:source-1", "upsert:1"],
+        )
+        publisher.gateway.upsert_release.set()
+        upsert_thread.join(timeout=2)
+        delete_thread.join(timeout=2)
+
+        self.assertFalse(upsert_thread.is_alive())
+        self.assertFalse(delete_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            publisher.gateway.events,
+            ["delete_source:source-1", "upsert:1", "delete_source:source-1"],
+        )
+
     def test_activation_audit_failure_restores_previous_alias_and_deletes_new_collection(
         self,
     ) -> None:
-        publisher = build_publisher(chunks=sample_chunks(1), fail_activation=True)
-        publisher.gateway.alias = "knowledge_chunks_qwen3_v6"
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.audit.fail_activation = True
 
         with self.assertRaises(RuntimeError):
             publisher.build_and_activate("knowledge_chunks_qwen3_v7")
@@ -571,6 +882,85 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v6")
         self.assertEqual(publisher.audit.publication.status, "failed")
         self.assertEqual(publisher.gateway.events[-2:], ["activate_alias", "delete_collection"])
+
+    def test_activation_holds_alias_fence_through_audit_and_live_verification(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+
+        publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        timeline = publisher.audit.timeline
+        acquire = timeline.index("alias-lock-acquire")
+        activate = timeline.index("activate:knowledge_chunks_qwen3_v7")
+        audit_active = timeline.index("audit-active")
+        release = timeline.index("alias-lock-release")
+        self.assertLess(acquire, timeline.index("resolve"))
+        self.assertLess(activate, audit_active)
+        self.assertIn("resolve", timeline[audit_active + 1 : release])
+
+    def test_build_entry_fails_closed_after_crash_between_alias_switch_and_audit(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(1),
+            crash_after_alias_switch=True,
+        )
+
+        with self.assertRaises(SystemExit):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v7")
+        self.assertEqual(publisher.audit.publication.status, "validated")
+        create_count = publisher.gateway.events.count("create")
+
+        with self.assertRaisesRegex(RetrievalPublicationError, "reconciliation required"):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v8")
+
+        self.assertEqual(publisher.gateway.events.count("create"), create_count)
+
+    def test_stale_restore_never_overwrites_newer_alias_generation(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(1),
+        )
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.gateway.fail_activation_call = True
+        publisher.gateway.alias_after_activation_failure = "knowledge_chunks_qwen3_v8"
+
+        with self.assertRaises(PublicationRecoveryError) as captured:
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v8")
+        self.assertIn("alias_generation_changed", captured.exception.recovery_codes)
+
+    def test_two_builders_are_serialized_by_alias_fence(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.gateway.block_first_create = True
+        results: list[str] = []
+        errors: list[Exception] = []
+
+        def build(collection_name: str) -> None:
+            try:
+                results.append(publisher.build_and_activate(collection_name).collection_name)
+            except Exception as error:
+                errors.append(error)
+
+        first = Thread(target=build, args=("knowledge_chunks_qwen3_v7",))
+        second = Thread(target=build, args=("knowledge_chunks_qwen3_v8",))
+        first.start()
+        self.assertTrue(publisher.gateway.create_entered.wait(timeout=1))
+        second.start()
+        self.assertTrue(publisher.audit.second_alias_wait.wait(timeout=1))
+
+        self.assertEqual(publisher.gateway.events.count("create"), 1)
+        publisher.gateway.create_release.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            results,
+            ["knowledge_chunks_qwen3_v7", "knowledge_chunks_qwen3_v8"],
+        )
+        self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v8")
 
     def test_chunk_cannot_expand_configured_permission_scope(self) -> None:
         chunks = sample_chunks(1)
@@ -584,8 +974,9 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(publisher.audit.publication.status, "failed")
 
     def test_ambiguous_alias_activation_failure_is_detected_and_rolled_back(self) -> None:
-        publisher = build_publisher(chunks=sample_chunks(1), fail_activation_call=True)
-        publisher.gateway.alias = "knowledge_chunks_qwen3_v6"
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.gateway.fail_activation_call = True
 
         with self.assertRaises(RuntimeError):
             publisher.build_and_activate("knowledge_chunks_qwen3_v7")
@@ -608,12 +999,10 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(publisher.audit.publication.status, "failed")
 
     def test_restore_failure_is_surfaced_and_aliased_collection_is_retained(self) -> None:
-        publisher = build_publisher(
-            chunks=sample_chunks(1),
-            fail_activation_call=True,
-            fail_restore=True,
-        )
-        publisher.gateway.alias = "knowledge_chunks_qwen3_v6"
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.gateway.fail_activation_call = True
+        publisher.gateway.fail_restore = True
 
         with self.assertRaises(PublicationRecoveryError) as captured:
             publisher.build_and_activate("knowledge_chunks_qwen3_v7")
@@ -636,16 +1025,16 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertIn("audit_mark_failed_failed", captured.exception.recovery_codes)
         self.assertNotIn("permission probe failed", str(captured.exception))
 
-    def test_initial_alias_resolution_failure_marks_publication_failed(self) -> None:
+    def test_initial_alias_resolution_failure_stops_before_publication_create(self) -> None:
         publisher = build_publisher(
             chunks=sample_chunks(1),
             fail_initial_alias_resolution=True,
         )
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RetrievalPublicationError, "reconciliation required"):
             publisher.build_and_activate("knowledge_chunks_qwen3_v7")
 
-        self.assertEqual(publisher.audit.publication.status, "failed")
+        self.assertIsNone(publisher.audit.publication)
         self.assertNotIn("create", publisher.gateway.events)
 
     def test_structured_point_contains_safe_catalog_metadata_only(self) -> None:
@@ -719,10 +1108,47 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(profile.unit, "CNY")
         self.assertEqual(
             profile.safe_sample_values,
-            ("12.50", "[redacted-email]", "[redacted-number]"),
+            ("12.50",),
         )
         self.assertEqual(profile.statistics_summary["row_count"], 10)
         self.assertEqual(profile.statistics_summary["sample_null_count"], 1)
+
+    def test_structured_string_samples_default_deny_multilingual_pii(self) -> None:
+        database, repository = build_real_structured_catalog()
+        self.addCleanup(database.engine.dispose)
+
+        item = repository.get_catalog().datasets[0]
+        string_profile = next(
+            profile for profile in item.column_profiles if profile.physical_name == "customer_note"
+        )
+        publisher = build_publisher(
+            chunks=[],
+            structured_catalog_provider=repository,
+        )
+        publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+        structured_payload = next(
+            point.payload
+            for point in publisher.gateway.points
+            if point.payload["source_type"] == "structured"
+        )
+
+        self.assertEqual(string_profile.safe_sample_values, ())
+        serialized = repr(structured_payload)
+        for sensitive in (
+            "张伟",
+            "北京市朝阳区建国路88号",
+            "+86 138-0013-8000",
+            "ACCT-1234",
+            "María García",
+        ):
+            self.assertNotIn(sensitive, serialized)
+        amount = next(
+            column
+            for column in structured_payload["columns"]
+            if column["physical_name"] == "amount"
+        )
+        self.assertEqual(amount["unit"], "CNY")
+        self.assertEqual(amount["safe_sample_values"], ["12.50"])
 
     def test_full_build_uses_real_catalog_profiles_without_rows(self) -> None:
         database, repository = build_real_structured_catalog()
