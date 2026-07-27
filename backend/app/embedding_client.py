@@ -53,6 +53,8 @@ class SyncEmbeddingTransport(Protocol):
         self,
         url: str,
         payload: Mapping[str, object],
+        *,
+        timeout_seconds: float | None = None,
     ) -> Mapping[str, object]: ...
 
     def close(self) -> None: ...
@@ -128,8 +130,16 @@ class _SyncHttpxEmbeddingTransport:
         self,
         url: str,
         payload: Mapping[str, object],
+        *,
+        timeout_seconds: float | None = None,
     ) -> Mapping[str, object]:
-        response = self._client.post(url, json=dict(payload))
+        request_kwargs: dict[str, object] = {}
+        if timeout_seconds is not None:
+            request_kwargs["timeout"] = httpx.Timeout(
+                timeout_seconds,
+                connect=min(timeout_seconds, 2.0),
+            )
+        response = self._client.post(url, json=dict(payload), **request_kwargs)
         response.raise_for_status()
         try:
             result = response.json()
@@ -258,6 +268,7 @@ class SyncHttpEmbeddingClient:
         *,
         purpose: EmbeddingPurpose,
         expected: EmbeddingMetadataExpectation,
+        timeout_seconds: float | None = None,
     ) -> list[list[float]]:
         if self._closed:
             raise EmbeddingServiceError("embedding client is closed")
@@ -265,13 +276,18 @@ class SyncHttpEmbeddingClient:
         if purpose not in {"query", "document"}:
             raise ValueError("purpose must be 'query' or 'document'")
         expected_metadata = _metadata_from_expectation(expected)
+        request_timeout = _optional_timeout(timeout_seconds)
 
         vectors: list[list[float]] = []
         endpoint = f"{self.base_url}/embeddings"
         for batch in _split_batches(values, purpose):
             payload = {"texts": list(batch), "purpose": purpose}
             try:
-                raw_response = self._transport.post_json(endpoint, payload)
+                raw_response = self._transport.post_json(
+                    endpoint,
+                    payload,
+                    timeout_seconds=request_timeout,
+                )
             except EmbeddingClientError:
                 raise
             except httpx.HTTPStatusError as error:
@@ -366,6 +382,17 @@ def _validate_base_url(base_url: str) -> str:
     if parsed.port is not None:
         authority += f":{parsed.port}"
     return f"{parsed.scheme.lower()}://{authority}/v1"
+
+
+def _optional_timeout(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout_seconds must be positive and finite")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout_seconds must be positive and finite")
+    return timeout
 
 
 def _metadata_from_expectation(

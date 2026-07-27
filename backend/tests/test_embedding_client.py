@@ -84,11 +84,13 @@ class FakeSyncEmbeddingTransport:
     ) -> None:
         self.overrides = overrides or {}
         self.error = error
-        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.calls: list[tuple[str, dict[str, Any], float | None]] = []
         self.close_calls = 0
 
-    def post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        self.calls.append((url, payload))
+    def post_json(
+        self, url: str, payload: dict[str, Any], *, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
+        self.calls.append((url, payload, timeout_seconds))
         if self.error is not None:
             raise self.error
         response: dict[str, Any] = {
@@ -118,7 +120,7 @@ class RecordingSyncHttpxClient:
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.close_calls = 0
 
-    def post(self, url: str, json: dict[str, Any]) -> httpx.Response:
+    def post(self, url: str, json: dict[str, Any], **kwargs: Any) -> httpx.Response:
         self.requests.append((url, json))
         payload = FakeSyncEmbeddingTransport().post_json(url, json)
         return httpx.Response(200, request=httpx.Request("POST", url), json=payload)
@@ -470,6 +472,22 @@ class SyncEmbeddingClientTest(unittest.TestCase):
         self.assertFalse(kwargs["trust_env"])
         self.assertEqual(kwargs["limits"].max_connections, 32)
         self.assertEqual(kwargs["limits"].max_keepalive_connections, 16)
+
+    def test_sync_client_passes_per_request_timeout_to_transport(self) -> None:
+        transport = FakeSyncEmbeddingTransport()
+        client = SyncHttpEmbeddingClient(
+            "http://embedding-service:8081",
+            transport=transport,
+        )
+
+        client.embed(
+            ["one"],
+            purpose="query",
+            expected=metadata(),
+            timeout_seconds=0.25,
+        )
+
+        self.assertEqual(transport.calls[0][2], 0.25)
 
 
 if __name__ == "__main__":

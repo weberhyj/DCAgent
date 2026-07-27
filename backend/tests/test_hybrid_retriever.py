@@ -7,6 +7,7 @@ from dataclasses import replace
 
 from app.embedding_contracts import EmbeddingModelMetadata
 from app.hybrid_retriever import (
+    HybridRetrievalError,
     HybridRetrievalTimeout,
     HybridRetriever,
     reciprocal_rank_fusion,
@@ -79,10 +80,12 @@ class RecordingEmbedding:
     def __init__(self, *, delay: float = 0.0) -> None:
         self.delay = delay
         self.calls: list[tuple[tuple[str, ...], str, object]] = []
+        self.timeouts: list[float | None] = []
         self.thread_names: list[str] = []
 
-    def embed(self, texts, *, purpose, expected):
+    def embed(self, texts, *, purpose, expected, timeout_seconds=None):
         self.calls.append((tuple(texts), purpose, expected))
+        self.timeouts.append(timeout_seconds)
         self.thread_names.append(threading.current_thread().name)
         if self.delay:
             time.sleep(self.delay)
@@ -120,23 +123,27 @@ class RecordingGateway:
         self.sparse_calls: list[tuple[object, RetrievalScope, int]] = []
         self.retrieve_calls: list[tuple[tuple[str, ...], RetrievalScope]] = []
         self.search_threads: list[str] = []
+        self.timeouts: list[float | None] = []
 
-    def search_dense(self, vector, *, scope, limit, collection_name=None):
+    def search_dense(self, vector, *, scope, limit, collection_name=None, timeout_seconds=None):
         self.dense_calls.append((vector, scope, limit))
+        self.timeouts.append(timeout_seconds)
         self.search_threads.append(threading.current_thread().name)
         if self.delay:
             time.sleep(self.delay)
         return self.dense[:limit]
 
-    def search_sparse(self, vector, *, scope, limit, collection_name=None):
+    def search_sparse(self, vector, *, scope, limit, collection_name=None, timeout_seconds=None):
         self.sparse_calls.append((vector, scope, limit))
+        self.timeouts.append(timeout_seconds)
         self.search_threads.append(threading.current_thread().name)
         if self.delay:
             time.sleep(self.delay)
         return self.sparse[:limit]
 
-    def retrieve_points(self, point_ids, *, scope, collection_name=None):
+    def retrieve_points(self, point_ids, *, scope, collection_name=None, timeout_seconds=None):
         self.retrieve_calls.append((tuple(point_ids), scope))
+        self.timeouts.append(timeout_seconds)
         return self.adjacent
 
 
@@ -144,16 +151,19 @@ class RecordingReranker:
     def __init__(self) -> None:
         self.batch_sizes: list[int] = []
         self.passage_count = 0
+        self.timeouts: list[float | None] = []
 
-    def rerank(self, query, passages, *, expected):
+    def rerank(self, query, passages, *, expected, timeout_seconds=None):
         self.batch_sizes.append(len(passages))
+        self.timeouts.append(timeout_seconds)
         self.passage_count = len(passages)
         return [1.0 - index / 100 for index in range(len(passages))]
 
 
 class BusyOnceReranker(RecordingReranker):
-    def rerank(self, query, passages, *, expected):
+    def rerank(self, query, passages, *, expected, timeout_seconds=None):
         self.batch_sizes.append(len(passages))
+        self.timeouts.append(timeout_seconds)
         if len(self.batch_sizes) == 1:
             raise RerankerBusy("busy")
         self.passage_count = len(passages)
@@ -161,9 +171,87 @@ class BusyOnceReranker(RecordingReranker):
 
 
 class FailingReranker(RecordingReranker):
-    def rerank(self, query, passages, *, expected):
+    def rerank(self, query, passages, *, expected, timeout_seconds=None):
         self.batch_sizes.append(len(passages))
+        self.timeouts.append(timeout_seconds)
         raise RerankerServiceError("unavailable")
+
+
+class NonCooperativeGate:
+    def __init__(self, block_first: int) -> None:
+        self.block_first = block_first
+        self.release = threading.Event()
+        self._condition = threading.Condition()
+        self.call_count = 0
+
+    def enter(self) -> None:
+        with self._condition:
+            self.call_count += 1
+            should_block = self.call_count <= self.block_first
+            self._condition.notify_all()
+        if should_block:
+            self.release.wait()
+
+    def wait_for_calls(self, count: int, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self.call_count < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+
+class GatedEmbedding(RecordingEmbedding):
+    def __init__(self, gate: NonCooperativeGate) -> None:
+        super().__init__()
+        self.gate = gate
+
+    def embed(self, texts, *, purpose, expected, timeout_seconds=None):
+        self.gate.enter()
+        return super().embed(
+            texts,
+            purpose=purpose,
+            expected=expected,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class GatedSparse(RecordingSparse):
+    def __init__(self, gate: NonCooperativeGate) -> None:
+        super().__init__()
+        self.gate = gate
+
+    def embed_query(self, query):
+        self.gate.enter()
+        return super().embed_query(query)
+
+
+class BlockingSearchGateway(RecordingGateway):
+    def __init__(self, dense, sparse) -> None:
+        super().__init__(dense, sparse)
+        self.gate = NonCooperativeGate(2)
+
+    def search_dense(self, vector, *, scope, limit, collection_name=None, timeout_seconds=None):
+        self.gate.enter()
+        return super().search_dense(
+            vector,
+            scope=scope,
+            limit=limit,
+            collection_name=collection_name,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def search_sparse(self, vector, *, scope, limit, collection_name=None, timeout_seconds=None):
+        self.gate.enter()
+        return super().search_sparse(
+            vector,
+            scope=scope,
+            limit=limit,
+            collection_name=collection_name,
+            timeout_seconds=timeout_seconds,
+        )
 
 
 def build_retriever(
@@ -298,6 +386,11 @@ class HybridRetrieverTest(unittest.TestCase):
         self.assertIn("reranker", outcome.stage_ms)
         self.assertIn("adjacency", outcome.stage_ms)
         self.assertEqual(retriever._executor._max_workers, 4)
+        propagated = (
+            retriever.embedding.timeouts + retriever.gateway.timeouts + retriever.reranker.timeouts
+        )
+        self.assertTrue(propagated)
+        self.assertTrue(all(timeout is not None and 0 < timeout <= 5.0 for timeout in propagated))
 
     def test_reuses_one_persistent_executor_across_requests(self) -> None:
         retriever = self.addCleanupFor(build_retriever())
@@ -420,6 +513,178 @@ class HybridRetrieverTest(unittest.TestCase):
         self.assertEqual(retriever.gateway.dense_calls[0][1], expected_scope)
         self.assertEqual(retriever.gateway.sparse_calls[0][1], expected_scope)
         self.assertEqual(retriever.gateway.retrieve_calls[0][1], expected_scope)
+
+    def test_timeout_quarantines_busy_generation_so_a_healthy_request_can_run(self) -> None:
+        gate = NonCooperativeGate(4)
+        retriever = self.addCleanupFor(
+            build_retriever(
+                embedding=GatedEmbedding(gate),
+                sparse_encoder=GatedSparse(gate),
+                timeout=0.05,
+            )
+        )
+        errors: list[Exception] = []
+
+        def run_blocked(query: str) -> None:
+            try:
+                retriever.retrieve(request(query))
+            except Exception as error:
+                errors.append(error)
+
+        workers = [
+            threading.Thread(target=run_blocked, args=(f"blocked-{index}",)) for index in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        self.assertTrue(gate.wait_for_calls(4))
+        for worker in workers:
+            worker.join(timeout=0.3)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all(isinstance(error, HybridRetrievalTimeout) for error in errors))
+
+        started = time.monotonic()
+        try:
+            healthy = retriever.retrieve(request("healthy"))
+        finally:
+            gate.release.set()
+
+        self.assertTrue(healthy.hits)
+        self.assertLess(time.monotonic() - started, 0.2)
+
+    def test_executor_quarantine_is_bounded_and_trips_a_sanitized_bulkhead(self) -> None:
+        gate = NonCooperativeGate(100)
+        retriever = self.addCleanupFor(
+            build_retriever(
+                embedding=GatedEmbedding(gate),
+                sparse_encoder=GatedSparse(gate),
+                timeout=0.02,
+            )
+        )
+        try:
+            for index in range(3):
+                with self.assertRaises(HybridRetrievalTimeout):
+                    retriever.retrieve(request(f"stuck-{index}"))
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(HybridRetrievalError, "capacity unavailable"):
+                retriever.retrieve(request("bulkhead"))
+            self.assertLess(time.monotonic() - started, 0.05)
+            self.assertLessEqual(len(retriever._executor_generations), 3)
+        finally:
+            gate.release.set()
+
+    def test_bulkhead_recovers_after_quarantined_workers_finish(self) -> None:
+        gate = NonCooperativeGate(100)
+        retriever = self.addCleanupFor(
+            build_retriever(
+                embedding=GatedEmbedding(gate),
+                sparse_encoder=GatedSparse(gate),
+                timeout=0.02,
+            )
+        )
+        try:
+            for index in range(3):
+                with self.assertRaises(HybridRetrievalTimeout):
+                    retriever.retrieve(request(f"stuck-{index}"))
+
+            with self.assertRaisesRegex(HybridRetrievalError, "capacity unavailable"):
+                retriever.retrieve(request("bulkhead"))
+
+            gate.release.set()
+            drain_deadline = time.monotonic() + 1.0
+            while len(retriever._executor_generations) == 3 and time.monotonic() < drain_deadline:
+                time.sleep(0.005)
+
+            healthy = retriever.retrieve(request("recovered"))
+        finally:
+            gate.release.set()
+
+        self.assertTrue(healthy.hits)
+
+    def test_close_during_search_allows_inflight_request_to_finish_all_stages(self) -> None:
+        dense = tuple(candidate(f"c{index}", chunk_index=index) for index in range(24))
+        gateway = BlockingSearchGateway(dense, dense)
+        retriever = HybridRetriever(
+            embedding=RecordingEmbedding(),
+            sparse=RecordingSparse(),
+            gateway=gateway,
+            reranker=RecordingReranker(),
+            embedding_metadata=EMBEDDING,
+            reranker_metadata=RERANKER,
+            total_timeout_seconds=1.0,
+        )
+        outcomes = []
+        retrieve_errors: list[Exception] = []
+        close_errors: list[Exception] = []
+
+        def retrieve() -> None:
+            try:
+                outcomes.append(retriever.retrieve(request()))
+            except Exception as error:
+                retrieve_errors.append(error)
+
+        def close() -> None:
+            try:
+                retriever.close()
+            except Exception as error:
+                close_errors.append(error)
+
+        retrieve_thread = threading.Thread(target=retrieve)
+        retrieve_thread.start()
+        self.assertTrue(gateway.gate.wait_for_calls(2))
+        close_thread = threading.Thread(target=close)
+        close_thread.start()
+        self.assertTrue(close_thread.is_alive())
+        gateway.gate.release.set()
+        retrieve_thread.join(timeout=1.0)
+        close_thread.join(timeout=1.0)
+
+        self.assertFalse(retrieve_errors)
+        self.assertFalse(close_errors)
+        self.assertTrue(outcomes[0].hits)
+        with self.assertRaisesRegex(HybridRetrievalError, "closed"):
+            retriever.retrieve(request("after-close"))
+
+    def test_close_never_waits_for_noncooperative_timed_out_workers(self) -> None:
+        gate = NonCooperativeGate(2)
+        retriever = build_retriever(
+            embedding=GatedEmbedding(gate),
+            sparse_encoder=GatedSparse(gate),
+            timeout=0.05,
+        )
+        retrieve_errors: list[Exception] = []
+        close_errors: list[Exception] = []
+
+        def retrieve() -> None:
+            try:
+                retriever.retrieve(request())
+            except Exception as error:
+                retrieve_errors.append(error)
+
+        def close() -> None:
+            try:
+                retriever.close()
+            except Exception as error:
+                close_errors.append(error)
+
+        retrieve_thread = threading.Thread(target=retrieve)
+        retrieve_thread.start()
+        self.assertTrue(gate.wait_for_calls(2))
+        close_thread = threading.Thread(target=close)
+        close_thread.start()
+        try:
+            close_thread.join(timeout=0.2)
+            self.assertFalse(close_thread.is_alive())
+            self.assertTrue(
+                not close_errors
+                or all(isinstance(error, HybridRetrievalError) for error in close_errors)
+            )
+        finally:
+            gate.release.set()
+            retrieve_thread.join(timeout=1.0)
+            close_thread.join(timeout=1.0)
+        self.assertTrue(all(isinstance(error, HybridRetrievalTimeout) for error in retrieve_errors))
 
 
 if __name__ == "__main__":

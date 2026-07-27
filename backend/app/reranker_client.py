@@ -47,6 +47,8 @@ class RerankerTransport(Protocol):
         self,
         url: str,
         payload: Mapping[str, object],
+        *,
+        timeout_seconds: float | None = None,
     ) -> Mapping[str, object]: ...
 
     def close(self) -> None: ...
@@ -60,8 +62,16 @@ class _HttpxRerankerTransport:
         self,
         url: str,
         payload: Mapping[str, object],
+        *,
+        timeout_seconds: float | None = None,
     ) -> Mapping[str, object]:
-        response = self._client.post(url, json=dict(payload))
+        request_kwargs: dict[str, object] = {}
+        if timeout_seconds is not None:
+            request_kwargs["timeout"] = httpx.Timeout(
+                timeout_seconds,
+                connect=min(timeout_seconds, 2.0),
+            )
+        response = self._client.post(url, json=dict(payload), **request_kwargs)
         response.raise_for_status()
         try:
             result = response.json()
@@ -106,19 +116,25 @@ class SyncHttpRerankerClient:
         passages: Sequence[str],
         *,
         expected: RerankerMetadataExpectation,
+        timeout_seconds: float | None = None,
     ) -> list[float]:
         if self._closed:
             raise RerankerServiceError("reranker client is closed")
         query_value = _validate_text(query, "query")
         passage_values = _validate_passages(passages)
         expected_metadata = _metadata_from_expectation(expected)
+        request_timeout = _optional_timeout(timeout_seconds)
 
         scores: list[float] = []
         endpoint = f"{self.base_url}/rerank"
         for batch in _split_batches(query_value, passage_values):
             payload = {"query": query_value, "passages": batch}
             try:
-                raw_response = self._transport.post_json(endpoint, payload)
+                raw_response = self._transport.post_json(
+                    endpoint,
+                    payload,
+                    timeout_seconds=request_timeout,
+                )
             except RerankerClientError:
                 raise
             except httpx.HTTPStatusError as error:
@@ -210,6 +226,17 @@ def _validate_base_url(base_url: str) -> str:
     if parsed.port is not None:
         authority += f":{parsed.port}"
     return f"{parsed.scheme.lower()}://{authority}/v1"
+
+
+def _optional_timeout(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout_seconds must be positive and finite")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout_seconds must be positive and finite")
+    return timeout
 
 
 def _validate_text(value: object, field: str) -> str:

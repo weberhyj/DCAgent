@@ -162,6 +162,7 @@ class QdrantRetrievalGateway:
         scope: RetrievalScope | None,
         limit: int,
         collection_name: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[RetrievalCandidate, ...]:
         retrieval_scope = _require_scope(scope)
         dense_vector = _finite_dense_vector(vector)
@@ -173,6 +174,7 @@ class QdrantRetrievalGateway:
             limit=_positive_integer(limit, name="limit"),
             with_payload=True,
             with_vectors=False,
+            timeout=_qdrant_timeout(timeout_seconds),
         )
         return _search_candidates(response, scope=retrieval_scope, rank_kind="dense")
 
@@ -183,6 +185,7 @@ class QdrantRetrievalGateway:
         scope: RetrievalScope | None,
         limit: int,
         collection_name: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[RetrievalCandidate, ...]:
         retrieval_scope = _require_scope(scope)
         if not isinstance(vector, SparseVector):
@@ -198,6 +201,7 @@ class QdrantRetrievalGateway:
             limit=_positive_integer(limit, name="limit"),
             with_payload=True,
             with_vectors=False,
+            timeout=_qdrant_timeout(timeout_seconds),
         )
         return _search_candidates(response, scope=retrieval_scope, rank_kind="sparse")
 
@@ -207,6 +211,7 @@ class QdrantRetrievalGateway:
         *,
         scope: RetrievalScope | None,
         collection_name: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[RetrievalCandidate, ...]:
         retrieval_scope = _require_scope(scope)
         if isinstance(point_ids, (str, bytes, bytearray)):
@@ -219,6 +224,7 @@ class QdrantRetrievalGateway:
             ids=requested_ids,
             with_payload=True,
             with_vectors=False,
+            timeout=_qdrant_timeout(timeout_seconds),
         )
         by_id: dict[str, RetrievalCandidate] = {}
         for record in records:
@@ -517,6 +523,17 @@ def _positive_integer(value: object, *, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _qdrant_timeout(value: float | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout_seconds must be positive and finite")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout_seconds must be positive and finite")
+    return max(1, math.ceil(timeout))
 
 
 def _nonnegative_integer(value: object, *, name: str) -> int:

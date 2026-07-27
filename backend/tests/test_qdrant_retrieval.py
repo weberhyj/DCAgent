@@ -245,6 +245,32 @@ class QdrantRetrievalTest(unittest.TestCase):
         self.assertEqual([candidate.chunk_id for candidate in candidates], ["first", "second"])
         self.assertEqual(self.client.retrieve_calls[0].collection_name, "knowledge_chunks_current")
 
+    def test_search_and_retrieve_apply_per_request_qdrant_timeout(self) -> None:
+        point_id = str(uuid4())
+        self.client.query_points_result = [scored_point(chunk_id="a")]
+        self.client.retrieve_result = [SimpleNamespace(id=point_id, payload=payload())]
+
+        self.gateway.search_dense(
+            [1.0, 0.0],
+            scope=self.scope,
+            limit=1,
+            timeout_seconds=1.25,
+        )
+        self.gateway.search_sparse(
+            SparseVector(indices=(1,), values=(1.0,)),
+            scope=self.scope,
+            limit=1,
+            timeout_seconds=1.25,
+        )
+        self.gateway.retrieve_points(
+            [point_id],
+            scope=self.scope,
+            timeout_seconds=1.25,
+        )
+
+        self.assertEqual([call.timeout for call in self.client.query_calls], [2, 2])
+        self.assertEqual(self.client.retrieve_calls[0].timeout, 2)
+
     def test_upserts_named_vectors_and_deletes_source_with_maintenance_scope(self) -> None:
         point = models.PointStruct(
             id=str(uuid4()),

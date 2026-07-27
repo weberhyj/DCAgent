@@ -6,8 +6,8 @@ import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
-from dataclasses import dataclass, replace
-from threading import Lock
+from dataclasses import dataclass, field, replace
+from threading import Condition, RLock
 from typing import Protocol
 
 from .embedding_contracts import EmbeddingMetadataExpectation
@@ -43,6 +43,7 @@ class DenseEmbeddingClient(Protocol):
         *,
         purpose: str,
         expected: EmbeddingMetadataExpectation,
+        timeout_seconds: float | None = None,
     ) -> list[list[float]]: ...
 
 
@@ -58,6 +59,7 @@ class HybridSearchGateway(Protocol):
         scope: RetrievalScope,
         limit: int,
         collection_name: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[RetrievalCandidate, ...]: ...
 
     def search_sparse(
@@ -67,6 +69,7 @@ class HybridSearchGateway(Protocol):
         scope: RetrievalScope,
         limit: int,
         collection_name: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[RetrievalCandidate, ...]: ...
 
     def retrieve_points(
@@ -75,6 +78,7 @@ class HybridSearchGateway(Protocol):
         *,
         scope: RetrievalScope,
         collection_name: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[RetrievalCandidate, ...]: ...
 
 
@@ -85,6 +89,7 @@ class PassageReranker(Protocol):
         passages: Sequence[str],
         *,
         expected: RerankerMetadataExpectation,
+        timeout_seconds: float | None = None,
     ) -> list[float]: ...
 
 
@@ -97,6 +102,20 @@ class HybridRetrievalOutcome:
     hits: tuple[KnowledgeSearchHitModel, ...]
     stage_ms: Mapping[str, float]
     fallback_reason: str | None = None
+
+
+@dataclass(slots=True)
+class _ExecutorGeneration:
+    generation_id: int
+    executor: ThreadPoolExecutor
+    active_requests: int = 0
+    pending_futures: set[Future[object]] = field(default_factory=set)
+    quarantined: bool = False
+    shutdown_started: bool = False
+
+
+_MAX_EXECUTOR_GENERATIONS = 3
+_MAX_CLOSE_WAIT_SECONDS = 1.0
 
 
 def reciprocal_rank_fusion(
@@ -195,23 +214,48 @@ class HybridRetriever:
         if not callable(monotonic):
             raise TypeError("monotonic must be callable")
         self._monotonic = monotonic
-        self._executor = ThreadPoolExecutor(
-            max_workers=4,
-            thread_name_prefix="hybrid-retrieval",
-        )
-        self._close_lock = Lock()
+        self._lifecycle = Condition(RLock())
+        self._next_generation_id = 1
+        first_generation = self._new_generation_locked()
+        self._executor_generations = [first_generation]
+        self._active_generation: _ExecutorGeneration | None = first_generation
+        self._executor = first_generation.executor
+        self._active_request_count = 0
+        self._closing = False
         self._closed = False
 
     def close(self) -> None:
-        with self._close_lock:
+        close_deadline = time.monotonic() + min(
+            self._total_timeout_seconds,
+            _MAX_CLOSE_WAIT_SECONDS,
+        )
+        shutdown: list[ThreadPoolExecutor] = []
+        with self._lifecycle:
             if self._closed:
                 return
-            self._closed = True
-        self._executor.shutdown(wait=True, cancel_futures=True)
+            self._closing = True
+            while self._active_request_count > 0 and not self._closed:
+                remaining = close_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HybridRetrievalError("hybrid retriever close timed out") from None
+                self._lifecycle.wait(remaining)
+            if self._closed:
+                return
+            shutdown = self._finalize_close_locked()
+        self._shutdown_executors(shutdown)
 
     def retrieve(self, request: RetrievalRequest) -> HybridRetrievalOutcome:
-        if self._closed:
-            raise HybridRetrievalError("hybrid retriever is closed")
+        generation = self._acquire_request_generation()
+        try:
+            return self._retrieve(request, generation)
+        finally:
+            self._release_request_generation(generation)
+
+    def _retrieve(
+        self,
+        request: RetrievalRequest,
+        generation: _ExecutorGeneration,
+    ) -> HybridRetrievalOutcome:
         query, requested_limit = _validate_request(request)
         deadline = self._monotonic() + self._total_timeout_seconds
         stage_ms: dict[str, float] = {}
@@ -219,10 +263,11 @@ class HybridRetriever:
         stage_started = self._monotonic()
         dense_vector, sparse_vector = self._run_parallel(
             (
-                lambda: self._embed_query(query),
+                lambda: self._embed_query(query, deadline=deadline),
                 lambda: self.sparse.embed_query(query),
             ),
             deadline=deadline,
+            generation=generation,
         )
         stage_ms["embedding"] = _elapsed_ms(stage_started, self._monotonic())
 
@@ -233,14 +278,17 @@ class HybridRetriever:
                     dense_vector,
                     scope=request.scope,
                     limit=self._dense_top_k,
+                    timeout_seconds=self._remaining_timeout(deadline),
                 ),
                 lambda: self.gateway.search_sparse(
                     sparse_vector,
                     scope=request.scope,
                     limit=self._sparse_top_k,
+                    timeout_seconds=self._remaining_timeout(deadline),
                 ),
             ),
             deadline=deadline,
+            generation=generation,
         )
         stage_ms["qdrant"] = _elapsed_ms(stage_started, self._monotonic())
 
@@ -250,7 +298,12 @@ class HybridRetriever:
         stage_ms["rrf"] = _elapsed_ms(stage_started, self._monotonic())
 
         stage_started = self._monotonic()
-        reranked = self._rerank(query, fused, deadline=deadline)
+        reranked = self._rerank(
+            query,
+            fused,
+            deadline=deadline,
+            generation=generation,
+        )
         stage_ms["reranker"] = _elapsed_ms(stage_started, self._monotonic())
 
         stage_started = self._monotonic()
@@ -263,6 +316,7 @@ class HybridRetriever:
             scope=request.scope,
             limit=evidence_limit,
             deadline=deadline,
+            generation=generation,
         )
         stage_ms["adjacency"] = _elapsed_ms(stage_started, self._monotonic())
         hits = tuple(
@@ -276,11 +330,12 @@ class HybridRetriever:
             stage_ms=stage_ms,
         )
 
-    def _embed_query(self, query: str) -> list[float]:
+    def _embed_query(self, query: str, *, deadline: float | None = None) -> list[float]:
         vectors = self.embedding.embed(
             [query],
             purpose="query",
             expected=self._embedding_metadata,
+            timeout_seconds=(None if deadline is None else self._remaining_timeout(deadline)),
         )
         if len(vectors) != 1:
             raise ValueError("query embedding returned an unexpected vector count")
@@ -292,6 +347,7 @@ class HybridRetriever:
         fused: Sequence[RetrievalCandidate],
         *,
         deadline: float,
+        generation: _ExecutorGeneration,
     ) -> tuple[RetrievalCandidate, ...]:
         candidates = tuple(fused[: self._rerank_top_k])
         if not candidates:
@@ -302,8 +358,10 @@ class HybridRetriever:
                     query,
                     [item.text for item in candidates],
                     expected=self._reranker_metadata,
+                    timeout_seconds=self._remaining_timeout(deadline),
                 ),
                 deadline=deadline,
+                generation=generation,
             )
         except RerankerBusy:
             candidates = candidates[: self._degraded_rerank_top_k]
@@ -312,8 +370,10 @@ class HybridRetriever:
                     query,
                     [item.text for item in candidates],
                     expected=self._reranker_metadata,
+                    timeout_seconds=self._remaining_timeout(deadline),
                 ),
                 deadline=deadline,
+                generation=generation,
             )
         if len(scores) != len(candidates):
             raise ValueError("reranker returned an unexpected score count")
@@ -343,6 +403,7 @@ class HybridRetriever:
         scope: RetrievalScope,
         limit: int,
         deadline: float,
+        generation: _ExecutorGeneration,
     ) -> tuple[RetrievalCandidate, ...]:
         if not seeds or limit <= 0:
             return ()
@@ -372,8 +433,10 @@ class HybridRetriever:
                 lambda: self.gateway.retrieve_points(
                     [point_id for _, _, point_id in references],
                     scope=scope,
+                    timeout_seconds=self._remaining_timeout(deadline),
                 ),
                 deadline=deadline,
+                generation=generation,
             )
         adjacent_by_key = {(item.source_id, item.chunk_id): item for item in adjacent}
         adjacent_by_key.update({(item.source_id, item.chunk_id): item for item in seeds})
@@ -416,28 +479,41 @@ class HybridRetriever:
         operations: Sequence[Callable[[], object]],
         *,
         deadline: float,
+        generation: _ExecutorGeneration,
     ) -> tuple[object, ...]:
-        futures = tuple(self._executor.submit(operation) for operation in operations)
+        futures = tuple(self._submit(generation, operation) for operation in operations)
         try:
-            return tuple(self._future_result(future, deadline) for future in futures)
+            return tuple(self._future_result(future, deadline, generation) for future in futures)
         except Exception:
             for future in futures:
                 future.cancel()
             raise
 
-    def _run_one(self, operation: Callable[[], object], *, deadline: float):
-        future = self._executor.submit(operation)
+    def _run_one(
+        self,
+        operation: Callable[[], object],
+        *,
+        deadline: float,
+        generation: _ExecutorGeneration,
+    ):
+        future = self._submit(generation, operation)
         try:
-            return self._future_result(future, deadline)
+            return self._future_result(future, deadline, generation)
         except Exception:
             future.cancel()
             raise
 
-    def _future_result(self, future: Future[object], deadline: float):
+    def _future_result(
+        self,
+        future: Future[object],
+        deadline: float,
+        generation: _ExecutorGeneration,
+    ):
         remaining = self._require_time(deadline)
         try:
             return future.result(timeout=remaining)
         except TimeoutError:
+            self._quarantine_generation(generation)
             raise HybridRetrievalTimeout("hybrid retrieval deadline exceeded") from None
 
     def _require_time(self, deadline: float) -> float:
@@ -445,6 +521,141 @@ class HybridRetriever:
         if remaining <= 0:
             raise HybridRetrievalTimeout("hybrid retrieval deadline exceeded")
         return remaining
+
+    def _remaining_timeout(self, deadline: float) -> float:
+        return self._require_time(deadline)
+
+    def _acquire_request_generation(self) -> _ExecutorGeneration:
+        with self._lifecycle:
+            self._prune_generations_locked()
+            if self._closed:
+                raise HybridRetrievalError("hybrid retriever is closed")
+            if self._closing:
+                raise HybridRetrievalError("hybrid retriever is closing")
+            if (
+                self._active_generation is None
+                and len(self._executor_generations) < _MAX_EXECUTOR_GENERATIONS
+            ):
+                replacement = self._new_generation_locked()
+                self._executor_generations.append(replacement)
+                self._active_generation = replacement
+                self._executor = replacement.executor
+            generation = self._active_generation
+            if generation is None:
+                raise HybridRetrievalError("hybrid retrieval worker capacity unavailable")
+            generation.active_requests += 1
+            self._active_request_count += 1
+            return generation
+
+    def _release_request_generation(self, generation: _ExecutorGeneration) -> None:
+        shutdown: list[ThreadPoolExecutor] = []
+        with self._lifecycle:
+            generation.active_requests -= 1
+            self._active_request_count -= 1
+            if generation.quarantined and generation.active_requests == 0:
+                executor = self._start_shutdown_locked(generation)
+                if executor is not None:
+                    shutdown.append(executor)
+            self._prune_generations_locked()
+            if self._closing and self._active_request_count == 0 and not self._closed:
+                shutdown.extend(self._finalize_close_locked())
+            self._lifecycle.notify_all()
+        self._shutdown_executors(shutdown)
+
+    def _submit(
+        self,
+        generation: _ExecutorGeneration,
+        operation: Callable[[], object],
+    ) -> Future[object]:
+        with self._lifecycle:
+            if generation.active_requests <= 0 or generation.shutdown_started:
+                raise HybridRetrievalError("hybrid retrieval worker unavailable") from None
+            try:
+                future = generation.executor.submit(operation)
+            except RuntimeError:
+                raise HybridRetrievalError("hybrid retrieval worker unavailable") from None
+            generation.pending_futures.add(future)
+            future.add_done_callback(
+                lambda completed: self._future_completed(generation, completed)
+            )
+            return future
+
+    def _future_completed(
+        self,
+        generation: _ExecutorGeneration,
+        future: Future[object],
+    ) -> None:
+        with self._lifecycle:
+            generation.pending_futures.discard(future)
+            self._prune_generations_locked()
+            self._lifecycle.notify_all()
+
+    def _quarantine_generation(self, generation: _ExecutorGeneration) -> None:
+        with self._lifecycle:
+            if generation.quarantined:
+                return
+            generation.quarantined = True
+            if self._active_generation is generation:
+                self._active_generation = None
+            self._prune_generations_locked()
+            if (
+                not self._closing
+                and not self._closed
+                and self._active_generation is None
+                and len(self._executor_generations) < _MAX_EXECUTOR_GENERATIONS
+            ):
+                replacement = self._new_generation_locked()
+                self._executor_generations.append(replacement)
+                self._active_generation = replacement
+                self._executor = replacement.executor
+            self._lifecycle.notify_all()
+
+    def _new_generation_locked(self) -> _ExecutorGeneration:
+        generation_id = self._next_generation_id
+        self._next_generation_id += 1
+        return _ExecutorGeneration(
+            generation_id=generation_id,
+            executor=ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix=f"hybrid-retrieval-{generation_id}",
+            ),
+        )
+
+    def _start_shutdown_locked(
+        self,
+        generation: _ExecutorGeneration,
+    ) -> ThreadPoolExecutor | None:
+        if generation.shutdown_started:
+            return None
+        generation.shutdown_started = True
+        return generation.executor
+
+    def _finalize_close_locked(self) -> list[ThreadPoolExecutor]:
+        self._closed = True
+        self._active_generation = None
+        shutdown: list[ThreadPoolExecutor] = []
+        for generation in self._executor_generations:
+            executor = self._start_shutdown_locked(generation)
+            if executor is not None:
+                shutdown.append(executor)
+        self._lifecycle.notify_all()
+        return shutdown
+
+    def _prune_generations_locked(self) -> None:
+        self._executor_generations[:] = [
+            generation
+            for generation in self._executor_generations
+            if not (
+                generation.shutdown_started
+                and generation.active_requests == 0
+                and not generation.pending_futures
+            )
+        ]
+
+    @staticmethod
+    def _shutdown_executors(executors: Sequence[ThreadPoolExecutor]) -> None:
+        for executor in executors:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _ranked_candidates(

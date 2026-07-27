@@ -32,11 +32,13 @@ class FakeSyncTransport:
         self.scores = scores
         self.overrides = overrides or {}
         self.error = error
-        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.calls: list[tuple[str, dict[str, Any], float | None]] = []
         self.close_calls = 0
 
-    def post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        self.calls.append((url, payload))
+    def post_json(
+        self, url: str, payload: dict[str, Any], *, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
+        self.calls.append((url, payload, timeout_seconds))
         if self.error is not None:
             raise self.error
         scores = self.scores
@@ -71,7 +73,7 @@ class RecordingHttpxClient:
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.close_calls = 0
 
-    def post(self, url: str, json: dict[str, Any]) -> httpx.Response:
+    def post(self, url: str, json: dict[str, Any], **kwargs: Any) -> httpx.Response:
         self.requests.append((url, json))
         response = FakeSyncTransport().post_json(url, json)
         return httpx.Response(200, request=httpx.Request("POST", url), json=response)
@@ -99,7 +101,7 @@ class RerankerClientTest(unittest.TestCase):
 
         self.assertEqual(len(scores), 33)
         self.assertGreater(len(transport.calls), 1)
-        for _, payload in transport.calls:
+        for _, payload, _ in transport.calls:
             self.assertLessEqual(len(payload["passages"]), 32)
             encoded = json.dumps(
                 payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
@@ -192,6 +194,17 @@ class RerankerClientTest(unittest.TestCase):
         self.assertFalse(kwargs["trust_env"])
         self.assertEqual(kwargs["limits"].max_connections, 32)
         self.assertEqual(kwargs["limits"].max_keepalive_connections, 16)
+
+    def test_client_passes_per_request_timeout_to_transport(self) -> None:
+        transport = FakeSyncTransport()
+        client = SyncHttpRerankerClient(
+            "http://reranker-service:8082",
+            transport=transport,
+        )
+
+        client.rerank("q", ["p"], expected=metadata(), timeout_seconds=0.25)
+
+        self.assertEqual(transport.calls[0][2], 0.25)
 
 
 if __name__ == "__main__":
