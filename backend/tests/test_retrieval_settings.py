@@ -129,20 +129,50 @@ class RetrievalSettingsTest(unittest.TestCase):
         self.assertFalse(hasattr(settings.reranker, "normalized"))
         self.assertFalse(hasattr(settings.reranker, "encoding_profile_sha256"))
 
+    def test_rejects_final_top_k_above_degraded_rerank_top_k_in_every_mode(self) -> None:
+        for mode in RetrievalMode:
+            with self.subTest(mode=mode):
+                environ = {"RETRIEVAL_MODE": mode.value}
+                if mode is not RetrievalMode.LEGACY:
+                    environ = private_qwen_environment()
+                    environ["RETRIEVAL_MODE"] = mode.value
+                environ["RETRIEVAL_FINAL_TOP_K"] = "13"
+                environ["RETRIEVAL_DEGRADED_RERANK_TOP_K"] = "12"
+                with self.assertRaisesRegex(ValueError, "RETRIEVAL_FINAL_TOP_K"):
+                    RetrievalSettings.from_environ(environ)
+
+    def test_rejects_degraded_rerank_top_k_above_rerank_top_k_in_every_mode(self) -> None:
+        for mode in RetrievalMode:
+            with self.subTest(mode=mode):
+                environ = {"RETRIEVAL_MODE": mode.value}
+                if mode is not RetrievalMode.LEGACY:
+                    environ = private_qwen_environment()
+                    environ["RETRIEVAL_MODE"] = mode.value
+                environ["RETRIEVAL_DEGRADED_RERANK_TOP_K"] = "25"
+                environ["RETRIEVAL_RERANK_TOP_K"] = "24"
+                with self.assertRaisesRegex(ValueError, "RETRIEVAL_DEGRADED_RERANK_TOP_K"):
+                    RetrievalSettings.from_environ(environ)
+
 
 class RetrievalModelsTest(unittest.TestCase):
     def test_scope_is_stable_and_fails_closed_without_permissions(self) -> None:
         scope = RetrievalScope(
-            knowledge_base_id="finance",
-            permission_tags=("internal",),
-            publication_version="knowledge_chunks_qwen3_v1",
+            knowledge_base_id=" finance ",
+            permission_tags=(" internal ",),
+            publication_version=" knowledge_chunks_qwen3_v1 ",
         )
 
+        self.assertEqual(scope.knowledge_base_id, "finance")
+        self.assertEqual(scope.permission_tags, ("internal",))
         self.assertEqual(scope.publication_version, "knowledge_chunks_qwen3_v1")
         with self.assertRaisesRegex(ValueError, "knowledge_base_id"):
             RetrievalScope(" ", ("internal",), "v1")
         with self.assertRaisesRegex(ValueError, "permission_tags"):
             RetrievalScope("finance", (), "v1")
+        with self.assertRaisesRegex(ValueError, "permission_tags"):
+            RetrievalScope("finance", (" ",), "v1")
+        with self.assertRaisesRegex(ValueError, "publication_version"):
+            RetrievalScope("finance", ("internal",), " ")
 
     def test_outcome_keeps_retrieval_diagnostics_internal(self) -> None:
         candidate = RetrievalCandidate(

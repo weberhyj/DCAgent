@@ -192,6 +192,16 @@ class RetrievalSettings:
         total_timeout_seconds = _positive_float(environ, "RETRIEVAL_TOTAL_TIMEOUT_SECONDS", 5.0)
         shadow_percent = _percentage(environ, "RETRIEVAL_SHADOW_PERCENT", 0.0)
         canary_percent = _percentage(environ, "RETRIEVAL_CANARY_PERCENT", 100.0)
+        if degraded_rerank_top_k > rerank_top_k:
+            raise RetrievalSettingsError(
+                "RETRIEVAL_DEGRADED_RERANK_TOP_K must be less than or equal to "
+                "RETRIEVAL_RERANK_TOP_K"
+            )
+        if final_top_k > degraded_rerank_top_k:
+            raise RetrievalSettingsError(
+                "RETRIEVAL_FINAL_TOP_K must be less than or equal to "
+                "RETRIEVAL_DEGRADED_RERANK_TOP_K"
+            )
         qdrant_collection_alias = environ.get(
             "QDRANT_COLLECTION_ALIAS", "knowledge_chunks_current"
         ).strip()

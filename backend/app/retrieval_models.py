@@ -20,10 +20,18 @@ class RetrievalScope:
     publication_version: str
 
     def __post_init__(self) -> None:
-        if not self.knowledge_base_id.strip():
+        knowledge_base_id = self.knowledge_base_id.strip()
+        if not knowledge_base_id:
             raise ValueError("knowledge_base_id must not be empty")
-        if not self.permission_tags:
+        permission_tags = tuple(tag.strip() for tag in self.permission_tags)
+        if not permission_tags or any(not tag for tag in permission_tags):
             raise ValueError("permission_tags must not be empty")
+        publication_version = self.publication_version.strip()
+        if not publication_version:
+            raise ValueError("publication_version must not be empty")
+        object.__setattr__(self, "knowledge_base_id", knowledge_base_id)
+        object.__setattr__(self, "permission_tags", permission_tags)
+        object.__setattr__(self, "publication_version", publication_version)
 
 
 @dataclass(frozen=True, slots=True)
