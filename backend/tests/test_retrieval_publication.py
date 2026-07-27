@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
@@ -141,6 +142,8 @@ class RecordingGateway:
         self.alias_after_activation_failure = alias_after_activation_failure
         self.unrelated_authorized_hits = unrelated_authorized_hits
         self.wrong_point_identity_hits = wrong_point_identity_hits
+        self.activation_error_message = "ambiguous alias update failure"
+        self.restore_error_message = "restore unavailable"
         self.existing_collections: set[str] = set()
         self.resolve_calls = 0
         self.deleted_scopes: list[IndexMaintenanceScope] = []
@@ -187,7 +190,7 @@ class RecordingGateway:
         self.events.append("activate_alias")
         self.timeline.append(f"activate:{collection_name}")
         if self.fail_restore and collection_name == "knowledge_chunks_qwen3_v6":
-            raise RuntimeError("restore unavailable")
+            raise RuntimeError(self.restore_error_message)
         self.alias = collection_name
         if self.crash_after_alias_switch:
             self.crash_after_alias_switch = False
@@ -196,7 +199,7 @@ class RecordingGateway:
             self.fail_activation_call = False
             if self.alias_after_activation_failure is not None:
                 self.alias = self.alias_after_activation_failure
-            raise RuntimeError("ambiguous alias update failure")
+            raise RuntimeError(self.activation_error_message)
 
     def resolve_alias(self):
         self.resolve_calls += 1
@@ -323,6 +326,10 @@ class RecordingAudit:
         self.timeline: list[str] = []
         self.fail_next_fence_exit: str | None = None
         self.fence_exit_callback = None
+        self.alias_lock_error_message = "PRIVATE-ALIAS-LOCK-FAILURE"
+        self.fence_exit_error_message = "PRIVATE-COMMIT-FAILURE"
+        self.recovery_state_error_message: str | None = None
+        self.recover_activation_error_message: str | None = None
 
     @contextmanager
     def source_maintenance_lock(self, source_id):
@@ -341,7 +348,7 @@ class RecordingAudit:
     def alias_publication_lock(self, alias_name):
         self.timeline.append("alias-lock-wait")
         if self.fail_alias_lock:
-            raise RuntimeError("PRIVATE-ALIAS-LOCK-FAILURE")
+            raise RuntimeError(self.alias_lock_error_message)
         if self.timeline.count("alias-lock-wait") >= 2:
             self.second_alias_wait.set()
         with self.alias_lock:
@@ -364,7 +371,7 @@ class RecordingAudit:
                 self.previous = previous
             if self.fence_exit_callback is not None:
                 self.fence_exit_callback(failure_mode)
-            raise RuntimeError("PRIVATE-COMMIT-FAILURE")
+            raise RuntimeError(self.fence_exit_error_message)
 
     def create_publication(self, **values):
         publication = RetrievalPublication(
@@ -439,6 +446,8 @@ class RecordingAudit:
         )
 
     def publication_recovery_state(self, publication_id, *, fence):
+        if self.recovery_state_error_message is not None:
+            raise RuntimeError(self.recovery_state_error_message)
         target = self.publications[publication_id]
         if target.alias_name != fence.alias_name:
             raise AssertionError("alias fence mismatch")
@@ -455,6 +464,8 @@ class RecordingAudit:
         error_message,
         fence,
     ):
+        if self.recover_activation_error_message is not None:
+            raise RuntimeError(self.recover_activation_error_message)
         target = self.publications[publication_id]
         if target.alias_name != fence.alias_name:
             raise AssertionError("alias fence mismatch")
@@ -669,6 +680,21 @@ def build_real_structured_catalog() -> tuple[Database, StructuredRepository]:
 
 
 class RetrievalPublicationTest(unittest.TestCase):
+    def assert_context_free_sanitized(
+        self,
+        error: Exception,
+        *,
+        secret_marker: str,
+        expected_message: str,
+    ) -> None:
+        self.assertEqual(str(error), expected_message)
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        formatted_traceback = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+        self.assertNotIn(secret_marker, formatted_traceback)
+
     def test_build_validates_before_alias_switch(self) -> None:
         publisher = build_publisher(chunks=sample_chunks(3))
 
@@ -1452,7 +1478,7 @@ class RetrievalPublicationTest(unittest.TestCase):
         chunks[0].metadata["permission_tags"] = ["external"]
         publisher = build_publisher(chunks=chunks)
 
-        with self.assertRaisesRegex(ValueError, "outside configured"):
+        with self.assertRaisesRegex(RetrievalPublicationError, "retrieval publication failed"):
             publisher.build_and_activate("knowledge_chunks_qwen3_v1")
 
         self.assertNotIn("activate_alias", publisher.gateway.events)
@@ -1477,7 +1503,7 @@ class RetrievalPublicationTest(unittest.TestCase):
             create_timeout_after_create=True,
         )
 
-        with self.assertRaises(TimeoutError):
+        with self.assertRaisesRegex(RetrievalPublicationError, "retrieval publication failed"):
             publisher.build_and_activate("knowledge_chunks_qwen3_v7")
 
         self.assertNotIn("knowledge_chunks_qwen3_v7", publisher.gateway.existing_collections)
@@ -1495,6 +1521,32 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertIn("alias_restore_failed", captured.exception.recovery_codes)
         self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v7")
         self.assertNotIn("delete_collection", publisher.gateway.events)
+
+    def test_alias_restore_failure_is_context_free_and_redacts_raw_details(self) -> None:
+        secret_marker = "SECRET-ALIAS-RESTORE-4d91"
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.gateway.fail_activation_call = True
+        publisher.gateway.activation_error_message = secret_marker
+        publisher.gateway.fail_restore = True
+        publisher.gateway.restore_error_message = secret_marker
+
+        raised: PublicationRecoveryError | None = None
+        try:
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        except PublicationRecoveryError as error:
+            raised = error
+
+        self.assertIsNotNone(raised)
+        assert raised is not None
+        self.assert_context_free_sanitized(
+            raised,
+            secret_marker=secret_marker,
+            expected_message=(
+                "retrieval publication failed with RuntimeError; "
+                "recovery failures: alias_restore_failed"
+            ),
+        )
 
     def test_mark_failed_failure_is_combined_with_primary_failure(self) -> None:
         publisher = build_publisher(
@@ -1525,19 +1577,82 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertNotIn("activate_alias", publisher.gateway.events)
 
     def test_alias_fence_acquisition_failure_marks_publication_failed_safely(self) -> None:
+        secret_marker = "SECRET-ALIAS-FENCE-91ac"
         publisher = build_publisher(
             chunks=sample_chunks(1),
             fail_alias_lock=True,
         )
+        publisher.audit.alias_lock_error_message = secret_marker
 
-        with self.assertRaises(RetrievalPublicationError) as captured:
+        raised: RetrievalPublicationError | None = None
+        try:
             publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        except RetrievalPublicationError as error:
+            raised = error
 
-        self.assertNotIn("PRIVATE-ALIAS-LOCK-FAILURE", str(captured.exception))
+        self.assertIsNotNone(raised)
+        assert raised is not None
+        self.assert_context_free_sanitized(
+            raised,
+            secret_marker=secret_marker,
+            expected_message="retrieval publication coordination failed",
+        )
         self.assertIsNotNone(publisher.audit.publication)
         self.assertEqual(publisher.audit.publication.status, "failed")
         self.assertNotIn("create", publisher.gateway.events)
         self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_commit_reconciliation_failure_is_context_free_and_redacts_raw_details(
+        self,
+    ) -> None:
+        secret_marker = "SECRET-COMMIT-RECOVERY-0a73"
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.audit.fail_next_fence_exit = "both_target"
+        publisher.audit.fence_exit_error_message = secret_marker
+        publisher.audit.recovery_state_error_message = secret_marker
+
+        raised: PublicationRecoveryError | None = None
+        try:
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        except PublicationRecoveryError as error:
+            raised = error
+
+        self.assertIsNotNone(raised)
+        assert raised is not None
+        self.assert_context_free_sanitized(
+            raised,
+            secret_marker=secret_marker,
+            expected_message=(
+                "retrieval publication failed with RuntimeError; "
+                "recovery failures: commit_reconciliation_failed"
+            ),
+        )
+
+    def test_audit_recovery_failure_is_context_free_and_redacts_raw_details(self) -> None:
+        secret_marker = "SECRET-AUDIT-RECOVERY-b3e8"
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.audit.fail_next_fence_exit = "audit_target_alias_previous"
+        publisher.audit.fence_exit_error_message = secret_marker
+        publisher.audit.recover_activation_error_message = secret_marker
+
+        raised: PublicationRecoveryError | None = None
+        try:
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        except PublicationRecoveryError as error:
+            raised = error
+
+        self.assertIsNotNone(raised)
+        assert raised is not None
+        self.assert_context_free_sanitized(
+            raised,
+            secret_marker=secret_marker,
+            expected_message=(
+                "retrieval publication failed with RuntimeError; "
+                "recovery failures: audit_recovery_failed"
+            ),
+        )
 
     def test_structured_point_contains_safe_catalog_metadata_only(self) -> None:
         point = StructuredMetadataPointBuilder(

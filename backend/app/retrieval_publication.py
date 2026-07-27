@@ -102,6 +102,16 @@ class _AliasGenerationChangedError(RuntimeError):
     pass
 
 
+def _sanitized_build_error(error: Exception) -> RetrievalPublicationError:
+    if isinstance(error, PublicationRecoveryError):
+        return PublicationRecoveryError(error.primary_code, error.recovery_codes)
+    if isinstance(error, IndexValidationError):
+        return IndexValidationError("retrieval index validation failed")
+    if isinstance(error, RetrievalReconciliationRequiredError):
+        return RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+    return RetrievalPublicationError("retrieval publication failed")
+
+
 class PublicationRepository(Protocol):
     def list_knowledge_sources(self) -> list[KnowledgeSourceModel]: ...
 
@@ -433,6 +443,8 @@ class RetrievalIndexPublisher:
         alias_fence_acquired = False
         body_completed = False
         fence_state = _BuildFenceState()
+        exit_recovery: tuple[str | None, str | None, str] | None = None
+        sanitized_error: RetrievalPublicationError | None = None
         try:
             with self.audit.alias_publication_lock(self._alias_name) as alias_fence:
                 alias_fence_acquired = True
@@ -448,30 +460,46 @@ class RetrievalIndexPublisher:
                 body_completed = True
                 return result
         except Exception as error:
+            primary_code = error.__class__.__name__
             if alias_fence_acquired:
                 if body_completed and activate:
-                    return self._recover_fence_exit_failure(
-                        publication,
-                        previous_alias=fence_state.previous_alias,
-                        previous_publication_id=fence_state.previous_publication_id,
-                        primary_error=error,
+                    exit_recovery = (
+                        fence_state.previous_alias,
+                        fence_state.previous_publication_id,
+                        primary_code,
                     )
-                if body_completed:
-                    raise RetrievalPublicationError(
+                elif body_completed:
+                    sanitized_error = RetrievalPublicationError(
                         "retrieval publication coordination failed"
-                    ) from None
-                raise
-            try:
-                self.audit.mark_publication_failed(
-                    publication.id,
-                    error.__class__.__name__,
-                )
-            except Exception:
-                raise PublicationRecoveryError(
-                    error.__class__.__name__,
-                    ("audit_mark_failed_failed",),
-                ) from error
-            raise RetrievalPublicationError("retrieval publication coordination failed") from error
+                    )
+                else:
+                    sanitized_error = _sanitized_build_error(error)
+            else:
+                try:
+                    self.audit.mark_publication_failed(
+                        publication.id,
+                        primary_code,
+                    )
+                except Exception:
+                    sanitized_error = PublicationRecoveryError(
+                        primary_code,
+                        ("audit_mark_failed_failed",),
+                    )
+                else:
+                    sanitized_error = RetrievalPublicationError(
+                        "retrieval publication coordination failed"
+                    )
+        if exit_recovery is not None:
+            previous_alias, previous_publication_id, primary_code = exit_recovery
+            return self._recover_fence_exit_failure(
+                publication,
+                previous_alias=previous_alias,
+                previous_publication_id=previous_publication_id,
+                primary_code=primary_code,
+            )
+        if sanitized_error is not None:
+            raise sanitized_error
+        raise AssertionError("Retrieval publication build reached an invalid state")
 
     def _build_with_alias_fence(
         self,
@@ -491,6 +519,7 @@ class RetrievalIndexPublisher:
         point_count = 0
         validation_samples: list[_ValidationSample] = []
         alias_switch_attempted = False
+        sanitized_error: RetrievalPublicationError | None = None
         try:
             previous_publication = self._reconcile_alias_audit()
             previous_alias = self.gateway.resolve_alias()
@@ -516,6 +545,7 @@ class RetrievalIndexPublisher:
                 point_count += self._upsert_batch(
                     collection_name, batch, validation_samples, sample_limit
                 )
+            validation_error: IndexValidationError | None = None
             try:
                 validated_count = self.gateway.validate_collection(
                     collection_name,
@@ -527,8 +557,10 @@ class RetrievalIndexPublisher:
                     publication_version,
                     validation_samples,
                 )
-            except Exception as error:
-                raise IndexValidationError("retrieval index validation failed") from error
+            except Exception:
+                validation_error = IndexValidationError("retrieval index validation failed")
+            if validation_error is not None:
+                raise validation_error
             publication = self.audit.mark_publication_validated(
                 publication.id,
                 point_count=validated_count,
@@ -545,6 +577,7 @@ class RetrievalIndexPublisher:
             self._verify_activation(publication, collection_name)
             return publication
         except Exception as error:
+            primary_code = error.__class__.__name__
             recovery_codes: list[str] = []
             if alias_state_known and alias_switch_attempted:
                 try:
@@ -559,7 +592,7 @@ class RetrievalIndexPublisher:
             try:
                 self.audit.mark_publication_failed(
                     publication.id,
-                    error.__class__.__name__,
+                    primary_code,
                     fence=alias_fence,
                 )
             except Exception:
@@ -570,11 +603,15 @@ class RetrievalIndexPublisher:
                 except Exception:
                     recovery_codes.append("collection_cleanup_failed")
             if recovery_codes:
-                raise PublicationRecoveryError(
-                    error.__class__.__name__,
+                sanitized_error = PublicationRecoveryError(
+                    primary_code,
                     recovery_codes,
-                ) from error
-            raise
+                )
+            else:
+                sanitized_error = _sanitized_build_error(error)
+        if sanitized_error is not None:
+            raise sanitized_error
+        raise AssertionError("Retrieval publication failure handling reached an invalid state")
 
     def _recover_fence_exit_failure(
         self,
@@ -582,9 +619,8 @@ class RetrievalIndexPublisher:
         *,
         previous_alias: str | None,
         previous_publication_id: str | None,
-        primary_error: Exception,
+        primary_code: str,
     ) -> RetrievalPublication:
-        primary_code = primary_error.__class__.__name__
         for _attempt in range(2):
             try:
                 outcome = self._reconcile_fence_exit_failure(
@@ -997,22 +1033,28 @@ class RetrievalIndexPublisher:
         return publication
 
     def _reconcile_alias_audit(self) -> RetrievalPublication | None:
+        reconciliation_error: RetrievalReconciliationRequiredError | None = None
         try:
             live_collection = self.gateway.resolve_alias()
             active = self.audit.active_publication(self._alias_name)
-        except Exception as error:
-            raise RetrievalReconciliationRequiredError(
+        except Exception:
+            reconciliation_error = RetrievalReconciliationRequiredError(
                 "retrieval index reconciliation required"
-            ) from error
+            )
+        if reconciliation_error is not None:
+            raise reconciliation_error
         if live_collection is None and active is None:
             return None
         if active is not None and live_collection == active.collection_name:
+            invalid_version_error: RetrievalReconciliationRequiredError | None = None
             try:
                 collection_publication_version(active.collection_name)
-            except ValueError as error:
-                raise RetrievalReconciliationRequiredError(
+            except ValueError:
+                invalid_version_error = RetrievalReconciliationRequiredError(
                     "retrieval index reconciliation required"
-                ) from error
+                )
+            if invalid_version_error is not None:
+                raise invalid_version_error
             return active
         raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
 
@@ -1030,41 +1072,53 @@ class RetrievalIndexPublisher:
         if publication is None:
             raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
         self._require_live_alias(publication.collection_name)
+        invalid_version_error: RetrievalReconciliationRequiredError | None = None
         try:
             collection_publication_version(publication.collection_name)
-        except ValueError as error:
-            raise RetrievalReconciliationRequiredError(
+        except ValueError:
+            invalid_version_error = RetrievalReconciliationRequiredError(
                 "retrieval index reconciliation required"
-            ) from error
+            )
+        if invalid_version_error is not None:
+            raise invalid_version_error
         return publication
 
     def _destructive_publication(self) -> RetrievalPublication | None:
+        reconciliation_error: RetrievalReconciliationRequiredError | None = None
         try:
             live_collection = self.gateway.resolve_alias()
             publication = self.audit.active_publication(self._alias_name)
-        except Exception as error:
-            raise RetrievalReconciliationRequiredError(
+        except Exception:
+            reconciliation_error = RetrievalReconciliationRequiredError(
                 "retrieval index reconciliation required"
-            ) from error
+            )
+        if reconciliation_error is not None:
+            raise reconciliation_error
         if live_collection is None and publication is None:
             return None
         if publication is None or live_collection != publication.collection_name:
             raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+        invalid_version_error: RetrievalReconciliationRequiredError | None = None
         try:
             collection_publication_version(publication.collection_name)
-        except ValueError as error:
-            raise RetrievalReconciliationRequiredError(
+        except ValueError:
+            invalid_version_error = RetrievalReconciliationRequiredError(
                 "retrieval index reconciliation required"
-            ) from error
+            )
+        if invalid_version_error is not None:
+            raise invalid_version_error
         return publication
 
     def _require_live_alias(self, expected_collection: str) -> None:
+        reconciliation_error: RetrievalReconciliationRequiredError | None = None
         try:
             live_collection = self.gateway.resolve_alias()
-        except Exception as error:
-            raise RetrievalReconciliationRequiredError(
+        except Exception:
+            reconciliation_error = RetrievalReconciliationRequiredError(
                 "retrieval index reconciliation required"
-            ) from error
+            )
+        if reconciliation_error is not None:
+            raise reconciliation_error
         if live_collection != expected_collection:
             raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
 
