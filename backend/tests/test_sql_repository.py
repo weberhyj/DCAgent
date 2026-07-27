@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from app.database import Database
 from app.models import KnowledgeChunkModel
+from app.repository import InMemoryChatRepository
 from app.seed import build_seed_state
 from app.sql_repository import SqlChatRepository
 
@@ -216,6 +217,67 @@ class SqlRepositoryTest(unittest.TestCase):
             filtered_hits = self.repository.search_knowledge_chunks("回款风险", limit=1)
 
         self.assertEqual(filtered_hits, [])
+
+    def test_chunk_metadata_round_trips_through_sql_repository(self) -> None:
+        self.repository.add_uploaded_knowledge_source(
+            source_id="source-metadata",
+            name="policy.txt",
+            source_type="TXT",
+            classification="internal",
+            records=0,
+            file_path="policy.txt",
+            file_size=64,
+            mime_type="text/plain",
+        )
+        chunk = KnowledgeChunkModel(
+            id="chunk-metadata-1",
+            source_id="source-metadata",
+            chunk_index=0,
+            text="body",
+            token_count=1,
+            metadata={"section_title": "Policy", "page_number": 3},
+        )
+
+        self.repository.complete_knowledge_source_indexing("source-metadata", [chunk])
+
+        stored = SqlChatRepository(self.database).list_knowledge_chunks("source-metadata")[0]
+        self.assertEqual(stored.metadata, {"section_title": "Policy", "page_number": 3})
+
+    def test_chunk_metadata_defaults_and_round_trips_through_memory_repository(self) -> None:
+        repository = InMemoryChatRepository(build_seed_state())
+        repository.add_uploaded_knowledge_source(
+            source_id="source-memory-metadata",
+            name="policy.txt",
+            source_type="TXT",
+            classification="internal",
+            records=0,
+            file_path="policy.txt",
+            file_size=64,
+            mime_type="text/plain",
+        )
+        default_chunk = KnowledgeChunkModel(
+            id="chunk-default-metadata",
+            source_id="source-memory-metadata",
+            chunk_index=0,
+            text="default",
+            token_count=1,
+        )
+        metadata_chunk = KnowledgeChunkModel(
+            id="chunk-memory-metadata",
+            source_id="source-memory-metadata",
+            chunk_index=1,
+            text="body",
+            token_count=1,
+            metadata={"slide_number": 4},
+        )
+
+        repository.complete_knowledge_source_indexing(
+            "source-memory-metadata", [default_chunk, metadata_chunk]
+        )
+
+        stored = repository.list_knowledge_chunks("source-memory-metadata")
+        self.assertEqual(stored[0].metadata, {})
+        self.assertEqual(stored[1].metadata, {"slide_number": 4})
 
     def test_ranks_travel_receipt_materials_for_business_synonyms(self) -> None:
         self.repository.add_uploaded_knowledge_source(

@@ -299,8 +299,63 @@ class KnowledgeChunkRecord(Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(JSON)
+    chunk_metadata: Mapped[dict[str, object]] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
 
     source: Mapped[KnowledgeSourceRecord] = relationship(back_populates="chunks")
+
+
+class RetrievalPublicationRecord(Base):
+    __tablename__ = "retrieval_publications"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    collection_name: Mapped[str] = mapped_column(String(240), nullable=False, unique=True)
+    alias_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    embedding_model_version: Mapped[str] = mapped_column(String(120), nullable=False)
+    sparse_profile_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    point_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(40), nullable=False)
+    completed_at: Mapped[str | None] = mapped_column(String(40))
+
+
+class RetrievalSourceIndexRecord(Base):
+    __tablename__ = "retrieval_source_indexes"
+
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    publication_id: Mapped[str | None] = mapped_column(
+        ForeignKey("retrieval_publications.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    indexed_chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[str] = mapped_column(String(40), nullable=False)
+
+
+class RetrievalShadowComparisonRecord(Base):
+    __tablename__ = "retrieval_shadow_comparisons"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    routing_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    legacy_chunk_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    qwen_chunk_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    legacy_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    qwen_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    fallback_reason: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
 
 
 class StructuredPreviewRecord(Base):
@@ -459,6 +514,7 @@ class Database:
         Base.metadata.create_all(self.engine)
         self._ensure_knowledge_source_upload_columns()
         self._ensure_knowledge_chunk_embedding_column()
+        self._ensure_knowledge_chunk_metadata_column()
         self._ensure_evaluation_columns()
         self._ensure_evaluation_run_counter()
 
@@ -496,6 +552,20 @@ class Database:
 
         with self.engine.begin() as connection:
             connection.execute(text("ALTER TABLE knowledge_chunks ADD COLUMN embedding JSON"))
+
+    def _ensure_knowledge_chunk_metadata_column(self) -> None:
+        inspector = inspect(self.engine)
+        if not inspector.has_table("knowledge_chunks"):
+            return
+
+        columns = {column["name"] for column in inspector.get_columns("knowledge_chunks")}
+        if "metadata" in columns:
+            return
+
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE knowledge_chunks ADD COLUMN metadata JSON NOT NULL DEFAULT '{}'")
+            )
 
     def _ensure_evaluation_columns(self) -> None:
         inspector = inspect(self.engine)

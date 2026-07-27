@@ -205,6 +205,7 @@ def ensure_chunk_embedding(
         text=chunk.text,
         token_count=chunk.token_count,
         embedding=provider.embed(chunk.text),
+        metadata=deepcopy(chunk.metadata),
     )
 
 

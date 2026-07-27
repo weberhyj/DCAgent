@@ -12,6 +12,7 @@ from alembic import command
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 REVISION = "20260715_00"
+QWEN3_RETRIEVAL_REVISION = "20260727_04"
 
 EXPECTED_COLUMNS: dict[str, tuple[tuple[str, str, bool, bool], ...]] = {
     "agent_runs": (
@@ -199,6 +200,144 @@ def make_config(database_url: str) -> Config:
 
 
 class AlembicBaselineTest(unittest.TestCase):
+    def test_qwen3_retrieval_schema_is_present_after_head_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite+pysqlite:///{(Path(temp_dir) / 'retrieval.db').as_posix()}"
+            command.upgrade(make_config(database_url), "head")
+
+            engine = create_engine(database_url)
+            try:
+                inspector = inspect(engine)
+                self.assertEqual(
+                    {
+                        "retrieval_publications",
+                        "retrieval_source_indexes",
+                        "retrieval_shadow_comparisons",
+                    },
+                    {
+                        table
+                        for table in inspector.get_table_names()
+                        if table.startswith("retrieval_")
+                    },
+                )
+                chunk_columns = {
+                    column["name"]: column for column in inspector.get_columns("knowledge_chunks")
+                }
+                self.assertFalse(chunk_columns["metadata"]["nullable"])
+                self.assertIn("{}", chunk_columns["metadata"]["default"])
+
+                expected_columns = {
+                    "retrieval_publications": (
+                        "id",
+                        "collection_name",
+                        "alias_name",
+                        "status",
+                        "embedding_model_version",
+                        "sparse_profile_sha256",
+                        "dimensions",
+                        "point_count",
+                        "error_message",
+                        "created_at",
+                        "completed_at",
+                    ),
+                    "retrieval_source_indexes": (
+                        "source_id",
+                        "publication_id",
+                        "status",
+                        "indexed_chunk_count",
+                        "error_message",
+                        "updated_at",
+                    ),
+                    "retrieval_shadow_comparisons": (
+                        "id",
+                        "request_id",
+                        "routing_key_hash",
+                        "query_hash",
+                        "legacy_chunk_ids",
+                        "qwen_chunk_ids",
+                        "legacy_ms",
+                        "qwen_ms",
+                        "status",
+                        "fallback_reason",
+                        "created_at",
+                    ),
+                }
+                for table_name, columns in expected_columns.items():
+                    self.assertEqual(
+                        columns,
+                        tuple(column["name"] for column in inspector.get_columns(table_name)),
+                    )
+
+                expected_indexes = {
+                    "retrieval_publications": {"ix_retrieval_publications_status"},
+                    "retrieval_source_indexes": {"ix_retrieval_source_indexes_status"},
+                    "retrieval_shadow_comparisons": {
+                        "ix_retrieval_shadow_comparisons_created_at",
+                        "ix_retrieval_shadow_comparisons_status",
+                    },
+                }
+                for table_name, index_names in expected_indexes.items():
+                    self.assertEqual(
+                        index_names,
+                        {index["name"] for index in inspector.get_indexes(table_name)},
+                    )
+
+                source_foreign_keys = {
+                    (
+                        tuple(foreign_key["constrained_columns"]),
+                        foreign_key["referred_table"],
+                        tuple(foreign_key["referred_columns"]),
+                        foreign_key["options"].get("ondelete"),
+                    )
+                    for foreign_key in inspector.get_foreign_keys("retrieval_source_indexes")
+                }
+                self.assertEqual(
+                    {
+                        (("source_id",), "knowledge_sources", ("id",), "CASCADE"),
+                        (("publication_id",), "retrieval_publications", ("id",), "SET NULL"),
+                    },
+                    source_foreign_keys,
+                )
+                unique_constraints = {
+                    (constraint["name"], tuple(constraint["column_names"]))
+                    for constraint in inspector.get_unique_constraints("retrieval_publications")
+                }
+                self.assertIn((None, ("collection_name",)), unique_constraints)
+                shadow_unique_constraints = {
+                    tuple(constraint["column_names"])
+                    for constraint in inspector.get_unique_constraints(
+                        "retrieval_shadow_comparisons"
+                    )
+                }
+                self.assertIn(("request_id",), shadow_unique_constraints)
+                with engine.connect() as connection:
+                    self.assertEqual(
+                        QWEN3_RETRIEVAL_REVISION,
+                        connection.scalar(text("SELECT version_num FROM alembic_version")),
+                    )
+            finally:
+                engine.dispose()
+
+    def test_qwen3_retrieval_downgrade_removes_tables_before_chunk_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite+pysqlite:///{(Path(temp_dir) / 'downgrade.db').as_posix()}"
+            config = make_config(database_url)
+            command.upgrade(config, "head")
+            command.downgrade(config, "20260722_03")
+
+            engine = create_engine(database_url)
+            try:
+                inspector = inspect(engine)
+                self.assertFalse(
+                    any(table.startswith("retrieval_") for table in inspector.get_table_names())
+                )
+                self.assertNotIn(
+                    "metadata",
+                    {column["name"] for column in inspector.get_columns("knowledge_chunks")},
+                )
+            finally:
+                engine.dispose()
+
     def test_structured_job_sequence_is_present_after_head_migration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_url = f"sqlite+pysqlite:///{(Path(temp_dir) / 'sequence.db').as_posix()}"

@@ -118,6 +118,7 @@ class KnowledgeChunkModel:
     text: str
     token_count: int
     embedding: list[float] | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

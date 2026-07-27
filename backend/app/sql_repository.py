@@ -243,6 +243,7 @@ def knowledge_chunk_from_record(record: KnowledgeChunkRecord) -> KnowledgeChunkM
         text=record.text,
         token_count=record.token_count,
         embedding=record.embedding,
+        metadata=record.chunk_metadata,
     )
 
 
@@ -1223,6 +1224,7 @@ class SqlChatRepository:
                         text=chunk.text,
                         token_count=chunk.token_count,
                         embedding=chunk.embedding,
+                        chunk_metadata=chunk.metadata,
                     )
                 )
             source.records = len(embedded_chunks)

@@ -232,7 +232,7 @@ class LazyStartupTest(unittest.TestCase):
                 "CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)"
             )
             connection.exec_driver_sql(
-                "INSERT INTO alembic_version (version_num) VALUES ('20260722_03')"
+                "INSERT INTO alembic_version (version_num) VALUES ('20260727_04')"
             )
 
         class FakeResponse:

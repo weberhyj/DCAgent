@@ -16,7 +16,7 @@ from app.database import Database
 from app.migration_entrypoint import BaselineSchemaMismatch, run_migrations
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-CURRENT_REVISION = "20260722_03"
+CURRENT_REVISION = "20260727_04"
 
 
 def sqlite_url(path: Path) -> str:
@@ -1175,7 +1175,7 @@ class MigrationEntrypointTest(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 BaselineSchemaMismatch,
-                r"extra tables: structured_columns",
+                r"extra tables: retrieval_publications",
             ):
                 run_migrations(
                     database_url=database_url,
