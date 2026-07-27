@@ -84,6 +84,8 @@ from .repository import (
 from .retrieval import is_reliable_knowledge_score, resolve_effective_retrieval_min_score
 
 if TYPE_CHECKING:
+    from .retrieval_models import RetrievalScope
+    from .retrieval_router import RetrievalRouter
     from .structured_answer import StructuredAnswerService
 
 
@@ -413,10 +415,14 @@ class SqlChatRepository:
         *,
         owns_database: bool = False,
         retrieval_permission_tags: Sequence[str] = (),
+        retrieval_router: RetrievalRouter | None = None,
+        retrieval_scope: RetrievalScope | None = None,
     ) -> None:
         self._database = database
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service
+        self.retrieval_router = retrieval_router
+        self._retrieval_scope = retrieval_scope
         self._owns_database = owns_database
         if isinstance(retrieval_permission_tags, (str, bytes, bytearray)):
             raise TypeError("retrieval_permission_tags must be a sequence")
@@ -427,7 +433,7 @@ class SqlChatRepository:
         self._closed = False
         self._agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
-                search_knowledge=self.search_knowledge_chunks,
+                search_knowledge=self._search_routed_knowledge_chunks,
                 inspect_document=self.list_knowledge_chunks,
             ),
             llm_provider=self._llm_provider,
@@ -1363,6 +1369,26 @@ class SqlChatRepository:
                 limit,
                 effective_minimum_score,
             )
+
+    def _search_routed_knowledge_chunks(
+        self,
+        query: str,
+        limit: int,
+        routing_key: str,
+    ) -> list[KnowledgeSearchHitModel]:
+        if self.retrieval_router is None or self._retrieval_scope is None:
+            return self.search_knowledge_chunks(query, limit)
+        from .retrieval_models import RetrievalRequest
+
+        outcome = self.retrieval_router.search(
+            RetrievalRequest(
+                query=query,
+                limit=limit,
+                routing_key=routing_key,
+                scope=self._retrieval_scope,
+            )
+        )
+        return list(outcome.hits)
 
     def _bundle(
         self, active_conversation_id: str

@@ -88,7 +88,7 @@ class AgentRunAudit:
 
 @dataclass(slots=True)
 class KnowledgeAgentTools:
-    search_knowledge: Callable[[str, int], list[KnowledgeSearchHitModel]]
+    search_knowledge: Callable[[str, int, str], list[KnowledgeSearchHitModel]]
     inspect_document: Callable[[str], list[KnowledgeChunkModel]]
 
 
@@ -312,7 +312,7 @@ class ReadOnlyKnowledgeAgent:
 
     def _search(self, state: AgentState) -> dict:
         query = state["search_queries"][state["query_index"]]
-        hits = self.tools.search_knowledge(query, self.max_hits)
+        hits = self.tools.search_knowledge(query, self.max_hits, state["conversation_id"])
         merged = merge_ranked_hits(state["knowledge_hits"], hits, self.max_hits)
         source_ids = list(dict.fromkeys(hit.source.id for hit in hits))
         step = self._step(

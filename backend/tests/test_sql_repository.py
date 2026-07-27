@@ -4,9 +4,12 @@ import os
 import unittest
 from unittest.mock import patch
 
+from app.agent import AgentRunResult
 from app.database import Database
-from app.models import KnowledgeChunkModel
+from app.models import ChatMessageModel, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
+from app.retrieval_models import RetrievalMode, RetrievalScope
+from app.retrieval_router import RoutedRetrievalOutcome
 from app.seed import build_seed_state
 from app.sql_repository import SqlChatRepository
 
@@ -349,6 +352,84 @@ class SqlRepositoryTest(unittest.TestCase):
 
         self.assertEqual([hit.source.id for hit in hits], ["kb-allowed"])
         self.assertTrue(hasattr(scoped, "_search_legacy_knowledge_chunks"))
+
+    def test_agent_uses_conversation_id_as_retrieval_routing_key(self) -> None:
+        class RecordingRouter:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def search(self, request):
+                self.requests.append(request)
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.LEGACY,
+                    hits=(),
+                    stage_ms={},
+                )
+
+        router = RecordingRouter()
+        repository = SqlChatRepository(
+            self.database,
+            retrieval_router=router,
+            retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "policy question", "quick")
+
+        self.assertEqual(len(router.requests), 1)
+        self.assertEqual(router.requests[0].routing_key, conversation_id)
+        self.assertEqual(router.requests[0].query, "policy question")
+
+    def test_structured_answer_path_remains_before_retrieval_router(self) -> None:
+        class NeverRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, request):
+                self.calls += 1
+                raise AssertionError(f"router must not receive structured request {request}")
+
+        class StructuredService:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def try_answer(self, *, conversation_id, content, mode, previous_messages):
+                del content, previous_messages
+                self.calls += 1
+                return AgentRunResult(
+                    id="structured-run-1",
+                    conversation_id=conversation_id,
+                    query="redacted structured query",
+                    mode=mode,
+                    status="completed",
+                    started_at="2026-07-28 10:00:00",
+                    completed_at="2026-07-28 10:00:01",
+                    reply=ChatMessageModel(
+                        id="structured-reply-1",
+                        role="assistant",
+                        time="2026-07-28 10:00:01",
+                        content="42",
+                    ),
+                    steps=[],
+                    evidence_count=0,
+                    source_count=0,
+                )
+
+        router = NeverRouter()
+        structured = StructuredService()
+        repository = SqlChatRepository(
+            self.database,
+            structured_service=structured,
+            retrieval_router=router,
+            retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(conversation_id, "average sales", "quick")
+
+        self.assertEqual(structured.calls, 1)
+        self.assertEqual(router.calls, 0)
+        self.assertEqual(messages[-1].content, "42")
 
 
 if __name__ == "__main__":

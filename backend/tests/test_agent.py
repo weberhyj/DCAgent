@@ -71,8 +71,15 @@ class AgentTest(unittest.TestCase):
         finance_chunk = chunk("kb-finance", 0, "票据材料包括发票、行程单和审批记录。")
         search_calls: list[str] = []
 
-        def search(query: str, limit: int) -> list[KnowledgeSearchHitModel]:
+        routing_keys: list[str] = []
+
+        def search(
+            query: str,
+            limit: int,
+            routing_key: str,
+        ) -> list[KnowledgeSearchHitModel]:
             search_calls.append(query)
+            routing_keys.append(routing_key)
             if len(search_calls) == 1:
                 return [hit(policy, policy_chunk, 0.8)]
             return [hit(finance, finance_chunk, 8.2)]
@@ -94,6 +101,7 @@ class AgentTest(unittest.TestCase):
         )
 
         self.assertEqual(len(search_calls), 2)
+        self.assertEqual(routing_keys, ["conv-agent", "conv-agent"])
         self.assertNotEqual(search_calls[0], search_calls[1])
         self.assertEqual(result.reply.id, "msg-agent-answer")
         self.assertIsNotNone(provider.request)
@@ -121,7 +129,7 @@ class AgentTest(unittest.TestCase):
         provider = RecordingProvider()
         agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
-                search_knowledge=lambda query, limit: [policy_hit, finance_hit],
+                search_knowledge=lambda query, limit, routing_key: [policy_hit, finance_hit],
                 inspect_document=inspect,
             ),
             llm_provider=provider,
@@ -147,7 +155,7 @@ class AgentTest(unittest.TestCase):
         provider = RecordingProvider()
         agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
-                search_knowledge=lambda query, limit: [],
+                search_knowledge=lambda query, limit, routing_key: [],
                 inspect_document=lambda source_id: self.fail(
                     "empty search must not inspect a document"
                 ),
