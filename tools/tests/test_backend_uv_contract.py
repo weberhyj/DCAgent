@@ -99,7 +99,9 @@ class BackendUvContractTest(unittest.TestCase):
         self.assert_exact_requirements(
             project["dependencies"],
             {
+                "alembic>=1.16,<2",
                 "asynctor>=0.13.2",
+                "clickhouse-connect>=0.8,<1",
                 "fastapi>=0.116.0",
                 "gunicorn>=26.0.0",
                 "httpx>=0.28.0",
@@ -109,6 +111,8 @@ class BackendUvContractTest(unittest.TestCase):
                 "pypdf>=5.0.0",
                 "python-docx>=1.1.0",
                 "python-multipart>=0.0.20",
+                "redis>=5,<7",
+                "sqlglot>=27,<30",
                 "sqlalchemy>=2.0.0",
                 "uvicorn[standard]>=0.35.0",
             },
@@ -120,10 +124,7 @@ class BackendUvContractTest(unittest.TestCase):
         self.assert_exact_requirements(
             dependency_groups["offline"],
             {
-                "alembic>=1.16,<2",
-                "clickhouse-connect>=0.8,<1",
                 "qdrant-client>=1.14,<2",
-                "redis>=5,<7",
                 "polars>=1.30,<2",
                 "pyarrow>=19,<22",
                 "pyxlsb>=1.0,<2",
@@ -131,7 +132,6 @@ class BackendUvContractTest(unittest.TestCase):
                 "paddlepaddle>=3,<4",
                 "paddleocr>=3,<4",
                 "jieba>=0.42,<1",
-                "sqlglot>=27,<30",
                 "FlagEmbedding>=1.3,<2",
                 "onnxruntime>=1.22,<2",
                 "psycopg[binary]>=3.2,<4",
@@ -158,7 +158,27 @@ class BackendUvContractTest(unittest.TestCase):
 
         self.assert_exact_requirements(
             dependency_groups["dev"],
-            {"alembic>=1.16,<2", "fastapi-cli>=0.0.32"},
+            {"fastapi-cli>=0.0.32"},
+        )
+
+    def test_api_runtime_dependencies_are_available_without_dependency_groups(self) -> None:
+        pyproject = self.load_pyproject()
+        dependency_names = {
+            self.requirement_name_and_specifier(requirement)[0]
+            for requirement in pyproject["project"]["dependencies"]
+        }
+        required_runtime_dependencies = {
+            "alembic",
+            "clickhouse-connect",
+            "redis",
+            "sqlglot",
+        }
+
+        self.assertEqual(
+            set(),
+            required_runtime_dependencies - dependency_names,
+            "uv sync --no-dev must install every dependency used by API import, startup, "
+            "health checks, and the optional structured-query route",
         )
 
     def test_uv_lock_matches_project_dependency_metadata(self) -> None:
