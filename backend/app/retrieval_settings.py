@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -18,6 +19,32 @@ class RetrievalSettingsError(ValueError):
 _EMBEDDING_NAME = "Qwen/Qwen3-Embedding-0.6B"
 _RERANKER_NAME = "Qwen/Qwen3-Reranker-0.6B"
 _QWEN3_DIMENSIONS = 1024
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class RerankerModelSettings:
+    """Pinned identity and prompt profile for the private Reranker service."""
+
+    name: str
+    version: str
+    sha256: str
+    prompt_profile_sha256: str
+    protocol_version: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("name", "version", "protocol_version"):
+            value = getattr(self, field_name).strip()
+            if not value:
+                raise ValueError(f"{field_name} must not be empty")
+            object.__setattr__(self, field_name, value)
+        for field_name in ("sha256", "prompt_profile_sha256"):
+            value = getattr(self, field_name).strip()
+            if _SHA256_PATTERN.fullmatch(value) is None:
+                raise ValueError(
+                    f"{field_name} must be exactly 64 lowercase hexadecimal characters"
+                )
+            object.__setattr__(self, field_name, value)
 
 
 def _required(environ: Mapping[str, str], key: str) -> str:
@@ -70,7 +97,7 @@ def _permission_tags(environ: Mapping[str, str]) -> tuple[str, ...]:
     return tags
 
 
-def _model_metadata(
+def _embedding_metadata(
     environ: Mapping[str, str],
     *,
     prefix: str,
@@ -105,6 +132,22 @@ def _model_metadata(
         raise RetrievalSettingsError(str(error)) from error
 
 
+def _reranker_metadata(environ: Mapping[str, str]) -> RerankerModelSettings:
+    name = _required(environ, "RERANKER_MODEL_NAME")
+    if name != _RERANKER_NAME:
+        raise RetrievalSettingsError(f"RERANKER_MODEL_NAME must be {_RERANKER_NAME}")
+    try:
+        return RerankerModelSettings(
+            name=name,
+            version=_required(environ, "RERANKER_MODEL_VERSION"),
+            sha256=_required(environ, "RERANKER_MODEL_SHA256"),
+            prompt_profile_sha256=_required(environ, "RERANKER_PROMPT_PROFILE_SHA256"),
+            protocol_version=_required(environ, "RERANKER_PROTOCOL_VERSION"),
+        )
+    except ValueError as error:
+        raise RetrievalSettingsError(str(error)) from error
+
+
 @dataclass(frozen=True, slots=True)
 class RetrievalSettings:
     mode: RetrievalMode
@@ -124,7 +167,7 @@ class RetrievalSettings:
     embedding_service_url: str | None
     reranker_service_url: str | None
     embedding: EmbeddingModelMetadata | None
-    reranker: EmbeddingModelMetadata | None
+    reranker: RerankerModelSettings | None
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> RetrievalSettings:
@@ -210,14 +253,10 @@ class RetrievalSettings:
             qdrant_collection_alias=qdrant_collection_alias,
             embedding_service_url=embedding_service_url,
             reranker_service_url=reranker_service_url,
-            embedding=_model_metadata(
+            embedding=_embedding_metadata(
                 environ,
                 prefix="EMBEDDING",
                 expected_name=_EMBEDDING_NAME,
             ),
-            reranker=_model_metadata(
-                environ,
-                prefix="RERANKER",
-                expected_name=_RERANKER_NAME,
-            ),
+            reranker=_reranker_metadata(environ),
         )

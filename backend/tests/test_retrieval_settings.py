@@ -24,9 +24,7 @@ def private_qwen_environment() -> dict[str, str]:
         "RERANKER_MODEL_NAME": "Qwen/Qwen3-Reranker-0.6B",
         "RERANKER_MODEL_VERSION": "1.0.0",
         "RERANKER_MODEL_SHA256": checksum,
-        "RERANKER_MODEL_DIMENSIONS": "1024",
-        "RERANKER_MODEL_NORMALIZED": "true",
-        "RERANKER_ENCODING_PROFILE_SHA256": checksum,
+        "RERANKER_PROMPT_PROFILE_SHA256": checksum,
         "RERANKER_PROTOCOL_VERSION": "v1",
     }
 
@@ -46,6 +44,7 @@ class RetrievalSettingsTest(unittest.TestCase):
         self.assertEqual(settings.embedding.name, "Qwen/Qwen3-Embedding-0.6B")
         self.assertEqual(settings.embedding.dimensions, 1024)
         self.assertEqual(settings.reranker.name, "Qwen/Qwen3-Reranker-0.6B")
+        self.assertEqual(settings.reranker.prompt_profile_sha256, "a" * 64)
         self.assertEqual(settings.knowledge_base_id, "default")
         self.assertEqual(settings.permission_tags, ("internal", "restricted"))
         self.assertEqual(settings.qdrant_collection_alias, "knowledge_chunks_current")
@@ -114,9 +113,7 @@ class RetrievalSettingsTest(unittest.TestCase):
             "RERANKER_MODEL_VERSION",
             "RERANKER_MODEL_NAME",
             "RERANKER_MODEL_SHA256",
-            "RERANKER_MODEL_DIMENSIONS",
-            "RERANKER_MODEL_NORMALIZED",
-            "RERANKER_ENCODING_PROFILE_SHA256",
+            "RERANKER_PROMPT_PROFILE_SHA256",
             "RERANKER_PROTOCOL_VERSION",
         ):
             with self.subTest(key=key):
@@ -124,6 +121,13 @@ class RetrievalSettingsTest(unittest.TestCase):
                 del environ[key]
                 with self.assertRaisesRegex(ValueError, key):
                     RetrievalSettings.from_environ(environ)
+
+    def test_reranker_does_not_require_embedding_only_metadata(self) -> None:
+        settings = RetrievalSettings.from_environ(private_qwen_environment())
+
+        self.assertFalse(hasattr(settings.reranker, "dimensions"))
+        self.assertFalse(hasattr(settings.reranker, "normalized"))
+        self.assertFalse(hasattr(settings.reranker, "encoding_profile_sha256"))
 
 
 class RetrievalModelsTest(unittest.TestCase):
