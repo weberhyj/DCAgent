@@ -4,6 +4,7 @@ import math
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Literal
 
 from .evaluation import (
@@ -264,16 +265,18 @@ def evaluate_retrieval_quality(
     valid_recall = _unit_interval(recall_at_50)
     valid_legacy_ndcg = _unit_interval(legacy_ndcg_at_8)
     valid_qwen_ndcg = _unit_interval(qwen3_ndcg_at_8)
-    delta = (
-        round(qwen3_ndcg_at_8 - legacy_ndcg_at_8, 4)
+    raw_delta = (
+        Decimal(str(qwen3_ndcg_at_8)) - Decimal(str(legacy_ndcg_at_8))
         if valid_legacy_ndcg and valid_qwen_ndcg
-        else 0.0
+        else Decimal(0)
     )
+    delta = round(float(raw_delta), 4)
+    improvement_target_met = valid_legacy_ndcg and valid_qwen_ndcg and raw_delta >= Decimal("0.05")
     if not valid_recall or recall_at_50 < 0.90:
         failed.append("recall_at_50")
     if not valid_legacy_ndcg or not valid_qwen_ndcg or qwen3_ndcg_at_8 < legacy_ndcg_at_8:
         failed.append("ndcg_at_8_not_worse_than_legacy")
-    if not valid_legacy_ndcg or not valid_qwen_ndcg or delta < 0.05:
+    if not improvement_target_met:
         failed.append("ndcg_at_8_improvement_target")
     for name, value in (
         ("critical_top_8_regressions", critical_top_8_regressions),
@@ -287,7 +290,7 @@ def evaluate_retrieval_quality(
         failed_gates=tuple(failed),
         ndcg_at_8_delta=delta,
         ndcg_improvement_target=0.05,
-        ndcg_improvement_target_met=delta >= 0.05,
+        ndcg_improvement_target_met=improvement_target_met,
     )
 
 

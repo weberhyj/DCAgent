@@ -8,15 +8,21 @@ model or connects unless HYBRID_E2E=1 is explicitly set.
 from __future__ import annotations
 
 import os
+import re
 import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import httpx
 
 LIVE_ENABLED = os.environ.get("HYBRID_E2E") == "1"
+_NUMERIC_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_.,])[-+]?(?:(?:\d{1,3}(?:,\d{3})+)|\d+)"
+    r"(?:\.\d+)?(?:[eE][+-]?\d+)?(?![A-Za-z0-9_]|[.,]\d)"
+)
 
 
 class _FakeResponse:
@@ -78,6 +84,8 @@ class HybridE2EContractTest(unittest.TestCase):
 
     def test_exact_aggregate_assertion_uses_clickhouse_audit_and_decimal_equality(self) -> None:
         case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
+        case.expected_column = "amount"
+        case.expected_row_count = 4
         assert_exact = getattr(case, "_assert_exact_aggregate", None)
         self.assertTrue(callable(assert_exact))
         exact_audit = {
@@ -102,6 +110,8 @@ class HybridE2EContractTest(unittest.TestCase):
 
     def test_exact_aggregate_rejects_incomplete_or_chunk_derived_audit(self) -> None:
         case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
+        case.expected_column = "amount"
+        case.expected_row_count = 4
         base_audit = {
             "route": "clickhouse",
             "aggregate": "avg",
@@ -117,7 +127,8 @@ class HybridE2EContractTest(unittest.TestCase):
             {**base_audit, "route": "retrieval_chunks"},
             {**base_audit, "sourceId": "another-source"},
             {**base_audit, "columns": []},
-            {**base_audit, "rowCount": 0},
+            {**base_audit, "columns": ["other_amount"]},
+            {**base_audit, "rowCount": 1},
             {**base_audit, "completeData": False},
             {**base_audit, "estimated": True},
             {**base_audit, "chunkDerived": True},
@@ -126,6 +137,107 @@ class HybridE2EContractTest(unittest.TestCase):
         for audit in invalid_audits:
             with self.subTest(audit=audit), self.assertRaises(AssertionError):
                 case._assert_exact_aggregate(audit, Decimal("2.5"), "spreadsheet-1")
+
+    def test_exact_answer_requires_equal_numeric_token_not_substring(self) -> None:
+        case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
+        assert_answer = getattr(case, "_assert_exact_answer_numeric_token", None)
+        self.assertTrue(callable(assert_answer))
+
+        assert_answer("The exact average is 2.5.", Decimal("2.5"))
+        with self.assertRaises(AssertionError):
+            assert_answer("The exact average is 12.5.", Decimal("2.5"))
+        with self.assertRaises(AssertionError):
+            assert_answer("The calculation used version2.5draft.", Decimal("2.5"))
+
+    def test_live_settings_parse_expected_column_and_positive_row_count(self) -> None:
+        with TemporaryDirectory() as directory:
+            narrative = Path(directory, "narrative.txt")
+            spreadsheet = Path(directory, "spreadsheet.csv")
+            narrative.touch()
+            spreadsheet.touch()
+            environment = {
+                "HYBRID_E2E_API_BASE": "http://api.internal",
+                "HYBRID_E2E_CONTROL_BASE": "http://harness.internal",
+                "HYBRID_E2E_NARRATIVE_FIXTURE": str(narrative),
+                "HYBRID_E2E_SPREADSHEET_FIXTURE": str(spreadsheet),
+                "HYBRID_E2E_EXPECTED_AVERAGE": "2.5",
+                "HYBRID_E2E_EXPECTED_COLUMN": "amount",
+                "HYBRID_E2E_EXPECTED_ROW_COUNT": "4",
+            }
+
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch(f"{__name__}.httpx.Client"),
+            ):
+                HybridRetrievalEndToEndTest.setUpClass()
+
+            self.assertEqual(
+                getattr(HybridRetrievalEndToEndTest, "expected_column", None),
+                "amount",
+            )
+            self.assertEqual(
+                getattr(HybridRetrievalEndToEndTest, "expected_row_count", None),
+                4,
+            )
+
+    def test_live_settings_require_expected_column_and_row_count(self) -> None:
+        with TemporaryDirectory() as directory:
+            narrative = Path(directory, "narrative.txt")
+            spreadsheet = Path(directory, "spreadsheet.csv")
+            narrative.touch()
+            spreadsheet.touch()
+            base_environment = {
+                "HYBRID_E2E_API_BASE": "http://api.internal",
+                "HYBRID_E2E_CONTROL_BASE": "http://harness.internal",
+                "HYBRID_E2E_NARRATIVE_FIXTURE": str(narrative),
+                "HYBRID_E2E_SPREADSHEET_FIXTURE": str(spreadsheet),
+                "HYBRID_E2E_EXPECTED_AVERAGE": "2.5",
+                "HYBRID_E2E_EXPECTED_COLUMN": "amount",
+                "HYBRID_E2E_EXPECTED_ROW_COUNT": "4",
+            }
+
+            for missing_name in (
+                "HYBRID_E2E_EXPECTED_COLUMN",
+                "HYBRID_E2E_EXPECTED_ROW_COUNT",
+            ):
+                environment = {
+                    name: value for name, value in base_environment.items() if name != missing_name
+                }
+                with (
+                    self.subTest(missing_name=missing_name),
+                    patch.dict(os.environ, environment, clear=True),
+                    patch(f"{__name__}.httpx.Client"),
+                    self.assertRaises(RuntimeError),
+                ):
+                    HybridRetrievalEndToEndTest.setUpClass()
+
+    def test_live_settings_reject_non_positive_or_non_integer_row_count(self) -> None:
+        with TemporaryDirectory() as directory:
+            narrative = Path(directory, "narrative.txt")
+            spreadsheet = Path(directory, "spreadsheet.csv")
+            narrative.touch()
+            spreadsheet.touch()
+            base_environment = {
+                "HYBRID_E2E_API_BASE": "http://api.internal",
+                "HYBRID_E2E_CONTROL_BASE": "http://harness.internal",
+                "HYBRID_E2E_NARRATIVE_FIXTURE": str(narrative),
+                "HYBRID_E2E_SPREADSHEET_FIXTURE": str(spreadsheet),
+                "HYBRID_E2E_EXPECTED_AVERAGE": "2.5",
+                "HYBRID_E2E_EXPECTED_COLUMN": "amount",
+            }
+
+            for row_count in ("0", "1.5"):
+                with (
+                    self.subTest(row_count=row_count),
+                    patch.dict(
+                        os.environ,
+                        {**base_environment, "HYBRID_E2E_EXPECTED_ROW_COUNT": row_count},
+                        clear=True,
+                    ),
+                    patch(f"{__name__}.httpx.Client"),
+                    self.assertRaises(RuntimeError),
+                ):
+                    HybridRetrievalEndToEndTest.setUpClass()
 
 
 @unittest.skipUnless(LIVE_ENABLED, "set HYBRID_E2E=1 to run private live services")
@@ -138,6 +250,8 @@ class HybridRetrievalEndToEndTest(unittest.TestCase):
             "HYBRID_E2E_NARRATIVE_FIXTURE",
             "HYBRID_E2E_SPREADSHEET_FIXTURE",
             "HYBRID_E2E_EXPECTED_AVERAGE",
+            "HYBRID_E2E_EXPECTED_COLUMN",
+            "HYBRID_E2E_EXPECTED_ROW_COUNT",
         )
         missing = [name for name in required if not os.environ.get(name, "").strip()]
         if missing:
@@ -152,6 +266,13 @@ class HybridRetrievalEndToEndTest(unittest.TestCase):
             if not fixture.is_file():
                 raise RuntimeError(f"HYBRID_E2E fixture is missing: {fixture}")
         cls.expected_average = Decimal(os.environ["HYBRID_E2E_EXPECTED_AVERAGE"])
+        cls.expected_column = os.environ["HYBRID_E2E_EXPECTED_COLUMN"].strip()
+        try:
+            cls.expected_row_count = int(os.environ["HYBRID_E2E_EXPECTED_ROW_COUNT"])
+        except ValueError as exc:
+            raise RuntimeError("HYBRID_E2E_EXPECTED_ROW_COUNT must be a positive integer") from exc
+        if cls.expected_row_count <= 0:
+            raise RuntimeError("HYBRID_E2E_EXPECTED_ROW_COUNT must be a positive integer")
         cls.fixture_timeout_seconds = float(
             os.environ.get("HYBRID_E2E_FIXTURE_TIMEOUT_SECONDS", "60")
         )
@@ -283,12 +404,17 @@ class HybridRetrievalEndToEndTest(unittest.TestCase):
         self.assertIs(audit.get("estimated"), False)
         self.assertIs(audit.get("chunkDerived"), False)
         columns = audit.get("columns")
-        self.assertIsInstance(columns, list)
-        self.assertTrue(columns)
+        self.assertEqual(columns, [self.expected_column])
         row_count = audit.get("rowCount")
-        self.assertIsInstance(row_count, int)
-        self.assertGreater(row_count, 0)
+        self.assertIs(type(row_count), int)
+        self.assertEqual(row_count, self.expected_row_count)
         self.assertEqual(Decimal(str(audit.get("value"))), expected)
+
+    def _assert_exact_answer_numeric_token(self, answer: str, expected: Decimal) -> None:
+        values = {
+            Decimal(match.group(0).replace(",", "")) for match in _NUMERIC_TOKEN.finditer(answer)
+        }
+        self.assertIn(expected, values)
 
     def _publish_spreadsheet(self, source_id: str) -> None:
         preview_response = self.client.get(
@@ -366,6 +492,7 @@ class HybridRetrievalEndToEndTest(unittest.TestCase):
         )
         self.assertNotIn("estimated", aggregate_text.lower())
         self.assertNotIn("chunk-derived", aggregate_text.lower())
+        self._assert_exact_answer_numeric_token(aggregate_text, self.expected_average)
         spreadsheet_id = str(self.spreadsheet["id"])
         audit = self._wait_for_structured_query_audit(spreadsheet_id)
         self._assert_exact_aggregate(audit, self.expected_average, spreadsheet_id)

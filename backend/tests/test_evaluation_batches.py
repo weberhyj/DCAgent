@@ -697,6 +697,41 @@ class RetrievalQualityGateTest(unittest.TestCase):
         self.assertTrue(result.ndcg_improvement_target_met)
         self.assertEqual(result.failed_gates, ())
 
+    def test_quality_gate_uses_raw_ndcg_delta_before_rounding_report(self) -> None:
+        from app.evaluation_batches import evaluate_retrieval_quality
+
+        for qwen_ndcg in (0.64995, 0.64996):
+            with self.subTest(qwen_ndcg=qwen_ndcg):
+                result = evaluate_retrieval_quality(
+                    recall_at_50=0.90,
+                    legacy_ndcg_at_8=0.60,
+                    qwen3_ndcg_at_8=qwen_ndcg,
+                    critical_top_8_regressions=0,
+                    permission_leaks=0,
+                    structured_aggregate_mismatches=0,
+                )
+
+                self.assertFalse(result.passed)
+                self.assertEqual(result.ndcg_at_8_delta, 0.05)
+                self.assertFalse(result.ndcg_improvement_target_met)
+                self.assertEqual(
+                    result.failed_gates,
+                    ("ndcg_at_8_improvement_target",),
+                )
+
+        above_target = evaluate_retrieval_quality(
+            recall_at_50=0.90,
+            legacy_ndcg_at_8=0.60,
+            qwen3_ndcg_at_8=0.65001,
+            critical_top_8_regressions=0,
+            permission_leaks=0,
+            structured_aggregate_mismatches=0,
+        )
+
+        self.assertTrue(above_target.passed)
+        self.assertTrue(above_target.ndcg_improvement_target_met)
+        self.assertEqual(above_target.failed_gates, ())
+
     def test_quality_gates_reject_nan_and_infinity(self) -> None:
         from app.evaluation_batches import evaluate_retrieval_quality
 
