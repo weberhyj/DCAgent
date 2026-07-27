@@ -114,10 +114,19 @@ class StructuredPublicationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class StructuredColumnProfile:
+    physical_name: str
+    unit: str | None
+    safe_sample_values: tuple[str, ...]
+    statistics_summary: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class StructuredDatasetCatalog:
     schema: StructuredDatasetSchema
     source_name: str
     active_publication: StructuredPublication | None
+    column_profiles: tuple[StructuredColumnProfile, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

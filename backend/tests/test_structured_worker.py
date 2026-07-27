@@ -20,7 +20,7 @@ from app.database import (
 )
 from app.structured_models import StructuredPublicationResult
 from app.structured_repository import StructuredLeaseError, StructuredRepository
-from app.structured_worker import StructuredIngestionWorker, build_structured_worker
+from app.structured_worker import StructuredIngestionWorker, build_structured_worker, main
 from tests.support.structured_fakes import sample_confirmed_schema
 
 INDEXED = "\u5df2\u7d22\u5f15"
@@ -767,6 +767,87 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertIs(gateway._ingest_client, clients[0])
         self.assertIs(gateway._query_client, clients[1])
         self.assertIsNot(gateway._ingest_client, gateway._query_client)
+
+    def test_worker_factory_injects_real_metadata_indexer_in_qwen3_mode(self) -> None:
+        ingest_password = Path(self.temp_dir.name) / "qwen-ingest-password"
+        ingest_password.write_text("ingest-secret", encoding="utf-8")
+        metadata_indexer = object()
+        metadata_calls = []
+        environment = {
+            "STRUCTURED_QUERY_ENABLED": "true",
+            "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+            "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+            "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+            "PARQUET_ROOT": self.temp_dir.name,
+            "RETRIEVAL_MODE": "qwen3",
+            "RETRIEVAL_PERMISSION_TAGS": "internal",
+            "QDRANT_URL": "http://127.0.0.1:6333",
+            "EMBEDDING_SERVICE_URL": "http://127.0.0.1:8081",
+            "RERANKER_SERVICE_URL": "http://127.0.0.1:8082",
+            "EMBEDDING_MODEL_NAME": "Qwen/Qwen3-Embedding-0.6B",
+            "EMBEDDING_MODEL_VERSION": "embedding-v1",
+            "EMBEDDING_MODEL_SHA256": "a" * 64,
+            "EMBEDDING_MODEL_DIMENSIONS": "1024",
+            "EMBEDDING_MODEL_NORMALIZED": "true",
+            "EMBEDDING_ENCODING_PROFILE_SHA256": "b" * 64,
+            "EMBEDDING_PROTOCOL_VERSION": "v1",
+            "RERANKER_MODEL_NAME": "Qwen/Qwen3-Reranker-0.6B",
+            "RERANKER_MODEL_VERSION": "reranker-v1",
+            "RERANKER_MODEL_SHA256": "c" * 64,
+            "RERANKER_PROMPT_PROFILE_SHA256": "d" * 64,
+            "RERANKER_PROTOCOL_VERSION": "v1",
+        }
+
+        with patch(
+            "app.structured_worker._build_production_metadata_indexer",
+            side_effect=lambda source, database: (
+                metadata_calls.append((source, database)) or metadata_indexer
+            ),
+        ):
+            worker = build_structured_worker(
+                environment,
+                database_factory=lambda _url: self.database,
+                clickhouse_client_factory=lambda **_kwargs: object(),
+            )
+
+        self.assertIs(worker.metadata_indexer, metadata_indexer)
+        self.assertEqual(metadata_calls, [(environment, self.database)])
+
+    def test_worker_factory_fails_closed_when_required_metadata_indexer_cannot_start(self) -> None:
+        ingest_password = Path(self.temp_dir.name) / "failed-qwen-ingest-password"
+        ingest_password.write_text("ingest-secret", encoding="utf-8")
+        environment = {
+            "STRUCTURED_QUERY_ENABLED": "true",
+            "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+            "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+            "RETRIEVAL_MODE": "qwen3",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "metadata indexer unavailable"):
+            build_structured_worker(
+                environment,
+                database_factory=lambda _url: self.database,
+                clickhouse_client_factory=lambda **_kwargs: self.fail(
+                    "ClickHouse must not start after metadata indexer failure"
+                ),
+                metadata_indexer_factory=lambda _source, _database: (_ for _ in ()).throw(
+                    RuntimeError("metadata indexer unavailable")
+                ),
+            )
+
+    def test_main_runs_factory_built_worker_forever(self) -> None:
+        class Worker:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def run_forever(self) -> None:
+                self.calls += 1
+
+        worker = Worker()
+        with patch("app.structured_worker.build_structured_worker", return_value=worker):
+            main()
+
+        self.assertEqual(worker.calls, 1)
 
     def test_worker_factory_requires_ingest_secret_before_resource_factories(self) -> None:
         root = Path(self.temp_dir.name)

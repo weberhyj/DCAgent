@@ -23,7 +23,11 @@ from .structured_repository import StructuredRepository
 PublisherFactory = Callable[[Mapping[str, str]], RetrievalIndexPublisher]
 
 
-def build_publisher_from_environ(environ: Mapping[str, str]) -> RetrievalIndexPublisher:
+def build_publisher_from_environ(
+    environ: Mapping[str, str],
+    *,
+    database: Database | None = None,
+) -> RetrievalIndexPublisher:
     retrieval = RetrievalSettings.from_environ(environ)
     if retrieval.embedding is None or retrieval.embedding_service_url is None:
         raise ValueError("retrieval index worker requires RETRIEVAL_MODE=shadow or qwen3")
@@ -32,8 +36,9 @@ def build_publisher_from_environ(environ: Mapping[str, str]) -> RetrievalIndexPu
     sparse_profile_sha256 = environ.get("SPARSE_PROFILE_SHA256", "").strip()
     if not sparse_profile_sha256:
         raise ValueError("SPARSE_PROFILE_SHA256 is required")
-    offline = OfflineSettings.from_environ(environ)
-    database = Database(offline.database_url)
+    if database is None:
+        offline = OfflineSettings.from_environ(environ)
+        database = Database(offline.database_url)
     repository = SqlChatRepository(database)
     audit = RetrievalAuditRepository(database)
     gateway = QdrantRetrievalGateway(

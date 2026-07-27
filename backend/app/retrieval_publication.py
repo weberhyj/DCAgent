@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client.http import models
@@ -20,6 +21,8 @@ from .retrieval_audit import RetrievalPublication
 from .retrieval_models import RetrievalScope
 from .sparse_embedding import SparseVector
 from .structured_models import (
+    StructuredCatalog,
+    StructuredColumnProfile,
     StructuredDatasetCatalog,
     StructuredDatasetSchema,
     StructuredPublicationResult,
@@ -41,6 +44,18 @@ _SAFE_COLUMN_FIELDS = frozenset(
         "null_policy",
     }
 )
+_SAFE_STATISTICS_FIELDS = frozenset(
+    {
+        "row_count",
+        "null_count",
+        "non_null_count",
+        "sample_rows",
+        "sample_null_count",
+        "distinct_estimate",
+        "minimum",
+        "maximum",
+    }
+)
 
 
 class RetrievalPublicationError(RuntimeError):
@@ -52,6 +67,24 @@ class IndexValidationError(RetrievalPublicationError):
 
 
 class ActiveIndexUnavailableError(RetrievalPublicationError):
+    pass
+
+
+class PublicationRecoveryError(RetrievalPublicationError):
+    """Sanitized primary failure plus recovery operations that did not complete."""
+
+    def __init__(self, primary_code: str, recovery_codes: Sequence[str]) -> None:
+        self.primary_code = _required_text(primary_code, "primary_code")
+        self.recovery_codes = tuple(
+            _required_text(code, "recovery_code") for code in recovery_codes
+        )
+        super().__init__(
+            "retrieval publication failed with "
+            f"{self.primary_code}; recovery failures: {','.join(self.recovery_codes)}"
+        )
+
+
+class _AliasRestorationError(RuntimeError):
     pass
 
 
@@ -92,6 +125,18 @@ class DenseEmbeddingClient(Protocol):
 class SparseDocumentEncoder(Protocol):
     def embed_documents(self, texts: Sequence[str]) -> tuple[SparseVector, ...]: ...
 
+    def embed_query(self, query: str) -> SparseVector: ...
+
+
+class StructuredCatalogProvider(Protocol):
+    def get_catalog(self) -> StructuredCatalog: ...
+
+    def get_retrieval_column_profiles(
+        self,
+        schema: StructuredDatasetSchema,
+        result: StructuredPublicationResult,
+    ) -> tuple[StructuredColumnProfile, ...]: ...
+
 
 class PublicationGateway(Protocol):
     alias_name: str
@@ -122,6 +167,32 @@ class PublicationGateway(Protocol):
         collection_name: str | None = None,
     ) -> None: ...
 
+    def retrieve_points(
+        self,
+        point_ids: Sequence[int | str],
+        *,
+        scope: RetrievalScope | None,
+        collection_name: str | None = None,
+    ) -> tuple[object, ...]: ...
+
+    def search_dense(
+        self,
+        vector: Sequence[float],
+        *,
+        scope: RetrievalScope | None,
+        limit: int,
+        collection_name: str | None = None,
+    ) -> tuple[object, ...]: ...
+
+    def search_sparse(
+        self,
+        vector: SparseVector,
+        *,
+        scope: RetrievalScope | None,
+        limit: int,
+        collection_name: str | None = None,
+    ) -> tuple[object, ...]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class SourceIndexResult:
@@ -138,6 +209,12 @@ class _PointDraft:
     point_id: str
     text: str
     payload: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationSample:
+    point_id: str
+    query: str
 
 
 class StructuredMetadataPointBuilder:
@@ -242,7 +319,7 @@ class RetrievalIndexPublisher:
         alias_name: str,
         knowledge_base_id: str,
         permission_tags: Sequence[str],
-        structured_catalog_provider: Any | None = None,
+        structured_catalog_provider: StructuredCatalogProvider | None = None,
     ) -> None:
         self.repository = repository
         self.audit = audit
@@ -295,18 +372,18 @@ class RetrievalIndexPublisher:
         )
         previous_alias: str | None = None
         alias_state_known = False
-        collection_created = False
+        collection_may_exist = False
         point_count = 0
-        validation_samples: list[tuple[str, list[float]]] = []
-        alias_switched = False
+        validation_samples: list[_ValidationSample] = []
+        alias_switch_attempted = False
         try:
             previous_alias = self.gateway.resolve_alias()
             alias_state_known = True
+            collection_may_exist = True
             self.gateway.create_collection(
                 collection_name,
                 dense_dimensions=self._embedding_metadata.dimensions,
             )
-            collection_created = True
             batch: list[_PointDraft] = []
             for draft in self._iter_full_build_drafts(publication_version):
                 batch.append(draft)
@@ -338,19 +415,37 @@ class RetrievalIndexPublisher:
             )
             if not activate:
                 return publication
+            alias_switch_attempted = True
             self.gateway.activate_alias(collection_name)
-            alias_switched = True
             publication = self.audit.mark_publication_active(
                 publication.id,
                 point_count=validated_count,
             )
             return publication
         except Exception as error:
-            if alias_state_known and (alias_switched or self._alias_points_to(collection_name)):
-                self._restore_alias(previous_alias)
-            self._mark_failed(publication.id, error)
-            if collection_created:
-                self._delete_if_unaliased(collection_name)
+            recovery_codes: list[str] = []
+            if alias_state_known and alias_switch_attempted:
+                try:
+                    self._restore_alias(previous_alias)
+                except _AliasRestorationError:
+                    recovery_codes.append("alias_restore_failed")
+            try:
+                self.audit.mark_publication_failed(
+                    publication.id,
+                    error.__class__.__name__,
+                )
+            except Exception:
+                recovery_codes.append("audit_mark_failed_failed")
+            if collection_may_exist:
+                try:
+                    self._delete_if_unaliased(collection_name)
+                except Exception:
+                    recovery_codes.append("collection_cleanup_failed")
+            if recovery_codes:
+                raise PublicationRecoveryError(
+                    error.__class__.__name__,
+                    recovery_codes,
+                ) from error
             raise
 
     def upsert_source(self, source_id: str) -> SourceIndexResult:
@@ -394,19 +489,11 @@ class RetrievalIndexPublisher:
         publication = self._active_publication()
         version = collection_publication_version(publication.collection_name)
         source = self._source(schema.source_id)
-        columns = tuple(
-            {
-                "physical_name": column.physical_name,
-                "original_name": column.original_name,
-                "display_name": column.display_name,
-                "data_type": column.data_type.value,
-                "aliases": column.aliases,
-                "allow_aggregate": column.allow_aggregate,
-                "allow_filter": column.allow_filter,
-                "null_policy": column.null_policy,
-            }
-            for column in schema.columns
-        )
+        profiles: tuple[StructuredColumnProfile, ...] = ()
+        provider = self._structured_catalog_provider
+        if provider is not None:
+            profiles = provider.get_retrieval_column_profiles(schema, result)
+        columns = _structured_columns(schema, profiles)
         payload = self._structured_builder.build_payload(
             source_id=source.id,
             source_name=source.name,
@@ -494,19 +581,7 @@ class RetrievalIndexPublisher:
         if publication is None:
             raise ValueError("structured catalog item is not published")
         source = self._source(item.schema.source_id)
-        columns = tuple(
-            {
-                "physical_name": column.physical_name,
-                "original_name": column.original_name,
-                "display_name": column.display_name,
-                "data_type": column.data_type.value,
-                "aliases": column.aliases,
-                "allow_aggregate": column.allow_aggregate,
-                "allow_filter": column.allow_filter,
-                "null_policy": column.null_policy,
-            }
-            for column in item.schema.columns
-        )
+        columns = _structured_columns(item.schema, item.column_profiles)
         payload = self._structured_builder.build_payload(
             source_id=item.schema.source_id,
             source_name=source.name,
@@ -533,7 +608,7 @@ class RetrievalIndexPublisher:
         self,
         collection_name: str,
         drafts: Sequence[_PointDraft],
-        validation_samples: list[tuple[str, list[float]]],
+        validation_samples: list[_ValidationSample],
         sample_limit: int,
     ) -> int:
         texts = [draft.text for draft in drafts]
@@ -561,8 +636,11 @@ class RetrievalIndexPublisher:
         self.gateway.upsert_points(collection_name, points)
         remaining = max(0, sample_limit - len(validation_samples))
         validation_samples.extend(
-            (str(point.id), list(dense))
-            for point, dense in zip(points[:remaining], dense_vectors[:remaining], strict=True)
+            _ValidationSample(
+                point_id=str(point.id),
+                query=_validation_query(draft.payload),
+            )
+            for point, draft in zip(points[:remaining], drafts[:remaining], strict=True)
         )
         return len(points)
 
@@ -570,46 +648,69 @@ class RetrievalIndexPublisher:
         self,
         collection_name: str,
         publication_version: str,
-        samples: Sequence[tuple[str, list[float]]],
+        samples: Sequence[_ValidationSample],
     ) -> None:
         if not samples:
-            return
-        retrieve = getattr(self.gateway, "retrieve_points", None)
-        search = getattr(self.gateway, "search_dense", None)
+            raise ValueError("retrieval publication has no validation samples")
         scope = RetrievalScope(
             knowledge_base_id=self._knowledge_base_id,
             publication_version=publication_version,
             permission_tags=self._permission_tags,
         )
-        if callable(retrieve):
-            candidates = retrieve(
-                [point_id for point_id, _vector in samples],
-                scope=scope,
-                collection_name=collection_name,
-            )
-            if len(candidates) != len(samples):
-                raise ValueError("validation sample payloads are incomplete")
-        if callable(search):
-            candidates = search(
-                samples[0][1],
+        candidates = self.gateway.retrieve_points(
+            [sample.point_id for sample in samples],
+            scope=scope,
+            collection_name=collection_name,
+        )
+        if len(candidates) != len(samples):
+            raise ValueError("validation sample payloads are incomplete")
+        queries = [sample.query for sample in samples]
+        dense_queries = self.embedding.embed(
+            queries,
+            purpose="query",
+            expected=self._embedding_metadata,
+        )
+        sparse_queries = tuple(self.sparse.embed_query(query) for query in queries)
+        if len(dense_queries) != len(samples) or len(sparse_queries) != len(samples):
+            raise ValueError("validation query encoders returned an unexpected count")
+        for dense_query, sparse_query in zip(
+            dense_queries,
+            sparse_queries,
+            strict=True,
+        ):
+            dense_candidates = self.gateway.search_dense(
+                dense_query,
                 scope=scope,
                 limit=1,
                 collection_name=collection_name,
             )
-            if not candidates:
+            sparse_candidates = self.gateway.search_sparse(
+                sparse_query,
+                scope=scope,
+                limit=1,
+                collection_name=collection_name,
+            )
+            if not dense_candidates or not sparse_candidates:
                 raise ValueError("representative retrieval query returned no results")
-            denied = search(
-                samples[0][1],
-                scope=RetrievalScope(
-                    knowledge_base_id=self._knowledge_base_id,
-                    publication_version=publication_version,
-                    permission_tags=("__publication_validation_denied__",),
-                ),
-                limit=1,
-                collection_name=collection_name,
-            )
-            if denied:
-                raise ValueError("permission validation probe returned forbidden results")
+        denied_scope = RetrievalScope(
+            knowledge_base_id=self._knowledge_base_id,
+            publication_version=publication_version,
+            permission_tags=("__publication_validation_denied__",),
+        )
+        denied_dense = self.gateway.search_dense(
+            dense_queries[0],
+            scope=denied_scope,
+            limit=1,
+            collection_name=collection_name,
+        )
+        denied_sparse = self.gateway.search_sparse(
+            sparse_queries[0],
+            scope=denied_scope,
+            limit=1,
+            collection_name=collection_name,
+        )
+        if denied_dense or denied_sparse:
+            raise ValueError("permission validation probe returned forbidden results")
 
     def _active_publication(self, *, required: bool = True) -> RetrievalPublication | None:
         publication = self.audit.active_publication(self._alias_name)
@@ -627,54 +728,46 @@ class RetrievalIndexPublisher:
         return source
 
     def _restore_alias(self, previous_alias: str | None) -> None:
-        try:
-            if previous_alias is not None:
-                self.gateway.activate_alias(previous_alias)
-            else:
-                remove_alias = getattr(self.gateway, "remove_alias", None)
-                if callable(remove_alias):
-                    remove_alias()
+        for _attempt in range(2):
+            try:
+                if previous_alias is not None:
+                    self.gateway.activate_alias(previous_alias)
                 else:
-                    client = getattr(self.gateway, "client", None)
-                    if client is None:
-                        return
-                    client.update_collection_aliases(
-                        change_aliases_operations=[
-                            models.DeleteAliasOperation(
-                                delete_alias=models.DeleteAlias(alias_name=self._alias_name)
-                            )
-                        ]
-                    )
-        except Exception:
-            return
-
-    def _alias_points_to(self, collection_name: str) -> bool:
-        try:
-            return self.gateway.resolve_alias() == collection_name
-        except Exception:
-            return False
-
-    def _mark_failed(self, publication_id: str, error: Exception) -> None:
-        try:
-            self.audit.mark_publication_failed(publication_id, error.__class__.__name__)
-        except Exception:
-            return
+                    remove_alias = getattr(self.gateway, "remove_alias", None)
+                    if callable(remove_alias):
+                        remove_alias()
+                    else:
+                        client = getattr(self.gateway, "client", None)
+                        if client is None:
+                            raise RuntimeError("alias client is unavailable")
+                        client.update_collection_aliases(
+                            change_aliases_operations=[
+                                models.DeleteAliasOperation(
+                                    delete_alias=models.DeleteAlias(alias_name=self._alias_name)
+                                )
+                            ]
+                        )
+            except Exception:
+                pass
+            try:
+                if self.gateway.resolve_alias() == previous_alias:
+                    return
+            except Exception:
+                continue
+        raise _AliasRestorationError("retrieval alias restoration could not be verified")
 
     def _delete_if_unaliased(self, collection_name: str) -> None:
-        try:
-            if self.gateway.resolve_alias() == collection_name:
-                return
-            client = getattr(self.gateway, "client", None)
-            if client is None:
-                return
-            aliases = getattr(client.get_aliases(), "aliases", None)
-            if aliases is None:
-                return
-            if any(getattr(alias, "collection_name", None) == collection_name for alias in aliases):
-                return
-            self.gateway.delete_collection(collection_name)
-        except Exception:
+        if self.gateway.resolve_alias() == collection_name:
             return
+        client = getattr(self.gateway, "client", None)
+        if client is None:
+            raise RuntimeError("Qdrant alias client is unavailable")
+        aliases = getattr(client.get_aliases(), "aliases", None)
+        if aliases is None:
+            raise RuntimeError("Qdrant aliases response is malformed")
+        if any(getattr(alias, "collection_name", None) == collection_name for alias in aliases):
+            return
+        self.gateway.delete_collection(collection_name)
 
 
 def deterministic_point_id(source_id: str, chunk_id: object, publication_version: str) -> str:
@@ -686,6 +779,33 @@ def deterministic_point_id(source_id: str, chunk_id: object, publication_version
         )
     )
     return str(uuid5(NAMESPACE_URL, identity))
+
+
+def _validation_query(payload: Mapping[str, object]) -> str:
+    if payload.get("source_type") == "structured":
+        columns = payload.get("columns")
+        first_display_name = ""
+        if isinstance(columns, Sequence) and not isinstance(columns, (str, bytes, bytearray)):
+            first = next((column for column in columns if isinstance(column, Mapping)), None)
+            if first is not None:
+                display_name = first.get("display_name")
+                if isinstance(display_name, str):
+                    first_display_name = display_name.strip()
+        values = (
+            payload.get("dataset_id"),
+            payload.get("worksheet_name"),
+            first_display_name,
+        )
+    else:
+        section_title = payload.get("section_title")
+        text = payload.get("text")
+        values = (
+            payload.get("source_name"),
+            section_title if isinstance(section_title, str) else "",
+            text[:160] if isinstance(text, str) else "",
+        )
+    query = " ".join(str(value).strip() for value in values if str(value).strip())
+    return _required_text(query, "validation query")
 
 
 def collection_publication_version(collection_name: str) -> str:
@@ -710,10 +830,58 @@ def _safe_column(column: Mapping[str, object]) -> dict[str, object]:
             safe[name] = [str(item)[:240] for item in value][:20]
         elif name in {"allow_aggregate", "allow_filter"}:
             safe[name] = bool(value)
+        elif name == "statistics_summary":
+            safe[name] = _safe_statistics_summary(value)
+        elif name == "unit":
+            safe[name] = None if value is None else str(value)[:80]
         elif value is not None:
             safe[name] = str(value)[:1000]
     if not safe.get("physical_name") or not safe.get("data_type"):
         raise ValueError("structured columns require physical_name and data_type")
+    return safe
+
+
+def _structured_columns(
+    schema: StructuredDatasetSchema,
+    profiles: Sequence[StructuredColumnProfile],
+) -> tuple[dict[str, object], ...]:
+    profiles_by_name = {profile.physical_name: profile for profile in profiles}
+    columns: list[dict[str, object]] = []
+    for column in schema.columns:
+        profile = profiles_by_name.get(column.physical_name)
+        columns.append(
+            {
+                "physical_name": column.physical_name,
+                "original_name": column.original_name,
+                "display_name": column.display_name,
+                "data_type": column.data_type.value,
+                "aliases": column.aliases,
+                "unit": None if profile is None else profile.unit,
+                "safe_sample_values": (() if profile is None else profile.safe_sample_values),
+                "statistics_summary": ({} if profile is None else profile.statistics_summary),
+                "allow_aggregate": column.allow_aggregate,
+                "allow_filter": column.allow_filter,
+                "null_policy": column.null_policy,
+            }
+        )
+    return tuple(columns)
+
+
+def _safe_statistics_summary(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError("structured column statistics_summary must be a mapping")
+    safe: dict[str, object] = {}
+    for name, raw_value in value.items():
+        if name not in _SAFE_STATISTICS_FIELDS:
+            continue
+        if isinstance(raw_value, float) and not math.isfinite(raw_value):
+            raise ValueError("structured column statistics values must be finite")
+        if raw_value is None or isinstance(raw_value, (bool, int, float)):
+            safe[name] = raw_value
+        elif isinstance(raw_value, str):
+            safe[name] = raw_value[:240]
+        else:
+            raise TypeError("structured column statistics values must be JSON scalars")
     return safe
 
 
@@ -785,6 +953,7 @@ def _sha256(value: object) -> str:
 __all__ = [
     "ActiveIndexUnavailableError",
     "IndexValidationError",
+    "PublicationRecoveryError",
     "RetrievalIndexPublisher",
     "RetrievalPublicationError",
     "SourceIndexResult",

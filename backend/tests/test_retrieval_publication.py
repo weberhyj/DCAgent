@@ -6,16 +6,27 @@ from types import SimpleNamespace
 
 from qdrant_client.http import models
 
+from app.database import (
+    Database,
+    KnowledgeSourceRecord,
+    StructuredColumnRecord,
+    StructuredDatasetRecord,
+    StructuredPreviewRecord,
+    StructuredPublicationRecord,
+)
 from app.embedding_contracts import EmbeddingModelMetadata
 from app.models import KnowledgeChunkModel, KnowledgeSourceModel
 from app.qdrant_retrieval import IndexMaintenanceScope
 from app.retrieval_audit import RetrievalPublication
 from app.retrieval_publication import (
     IndexValidationError,
+    PublicationRecoveryError,
     RetrievalIndexPublisher,
     StructuredMetadataPointBuilder,
 )
 from app.sparse_embedding import SparseVector
+from app.structured_models import StructuredColumnType, StructuredPublicationResult
+from app.structured_repository import StructuredRepository
 
 EMBEDDING = EmbeddingModelMetadata(
     name="Qwen/Qwen3-Embedding-0.6B",
@@ -71,21 +82,23 @@ class RecordingRepository:
 class RecordingEmbedding:
     def __init__(self) -> None:
         self.batches: list[list[str]] = []
+        self.purposes: list[str] = []
 
     def embed(self, texts, *, purpose, expected):
-        self.assert_document_request(purpose, expected)
+        if purpose not in {"document", "query"} or expected != EMBEDDING:
+            raise AssertionError((purpose, expected))
         batch = list(texts)
         self.batches.append(batch)
+        self.purposes.append(purpose)
         return [[float(index), 0.0, 1.0] for index, _text in enumerate(batch)]
-
-    def assert_document_request(self, purpose, expected) -> None:
-        if purpose != "document" or expected != EMBEDDING:
-            raise AssertionError((purpose, expected))
 
 
 class RecordingSparse:
     def embed_documents(self, texts):
         return tuple(SparseVector(indices=(0,), values=(1.0,)) for _ in texts)
+
+    def embed_query(self, text):
+        return SparseVector(indices=(0,), values=(1.0,))
 
 
 class RecordingGateway:
@@ -95,6 +108,10 @@ class RecordingGateway:
         fail_validation: bool = False,
         fail_activation_call: bool = False,
         fail_initial_alias_resolution: bool = False,
+        permission_probe_leaks: bool = False,
+        sample_query_empty: bool = False,
+        create_timeout_after_create: bool = False,
+        fail_restore: bool = False,
     ) -> None:
         self.events: list[str] = []
         self.points: list[models.PointStruct] = []
@@ -104,10 +121,19 @@ class RecordingGateway:
         self.fail_validation = fail_validation
         self.fail_activation_call = fail_activation_call
         self.fail_initial_alias_resolution = fail_initial_alias_resolution
+        self.permission_probe_leaks = permission_probe_leaks
+        self.sample_query_empty = sample_query_empty
+        self.create_timeout_after_create = create_timeout_after_create
+        self.fail_restore = fail_restore
+        self.existing_collections: set[str] = set()
+        self.resolve_calls = 0
         self.deleted_scopes: list[IndexMaintenanceScope] = []
 
     def create_collection(self, collection_name, *, dense_dimensions):
         self.events.append("create")
+        self.existing_collections.add(collection_name)
+        if self.create_timeout_after_create:
+            raise TimeoutError("ambiguous create timeout")
 
     def upsert_points(self, collection_name, points):
         self.events.append(f"upsert:{len(points)}")
@@ -121,12 +147,15 @@ class RecordingGateway:
 
     def activate_alias(self, collection_name):
         self.events.append("activate_alias")
+        if self.fail_restore and collection_name == "knowledge_chunks_qwen3_v6":
+            raise RuntimeError("restore unavailable")
         self.alias = collection_name
         if self.fail_activation_call:
             self.fail_activation_call = False
             raise RuntimeError("ambiguous alias update failure")
 
     def resolve_alias(self):
+        self.resolve_calls += 1
         if self.fail_initial_alias_resolution:
             self.fail_initial_alias_resolution = False
             raise RuntimeError("qdrant unavailable")
@@ -134,6 +163,7 @@ class RecordingGateway:
 
     def delete_collection(self, collection_name):
         self.events.append("delete_collection")
+        self.existing_collections.discard(collection_name)
 
     def get_aliases(self):
         aliases = []
@@ -158,12 +188,40 @@ class RecordingGateway:
         self.events.append(f"delete_source:{source_id}")
         self.deleted_scopes.append(maintenance_scope)
 
+    def retrieve_points(self, point_ids, *, scope, collection_name=None):
+        self.events.append(f"retrieve:{len(point_ids)}")
+        return tuple(SimpleNamespace(chunk_id=point_id) for point_id in point_ids)
+
+    def search_dense(self, vector, *, scope, limit, collection_name=None):
+        denied = "__publication_validation_denied__" in scope.permission_tags
+        self.events.append("dense_denied" if denied else "dense_sample")
+        if denied and not self.permission_probe_leaks:
+            return ()
+        if self.sample_query_empty and not denied:
+            return ()
+        return (SimpleNamespace(chunk_id="sample"),)
+
+    def search_sparse(self, vector, *, scope, limit, collection_name=None):
+        denied = "__publication_validation_denied__" in scope.permission_tags
+        self.events.append("sparse_denied" if denied else "sparse_sample")
+        if denied and not self.permission_probe_leaks:
+            return ()
+        if self.sample_query_empty and not denied:
+            return ()
+        return (SimpleNamespace(chunk_id="sample"),)
+
 
 class RecordingAudit:
-    def __init__(self, *, fail_activation: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_activation: bool = False,
+        fail_mark_failed: bool = False,
+    ) -> None:
         self.publication: RetrievalPublication | None = None
         self.previous: RetrievalPublication | None = None
         self.fail_activation = fail_activation
+        self.fail_mark_failed = fail_mark_failed
 
     def create_publication(self, **values):
         self.publication = RetrievalPublication(
@@ -198,6 +256,8 @@ class RecordingAudit:
         return self.publication
 
     def mark_publication_failed(self, publication_id, error_message):
+        if self.fail_mark_failed:
+            raise RuntimeError("postgres failure state unavailable")
         assert self.publication is not None
         self.publication = replace(
             self.publication,
@@ -219,13 +279,26 @@ def build_publisher(
     fail_activation=False,
     fail_activation_call=False,
     fail_initial_alias_resolution=False,
+    permission_probe_leaks=False,
+    sample_query_empty=False,
+    create_timeout_after_create=False,
+    fail_restore=False,
+    fail_mark_failed=False,
+    structured_catalog_provider=None,
 ):
     gateway = RecordingGateway(
         fail_validation=fail_validation,
         fail_activation_call=fail_activation_call,
         fail_initial_alias_resolution=fail_initial_alias_resolution,
+        permission_probe_leaks=permission_probe_leaks,
+        sample_query_empty=sample_query_empty,
+        create_timeout_after_create=create_timeout_after_create,
+        fail_restore=fail_restore,
     )
-    audit = RecordingAudit(fail_activation=fail_activation)
+    audit = RecordingAudit(
+        fail_activation=fail_activation,
+        fail_mark_failed=fail_mark_failed,
+    )
     embedding = RecordingEmbedding()
     publisher = RetrievalIndexPublisher(
         repository=RecordingRepository(chunks),
@@ -238,11 +311,101 @@ def build_publisher(
         alias_name="knowledge_chunks_current",
         knowledge_base_id="default",
         permission_tags=("internal",),
+        structured_catalog_provider=structured_catalog_provider,
     )
     publisher.gateway = gateway
     publisher.audit = audit
     publisher.embedding = embedding
     return publisher
+
+
+def build_real_structured_catalog() -> tuple[Database, StructuredRepository]:
+    database = Database("sqlite+pysqlite:///:memory:")
+    database.create_schema()
+    with database.session() as session:
+        session.add(
+            KnowledgeSourceRecord(
+                id="source-1",
+                name="sales.xlsx",
+                source_type="XLSX",
+                records=10,
+                status="\u5df2\u7d22\u5f15",
+                updated_at="2026-07-27",
+                classification="internal",
+                sort_order=0,
+            )
+        )
+        dataset = StructuredDatasetRecord(
+            dataset_id="dataset-1",
+            source_id="source-1",
+            worksheet_name="Sales",
+            schema_version=1,
+            schema_hash="e" * 64,
+            status="published",
+        )
+        dataset.columns = [
+            StructuredColumnRecord(
+                id="dataset-1:1:0",
+                dataset_id="dataset-1",
+                schema_version=1,
+                physical_name="amount",
+                original_name="Amount (CNY)",
+                display_name="Amount (CNY)",
+                data_type=StructuredColumnType.DECIMAL.value,
+                aliases=["revenue"],
+                allow_aggregate=True,
+                allow_filter=True,
+                null_policy="ignore",
+                sort_order=0,
+            )
+        ]
+        session.add(dataset)
+        session.add(
+            StructuredPublicationRecord(
+                publication_id="structured-publication-1",
+                dataset_id="dataset-1",
+                schema_version=1,
+                physical_table_name="structured_dataset_1",
+                row_count=10,
+                content_hash="f" * 64,
+                status="published",
+            )
+        )
+        session.add(
+            StructuredPreviewRecord(
+                source_id="source-1",
+                payload={
+                    "source_id": "source-1",
+                    "datasets": [
+                        {
+                            "dataset_id": "dataset-1",
+                            "source_id": "source-1",
+                            "worksheet_name": "Sales",
+                            "sampled_rows": 3,
+                            "schema_hash": "e" * 64,
+                            "columns": [
+                                {
+                                    "physical_name": "amount",
+                                    "original_name": "Amount (CNY)",
+                                    "display_name": "Amount (CNY)",
+                                    "data_type": "decimal",
+                                    "aliases": ["revenue"],
+                                    "examples": [
+                                        "12.50",
+                                        "finance@example.internal",
+                                        "13800138000",
+                                    ],
+                                    "sampled_rows": 3,
+                                    "null_count": 1,
+                                }
+                            ],
+                        }
+                    ],
+                    "diagnostics": [],
+                },
+            )
+        )
+    return database, StructuredRepository(database)
 
 
 class RetrievalPublicationTest(unittest.TestCase):
@@ -254,7 +417,21 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(result.point_count, 3)
         self.assertEqual(
             publisher.gateway.events,
-            ["create", "upsert:3", "validate:3", "activate_alias"],
+            [
+                "create",
+                "upsert:3",
+                "validate:3",
+                "retrieve:3",
+                "dense_sample",
+                "sparse_sample",
+                "dense_sample",
+                "sparse_sample",
+                "dense_sample",
+                "sparse_sample",
+                "dense_denied",
+                "sparse_denied",
+                "activate_alias",
+            ],
         )
 
     def test_failed_build_never_moves_alias_and_deletes_only_unaliased_collection(self) -> None:
@@ -282,7 +459,16 @@ class RetrievalPublicationTest(unittest.TestCase):
 
         publisher.build_and_activate("knowledge_chunks_qwen3_v1")
 
-        self.assertEqual([len(batch) for batch in publisher.embedding.batches], [64, 64, 2])
+        document_batch_sizes = [
+            len(batch)
+            for batch, purpose in zip(
+                publisher.embedding.batches,
+                publisher.embedding.purposes,
+                strict=True,
+            )
+            if purpose == "document"
+        ]
+        self.assertEqual(document_batch_sizes, [64, 64, 2])
 
     def test_point_ids_and_derived_adjacency_are_deterministic(self) -> None:
         first = build_publisher(chunks=sample_chunks(3))
@@ -310,6 +496,57 @@ class RetrievalPublicationTest(unittest.TestCase):
 
         self.assertEqual(result.status, "validated")
         self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_missing_mandatory_probe_method_fails_before_alias(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.gateway.search_dense = None
+
+        with self.assertRaises(IndexValidationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_permission_probe_leak_fails_before_alias(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1), permission_probe_leaks=True)
+
+        with self.assertRaises(IndexValidationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_empty_sample_query_results_fail_before_alias(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1), sample_query_empty=True)
+
+        with self.assertRaises(IndexValidationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_build_without_any_validation_sample_never_activates(self) -> None:
+        publisher = build_publisher(chunks=[])
+
+        with self.assertRaises(IndexValidationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_structured_only_build_uses_deterministic_catalog_sample_query(self) -> None:
+        database, repository = build_real_structured_catalog()
+        self.addCleanup(database.engine.dispose)
+        publisher = build_publisher(chunks=[], structured_catalog_provider=repository)
+
+        publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        query_batches = [
+            batch
+            for batch, purpose in zip(
+                publisher.embedding.batches,
+                publisher.embedding.purposes,
+                strict=True,
+            )
+            if purpose == "query"
+        ]
+        self.assertEqual(query_batches, [["dataset-1 Sales Amount (CNY)"]])
 
     def test_incremental_delete_uses_task5_maintenance_scope(self) -> None:
         publisher = build_publisher(chunks=sample_chunks(1))
@@ -356,6 +593,48 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v6")
         self.assertEqual(publisher.audit.publication.status, "failed")
         self.assertIn("delete_collection", publisher.gateway.events)
+        self.assertGreaterEqual(publisher.gateway.resolve_calls, 3)
+
+    def test_create_timeout_after_server_side_creation_cleans_unaliased_collection(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(1),
+            create_timeout_after_create=True,
+        )
+
+        with self.assertRaises(TimeoutError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertNotIn("knowledge_chunks_qwen3_v7", publisher.gateway.existing_collections)
+        self.assertEqual(publisher.audit.publication.status, "failed")
+
+    def test_restore_failure_is_surfaced_and_aliased_collection_is_retained(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(1),
+            fail_activation_call=True,
+            fail_restore=True,
+        )
+        publisher.gateway.alias = "knowledge_chunks_qwen3_v6"
+
+        with self.assertRaises(PublicationRecoveryError) as captured:
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertIn("alias_restore_failed", captured.exception.recovery_codes)
+        self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v7")
+        self.assertNotIn("delete_collection", publisher.gateway.events)
+
+    def test_mark_failed_failure_is_combined_with_primary_failure(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(1),
+            fail_validation=True,
+            fail_mark_failed=True,
+        )
+
+        with self.assertRaises(PublicationRecoveryError) as captured:
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertEqual(captured.exception.primary_code, "IndexValidationError")
+        self.assertIn("audit_mark_failed_failed", captured.exception.recovery_codes)
+        self.assertNotIn("permission probe failed", str(captured.exception))
 
     def test_initial_alias_resolution_failure_marks_publication_failed(self) -> None:
         publisher = build_publisher(
@@ -401,6 +680,124 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(point["row_count"], 10_000_000)
         self.assertNotIn("complete_rows", repr(point))
         self.assertNotIn("private", repr(point))
+
+    def test_structured_statistics_reject_non_finite_json_values(self) -> None:
+        builder = StructuredMetadataPointBuilder(
+            knowledge_base_id="default",
+            permission_tags=("internal",),
+            embedding_model_version="qwen3-embedding-v1",
+        )
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            builder.build_payload(
+                source_id="source-1",
+                source_name="sales.xlsx",
+                classification="internal",
+                dataset_id="dataset-1",
+                worksheet_name="Sales",
+                schema_version=1,
+                publication_id="structured-publication-1",
+                publication_version="v1",
+                row_count=10,
+                columns=(
+                    {
+                        "physical_name": "amount",
+                        "data_type": "decimal",
+                        "statistics_summary": {"minimum": float("nan")},
+                    },
+                ),
+            )
+
+    def test_real_structured_catalog_profiles_units_samples_and_statistics(self) -> None:
+        database, repository = build_real_structured_catalog()
+        self.addCleanup(database.engine.dispose)
+
+        item = repository.get_catalog().datasets[0]
+        profile = item.column_profiles[0]
+
+        self.assertEqual(profile.physical_name, "amount")
+        self.assertEqual(profile.unit, "CNY")
+        self.assertEqual(
+            profile.safe_sample_values,
+            ("12.50", "[redacted-email]", "[redacted-number]"),
+        )
+        self.assertEqual(profile.statistics_summary["row_count"], 10)
+        self.assertEqual(profile.statistics_summary["sample_null_count"], 1)
+
+    def test_full_build_uses_real_catalog_profiles_without_rows(self) -> None:
+        database, repository = build_real_structured_catalog()
+        self.addCleanup(database.engine.dispose)
+        publisher = build_publisher(
+            chunks=[],
+            structured_catalog_provider=repository,
+        )
+
+        publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        structured = next(
+            point.payload
+            for point in publisher.gateway.points
+            if point.payload["source_type"] == "structured"
+        )
+        column = structured["columns"][0]
+        self.assertEqual(column["unit"], "CNY")
+        self.assertEqual(column["safe_sample_values"][0], "12.50")
+        self.assertEqual(column["statistics_summary"]["row_count"], 10)
+        self.assertNotIn("complete_rows", repr(structured))
+
+    def test_incremental_structured_profile_uses_publication_null_counts(self) -> None:
+        database, repository = build_real_structured_catalog()
+        self.addCleanup(database.engine.dispose)
+        publisher = build_publisher(
+            chunks=[],
+            structured_catalog_provider=repository,
+        )
+        publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+        schema = repository.get_catalog().datasets[0].schema
+
+        publisher.index_publication(
+            schema,
+            StructuredPublicationResult(
+                publication_id="structured-publication-2",
+                physical_table_name="structured_dataset_2",
+                row_count=20,
+                column_count=1,
+                null_counts={"amount": 4},
+                content_hash="9" * 64,
+            ),
+        )
+
+        column = publisher.gateway.points[-1].payload["columns"][0]
+        self.assertEqual(column["statistics_summary"]["row_count"], 20)
+        self.assertEqual(column["statistics_summary"]["null_count"], 4)
+
+    def test_incremental_structured_index_requires_profile_loader(self) -> None:
+        database, repository = build_real_structured_catalog()
+        self.addCleanup(database.engine.dispose)
+
+        class CatalogOnlyProvider:
+            def get_catalog(self):
+                return repository.get_catalog()
+
+        publisher = build_publisher(
+            chunks=[],
+            structured_catalog_provider=CatalogOnlyProvider(),
+        )
+        publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+        schema = repository.get_catalog().datasets[0].schema
+
+        with self.assertRaises(AttributeError):
+            publisher.index_publication(
+                schema,
+                StructuredPublicationResult(
+                    publication_id="structured-publication-2",
+                    physical_table_name="structured_dataset_2",
+                    row_count=20,
+                    column_count=1,
+                    null_counts={"amount": 4},
+                    content_hash="9" * 64,
+                ),
+            )
 
 
 if __name__ == "__main__":

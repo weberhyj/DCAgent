@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -27,6 +28,7 @@ from .structured_models import (
     SpreadsheetPreview,
     StructuredCatalog,
     StructuredColumnPreview,
+    StructuredColumnProfile,
     StructuredColumnSchema,
     StructuredColumnType,
     StructuredConfirmationResult,
@@ -841,6 +843,14 @@ class StructuredRepository:
                 )
             ).all()
             source_ids = {record.source_id for record in records}
+            previews = {
+                preview.source_id: preview.payload
+                for preview in session.scalars(
+                    select(StructuredPreviewRecord).where(
+                        StructuredPreviewRecord.source_id.in_(source_ids)
+                    )
+                ).all()
+            }
             sources = {
                 source.id: source
                 for source in session.scalars(
@@ -882,9 +892,35 @@ class StructuredRepository:
                             or active_record.schema_version != selected.schema_version
                             else _publication_from_record(active_record)
                         ),
+                        column_profiles=_retrieval_column_profiles(
+                            selected,
+                            active_record,
+                            previews.get(selected.source_id),
+                        ),
                     )
                 )
             return StructuredCatalog(datasets=tuple(catalog_items))
+
+    def get_retrieval_column_profiles(
+        self,
+        schema: StructuredDatasetSchema,
+        result: StructuredPublicationResult,
+    ) -> tuple[StructuredColumnProfile, ...]:
+        with self._database.session() as session:
+            dataset = session.get(
+                StructuredDatasetRecord,
+                (schema.dataset_id, schema.schema_version),
+            )
+            if dataset is None or dataset.source_id != schema.source_id:
+                raise StructuredNotFoundError("Structured schema not found")
+            preview = session.get(StructuredPreviewRecord, schema.source_id)
+            return _retrieval_column_profiles(
+                dataset,
+                None,
+                None if preview is None else preview.payload,
+                row_count=result.row_count,
+                null_counts=result.null_counts,
+            )
 
     def get_structured_status(
         self,
@@ -1464,6 +1500,130 @@ def _schema_from_record(record: StructuredDatasetRecord) -> StructuredDatasetSch
         ),
         schema_hash=record.schema_hash,
     )
+
+
+_UNIT_SUFFIX_PATTERN = re.compile(
+    r"(?:\(|（|\[|【)\s*([A-Za-z%‰]+|[\u4e00-\u9fff]{1,8})\s*(?:\)|）|\]|】)\s*$"
+)
+_EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)\d{7,}(?!\d)")
+_MAX_SAFE_SAMPLES = 5
+_MAX_SAFE_SAMPLE_LENGTH = 120
+
+
+def _retrieval_column_profiles(
+    dataset: StructuredDatasetRecord,
+    publication: StructuredPublicationRecord | None,
+    preview_payload: object,
+    *,
+    row_count: int | None = None,
+    null_counts: Mapping[str, int] | None = None,
+) -> tuple[StructuredColumnProfile, ...]:
+    preview_columns = _preview_profile_columns(
+        preview_payload,
+        dataset_id=dataset.dataset_id,
+        worksheet_name=dataset.worksheet_name,
+    )
+    authoritative_row_count = (
+        row_count
+        if row_count is not None
+        else (0 if publication is None else publication.row_count)
+    )
+    profiles: list[StructuredColumnProfile] = []
+    for column in dataset.columns:
+        preview = preview_columns.get(column.physical_name, {})
+        examples = preview.get("examples", ())
+        safe_samples = _safe_sample_values(examples)
+        sample_rows = _safe_nonnegative_integer(preview.get("sampled_rows"))
+        sample_null_count = _safe_nonnegative_integer(preview.get("null_count"))
+        null_count = None if null_counts is None else null_counts.get(column.physical_name)
+        summary: dict[str, object] = {
+            "row_count": authoritative_row_count,
+            "null_count": null_count,
+            "non_null_count": (
+                None if null_count is None else max(0, authoritative_row_count - null_count)
+            ),
+            "sample_rows": sample_rows,
+            "sample_null_count": sample_null_count,
+        }
+        profiles.append(
+            StructuredColumnProfile(
+                physical_name=column.physical_name,
+                unit=_column_unit(column.display_name, column.original_name),
+                safe_sample_values=safe_samples,
+                statistics_summary=summary,
+            )
+        )
+    return tuple(profiles)
+
+
+def _preview_profile_columns(
+    payload: object,
+    *,
+    dataset_id: str,
+    worksheet_name: str,
+) -> dict[str, Mapping[str, object]]:
+    if not isinstance(payload, Mapping):
+        return {}
+    datasets = payload.get("datasets")
+    if isinstance(datasets, (str, bytes, bytearray)) or not isinstance(datasets, Sequence):
+        return {}
+    for raw_dataset in datasets:
+        if not isinstance(raw_dataset, Mapping):
+            continue
+        if (
+            raw_dataset.get("dataset_id") != dataset_id
+            or raw_dataset.get("worksheet_name") != worksheet_name
+        ):
+            continue
+        raw_columns = raw_dataset.get("columns")
+        if isinstance(raw_columns, (str, bytes, bytearray)) or not isinstance(
+            raw_columns, Sequence
+        ):
+            return {}
+        return {
+            str(column["physical_name"]): column
+            for column in raw_columns
+            if isinstance(column, Mapping) and isinstance(column.get("physical_name"), str)
+        }
+    return {}
+
+
+def _safe_sample_values(raw_values: object) -> tuple[str, ...]:
+    if isinstance(raw_values, (str, bytes, bytearray)) or not isinstance(raw_values, Sequence):
+        return ()
+    samples: list[str] = []
+    for raw_value in raw_values:
+        if not isinstance(raw_value, (str, int, float, bool)):
+            continue
+        value = str(raw_value).strip()
+        if not value:
+            continue
+        if _EMAIL_PATTERN.fullmatch(value):
+            redacted = "[redacted-email]"
+        elif _LONG_NUMBER_PATTERN.search(value):
+            redacted = "[redacted-number]"
+        else:
+            redacted = value[:_MAX_SAFE_SAMPLE_LENGTH]
+        if redacted not in samples:
+            samples.append(redacted)
+        if len(samples) == _MAX_SAFE_SAMPLES:
+            break
+    return tuple(samples)
+
+
+def _column_unit(*names: str) -> str | None:
+    for name in names:
+        match = _UNIT_SUFFIX_PATTERN.search(name.strip())
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _safe_nonnegative_integer(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _confirmed_schema_hash(columns: Sequence[StructuredColumnSchema]) -> str:

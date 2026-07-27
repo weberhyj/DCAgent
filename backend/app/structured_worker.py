@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from .clickhouse_gateway import ClickHouseGateway
 from .database import Database
 from .offline_settings import OfflineSettings, require_secret_file
+from .retrieval_models import RetrievalMode
 from .structured_ingestion import SpreadsheetPublisher
 from .structured_models import StructuredPublicationResult
 from .structured_repository import (
@@ -37,6 +38,9 @@ class StructuredPublisher(Protocol):
 
 class StructuredMetadataIndexer(Protocol):
     def index_publication(self, schema: object, result: StructuredPublicationResult): ...
+
+
+MetadataIndexerFactory = Callable[[Mapping[str, str], Database], StructuredMetadataIndexer | None]
 
 
 class StructuredIngestionWorker:
@@ -228,6 +232,7 @@ def build_structured_worker(
     *,
     database_factory: Callable[[str], Database] = Database,
     clickhouse_client_factory: Callable[..., Any] | None = None,
+    metadata_indexer_factory: MetadataIndexerFactory | None = None,
 ) -> StructuredIngestionWorker:
     source = os.environ if environ is None else environ
     settings = OfflineSettings.from_environ(source)
@@ -239,6 +244,18 @@ def build_structured_worker(
     )
     database = database_factory(settings.database_url)
     repository = StructuredRepository(database)
+    try:
+        retrieval_mode = RetrievalMode(
+            source.get("RETRIEVAL_MODE", RetrievalMode.LEGACY.value).strip().lower()
+        )
+    except ValueError as error:
+        raise ValueError("RETRIEVAL_MODE must be legacy, shadow, or qwen3") from error
+    metadata_indexer: StructuredMetadataIndexer | None = None
+    if retrieval_mode is not RetrievalMode.LEGACY:
+        factory = metadata_indexer_factory or _build_production_metadata_indexer
+        metadata_indexer = factory(source, database)
+        if metadata_indexer is None:
+            raise RuntimeError("metadata indexer is required for Shadow/Qwen3 retrieval")
     if clickhouse_client_factory is None:
         import clickhouse_connect
 
@@ -272,11 +289,21 @@ def build_structured_worker(
     return StructuredIngestionWorker(
         repository,
         publisher,
+        metadata_indexer=metadata_indexer,
         worker_id=worker_id,
         lease_seconds=int(source.get("STRUCTURED_JOB_LEASE_SECONDS", "60")),
         retry_delay_seconds=int(source.get("STRUCTURED_JOB_RETRY_SECONDS", "60")),
         poll_interval_seconds=float(source.get("STRUCTURED_JOB_POLL_SECONDS", "1")),
     )
+
+
+def _build_production_metadata_indexer(
+    environ: Mapping[str, str],
+    database: Database,
+) -> StructuredMetadataIndexer:
+    from .retrieval_index_worker import build_publisher_from_environ
+
+    return build_publisher_from_environ(environ, database=database)
 
 
 def _close_clients(clients: tuple[object, ...]) -> None:
