@@ -18,6 +18,45 @@ from app.qwen3_embedding_runtime import (
 
 
 class Qwen3EmbeddingRuntimeTest(unittest.TestCase):
+    def test_torch_model_call_runs_inside_inference_mode(self) -> None:
+        state = {"active": False, "entries": 0}
+
+        class InferenceMode:
+            def __enter__(self) -> None:
+                state["active"] = True
+                state["entries"] += 1
+
+            def __exit__(self, *args: object) -> None:
+                state["active"] = False
+
+        torch_module = types.ModuleType("torch")
+        torch_module.inference_mode = lambda: InferenceMode()  # type: ignore[attr-defined]
+
+        class Tokenizer:
+            def __call__(self, texts: list[str], **kwargs: object) -> dict[str, numpy.ndarray]:
+                return {
+                    "input_ids": numpy.ones((1, 2)),
+                    "attention_mask": numpy.ones((1, 2)),
+                }
+
+        class TorchModel:
+            def __call__(self, **kwargs: object) -> dict[str, numpy.ndarray]:
+                if not state["active"]:
+                    raise AssertionError("gradient-enabled model call")
+                hidden = numpy.zeros((1, 2, 1024))
+                hidden[0, -1, 0] = 1.0
+                return {"last_hidden_state": hidden}
+
+        TorchModel.__module__ = "transformers.fake"
+        with patch.dict("sys.modules", {"torch": torch_module}):
+            vectors = Qwen3EmbeddingBackend(Tokenizer(), TorchModel(), embedding_metadata()).embed(
+                ["q"], purpose="query"
+            )
+
+        self.assertEqual(len(vectors), 1)
+        self.assertEqual(state["entries"], 1)
+        self.assertFalse(state["active"])
+
     def test_last_token_pool_handles_left_and_right_padding(self) -> None:
         hidden = numpy.array([[[1, 0], [2, 0], [9, 0]], [[3, 0], [4, 0], [0, 0]]], dtype=float)
         mask = numpy.array([[1, 1, 1], [1, 1, 0]])

@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 from collections.abc import Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Literal
 
@@ -62,7 +63,8 @@ class Qwen3EmbeddingBackend:
             truncation=True,
             return_tensors=tensor_type,
         )
-        outputs = self.model(**encoded)
+        with _inference_context(self.model):
+            outputs = self.model(**encoded)
         hidden = _extract_hidden_state(outputs)
         pooled = last_token_pool(hidden, encoded["attention_mask"])
         vectors = numpy.asarray(pooled, dtype=float)
@@ -146,6 +148,14 @@ def _extract_hidden_state(outputs: Any) -> Any:
 
 def _is_torch_model(model: Any) -> bool:
     return model.__class__.__module__.startswith(("torch", "transformers"))
+
+
+def _inference_context(model: Any) -> Any:
+    if not _is_torch_model(model):
+        return nullcontext()
+    import torch  # type: ignore[import-not-found]
+
+    return torch.inference_mode()
 
 
 __all__ = [

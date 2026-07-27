@@ -34,6 +34,12 @@ from .reranker_contracts import (
 )
 
 RERANKER_METADATA_FILENAME = "reranker-metadata.json"
+OFFLINE_RERANKER_ENVIRONMENT = {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+}
 _MANIFEST_FIELDS = {
     "modelName",
     "modelVersion",
@@ -209,6 +215,7 @@ def create_production_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         model_root, metadata = _load_pinned_model_configuration(target)
+        target.update(OFFLINE_RERANKER_ENVIRONMENT)
         runtime = _runtime(target.get("RERANKER_RUNTIME", "openvino"))
         max_length = _positive_int(target, "RERANKER_MAX_LENGTH", 8192)
         max_items = _positive_int(target, "RERANKER_BATCH_MAX_ITEMS", MAX_RERANK_PASSAGES)
@@ -332,26 +339,51 @@ def compute_model_directory_sha256(model_root: Path) -> str:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("reranker model root must be an existing local directory")
     files: list[Path] = []
-    for directory, directory_names, file_names in os.walk(root, followlinks=False):
-        directory_path = Path(directory)
-        for name in directory_names:
-            path = directory_path / name
-            if path.is_symlink():
+
+    def collect(directory: Path) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise ValueError(f"cannot read reranker model directory: {directory}") from error
+        for entry in entries:
+            path = Path(entry.path)
+            if entry.is_symlink():
                 raise ValueError("reranker model tree contains a symbolic link")
-        for name in file_names:
-            path = directory_path / name
-            if path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as error:
+                raise ValueError(f"cannot inspect reranker model path: {path}") from error
+            if stat.S_ISDIR(mode):
+                collect(path)
+            elif stat.S_ISREG(mode):
+                files.append(path)
+            else:
                 raise ValueError("reranker model tree contains a non-regular file")
-            files.append(path)
+
+    collect(root)
     files.sort(key=lambda path: path.relative_to(root).as_posix().encode("utf-8"))
     digest = hashlib.sha256(b"dc-agent-reranker-model-tree-v1\0")
     for path in files:
         relative = path.relative_to(root).as_posix().encode("utf-8")
-        data = path.read_bytes()
+        before = path.stat()
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
-        digest.update(len(data).to_bytes(8, "big"))
-        digest.update(data)
+        digest.update(before.st_size.to_bytes(8, "big"))
+        bytes_read = 0
+        try:
+            with path.open("rb") as file_handle:
+                while chunk := file_handle.read(1024 * 1024):
+                    digest.update(chunk)
+                    bytes_read += len(chunk)
+        except OSError as error:
+            raise ValueError(f"cannot read reranker model file: {path}") from error
+        after = path.stat()
+        if (
+            bytes_read != before.st_size
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+        ):
+            raise ValueError(f"reranker model file changed while hashing: {path}")
     return digest.hexdigest()
 
 

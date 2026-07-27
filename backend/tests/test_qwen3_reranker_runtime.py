@@ -8,7 +8,9 @@ from unittest.mock import patch
 import numpy
 
 from app.qwen3_reranker_runtime import (
+    RERANK_PREFIX,
     RERANK_PROFILE_SHA256,
+    RERANK_SUFFIX,
     Qwen3RerankerBackend,
     Qwen3RerankerMalformedOutput,
     format_rerank_pair,
@@ -19,6 +21,54 @@ from app.reranker_contracts import RerankerModelMetadata
 
 
 class Qwen3RerankerRuntimeTest(unittest.TestCase):
+    def test_torch_model_call_runs_inside_inference_mode(self) -> None:
+        state = {"active": False, "entries": 0}
+
+        class InferenceMode:
+            def __enter__(self) -> None:
+                state["active"] = True
+                state["entries"] += 1
+
+            def __exit__(self, *args: object) -> None:
+                state["active"] = False
+
+        torch_module = types.ModuleType("torch")
+        torch_module.inference_mode = lambda: InferenceMode()  # type: ignore[attr-defined]
+
+        class Tokenizer:
+            def convert_tokens_to_ids(self, token: str) -> int:
+                return {"no": 0, "yes": 1}[token]
+
+            def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+                return [3]
+
+            def pad(
+                self,
+                encoded: dict[str, list[list[int]]],
+                **kwargs: object,
+            ) -> dict[str, numpy.ndarray]:
+                ids = numpy.asarray(encoded["input_ids"])
+                return {"input_ids": ids, "attention_mask": numpy.ones_like(ids)}
+
+        class TorchModel:
+            def __call__(self, **kwargs: object) -> dict[str, numpy.ndarray]:
+                if not state["active"]:
+                    raise AssertionError("gradient-enabled model call")
+                ids = numpy.asarray(kwargs["input_ids"])
+                logits = numpy.zeros((*ids.shape, 2))
+                logits[:, -1, :] = [1.0, 3.0]
+                return {"logits": logits}
+
+        TorchModel.__module__ = "transformers.fake"
+        with patch.dict("sys.modules", {"torch": torch_module}):
+            scores = Qwen3RerankerBackend(Tokenizer(), TorchModel(), reranker_metadata()).rerank(
+                "q", ["p"]
+            )
+
+        self.assertGreater(scores[0], 0.8)
+        self.assertEqual(state["entries"], 1)
+        self.assertFalse(state["active"])
+
     def test_yes_probability_uses_only_yes_and_no_logits(self) -> None:
         scores = yes_probability(numpy.array([[1.0, 3.0], [4.0, 2.0]]))
         self.assertGreater(scores[0], 0.8)
@@ -32,10 +82,18 @@ class Qwen3RerankerRuntimeTest(unittest.TestCase):
             def convert_tokens_to_ids(self, token: str) -> int:
                 return {"no": 0, "yes": 1}[token]
 
-            def __call__(self, texts: list[str], **kwargs: object) -> dict[str, numpy.ndarray]:
+            def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+                return [1]
+
+            def pad(
+                self,
+                encoded: dict[str, list[list[int]]],
+                **kwargs: object,
+            ) -> dict[str, numpy.ndarray]:
+                ids = numpy.asarray(encoded["input_ids"])
                 return {
-                    "input_ids": numpy.ones((1, 2)),
-                    "attention_mask": numpy.ones((1, 2)),
+                    "input_ids": ids,
+                    "attention_mask": numpy.ones_like(ids),
                 }
 
         class MissingLogitsModel:
@@ -57,13 +115,27 @@ class Qwen3RerankerRuntimeTest(unittest.TestCase):
             def convert_tokens_to_ids(self, token: str) -> int:
                 return {"no": 2, "yes": 5}[token]
 
-            def __call__(self, texts: list[str], **kwargs: object) -> dict[str, numpy.ndarray]:
-                observed.append(texts)
-                return {"input_ids": numpy.ones((2, 2)), "attention_mask": numpy.ones((2, 2))}
+            def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+                observed.append([text])
+                return [1]
+
+            def pad(
+                self,
+                encoded: dict[str, list[list[int]]],
+                **kwargs: object,
+            ) -> dict[str, numpy.ndarray]:
+                width = max(len(ids) for ids in encoded["input_ids"])
+                values = numpy.zeros((len(encoded["input_ids"]), width), dtype=int)
+                mask = numpy.zeros_like(values)
+                for index, ids in enumerate(encoded["input_ids"]):
+                    values[index, : len(ids)] = ids
+                    mask[index, : len(ids)] = 1
+                return {"input_ids": values, "attention_mask": mask}
 
         class Model:
             def __call__(self, **kwargs: object) -> dict[str, numpy.ndarray]:
-                logits = numpy.zeros((2, 2, 6))
+                sequence_length = numpy.asarray(kwargs["input_ids"]).shape[1]
+                logits = numpy.zeros((2, sequence_length, 6))
                 logits[0, -1, [2, 5]] = [1.0, 3.0]
                 logits[1, -1, [2, 5]] = [4.0, 2.0]
                 return {"logits": logits}
@@ -72,9 +144,90 @@ class Qwen3RerankerRuntimeTest(unittest.TestCase):
         scores = backend.rerank("q", ["good", "bad"])
         self.assertGreater(scores[0], 0.8)
         self.assertLess(scores[1], 0.2)
-        self.assertEqual(
-            observed[0], [format_rerank_pair("q", "good"), format_rerank_pair("q", "bad")]
-        )
+        self.assertIn("<Query>: q\n<Document>: good", observed[2][0])
+        self.assertIn("<Query>: q\n<Document>: bad", observed[3][0])
+
+    def test_overlength_body_preserves_suffix_and_scores_after_it(self) -> None:
+        class Tokenizer:
+            pad_token_id = 0
+
+            def __init__(self) -> None:
+                self.padded_ids: numpy.ndarray | None = None
+
+            def convert_tokens_to_ids(self, token: str) -> int:
+                return {"no": 6, "yes": 7}[token]
+
+            def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+                self.assert_no_special_tokens(add_special_tokens)
+                if text == RERANK_PREFIX:
+                    return [10, 11]
+                if text == RERANK_SUFFIX:
+                    return [90, 91]
+                return [20, 21, 22, 23, 24, 25]
+
+            def build_inputs_with_special_tokens(self, token_ids: list[int]) -> list[int]:
+                return [1, *token_ids, 2]
+
+            def pad(
+                self,
+                encoded: dict[str, list[list[int]]],
+                *,
+                padding: bool,
+                return_tensors: str,
+            ) -> dict[str, numpy.ndarray]:
+                self.assertTrue(padding)
+                self.assertEqual(return_tensors, "np")
+                self.padded_ids = numpy.asarray(encoded["input_ids"])
+                return {
+                    "input_ids": self.padded_ids,
+                    "attention_mask": numpy.ones_like(self.padded_ids),
+                }
+
+            def __call__(self, texts: list[str], **kwargs: object) -> dict[str, numpy.ndarray]:
+                # The old whole-prompt path right-truncates away the suffix.
+                ids = numpy.asarray([[1, 10, 11, 20, 21, 22, 23, 24]])
+                self.padded_ids = ids
+                return {"input_ids": ids, "attention_mask": numpy.ones_like(ids)}
+
+            def assert_no_special_tokens(self, value: bool) -> None:
+                if value:
+                    raise AssertionError("fixed prompt pieces must disable special tokens")
+
+            def assertTrue(self, value: object) -> None:
+                if not value:
+                    raise AssertionError("expected truthy value")
+
+            def assertEqual(self, left: object, right: object) -> None:
+                if left != right:
+                    raise AssertionError(f"{left!r} != {right!r}")
+
+        class Model:
+            def __call__(self, **kwargs: object) -> dict[str, numpy.ndarray]:
+                input_ids = numpy.asarray(kwargs["input_ids"])
+                logits = numpy.zeros((1, input_ids.shape[1], 8))
+                logits[0, -1, [6, 7]] = [1.0, 4.0]
+                return {"logits": logits}
+
+        tokenizer = Tokenizer()
+        backend = Qwen3RerankerBackend(tokenizer, Model(), reranker_metadata(), max_length=8)
+        scores = backend.rerank("long query", ["long passage"])
+
+        self.assertGreater(scores[0], 0.9)
+        self.assertEqual(tokenizer.padded_ids.tolist(), [[1, 10, 11, 20, 21, 90, 91, 2]])
+
+    def test_rejects_max_length_that_cannot_hold_fixed_prompt(self) -> None:
+        class Tokenizer:
+            def convert_tokens_to_ids(self, token: str) -> int:
+                return {"no": 0, "yes": 1}[token]
+
+            def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+                return [1, 2, 3]
+
+            def build_inputs_with_special_tokens(self, token_ids: list[int]) -> list[int]:
+                return [9, *token_ids, 8]
+
+        with self.assertRaisesRegex(ValueError, "fixed reranker prompt"):
+            Qwen3RerankerBackend(Tokenizer(), object(), reranker_metadata(), max_length=7)
 
     def test_all_loaders_pin_local_only_options(self) -> None:
         for runtime, module_name, class_name in (
@@ -125,6 +278,9 @@ def fake_model_modules(
     class FakeTokenizer:
         def convert_tokens_to_ids(self, token: str) -> int:
             return {"no": 0, "yes": 1}[token]
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            return [1]
 
     transformers = types.ModuleType("transformers")
     transformers.AutoTokenizer = TokenizerFactory  # type: ignore[attr-defined]

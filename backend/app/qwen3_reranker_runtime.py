@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Literal
 
@@ -69,21 +70,39 @@ class Qwen3RerankerBackend:
         self.max_length = max_length
         self.no_token_id = _token_id(tokenizer, "no")
         self.yes_token_id = _token_id(tokenizer, "yes")
+        self._prefix_ids = _encode_without_special_tokens(tokenizer, RERANK_PREFIX)
+        self._suffix_ids = _encode_without_special_tokens(tokenizer, RERANK_SUFFIX)
+        fixed_ids = _build_with_special_tokens(tokenizer, [*self._prefix_ids, *self._suffix_ids])
+        self._body_token_budget = max_length - len(fixed_ids)
+        if self._body_token_budget < 0:
+            raise ValueError("max_length cannot hold the fixed reranker prompt")
 
     def rerank(self, query: str, passages: Sequence[str]) -> list[float]:
         return self.score_pairs([(query, passage) for passage in passages])
 
     def score_pairs(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
-        prompts = [format_rerank_pair(query, passage) for query, passage in pairs]
         tensor_type = "pt" if _is_torch_model(self.model) else "np"
-        encoded = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors=tensor_type,
-        )
-        outputs = self.model(**encoded)
+        sequences: list[list[int]] = []
+        for query, passage in pairs:
+            body = (
+                f"<Instruct>: {DEFAULT_RETRIEVAL_INSTRUCTION}\n"
+                f"<Query>: {query}\n<Document>: {passage}"
+            )
+            body_ids = _encode_without_special_tokens(self.tokenizer, body)
+            content = [
+                *self._prefix_ids,
+                *body_ids[: self._body_token_budget],
+                *self._suffix_ids,
+            ]
+            sequence = _build_with_special_tokens(self.tokenizer, content)
+            if len(sequence) > self.max_length:
+                raise Qwen3RerankerMalformedOutput(
+                    "reranker tokenizer special-token accounting is inconsistent"
+                )
+            sequences.append(sequence)
+        encoded = _pad_sequences(self.tokenizer, sequences, tensor_type=tensor_type)
+        with _inference_context(self.model):
+            outputs = self.model(**encoded)
         try:
             logits = numpy.asarray(_to_numpy(_extract_logits(outputs)), dtype=float)
             attention_mask = numpy.asarray(_to_numpy(encoded["attention_mask"]))
@@ -93,7 +112,7 @@ class Qwen3RerankerBackend:
             raise Qwen3RerankerMalformedOutput(
                 "reranker logits or attention mask are malformed"
             ) from error
-        if logits.ndim != 3 or logits.shape[0] != len(prompts):
+        if logits.ndim != 3 or logits.shape[0] != len(sequences):
             raise Qwen3RerankerMalformedOutput("reranker model returned malformed logits")
         if attention_mask.ndim != 2 or attention_mask.shape != logits.shape[:2]:
             raise Qwen3RerankerMalformedOutput("reranker attention mask does not match logits")
@@ -161,6 +180,70 @@ def _token_id(tokenizer: Any, token: str) -> int:
     return value
 
 
+def _encode_without_special_tokens(tokenizer: Any, text: str) -> list[int]:
+    encode = getattr(tokenizer, "encode", None)
+    if callable(encode):
+        raw_ids = encode(text, add_special_tokens=False)
+    else:
+        encoded = tokenizer(text, add_special_tokens=False, truncation=False)
+        raw_ids = encoded["input_ids"]
+    try:
+        values = numpy.asarray(_to_numpy(raw_ids))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise Qwen3RerankerMalformedOutput(
+            "reranker tokenizer returned malformed token IDs"
+        ) from error
+    if values.ndim == 2 and values.shape[0] == 1:
+        values = values[0]
+    if values.ndim != 1:
+        raise Qwen3RerankerMalformedOutput("reranker tokenizer returned malformed token IDs")
+    result: list[int] = []
+    for value in values.tolist():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise Qwen3RerankerMalformedOutput("reranker tokenizer returned malformed token IDs")
+        result.append(value)
+    return result
+
+
+def _build_with_special_tokens(tokenizer: Any, token_ids: list[int]) -> list[int]:
+    builder = getattr(tokenizer, "build_inputs_with_special_tokens", None)
+    built = builder(token_ids) if callable(builder) else token_ids
+    try:
+        values = numpy.asarray(_to_numpy(built))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise Qwen3RerankerMalformedOutput(
+            "reranker tokenizer returned malformed special-token IDs"
+        ) from error
+    if values.ndim != 1:
+        raise Qwen3RerankerMalformedOutput(
+            "reranker tokenizer returned malformed special-token IDs"
+        )
+    return [int(value) for value in values.tolist()]
+
+
+def _pad_sequences(
+    tokenizer: Any,
+    sequences: list[list[int]],
+    *,
+    tensor_type: Literal["np", "pt"],
+) -> Any:
+    pad = getattr(tokenizer, "pad", None)
+    if callable(pad):
+        return pad({"input_ids": sequences}, padding=True, return_tensors=tensor_type)
+    if tensor_type == "pt":
+        raise RuntimeError("Torch reranker tokenization requires tokenizer.pad")
+    pad_token_id = getattr(tokenizer, "pad_token_id", 0)
+    if not isinstance(pad_token_id, int) or pad_token_id < 0:
+        pad_token_id = 0
+    width = max((len(sequence) for sequence in sequences), default=0)
+    input_ids = numpy.full((len(sequences), width), pad_token_id, dtype=numpy.int64)
+    attention_mask = numpy.zeros((len(sequences), width), dtype=numpy.int64)
+    for index, sequence in enumerate(sequences):
+        input_ids[index, : len(sequence)] = sequence
+        attention_mask[index, : len(sequence)] = 1
+    return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
 def _to_numpy(value: Any) -> numpy.ndarray:
     if hasattr(value, "detach"):
         value = value.detach().cpu()
@@ -181,6 +264,14 @@ def _extract_logits(outputs: Any) -> Any:
 
 def _is_torch_model(model: Any) -> bool:
     return model.__class__.__module__.startswith(("torch", "transformers"))
+
+
+def _inference_context(model: Any) -> Any:
+    if not _is_torch_model(model):
+        return nullcontext()
+    import torch  # type: ignore[import-not-found]
+
+    return torch.inference_mode()
 
 
 __all__ = [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
 import unittest
 
@@ -64,3 +65,39 @@ class DynamicBatcherTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         await batcher.close()
         self.assertEqual(await result, [2, 3])
+
+    async def test_cancelled_failed_request_consumes_internal_future_exception(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        observed_contexts: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: observed_contexts.append(context))
+
+        def process(items: list[int]) -> list[int]:
+            entered.set()
+            release.wait(timeout=2)
+            raise RuntimeError("backend failed")
+
+        try:
+            batcher = DynamicBatcher(process, max_items=1, max_queue_items=1, wait_ms=0)
+            await batcher.start()
+            waiter = asyncio.create_task(batcher.submit([1]))
+            await asyncio.to_thread(entered.wait, 2)
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+            release.set()
+            await batcher.close()
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        self.assertFalse(
+            any(
+                context.get("message") == "Future exception was never retrieved"
+                for context in observed_contexts
+            ),
+            observed_contexts,
+        )

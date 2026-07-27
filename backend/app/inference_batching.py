@@ -84,7 +84,11 @@ class DynamicBatcher[InputT, OutputT]:
             self._reserved_items += len(submitted)
             self._pending.append(_Pending(submitted, future))
             self._condition.notify()
-        return await asyncio.shield(future)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            future.add_done_callback(_consume_future_exception)
+            raise
 
     async def close(self) -> None:
         async with self._condition:
@@ -163,6 +167,11 @@ class DynamicBatcher[InputT, OutputT]:
             if total >= self._max_items:
                 break
         return total
+
+
+def _consume_future_exception(future: asyncio.Future[object]) -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 __all__ = ["DynamicBatcher", "InferenceBatcherClosed", "InferenceQueueFull"]

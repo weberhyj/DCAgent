@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from app.qwen3_reranker_runtime import Qwen3RerankerMalformedOutput
 from app.reranker_contracts import RerankerModelMetadata
-from app.reranker_service import create_reranker_app
+from app.reranker_service import (
+    RERANKER_METADATA_FILENAME,
+    compute_model_directory_sha256,
+    create_production_app,
+    create_reranker_app,
+)
 
 
 class Backend:
@@ -56,7 +66,207 @@ class GenericValueErrorBackend(Backend):
         return super().rerank(query, passages)
 
 
+def write_metadata_manifest(root: Path, **changes: object) -> None:
+    payload: dict[str, object] = {
+        "modelName": "Qwen/Qwen3-Reranker-0.6B",
+        "modelVersion": "1",
+        "promptProfileSha256": "b" * 64,
+        "protocolVersion": "1",
+    }
+    payload.update(changes)
+    (root / RERANKER_METADATA_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
 class RerankerServiceTest(unittest.TestCase):
+    def test_production_lifecycle_loads_pinned_backend_and_sets_offline_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "model"
+            root.mkdir()
+            (root / "weights.bin").write_bytes(b"weights")
+            write_metadata_manifest(root)
+            checksum = compute_model_directory_sha256(root)
+            environ = {
+                "RERANKER_MODEL_ROOT": str(root),
+                "RERANKER_MODEL_SHA256": checksum,
+                "RERANKER_RUNTIME": "torch",
+                "RERANKER_MAX_LENGTH": "128",
+                "RERANKER_BATCH_MAX_ITEMS": "4",
+                "RERANKER_QUEUE_MAX_ITEMS": "8",
+                "RERANKER_BATCH_WAIT_MS": "0",
+            }
+            backend = Backend()
+            loader_calls: list[tuple[Path, RerankerModelMetadata]] = []
+
+            def loader(model_root: Path, model_metadata: RerankerModelMetadata) -> Backend:
+                loader_calls.append((model_root, model_metadata))
+                return backend
+
+            app = create_production_app(environ=environ, backend_loader=loader)
+            self.assertEqual(loader_calls, [])
+            self.assertFalse(app.state.reranker_ready)
+
+            with TestClient(app) as client:
+                self.assertEqual(len(loader_calls), 1)
+                self.assertEqual(loader_calls[0][0], root)
+                self.assertEqual(loader_calls[0][1].sha256, checksum)
+                self.assertEqual(len(backend.calls), 2)
+                ready = client.get("/readyz")
+                metadata_response = client.get("/v1/metadata")
+                self.assertEqual(ready.status_code, 200)
+                self.assertEqual(metadata_response.status_code, 200)
+                self.assertEqual(metadata_response.json()["modelChecksum"], checksum)
+                response = client.post(
+                    "/v1/rerank", json={"query": "q", "passages": ["good", "bad"]}
+                )
+                self.assertEqual(response.status_code, 200)
+
+            self.assertFalse(app.state.reranker_ready)
+            self.assertIsNone(app.state.reranker_batcher)
+            for name, expected in (
+                ("HF_HUB_OFFLINE", "1"),
+                ("TRANSFORMERS_OFFLINE", "1"),
+                ("HF_HUB_DISABLE_TELEMETRY", "1"),
+                ("TOKENIZERS_PARALLELISM", "false"),
+            ):
+                self.assertEqual(environ[name], expected)
+
+    def test_production_rejects_checksum_and_manifest_before_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "model"
+            root.mkdir()
+            write_metadata_manifest(root)
+            loader_calls: list[Path] = []
+
+            def loader(model_root: Path, metadata: RerankerModelMetadata) -> Backend:
+                loader_calls.append(model_root)
+                return Backend()
+
+            mismatch_app = create_production_app(
+                environ={
+                    "RERANKER_MODEL_ROOT": str(root),
+                    "RERANKER_MODEL_SHA256": "a" * 64,
+                },
+                backend_loader=loader,
+            )
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                with TestClient(mismatch_app):
+                    pass
+            self.assertEqual(loader_calls, [])
+
+            for changes in ({"unexpected": "field"}, {"modelVersion": None}):
+                with self.subTest(changes=changes):
+                    write_metadata_manifest(root, **changes)
+                    checksum = compute_model_directory_sha256(root)
+                    app = create_production_app(
+                        environ={
+                            "RERANKER_MODEL_ROOT": str(root),
+                            "RERANKER_MODEL_SHA256": checksum,
+                        },
+                        backend_loader=loader,
+                    )
+                    with self.assertRaisesRegex(ValueError, RERANKER_METADATA_FILENAME):
+                        with TestClient(app):
+                            pass
+                    self.assertEqual(loader_calls, [])
+
+    def test_production_rejects_nonlocal_symlink_and_invalid_runtime_before_loader(self) -> None:
+        loader_calls: list[Path] = []
+
+        def loader(model_root: Path, metadata: RerankerModelMetadata) -> Backend:
+            loader_calls.append(model_root)
+            return Backend()
+
+        public_app = create_production_app(
+            environ={"RERANKER_MODEL_ROOT": "https://models.example/reranker"},
+            backend_loader=loader,
+        )
+        with self.assertRaisesRegex(ValueError, "local"):
+            with TestClient(public_app):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "model"
+            root.mkdir()
+            write_metadata_manifest(root)
+            checksum = compute_model_directory_sha256(root)
+            runtime_app = create_production_app(
+                environ={
+                    "RERANKER_MODEL_ROOT": str(root),
+                    "RERANKER_MODEL_SHA256": checksum,
+                    "RERANKER_RUNTIME": "remote",
+                },
+                backend_loader=loader,
+            )
+            with self.assertRaisesRegex(ValueError, "RERANKER_RUNTIME"):
+                with TestClient(runtime_app):
+                    pass
+
+            link = Path(temp_dir) / "model-link"
+            try:
+                link.symlink_to(root, target_is_directory=True)
+            except OSError:
+                pass
+            else:
+                symlink_app = create_production_app(
+                    environ={
+                        "RERANKER_MODEL_ROOT": str(link),
+                        "RERANKER_MODEL_SHA256": checksum,
+                    },
+                    backend_loader=loader,
+                )
+                with self.assertRaisesRegex(ValueError, "existing local directory"):
+                    with TestClient(symlink_app):
+                        pass
+        self.assertEqual(loader_calls, [])
+
+    def test_production_startup_self_test_failure_keeps_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_metadata_manifest(root)
+            checksum = compute_model_directory_sha256(root)
+            app = create_production_app(
+                environ={
+                    "RERANKER_MODEL_ROOT": str(root),
+                    "RERANKER_MODEL_SHA256": checksum,
+                },
+                backend_loader=lambda model_root, metadata: AlwaysFailingBackend(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "reranker backend startup self-test failed"):
+                with TestClient(app):
+                    pass
+            self.assertFalse(app.state.reranker_ready)
+
+    def test_model_checksum_streams_bounded_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "weights.bin").write_bytes(b"weights")
+            expected = compute_model_directory_sha256(root)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("full read")):
+                self.assertEqual(compute_model_directory_sha256(root), expected)
+
+    def test_model_checksum_detects_file_mutation_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "weights.bin"
+            target.write_bytes(b"weights")
+            original_stat = Path.stat
+            calls = 0
+
+            def changing_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+                nonlocal calls
+                result = original_stat(path, *args, **kwargs)
+                if path == target:
+                    calls += 1
+                    if calls >= 2:
+                        values = list(result)
+                        values[8] += 1
+                        return os.stat_result(values)
+                return result
+
+            with patch.object(Path, "stat", changing_stat):
+                with self.assertRaisesRegex(ValueError, "changed while hashing"):
+                    compute_model_directory_sha256(root)
+
     def test_rerank_and_metadata(self) -> None:
         metadata = RerankerModelMetadata("qwen", "1", "a" * 64, "b" * 64, "1")
         with TestClient(create_reranker_app(Backend(), metadata)) as client:
