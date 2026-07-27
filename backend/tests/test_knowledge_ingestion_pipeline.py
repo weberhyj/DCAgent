@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -86,9 +87,19 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         events = []
 
         class Lifecycle:
-            def upsert_source(inner_self, source_id):
+            def upsert_source(inner_self, source_id, *, finalize=None, on_failure=None):
                 events.append(("qdrant", len(self.repository.list_knowledge_chunks(source_id))))
-                return "publication-1", 1
+                if finalize is None:
+                    events.append("missing-finalize")
+                    return "publication-1", 1
+                indexed = finalize(
+                    SimpleNamespace(
+                        publication_id="publication-1",
+                        indexed_point_count=1,
+                    )
+                )
+                events.append("fence-release")
+                return indexed
 
         source_id = "source-lifecycle"
         path = Path(self.temp_dir.name) / "lifecycle.txt"
@@ -96,12 +107,19 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         self.repository.add_uploaded_knowledge_source(
             source_id, "lifecycle.txt", "TXT", "internal", 0, str(path), 22, "text/plain"
         )
+        original_complete = self.repository.complete_retrieval_source_indexing
+
+        def complete_retrieval_index(*args, **kwargs):
+            events.append("postgres-indexed")
+            return original_complete(*args, **kwargs)
+
+        self.repository.complete_retrieval_source_indexing = complete_retrieval_index
         queue = KnowledgeIngestionQueue(self.repository, index_lifecycle=Lifecycle())
 
         queue.enqueue(source_id, path, "TXT")
         queue.drain()
 
-        self.assertEqual(events, [("qdrant", 1)])
+        self.assertEqual(events, [("qdrant", 1), "postgres-indexed", "fence-release"])
         self.assertEqual(self.repository.get_source_index_status(source_id), "indexed")
 
     def test_qdrant_failure_does_not_delete_postgres_chunks(self) -> None:
@@ -263,6 +281,56 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
             item for item in self.repository.list_knowledge_sources() if item.id == source_id
         )
         self.assertEqual(source.status, old_status)
+
+    def test_reindex_without_active_generation_finalizes_and_requeues(self) -> None:
+        events: list[str] = []
+
+        class FreshSystemLifecycle:
+            def delete_source(inner_self, source_id, *, finalize=None):
+                events.append("safe-qdrant-noop")
+                self.assertIsNotNone(finalize)
+                retried = finalize()
+                events.append("postgres-reindex")
+                return retried
+
+            def upsert_source(inner_self, source_id, *, finalize=None, on_failure=None):
+                raise AssertionError("reindex should only enqueue during this request")
+
+        source_id = "source-fresh-reindex"
+        path = Path(self.temp_dir.name) / "fresh-reindex.txt"
+        path.write_text("fresh system replacement", encoding="utf-8")
+        self.repository.add_uploaded_knowledge_source(
+            source_id,
+            "fresh-reindex.txt",
+            "TXT",
+            "internal",
+            0,
+            str(path),
+            24,
+            "text/plain",
+        )
+        self.repository.complete_knowledge_source_indexing(
+            source_id,
+            parse_knowledge_file(path, source_id, "TXT"),
+        )
+        queue = KnowledgeIngestionQueue(
+            self.repository,
+            index_lifecycle=FreshSystemLifecycle(),
+        )
+        client = TestClient(
+            create_app(
+                repository=self.repository,
+                upload_dir=Path(self.temp_dir.name),
+                ingestion_queue=queue,
+            )
+        )
+
+        response = client.post(f"/api/knowledge/sources/{source_id}/reindex")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(events, ["safe-qdrant-noop", "postgres-reindex"])
+        source = next(item for item in response.json() if item["id"] == source_id)
+        self.assertEqual(source["records"], 0)
 
 
 if __name__ == "__main__":

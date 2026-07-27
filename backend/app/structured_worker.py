@@ -37,7 +37,14 @@ class StructuredPublisher(Protocol):
 
 
 class StructuredMetadataIndexer(Protocol):
-    def index_publication(self, schema: object, result: StructuredPublicationResult): ...
+    def index_publication(
+        self,
+        schema: object,
+        result: StructuredPublicationResult,
+        *,
+        finalize: Callable[[object], object] | None = None,
+        on_failure: Callable[[Exception], object] | None = None,
+    ): ...
 
 
 MetadataIndexerFactory = Callable[[Mapping[str, str], Database], StructuredMetadataIndexer | None]
@@ -145,18 +152,40 @@ class StructuredIngestionWorker:
             renew(force=True, checkpoint_row=result.row_count)
             self._repository.complete_publication(job.id, lease_token, result)
             if self.metadata_indexer is not None:
+                failure_finalized = False
                 try:
-                    publication_id, indexed_point_count = self.metadata_indexer.index_publication(
+
+                    def finalize_index(indexed: object) -> object:
+                        publication_id = getattr(indexed, "publication_id", None)
+                        indexed_point_count = getattr(indexed, "indexed_point_count", None)
+                        if publication_id is None or indexed_point_count is None:
+                            publication_id, indexed_point_count = indexed
+                        self._repository.complete_retrieval_dataset_indexing(
+                            publication_input.schema,
+                            result,
+                            publication_id,
+                            indexed_point_count,
+                        )
+                        return indexed
+
+                    def finalize_failure(error: Exception) -> None:
+                        nonlocal failure_finalized
+                        self._repository.fail_retrieval_dataset_indexing(
+                            publication_input.schema,
+                            result,
+                            error.__class__.__name__,
+                        )
+                        failure_finalized = True
+
+                    self.metadata_indexer.index_publication(
                         publication_input.schema,
                         result,
-                    )
-                    self._repository.complete_retrieval_dataset_indexing(
-                        publication_input.schema,
-                        result,
-                        publication_id,
-                        indexed_point_count,
+                        finalize=finalize_index,
+                        on_failure=finalize_failure,
                     )
                 except Exception as index_error:
+                    if failure_finalized:
+                        return
                     self._repository.fail_retrieval_dataset_indexing(
                         publication_input.schema,
                         result,

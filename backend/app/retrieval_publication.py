@@ -391,27 +391,6 @@ class RetrievalIndexPublisher:
         publication_version = collection_publication_version(collection_name)
         batch_limit = _batch_size(batch_size)
         sample_limit = _nonnegative_integer(validation_sample_size, "validation_sample_size")
-        with self.audit.alias_publication_lock(self._alias_name) as alias_fence:
-            self._reconcile_alias_audit()
-            return self._build_with_alias_fence(
-                collection_name,
-                publication_version=publication_version,
-                activate=activate,
-                batch_limit=batch_limit,
-                sample_limit=sample_limit,
-                alias_fence=alias_fence,
-            )
-
-    def _build_with_alias_fence(
-        self,
-        collection_name: str,
-        *,
-        publication_version: str,
-        activate: bool,
-        batch_limit: int,
-        sample_limit: int,
-        alias_fence: AliasPublicationFence,
-    ) -> RetrievalPublication:
         publication = self.audit.create_publication(
             collection_name=collection_name,
             alias_name=self._alias_name,
@@ -419,6 +398,44 @@ class RetrievalIndexPublisher:
             sparse_profile_sha256=self._sparse_profile_sha256,
             dimensions=self._embedding_metadata.dimensions,
         )
+        alias_fence_acquired = False
+        try:
+            with self.audit.alias_publication_lock(self._alias_name) as alias_fence:
+                alias_fence_acquired = True
+                return self._build_with_alias_fence(
+                    publication,
+                    publication_version=publication_version,
+                    activate=activate,
+                    batch_limit=batch_limit,
+                    sample_limit=sample_limit,
+                    alias_fence=alias_fence,
+                )
+        except Exception as error:
+            if alias_fence_acquired:
+                raise
+            try:
+                self.audit.mark_publication_failed(
+                    publication.id,
+                    error.__class__.__name__,
+                )
+            except Exception:
+                raise PublicationRecoveryError(
+                    error.__class__.__name__,
+                    ("audit_mark_failed_failed",),
+                ) from error
+            raise RetrievalPublicationError("retrieval publication coordination failed") from error
+
+    def _build_with_alias_fence(
+        self,
+        publication: RetrievalPublication,
+        *,
+        publication_version: str,
+        activate: bool,
+        batch_limit: int,
+        sample_limit: int,
+        alias_fence: AliasPublicationFence,
+    ) -> RetrievalPublication:
+        collection_name = publication.collection_name
         previous_alias: str | None = None
         alias_state_known = False
         collection_may_exist = False
@@ -426,6 +443,7 @@ class RetrievalIndexPublisher:
         validation_samples: list[_ValidationSample] = []
         alias_switch_attempted = False
         try:
+            self._reconcile_alias_audit()
             previous_alias = self.gateway.resolve_alias()
             alias_state_known = True
             collection_may_exist = True
@@ -505,9 +523,22 @@ class RetrievalIndexPublisher:
                 ) from error
             raise
 
-    def upsert_source(self, source_id: str) -> SourceIndexResult:
-        with self.audit.source_maintenance_lock(source_id):
-            return self._upsert_source_locked(source_id)
+    def upsert_source(
+        self,
+        source_id: str,
+        *,
+        finalize: Callable[[SourceIndexResult], object] | None = None,
+        on_failure: Callable[[Exception], object] | None = None,
+    ) -> object:
+        with self.audit.alias_publication_lock(self._alias_name):
+            with self.audit.source_maintenance_lock(source_id):
+                try:
+                    result = self._upsert_source_locked(source_id)
+                except Exception as error:
+                    if on_failure is not None:
+                        on_failure(error)
+                    raise
+                return result if finalize is None else finalize(result)
 
     def _upsert_source_locked(self, source_id: str) -> SourceIndexResult:
         publication = self._audited_live_publication()
@@ -529,6 +560,7 @@ class RetrievalIndexPublisher:
                 batch = []
         if batch:
             point_count += self._upsert_batch(publication.collection_name, batch, [], 0)
+        self._require_live_alias(publication.collection_name)
         return SourceIndexResult(publication.id, point_count)
 
     def delete_source(
@@ -537,24 +569,37 @@ class RetrievalIndexPublisher:
         *,
         finalize: Callable[[], object] | None = None,
     ) -> object | None:
-        with self.audit.source_maintenance_lock(source_id):
-            publication = self._audited_live_publication()
-            version = collection_publication_version(publication.collection_name)
-            self.gateway.delete_source(
-                source_id,
-                maintenance_scope=IndexMaintenanceScope(self._knowledge_base_id, version),
-                collection_name=publication.collection_name,
-            )
-            self._require_live_alias(publication.collection_name)
-            return None if finalize is None else finalize()
+        with self.audit.alias_publication_lock(self._alias_name):
+            with self.audit.source_maintenance_lock(source_id):
+                publication = self._destructive_publication()
+                if publication is None:
+                    return None if finalize is None else finalize()
+                version = collection_publication_version(publication.collection_name)
+                self.gateway.delete_source(
+                    source_id,
+                    maintenance_scope=IndexMaintenanceScope(self._knowledge_base_id, version),
+                    collection_name=publication.collection_name,
+                )
+                self._require_live_alias(publication.collection_name)
+                return None if finalize is None else finalize()
 
     def index_publication(
         self,
         schema: StructuredDatasetSchema,
         result: StructuredPublicationResult,
-    ) -> SourceIndexResult:
-        with self.audit.source_maintenance_lock(schema.source_id):
-            return self._index_publication_locked(schema, result)
+        *,
+        finalize: Callable[[SourceIndexResult], object] | None = None,
+        on_failure: Callable[[Exception], object] | None = None,
+    ) -> object:
+        with self.audit.alias_publication_lock(self._alias_name):
+            with self.audit.source_maintenance_lock(schema.source_id):
+                try:
+                    indexed = self._index_publication_locked(schema, result)
+                except Exception as error:
+                    if on_failure is not None:
+                        on_failure(error)
+                    raise
+                return indexed if finalize is None else finalize(indexed)
 
     def _index_publication_locked(
         self,
@@ -587,6 +632,7 @@ class RetrievalIndexPublisher:
             payload=payload,
         )
         count = self._upsert_batch(publication.collection_name, [draft], [], 0)
+        self._require_live_alias(publication.collection_name)
         return SourceIndexResult(publication.id, count)
 
     def _iter_full_build_drafts(self, publication_version: str):
@@ -840,6 +886,26 @@ class RetrievalIndexPublisher:
         if publication is None:
             raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
         self._require_live_alias(publication.collection_name)
+        try:
+            collection_publication_version(publication.collection_name)
+        except ValueError as error:
+            raise RetrievalReconciliationRequiredError(
+                "retrieval index reconciliation required"
+            ) from error
+        return publication
+
+    def _destructive_publication(self) -> RetrievalPublication | None:
+        try:
+            live_collection = self.gateway.resolve_alias()
+            publication = self.audit.active_publication(self._alias_name)
+        except Exception as error:
+            raise RetrievalReconciliationRequiredError(
+                "retrieval index reconciliation required"
+            ) from error
+        if live_collection is None and publication is None:
+            return None
+        if publication is None or live_collection != publication.collection_name:
+            raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
         try:
             collection_publication_version(publication.collection_name)
         except ValueError as error:

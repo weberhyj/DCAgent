@@ -22,7 +22,13 @@ class KnowledgeIngestionJob:
 
 
 class KnowledgeIndexLifecycle(Protocol):
-    def upsert_source(self, source_id: str): ...
+    def upsert_source(
+        self,
+        source_id: str,
+        *,
+        finalize: Callable[[object], object] | None = None,
+        on_failure: Callable[[Exception], object] | None = None,
+    ): ...
 
     def delete_source(
         self,
@@ -113,14 +119,37 @@ class KnowledgeIngestionQueue:
             return
         if self._index_lifecycle is None:
             return
+        failure_finalized = False
         try:
-            publication_id, indexed_chunk_count = self._index_lifecycle.upsert_source(job.source_id)
-            self._repository.complete_retrieval_source_indexing(
+
+            def finalize_index(indexed: object) -> object:
+                publication_id = getattr(indexed, "publication_id", None)
+                indexed_chunk_count = getattr(indexed, "indexed_point_count", None)
+                if publication_id is None or indexed_chunk_count is None:
+                    publication_id, indexed_chunk_count = indexed
+                self._repository.complete_retrieval_source_indexing(
+                    job.source_id,
+                    publication_id,
+                    indexed_chunk_count,
+                )
+                return indexed
+
+            def finalize_failure(error: Exception) -> None:
+                nonlocal failure_finalized
+                self._repository.fail_retrieval_source_indexing(
+                    job.source_id,
+                    error.__class__.__name__,
+                )
+                failure_finalized = True
+
+            self._index_lifecycle.upsert_source(
                 job.source_id,
-                publication_id,
-                indexed_chunk_count,
+                finalize=finalize_index,
+                on_failure=finalize_failure,
             )
         except Exception as error:
+            if failure_finalized:
+                return
             try:
                 self._repository.fail_retrieval_source_indexing(
                     job.source_id,

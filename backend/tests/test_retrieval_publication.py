@@ -140,6 +140,9 @@ class RecordingGateway:
         self.existing_collections: set[str] = set()
         self.resolve_calls = 0
         self.deleted_scopes: list[IndexMaintenanceScope] = []
+        self.deleted_collections: list[str | None] = []
+        self.upsert_collections: list[str] = []
+        self.delete_entered = Event()
         self.block_upserts = False
         self.upsert_entered = Event()
         self.upsert_release = Event()
@@ -161,7 +164,9 @@ class RecordingGateway:
 
     def upsert_points(self, collection_name, points):
         self.events.append(f"upsert:{len(points)}")
+        self.upsert_collections.append(collection_name)
         if self.block_upserts:
+            self.block_upserts = False
             self.upsert_entered.set()
             if not self.upsert_release.wait(timeout=2):
                 raise TimeoutError("timed out waiting to release upsert")
@@ -223,6 +228,8 @@ class RecordingGateway:
     def delete_source(self, source_id, *, maintenance_scope, collection_name=None):
         self.events.append(f"delete_source:{source_id}")
         self.deleted_scopes.append(maintenance_scope)
+        self.deleted_collections.append(collection_name)
+        self.delete_entered.set()
 
     def retrieve_points(self, point_ids, *, scope, collection_name=None):
         self.events.append(f"retrieve:{len(point_ids)}")
@@ -297,11 +304,14 @@ class RecordingAudit:
         *,
         fail_activation: bool = False,
         fail_mark_failed: bool = False,
+        fail_alias_lock: bool = False,
     ) -> None:
         self.publication: RetrievalPublication | None = None
         self.previous: RetrievalPublication | None = None
+        self.publications: dict[str, RetrievalPublication] = {}
         self.fail_activation = fail_activation
         self.fail_mark_failed = fail_mark_failed
+        self.fail_alias_lock = fail_alias_lock
         self.source_lock = Lock()
         self.source_lock_events: list[str] = []
         self.alias_lock = Lock()
@@ -311,16 +321,21 @@ class RecordingAudit:
     @contextmanager
     def source_maintenance_lock(self, source_id):
         self.source_lock_events.append(f"wait:{source_id}")
+        self.timeline.append(f"source-lock-wait:{source_id}")
         with self.source_lock:
             self.source_lock_events.append(f"acquire:{source_id}")
+            self.timeline.append(f"source-lock-acquire:{source_id}")
             try:
                 yield
             finally:
                 self.source_lock_events.append(f"release:{source_id}")
+                self.timeline.append(f"source-lock-release:{source_id}")
 
     @contextmanager
     def alias_publication_lock(self, alias_name):
         self.timeline.append("alias-lock-wait")
+        if self.fail_alias_lock:
+            raise RuntimeError("PRIVATE-ALIAS-LOCK-FAILURE")
         if self.timeline.count("alias-lock-wait") >= 2:
             self.second_alias_wait.set()
         with self.alias_lock:
@@ -331,10 +346,8 @@ class RecordingAudit:
                 self.timeline.append("alias-lock-release")
 
     def create_publication(self, **values):
-        if self.publication is not None and self.publication.status == "active":
-            self.previous = self.publication
-        self.publication = RetrievalPublication(
-            id="publication-1",
+        publication = RetrievalPublication(
+            id=f"publication-{len(self.publications) + 1}",
             collection_name=values["collection_name"],
             alias_name=values["alias_name"],
             status="building",
@@ -346,40 +359,63 @@ class RecordingAudit:
             created_at="2026-07-27T00:00:00+00:00",
             completed_at=None,
         )
-        return self.publication
+        self.publications[publication.id] = publication
+        self.publication = publication
+        return publication
 
     def mark_publication_validated(self, publication_id, *, point_count):
-        assert self.publication is not None
-        self.publication = replace(
-            self.publication,
+        publication = self.publications[publication_id]
+        publication = replace(
+            publication,
             status="validated",
             point_count=point_count,
         )
-        return self.publication
+        self.publications[publication_id] = publication
+        self.publication = publication
+        return publication
 
     def mark_publication_active(self, publication_id, *, point_count, fence=None):
         self.timeline.append("audit-active")
         if self.fail_activation:
             raise RuntimeError("postgres unavailable")
-        assert self.publication is not None
-        self.publication = replace(self.publication, status="active", point_count=point_count)
-        return self.publication
+        for candidate_id, candidate in tuple(self.publications.items()):
+            if (
+                candidate.status == "active"
+                and candidate.alias_name == self.publications[publication_id].alias_name
+            ):
+                self.previous = candidate
+                self.publications[candidate_id] = replace(candidate, status="retired")
+        publication = replace(
+            self.publications[publication_id],
+            status="active",
+            point_count=point_count,
+        )
+        self.publications[publication_id] = publication
+        self.publication = publication
+        return publication
 
     def mark_publication_failed(self, publication_id, error_message, *, fence=None):
         if self.fail_mark_failed:
             raise RuntimeError("postgres failure state unavailable")
-        assert self.publication is not None
-        self.publication = replace(
-            self.publication,
+        publication = replace(
+            self.publications[publication_id],
             status="failed",
             error_message=error_message,
         )
-        return self.publication
+        self.publications[publication_id] = publication
+        self.publication = publication
+        return publication
 
     def active_publication(self, alias_name=None):
-        if self.publication is not None and self.publication.status == "active":
-            return self.publication
-        return self.previous
+        return next(
+            (
+                publication
+                for publication in reversed(tuple(self.publications.values()))
+                if publication.status == "active"
+                and (alias_name is None or publication.alias_name == alias_name)
+            ),
+            None,
+        )
 
 
 def build_publisher(
@@ -394,6 +430,7 @@ def build_publisher(
     create_timeout_after_create=False,
     fail_restore=False,
     fail_mark_failed=False,
+    fail_alias_lock=False,
     crash_after_alias_switch=False,
     alias_after_activation_failure=None,
     unrelated_authorized_hits=False,
@@ -417,6 +454,7 @@ def build_publisher(
     audit = RecordingAudit(
         fail_activation=fail_activation,
         fail_mark_failed=fail_mark_failed,
+        fail_alias_lock=fail_alias_lock,
     )
     embedding = RecordingEmbedding()
     publisher = RetrievalIndexPublisher(
@@ -806,6 +844,45 @@ class RetrievalPublicationTest(unittest.TestCase):
             [IndexMaintenanceScope("default", "v7")],
         )
 
+    def test_fresh_system_delete_skips_qdrant_and_runs_finalize_under_fences(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        finalized: list[str] = []
+
+        result = publisher.delete_source(
+            "source-1",
+            finalize=lambda: finalized.append("postgres-finalize") or "deleted",
+        )
+
+        self.assertEqual(result, "deleted")
+        self.assertEqual(finalized, ["postgres-finalize"])
+        self.assertNotIn("delete_source:source-1", publisher.gateway.events)
+        self.assertEqual(
+            publisher.audit.timeline,
+            [
+                "alias-lock-wait",
+                "alias-lock-acquire",
+                "source-lock-wait:source-1",
+                "source-lock-acquire:source-1",
+                "resolve",
+                "source-lock-release:source-1",
+                "alias-lock-release",
+            ],
+        )
+
+    def test_fresh_system_delete_rejects_live_alias_without_active_audit(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.gateway.alias = "knowledge_chunks_qwen3_v7"
+        finalized: list[str] = []
+
+        with self.assertRaisesRegex(RetrievalPublicationError, "reconciliation required"):
+            publisher.delete_source(
+                "source-1",
+                finalize=lambda: finalized.append("postgres-finalize"),
+            )
+
+        self.assertEqual(finalized, [])
+        self.assertNotIn("delete_source:source-1", publisher.gateway.events)
+
     def test_incremental_delete_refuses_live_alias_mismatch(self) -> None:
         publisher = build_publisher(chunks=sample_chunks(1))
         publisher.build_and_activate("knowledge_chunks_qwen3_v7")
@@ -867,6 +944,226 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(
             publisher.gateway.events,
             ["delete_source:source-1", "upsert:1", "delete_source:source-1"],
+        )
+
+    def test_upsert_finalizes_postgres_status_before_releasing_fences(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        publisher.audit.timeline.clear()
+
+        result = publisher.upsert_source(
+            "source-1",
+            finalize=lambda indexed: (
+                publisher.audit.timeline.append("postgres-finalize") or indexed
+            ),
+        )
+
+        self.assertEqual(result.indexed_point_count, 1)
+        timeline = publisher.audit.timeline
+        self.assertLess(
+            timeline.index("alias-lock-acquire"), timeline.index("source-lock-acquire:source-1")
+        )
+        self.assertLess(
+            timeline.index("source-lock-acquire:source-1"), timeline.index("postgres-finalize")
+        )
+        self.assertLess(
+            timeline.index("postgres-finalize"), timeline.index("source-lock-release:source-1")
+        )
+        self.assertLess(
+            timeline.index("source-lock-release:source-1"), timeline.index("alias-lock-release")
+        )
+
+    def test_upsert_records_failure_status_before_releasing_fences(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        publisher.audit.timeline.clear()
+
+        def fail_delete(*args, **kwargs):
+            raise RuntimeError("qdrant unavailable")
+
+        publisher.gateway.delete_source = fail_delete
+
+        with self.assertRaises(RuntimeError):
+            publisher.upsert_source(
+                "source-1",
+                on_failure=lambda _error: publisher.audit.timeline.append("postgres-failed"),
+            )
+
+        timeline = publisher.audit.timeline
+        self.assertLess(
+            timeline.index("source-lock-acquire:source-1"), timeline.index("postgres-failed")
+        )
+        self.assertLess(
+            timeline.index("postgres-failed"), timeline.index("source-lock-release:source-1")
+        )
+        self.assertLess(
+            timeline.index("source-lock-release:source-1"), timeline.index("alias-lock-release")
+        )
+
+    def test_upsert_first_blocks_builder_and_later_build_contains_new_content(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.repository.chunks = [
+            replace(sample_chunks(1)[0], text="fresh content from incremental ingestion")
+        ]
+        publisher.gateway.events.clear()
+        publisher.gateway.upsert_collections.clear()
+        publisher.audit.timeline.clear()
+        publisher.audit.second_alias_wait.clear()
+        publisher.gateway.block_upserts = True
+        errors: list[Exception] = []
+
+        def upsert() -> None:
+            try:
+                publisher.upsert_source("source-1")
+            except Exception as error:
+                errors.append(error)
+
+        def build() -> None:
+            try:
+                publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+            except Exception as error:
+                errors.append(error)
+
+        upsert_thread = Thread(target=upsert)
+        build_thread = Thread(target=build)
+        upsert_thread.start()
+        self.assertTrue(publisher.gateway.upsert_entered.wait(timeout=1))
+        build_thread.start()
+
+        self.assertTrue(publisher.audit.second_alias_wait.wait(timeout=1))
+        self.assertNotIn("create", publisher.gateway.events)
+        publisher.gateway.upsert_release.set()
+        upsert_thread.join(timeout=2)
+        build_thread.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(upsert_thread.is_alive())
+        self.assertFalse(build_thread.is_alive())
+        self.assertTrue(
+            any(
+                point.payload["text"] == "fresh content from incremental ingestion"
+                for point in publisher.gateway.points_by_collection["knowledge_chunks_qwen3_v7"]
+            )
+        )
+        self.assertLess(
+            publisher.audit.timeline.index("alias-lock-acquire"),
+            publisher.audit.timeline.index("source-lock-acquire:source-1"),
+        )
+
+    def test_builder_first_makes_waiting_upsert_target_new_active_collection(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.repository.chunks = [replace(sample_chunks(1)[0], text="new generation")]
+        publisher.gateway.events.clear()
+        publisher.gateway.deleted_collections.clear()
+        publisher.gateway.upsert_collections.clear()
+        publisher.gateway.delete_entered.clear()
+        publisher.audit.timeline.clear()
+        publisher.audit.second_alias_wait.clear()
+        publisher.gateway.block_first_create = True
+        errors: list[Exception] = []
+
+        def build() -> None:
+            try:
+                publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+            except Exception as error:
+                errors.append(error)
+
+        build_thread = Thread(target=build)
+
+        def upsert() -> None:
+            try:
+                publisher.upsert_source("source-1")
+            except Exception as error:
+                errors.append(error)
+
+        upsert_thread = Thread(target=upsert)
+        build_thread.start()
+        self.assertTrue(publisher.gateway.create_entered.wait(timeout=1))
+        upsert_thread.start()
+
+        self.assertTrue(publisher.audit.second_alias_wait.wait(timeout=1))
+        self.assertFalse(publisher.gateway.delete_entered.is_set())
+        publisher.gateway.create_release.set()
+        build_thread.join(timeout=2)
+        upsert_thread.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(build_thread.is_alive())
+        self.assertFalse(upsert_thread.is_alive())
+        self.assertEqual(
+            publisher.gateway.deleted_collections[-1],
+            "knowledge_chunks_qwen3_v7",
+        )
+        self.assertEqual(
+            publisher.gateway.upsert_collections[-1],
+            "knowledge_chunks_qwen3_v7",
+        )
+        self.assertEqual(
+            publisher.gateway.points_by_collection["knowledge_chunks_qwen3_v7"][-1].payload["text"],
+            "new generation",
+        )
+
+    def test_builder_serializes_delete_or_reindex_finalize_on_new_generation(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.gateway.events.clear()
+        publisher.gateway.deleted_collections.clear()
+        publisher.gateway.delete_entered.clear()
+        publisher.audit.timeline.clear()
+        publisher.audit.second_alias_wait.clear()
+        publisher.gateway.block_first_create = True
+        finalized: list[str] = []
+        errors: list[Exception] = []
+
+        def build() -> None:
+            try:
+                publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+            except Exception as error:
+                errors.append(error)
+
+        build_thread = Thread(target=build)
+
+        def delete_or_reindex() -> None:
+            try:
+                publisher.delete_source(
+                    "source-1",
+                    finalize=lambda: finalized.append("postgres-finalize"),
+                )
+            except Exception as error:
+                errors.append(error)
+
+        delete_thread = Thread(target=delete_or_reindex)
+        build_thread.start()
+        self.assertTrue(publisher.gateway.create_entered.wait(timeout=1))
+        delete_thread.start()
+
+        self.assertTrue(publisher.audit.second_alias_wait.wait(timeout=1))
+        self.assertFalse(publisher.gateway.delete_entered.is_set())
+        self.assertEqual(finalized, [])
+        publisher.gateway.create_release.set()
+        build_thread.join(timeout=2)
+        delete_thread.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(finalized, ["postgres-finalize"])
+        self.assertEqual(
+            publisher.gateway.deleted_collections[-1],
+            "knowledge_chunks_qwen3_v7",
+        )
+        timeline = publisher.audit.timeline
+        source_acquire = timeline.index("source-lock-acquire:source-1")
+        alias_acquires = [
+            index
+            for index, event in enumerate(timeline[:source_acquire])
+            if event == "alias-lock-acquire"
+        ]
+        self.assertTrue(alias_acquires)
+        self.assertLess(alias_acquires[-1], source_acquire)
+        self.assertLess(
+            timeline.index("source-lock-release:source-1"),
+            timeline.index("alias-lock-release", source_acquire),
         )
 
     def test_activation_audit_failure_restores_previous_alias_and_deletes_new_collection(
@@ -1025,7 +1322,7 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertIn("audit_mark_failed_failed", captured.exception.recovery_codes)
         self.assertNotIn("permission probe failed", str(captured.exception))
 
-    def test_initial_alias_resolution_failure_stops_before_publication_create(self) -> None:
+    def test_initial_alias_resolution_failure_marks_building_publication_failed(self) -> None:
         publisher = build_publisher(
             chunks=sample_chunks(1),
             fail_initial_alias_resolution=True,
@@ -1034,8 +1331,25 @@ class RetrievalPublicationTest(unittest.TestCase):
         with self.assertRaisesRegex(RetrievalPublicationError, "reconciliation required"):
             publisher.build_and_activate("knowledge_chunks_qwen3_v7")
 
-        self.assertIsNone(publisher.audit.publication)
+        self.assertIsNotNone(publisher.audit.publication)
+        self.assertEqual(publisher.audit.publication.status, "failed")
         self.assertNotIn("create", publisher.gateway.events)
+        self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_alias_fence_acquisition_failure_marks_publication_failed_safely(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(1),
+            fail_alias_lock=True,
+        )
+
+        with self.assertRaises(RetrievalPublicationError) as captured:
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertNotIn("PRIVATE-ALIAS-LOCK-FAILURE", str(captured.exception))
+        self.assertIsNotNone(publisher.audit.publication)
+        self.assertEqual(publisher.audit.publication.status, "failed")
+        self.assertNotIn("create", publisher.gateway.events)
+        self.assertNotIn("activate_alias", publisher.gateway.events)
 
     def test_structured_point_contains_safe_catalog_metadata_only(self) -> None:
         point = StructuredMetadataPointBuilder(
@@ -1197,6 +1511,38 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(column["statistics_summary"]["row_count"], 20)
         self.assertEqual(column["statistics_summary"]["null_count"], 4)
 
+    def test_structured_index_finalizes_status_before_releasing_fences(self) -> None:
+        database, repository = build_real_structured_catalog()
+        self.addCleanup(database.engine.dispose)
+        publisher = build_publisher(chunks=[], structured_catalog_provider=repository)
+        publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+        publisher.audit.timeline.clear()
+        schema = repository.get_catalog().datasets[0].schema
+
+        result = publisher.index_publication(
+            schema,
+            StructuredPublicationResult(
+                publication_id="structured-publication-2",
+                physical_table_name="structured_dataset_2",
+                row_count=20,
+                column_count=1,
+                null_counts={"amount": 4},
+                content_hash="9" * 64,
+            ),
+            finalize=lambda indexed: (
+                publisher.audit.timeline.append("postgres-finalize") or indexed
+            ),
+        )
+
+        self.assertEqual(result.indexed_point_count, 1)
+        timeline = publisher.audit.timeline
+        source_lock = "source-lock-acquire:source-1"
+        source_release = "source-lock-release:source-1"
+        self.assertLess(timeline.index("alias-lock-acquire"), timeline.index(source_lock))
+        self.assertLess(timeline.index(source_lock), timeline.index("postgres-finalize"))
+        self.assertLess(timeline.index("postgres-finalize"), timeline.index(source_release))
+        self.assertLess(timeline.index(source_release), timeline.index("alias-lock-release"))
+
     def test_incremental_structured_index_requires_profile_loader(self) -> None:
         database, repository = build_real_structured_catalog()
         self.addCleanup(database.engine.dispose)
@@ -1212,6 +1558,7 @@ class RetrievalPublicationTest(unittest.TestCase):
         publisher.build_and_activate("knowledge_chunks_qwen3_v1")
         schema = repository.get_catalog().datasets[0].schema
 
+        publisher.audit.timeline.clear()
         with self.assertRaises(AttributeError):
             publisher.index_publication(
                 schema,
@@ -1223,7 +1570,19 @@ class RetrievalPublicationTest(unittest.TestCase):
                     null_counts={"amount": 4},
                     content_hash="9" * 64,
                 ),
+                on_failure=lambda _error: publisher.audit.timeline.append("postgres-failed"),
             )
+
+        timeline = publisher.audit.timeline
+        self.assertLess(
+            timeline.index("source-lock-acquire:source-1"), timeline.index("postgres-failed")
+        )
+        self.assertLess(
+            timeline.index("postgres-failed"), timeline.index("source-lock-release:source-1")
+        )
+        self.assertLess(
+            timeline.index("source-lock-release:source-1"), timeline.index("alias-lock-release")
+        )
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlalchemy import select
@@ -519,11 +520,28 @@ class StructuredWorkerTest(unittest.TestCase):
             return result
 
         self.repository.complete_publication = complete
+        original_retrieval_complete = self.repository.complete_retrieval_dataset_indexing
+
+        def complete_retrieval(*args, **kwargs):
+            events.append("postgres_retrieval_complete")
+            return original_retrieval_complete(*args, **kwargs)
+
+        self.repository.complete_retrieval_dataset_indexing = complete_retrieval
 
         class MetadataIndexer:
-            def index_publication(inner_self, schema, result):
+            def index_publication(inner_self, schema, result, *, finalize=None, on_failure=None):
                 events.append("qdrant_metadata")
-                return "retrieval-publication-1", 1
+                if finalize is None:
+                    events.append("missing_finalize")
+                    return "retrieval-publication-1", 1
+                indexed = finalize(
+                    SimpleNamespace(
+                        publication_id="retrieval-publication-1",
+                        indexed_point_count=1,
+                    )
+                )
+                events.append("fence_release")
+                return indexed
 
         self.enqueue()
         worker = StructuredIngestionWorker(
@@ -536,12 +554,22 @@ class StructuredWorkerTest(unittest.TestCase):
 
         self.assertTrue(worker.run_once())
 
-        self.assertEqual(events, ["clickhouse_complete", "qdrant_metadata"])
+        self.assertEqual(
+            events,
+            [
+                "clickhouse_complete",
+                "qdrant_metadata",
+                "postgres_retrieval_complete",
+                "fence_release",
+            ],
+        )
         self.assertEqual(self.repository.get_source_index_status(self.source_id), "indexed")
 
     def test_metadata_index_failure_does_not_roll_back_clickhouse_publication(self) -> None:
         class FailingMetadataIndexer:
-            def index_publication(self, schema, result):
+            def index_publication(self, schema, result, *, finalize=None, on_failure=None):
+                if on_failure is not None:
+                    on_failure(RuntimeError("qdrant unavailable"))
                 raise RuntimeError("qdrant unavailable")
 
         self.enqueue()
@@ -574,8 +602,12 @@ class StructuredWorkerTest(unittest.TestCase):
                 return self.publication_result(publication_id)
 
         class MetadataIndexer:
-            def index_publication(inner_self, schema, result):
-                return "retrieval-publication-1", 1
+            def index_publication(inner_self, schema, result, *, finalize=None, on_failure=None):
+                indexed = SimpleNamespace(
+                    publication_id="retrieval-publication-1",
+                    indexed_point_count=1,
+                )
+                return indexed if finalize is None else finalize(indexed)
 
         worker = StructuredIngestionWorker(
             self.repository,
@@ -611,10 +643,16 @@ class StructuredWorkerTest(unittest.TestCase):
         fail_sales = [True]
 
         class MetadataIndexer:
-            def index_publication(inner_self, schema, result):
+            def index_publication(inner_self, schema, result, *, finalize=None, on_failure=None):
                 if schema.dataset_id == self.dataset_id and fail_sales[0]:
+                    if on_failure is not None:
+                        on_failure(RuntimeError("qdrant unavailable"))
                     raise RuntimeError("qdrant unavailable")
-                return "retrieval-publication-1", 1
+                indexed = SimpleNamespace(
+                    publication_id="retrieval-publication-1",
+                    indexed_point_count=1,
+                )
+                return indexed if finalize is None else finalize(indexed)
 
         worker = StructuredIngestionWorker(
             self.repository,
