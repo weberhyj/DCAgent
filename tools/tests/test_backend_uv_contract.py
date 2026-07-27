@@ -106,6 +106,7 @@ class BackendUvContractTest(unittest.TestCase):
                 "gunicorn>=26.0.0",
                 "httpx>=0.28.0",
                 "langgraph>=0.2.0",
+                "loguru>=0.7",
                 "openpyxl>=3.1.0",
                 "psycopg[binary]>=3.2.0",
                 "pypdf>=5.0.0",

@@ -927,13 +927,13 @@ class LLMProviderTest(unittest.TestCase):
         self.assertIsInstance(provider, PhysocDeepSeekLLMProvider)
         self.assertEqual(
             llm_module.DEFAULT_PHYSOC_STREAM_PATH,
-            "/api/physoc/deepseek/stream",
+            "/api/physoc/deepseeks/stream",
         )
         self.assertEqual(provider.api_base, "http://127.0.0.1:11434")
         self.assertEqual(provider.stream_path, llm_module.DEFAULT_PHYSOC_STREAM_PATH)
         self.assertEqual(
             provider.stream_url,
-            "http://127.0.0.1:11434/api/physoc/deepseek/stream",
+            "http://127.0.0.1:11434/api/physoc/deepseeks/stream",
         )
         self.assertEqual(provider.model, "deepseek-r1")
 

@@ -46,7 +46,7 @@ def private_environment(**changes: str) -> dict[str, str]:
         "LLAMA_SERVER_URL": "http://127.0.0.1:8080",
         "LLM_PROVIDER": "physoc_deepseek",
         "LLM_API_BASE": "http://127.0.0.1:8090",
-        "LLM_STREAM_PATH": "/api/physoc/deepseek/stream",
+        "LLM_STREAM_PATH": "/api/physoc/deepseeks/stream",
         "LLM_MODEL": "my_deepseek_r1_7b",
     }
     values.update(changes)

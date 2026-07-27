@@ -38,7 +38,7 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 ```text
 LLM_PROVIDER=physoc_deepseek
 LLM_API_BASE=http://172.16.0.10:8090
-LLM_STREAM_PATH=/api/physoc/deepseek/stream
+LLM_STREAM_PATH=/api/physoc/deepseeks/stream
 LLM_MODEL=my_deepseek_r1_7b
 ```
 
@@ -74,7 +74,7 @@ New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null
   "model": "my_deepseek_r1_7b",
   "passed": true,
   "provider": "physoc_deepseek",
-  "streamPath": "/api/physoc/deepseek/stream"
+  "streamPath": "/api/physoc/deepseeks/stream"
 }
 ```
 

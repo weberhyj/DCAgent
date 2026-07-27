@@ -65,7 +65,7 @@ Physoc DeepSeek 流式接口可以按以下方式配置，示例使用本机 loo
 ```text
 LLM_PROVIDER=physoc_deepseek
 LLM_API_BASE=http://127.0.0.1:8090
-LLM_STREAM_PATH=/api/physoc/deepseek/stream
+LLM_STREAM_PATH=/api/physoc/deepseeks/stream
 LLM_MODEL=my_deepseek_r1_7b
 ```
 
@@ -90,7 +90,7 @@ Physoc 模式无需 LLM_API_KEY。后端向 `LLM_API_BASE` 与 `LLM_STREAM_PATH`
 ```text
 LLM_PROVIDER=physoc_deepseek
 LLM_API_BASE=http://172.16.0.10:8090
-LLM_STREAM_PATH=/api/physoc/deepseek/stream
+LLM_STREAM_PATH=/api/physoc/deepseeks/stream
 LLM_MODEL=my_deepseek_r1_7b
 ```
 
@@ -169,7 +169,7 @@ flowchart TD
 3. 切片和 48 维轻量哈希向量保存在 PostgreSQL。
 4. 查询时从 PostgreSQL 读取已索引切片，在 Python 中计算关键词和向量分数。
 5. LangGraph Agent 最多保留 5 个证据切片、深入检查 3 个资料来源，并把证据、调查摘要和最近 6 条消息组成完整 RAG 提示词。
-6. `physoc_deepseek` Provider 将完整提示词通过 `POST /api/physoc/deepseek/stream` 发送给私有 Physoc 服务，收集 SSE `message` 事件中的 `response`，再返回归纳后的答案。
+6. `physoc_deepseek` Provider 将完整提示词通过 `POST /api/physoc/deepseeks/stream` 发送给私有 Physoc 服务，收集 SSE `message` 事件中的 `response`，再返回归纳后的答案。
 
 没有可靠证据时不会调用模型。Physoc 超时、返回非 2xx、SSE 格式异常或答案为空时，API
 返回 HTTP 502；系统不得把检索切片或模板文本伪装成模型答案。

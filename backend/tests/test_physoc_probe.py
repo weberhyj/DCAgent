@@ -21,7 +21,7 @@ SAFE_REPORT = {
     "passed": True,
     "provider": "physoc_deepseek",
     "model": "my_deepseek_r1_7b",
-    "streamPath": "/api/physoc/deepseek/stream",
+    "streamPath": "/api/physoc/deepseeks/stream",
     "elapsedMs": 250.0,
     "answerChars": 12,
     "citationCount": 1,
@@ -40,7 +40,7 @@ class FakePhysocProvider(PhysocDeepSeekLLMProvider):
     def __init__(self) -> None:
         super().__init__(
             api_base="http://127.0.0.1:8090",
-            stream_path="/api/physoc/deepseek/stream",
+            stream_path="/api/physoc/deepseeks/stream",
             model="my_deepseek_r1_7b",
         )
         self.requests: list[LLMRequest] = []
@@ -105,7 +105,7 @@ class PhysocProbeTests(unittest.TestCase):
                 "passed": True,
                 "provider": "physoc_deepseek",
                 "model": "my_deepseek_r1_7b",
-                "streamPath": "/api/physoc/deepseek/stream",
+                "streamPath": "/api/physoc/deepseeks/stream",
                 "elapsedMs": 250.0,
                 "answerChars": len("Physoc 链路正常。"),
                 "citationCount": 1,

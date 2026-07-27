@@ -185,9 +185,11 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_model_failure_returns_user_safe_gateway_error(self) -> None:
+        provider_error = LLMProviderError("大模型服务暂时不可用，请稍后重试。")
+
         class FailingLLMProvider:
             def generate_reply(self, request: LLMRequest) -> ChatMessageModel:
-                raise LLMProviderError("大模型服务暂时不可用，请稍后重试。")
+                raise provider_error
 
         state = build_seed_state()
         state.knowledge_chunks_by_source["kb-001"] = [
@@ -209,12 +211,14 @@ class ApiContractTest(unittest.TestCase):
         client = TestClient(create_app(repository=repository), raise_server_exceptions=False)
         conversation_id = client.post("/api/conversations").json()["activeConversationId"]
 
-        response = client.post(
-            f"/api/conversations/{conversation_id}/messages",
-            json={"content": "请查询差旅制度", "mode": "deep"},
-        )
+        with patch("app.routes.logger", create=True) as route_logger:
+            response = client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                json={"content": "请查询差旅制度", "mode": "deep"},
+            )
 
         self.assertEqual(response.status_code, 502)
+        route_logger.exception.assert_called_once_with(provider_error)
         self.assertEqual(
             response.json(),
             {"detail": "大模型服务暂时不可用，请稍后重试。"},

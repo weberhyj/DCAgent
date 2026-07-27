@@ -32,7 +32,7 @@ RAG_SYSTEM_PROMPT = (
     "不要在回答中输出 [1]、[2] 等引用编号，也不要输出资料来源名称。"
 )
 
-DEFAULT_PHYSOC_STREAM_PATH = "/api/physoc/deepseek/stream"
+DEFAULT_PHYSOC_STREAM_PATH = "/api/physoc/deepseeks/stream"
 _PHYSOC_ALLOWED_NETWORKS = (
     ip_network("10.0.0.0/8"),
     ip_network("172.16.0.0/12"),

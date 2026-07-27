@@ -89,7 +89,7 @@ class ComposeContractTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "LLM_STREAM_PATH: ${LLM_STREAM_PATH:-/api/physoc/deepseek/stream}",
+            "LLM_STREAM_PATH: ${LLM_STREAM_PATH:-/api/physoc/deepseeks/stream}",
             text,
         )
         self.assertIn("LLM_API_KEY: ${LLM_API_KEY:-}", text)
@@ -671,7 +671,7 @@ class ComposeContractTest(unittest.TestCase):
         )
         self.assertTrue(expansions)
         optional_expansions = {
-            "LLM_STREAM_PATH": ":-/api/physoc/deepseek/stream",
+            "LLM_STREAM_PATH": ":-/api/physoc/deepseeks/stream",
             "LLM_API_KEY": ":-",
         }
         for name, suffix in expansions:

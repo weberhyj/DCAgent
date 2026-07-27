@@ -15,6 +15,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse
+from loguru import logger
 from pydantic import BeforeValidator
 
 from .evaluation import (
@@ -422,6 +423,7 @@ def send_message(
             request.mode,
         )
     except LLMProviderError as error:
+        logger.exception(error)
         raise HTTPException(status_code=502, detail=str(error)) from error
     return ConversationBundle.from_models(conversations, active_id, messages)
 

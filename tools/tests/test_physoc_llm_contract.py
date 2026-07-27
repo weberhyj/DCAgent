@@ -16,7 +16,7 @@ ENV_EXAMPLES = (
 PHYSOC_SETTINGS = (
     "LLM_PROVIDER=physoc_deepseek",
     "LLM_API_BASE=http://127.0.0.1:8090",
-    "LLM_STREAM_PATH=/api/physoc/deepseek/stream",
+    "LLM_STREAM_PATH=/api/physoc/deepseeks/stream",
     "LLM_MODEL=my_deepseek_r1_7b",
 )
 PHYSOC_BEGIN = "# BEGIN PHYSOC DEEPSEEK EXAMPLE"
@@ -136,7 +136,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         )
         self.assertRegex(
             offline_text,
-            r"(?m)^LLM_STREAM_PATH=/api/physoc/deepseek/stream\s*$",
+            r"(?m)^LLM_STREAM_PATH=/api/physoc/deepseeks/stream\s*$",
         )
         self.assertNotRegex(
             offline_text,
@@ -215,7 +215,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         for required_text in (
             "physoc_deepseek",
             "http://127.0.0.1:8090",
-            "/api/physoc/deepseek/stream",
+            "/api/physoc/deepseeks/stream",
             "POST",
             '"query"',
             '"model"',
@@ -239,7 +239,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "生产入口禁止 template 和 mock",
             "LLM_PROVIDER=physoc_deepseek",
             "LLM_API_BASE=http://172.16.0.10:8090",
-            "LLM_STREAM_PATH=/api/physoc/deepseek/stream",
+            "LLM_STREAM_PATH=/api/physoc/deepseeks/stream",
             "LLM_MODEL=my_deepseek_r1_7b",
             "容器可达的批准 private address",
             "且后端不在容器内运行的开发场景",
@@ -272,7 +272,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         for required_text in (
             "LLM_PROVIDER=physoc_deepseek",
             "LLM_API_BASE=http://172.16.0.10:8090",
-            "LLM_STREAM_PATH=/api/physoc/deepseek/stream",
+            "LLM_STREAM_PATH=/api/physoc/deepseeks/stream",
             "LLM_MODEL=my_deepseek_r1_7b",
             "& tools/prepare_offline_env.ps1",
             "只在 `deploy/offline/.env` 不存在时创建",
@@ -296,7 +296,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             '"model": "my_deepseek_r1_7b"',
             '"passed": true',
             '"provider": "physoc_deepseek"',
-            '"streamPath": "/api/physoc/deepseek/stream"',
+            '"streamPath": "/api/physoc/deepseeks/stream"',
             "HTTP 502",
             "不得返回检索切片",
             "回滚",
