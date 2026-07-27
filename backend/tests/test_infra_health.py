@@ -6,10 +6,12 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app.infra import health as health_module
@@ -69,7 +71,6 @@ class MetadataResponse:
         self.chunks = list(chunks or [body])
         self.read_delay_seconds = read_delay_seconds
         self.closed = False
-        self.read_timeouts: list[float] = []
 
     def __enter__(self) -> MetadataResponse:
         return self
@@ -82,9 +83,6 @@ class MetadataResponse:
             if self.read_delay_seconds:
                 time.sleep(self.read_delay_seconds)
             yield chunk
-
-    def set_read_timeout(self, timeout_seconds: float) -> None:
-        self.read_timeouts.append(timeout_seconds)
 
     def close(self) -> None:
         self.closed = True
@@ -260,6 +258,24 @@ class InfraHealthTest(unittest.TestCase):
         self.assertEqual(report["reranker"], {"ok": True, "detail": "degraded"})
         self.assertEqual(report["retrieval_shadow"], {"ok": True, "detail": "ready"})
 
+    def test_shadow_degraded_wrapper_preserves_probe_cancellation(self) -> None:
+        class CancellableCheck:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def __call__(self) -> tuple[bool, str]:
+                return False, "unavailable"
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        check = CancellableCheck()
+        degraded = health_module._degraded_dependency(check)
+
+        degraded.cancel()
+
+        self.assertTrue(check.cancelled)
+
     def test_retrieval_health_fails_closed_when_alias_and_audit_diverge(self) -> None:
         environ = retrieval_health_environment()
         gateway = RetrievalHealthGateway(alias="knowledge_chunks_qwen3_v2")
@@ -331,7 +347,6 @@ class InfraHealthTest(unittest.TestCase):
             )
         )
         self.assertTrue(trickle.closed)
-        self.assertTrue(trickle.read_timeouts)
 
     def test_metadata_stream_deadline_also_applies_when_the_final_read_ends(self) -> None:
         class SlowEndResponse(MetadataResponse):
@@ -351,6 +366,108 @@ class InfraHealthTest(unittest.TestCase):
         self.assertIsNone(payload)
         self.assertEqual(detail, "unavailable")
         self.assertTrue(slow_end.closed)
+
+    def test_real_httpx_metadata_probe_cancels_stalled_response_and_recovers(self) -> None:
+        first_chunk_sent = Event()
+        client_disconnected = Event()
+        request_lock = Lock()
+        request_count = 0
+        metadata_body = json.dumps(
+            retrieval_health_responses()["http://127.0.0.1:8081/v1/metadata"].payload
+        ).encode("utf-8")
+
+        class MetadataHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                nonlocal request_count
+                with request_lock:
+                    request_count += 1
+                    current_request = request_count
+                if current_request == 1:
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("connection", "keep-alive")
+                    self.end_headers()
+                    self.wfile.write(b"{")
+                    self.wfile.flush()
+                    first_chunk_sent.set()
+                    self.connection.settimeout(1.0)
+                    try:
+                        while self.connection.recv(1):
+                            pass
+                    except OSError:
+                        pass
+                    finally:
+                        client_disconnected.set()
+                        self.close_connection = True
+                    return
+
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(metadata_body)))
+                self.send_header("connection", "close")
+                self.end_headers()
+                self.wfile.write(metadata_body)
+                self.wfile.flush()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MetadataHandler)
+        server.daemon_threads = True
+        server_thread = Thread(target=server.serve_forever, name="metadata-test-server")
+        server_thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server_thread.join, 1.0)
+        self.addCleanup(server.shutdown)
+        service_url = f"http://127.0.0.1:{server.server_port}"
+        environ = retrieval_health_environment()
+        environ["DEPENDENCY_TIMEOUT_SECONDS"] = "0.2"
+        environ["EMBEDDING_SERVICE_URL"] = service_url
+        clients: list[httpx.Client] = []
+
+        def metadata_client_factory() -> httpx.Client:
+            client = httpx.Client(
+                timeout=httpx.Timeout(5.0),
+                follow_redirects=False,
+                trust_env=False,
+            )
+            clients.append(client)
+            return client
+
+        gateway = RetrievalHealthGateway()
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=RetrievalHealthHttpClient(retrieval_health_responses()),
+            metadata_http_client_factory=metadata_client_factory,
+            retrieval_settings=RetrievalSettings.from_environ(environ),
+            retrieval_gateway=gateway,
+            retrieval_scope_provider=retrieval_scope_provider(gateway),
+        )
+        embedding = next(check for check in checks if check.name == "embedding")
+
+        started = time.monotonic()
+        first = embedding.check()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(first, (False, "unavailable"))
+        self.assertTrue(first_chunk_sent.is_set())
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(client_disconnected.wait(0.2))
+        self.assertFalse(
+            any(
+                thread.name == "dependency-probe-embedding" and thread.is_alive()
+                for thread in threading.enumerate()
+            )
+        )
+        self.assertEqual(embedding.check(), (True, "ready"))
+        self.assertEqual(embedding.check(), (True, "ready"))
+        self.assertEqual(request_count, 3)
+        self.assertEqual(len(clients), 3)
+        self.assertTrue(all(client.is_closed for client in clients))
 
     def test_liveness_does_not_require_external_services(self) -> None:
         calls = 0

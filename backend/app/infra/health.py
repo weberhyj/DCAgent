@@ -25,11 +25,13 @@ from ..retrieval_settings import RetrievalSettings
 DependencyCheckCallable = Callable[[], tuple[bool, str]]
 DependencyReport = dict[str, dict[str, bool | str]]
 HttpClientFactory = Callable[..., Any]
+MetadataHttpClientFactory = Callable[[], Any]
 
 _MAX_DETAIL_LENGTH = 160
 _MAX_DEPENDENCY_TIMEOUT_SECONDS = 10.0
 _MAX_CLAMAV_RESPONSE_BYTES = 64
 _MAX_HTTP_HEALTH_BODY_BYTES = 1024
+_MAX_PROBE_CANCEL_GRACE_SECONDS = 0.2
 _ALLOWED_PRIVATE_SERVICE_HOSTS = frozenset({"clamav", "localhost"})
 _PRIVATE_NETWORKS = (
     ip_network("10.0.0.0/8"),
@@ -248,6 +250,16 @@ def _hard_timeout_check(
             return False, "check failed"
 
         if not done.wait(timeout_seconds):
+            cancel = getattr(check, "cancel", None)
+            if callable(cancel):
+                with suppress(BaseException):
+                    cancel()
+                worker.join(
+                    min(
+                        _MAX_PROBE_CANCEL_GRACE_SECONDS,
+                        max(0.05, timeout_seconds),
+                    )
+                )
             return False, "unavailable"
         if not outcome:
             return False, "check failed"
@@ -772,6 +784,8 @@ def _metadata_payload(
     client: Any,
     endpoint: str,
     timeout_seconds: float,
+    *,
+    probe: _CancellableMetadataProbe | None = None,
 ) -> tuple[Mapping[str, object] | None, str]:
     deadline = monotonic() + timeout_seconds
     stream = getattr(client, "stream", None)
@@ -790,10 +804,20 @@ def _metadata_payload(
         enter = getattr(stream_context, "__enter__", None)
         if callable(enter):
             with stream_context as response:
-                return _inspect_metadata_response(response, deadline)
+                if probe is not None and not probe.register_response(response):
+                    return None, "unavailable"
+                try:
+                    return _inspect_metadata_response(response, deadline)
+                finally:
+                    if probe is not None:
+                        probe.clear_response(response)
         try:
+            if probe is not None and not probe.register_response(stream_context):
+                return None, "unavailable"
             return _inspect_metadata_response(stream_context, deadline)
         finally:
+            if probe is not None:
+                probe.clear_response(stream_context)
             close = getattr(stream_context, "close", None)
             if callable(close):
                 with suppress(Exception):
@@ -827,9 +851,6 @@ def _inspect_metadata_response(
         remaining = deadline - monotonic()
         if remaining <= 0:
             return None, "unavailable"
-        set_read_timeout = getattr(response, "set_read_timeout", None)
-        if callable(set_read_timeout):
-            set_read_timeout(max(0.001, remaining))
         try:
             chunk = next(iterator)
         except StopIteration:
@@ -855,19 +876,120 @@ def _inspect_metadata_response(
     return payload, "ready"
 
 
+class _CancellableMetadataProbe:
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        timeout_seconds: float,
+        client_factory: MetadataHttpClientFactory,
+        close_client: bool,
+        validate_payload: Callable[[Mapping[str, object]], tuple[bool, str]],
+    ) -> None:
+        self._endpoint = endpoint
+        self._timeout_seconds = timeout_seconds
+        self._client_factory = client_factory
+        self._close_client = close_client
+        self._validate_payload = validate_payload
+        self._lock = Lock()
+        self._running = False
+        self._cancel_requested = False
+        self._client: Any | None = None
+        self._response: Any | None = None
+
+    def __call__(self) -> tuple[bool, str]:
+        with self._lock:
+            if self._running:
+                return False, "unavailable"
+            self._running = True
+            self._cancel_requested = False
+            self._client = None
+            self._response = None
+
+        client: Any | None = None
+        try:
+            client = self._client_factory()
+            if client is None or not self._register_client(client):
+                return False, "unavailable"
+            payload, detail = _metadata_payload(
+                client,
+                self._endpoint,
+                self._timeout_seconds,
+                probe=self,
+            )
+            if payload is None:
+                return False, detail
+            return self._validate_payload(payload)
+        except Exception:
+            return False, "unavailable"
+        finally:
+            if self._close_client and client is not None:
+                _close_probe_resource(client)
+            with self._lock:
+                if self._client is client:
+                    self._client = None
+                self._response = None
+                self._running = False
+
+    def cancel(self) -> None:
+        with self._lock:
+            if not self._running:
+                return
+            self._cancel_requested = True
+            response = self._response
+            client = self._client if self._close_client else None
+        _close_probe_resource(response)
+        _close_probe_resource(client)
+
+    def register_response(self, response: Any) -> bool:
+        with self._lock:
+            if not self._running or self._cancel_requested:
+                should_close = True
+            else:
+                self._response = response
+                should_close = False
+        if should_close:
+            _close_probe_resource(response)
+            return False
+        return True
+
+    def clear_response(self, response: Any) -> None:
+        with self._lock:
+            if self._response is response:
+                self._response = None
+
+    def _register_client(self, client: Any) -> bool:
+        with self._lock:
+            if not self._running or self._cancel_requested:
+                should_close = self._close_client
+                accepted = False
+            else:
+                self._client = client
+                should_close = False
+                accepted = True
+        if should_close:
+            _close_probe_resource(client)
+        return accepted
+
+
+def _close_probe_resource(resource: Any | None) -> None:
+    close = getattr(resource, "close", None)
+    if callable(close):
+        with suppress(BaseException):
+            close()
+
+
 def _embedding_metadata_check(
     service_url: str,
     expected: Any,
     *,
     client: Any,
     timeout_seconds: float,
+    client_factory: MetadataHttpClientFactory | None = None,
 ) -> DependencyCheckCallable:
     endpoint = _root_endpoint(service_url, "/v1/metadata")
 
-    def check() -> tuple[bool, str]:
-        payload, detail = _metadata_payload(client, endpoint, timeout_seconds)
-        if payload is None:
-            return False, detail
+    def validate_payload(payload: Mapping[str, object]) -> tuple[bool, str]:
         try:
             actual = EmbeddingMetadataResponse.model_validate(payload)
         except Exception:
@@ -883,7 +1005,13 @@ def _embedding_metadata_check(
         )
         return (True, "ready") if pinned else (False, "metadata mismatch")
 
-    return check
+    return _CancellableMetadataProbe(
+        endpoint=endpoint,
+        timeout_seconds=timeout_seconds,
+        client_factory=client_factory or (lambda: client),
+        close_client=client_factory is not None,
+        validate_payload=validate_payload,
+    )
 
 
 def _reranker_metadata_check(
@@ -892,13 +1020,11 @@ def _reranker_metadata_check(
     *,
     client: Any,
     timeout_seconds: float,
+    client_factory: MetadataHttpClientFactory | None = None,
 ) -> DependencyCheckCallable:
     endpoint = _root_endpoint(service_url, "/v1/metadata")
 
-    def check() -> tuple[bool, str]:
-        payload, detail = _metadata_payload(client, endpoint, timeout_seconds)
-        if payload is None:
-            return False, detail
+    def validate_payload(payload: Mapping[str, object]) -> tuple[bool, str]:
         try:
             actual = RerankerMetadataResponse.model_validate(payload)
         except Exception:
@@ -912,15 +1038,31 @@ def _reranker_metadata_check(
         )
         return (True, "ready") if pinned else (False, "metadata mismatch")
 
-    return check
+    return _CancellableMetadataProbe(
+        endpoint=endpoint,
+        timeout_seconds=timeout_seconds,
+        client_factory=client_factory or (lambda: client),
+        close_client=client_factory is not None,
+        validate_payload=validate_payload,
+    )
+
+
+class _DegradedDependencyCheck:
+    def __init__(self, check: DependencyCheckCallable) -> None:
+        self._check = check
+
+    def __call__(self) -> tuple[bool, str]:
+        ok, detail = self._check()
+        return (True, detail) if ok else (True, "degraded")
+
+    def cancel(self) -> None:
+        cancel = getattr(self._check, "cancel", None)
+        if callable(cancel):
+            cancel()
 
 
 def _degraded_dependency(check: DependencyCheckCallable) -> DependencyCheckCallable:
-    def degraded_check() -> tuple[bool, str]:
-        ok, detail = check()
-        return (True, detail) if ok else (True, "degraded")
-
-    return degraded_check
+    return _DegradedDependencyCheck(check)
 
 
 def validate_health_service_urls(
@@ -1013,6 +1155,7 @@ def build_dependency_checks(
     retrieval_settings: RetrievalSettings | None = None,
     retrieval_gateway: Any | None = None,
     retrieval_scope_provider: Any | None = None,
+    metadata_http_client_factory: MetadataHttpClientFactory | None = None,
 ) -> list[DependencyCheck]:
     validate_health_service_urls(
         settings,
@@ -1053,6 +1196,7 @@ def build_dependency_checks(
             retrieval_settings.embedding,
             client=http_client,
             timeout_seconds=timeout_seconds,
+            client_factory=metadata_http_client_factory,
         )
     raw_checks = [
         DependencyCheck(
@@ -1109,6 +1253,7 @@ def build_dependency_checks(
                     retrieval_settings.reranker,
                     client=http_client,
                     timeout_seconds=timeout_seconds,
+                    client_factory=metadata_http_client_factory,
                 ),
             )
         )

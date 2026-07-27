@@ -496,6 +496,10 @@ def create_production_app(
                         retrieval_settings=retrieval_settings,
                         retrieval_gateway=retrieval_gateway,
                         retrieval_scope_provider=retrieval_scope_provider,
+                        metadata_http_client_factory=lambda: create_http_health_client(
+                            settings.dependency_timeout_seconds,
+                            client_factory=health_http_client_factory,
+                        ),
                     ),
                     cache_ttl_seconds=0.5,
                     max_stale_seconds=bounded_health_timeout + 0.5,
