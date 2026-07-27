@@ -6,7 +6,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
-from .evaluation import EvaluationBatchModel, EvaluationCaseModel, EvaluationRunModel
+from .evaluation import (
+    EvaluationBatchModel,
+    EvaluationCaseModel,
+    EvaluationRunModel,
+    calculate_ranking_metrics,
+)
 
 EvaluationFailureReason = Literal[
     "false_positive",
@@ -259,10 +264,17 @@ def evaluate_retrieval_quality(
     valid_recall = _unit_interval(recall_at_50)
     valid_legacy_ndcg = _unit_interval(legacy_ndcg_at_8)
     valid_qwen_ndcg = _unit_interval(qwen3_ndcg_at_8)
+    delta = (
+        round(qwen3_ndcg_at_8 - legacy_ndcg_at_8, 4)
+        if valid_legacy_ndcg and valid_qwen_ndcg
+        else 0.0
+    )
     if not valid_recall or recall_at_50 < 0.90:
         failed.append("recall_at_50")
     if not valid_legacy_ndcg or not valid_qwen_ndcg or qwen3_ndcg_at_8 < legacy_ndcg_at_8:
         failed.append("ndcg_at_8_not_worse_than_legacy")
+    if not valid_legacy_ndcg or not valid_qwen_ndcg or delta < 0.05:
+        failed.append("ndcg_at_8_improvement_target")
     for name, value in (
         ("critical_top_8_regressions", critical_top_8_regressions),
         ("permission_leaks", permission_leaks),
@@ -270,11 +282,6 @@ def evaluate_retrieval_quality(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value != 0:
             failed.append(name)
-    delta = (
-        round(qwen3_ndcg_at_8 - legacy_ndcg_at_8, 4)
-        if valid_legacy_ndcg and valid_qwen_ndcg
-        else 0.0
-    )
     return RetrievalQualityGateResult(
         passed=not failed,
         failed_gates=tuple(failed),
@@ -435,7 +442,13 @@ def _is_top_8_regression(
     legacy_top = set(legacy_ids[:8])
     qwen_top = set(qwen_ids[:8])
     if relevant:
-        return bool(legacy_top & relevant) and not bool(qwen_top & relevant)
+        legacy_relevant = legacy_top & relevant
+        qwen_relevant = qwen_top & relevant
+        if legacy_relevant - qwen_relevant:
+            return True
+        legacy_ndcg = calculate_ranking_metrics(legacy_ids, relevant, 8).ndcg
+        qwen_ndcg = calculate_ranking_metrics(qwen_ids, relevant, 8).ndcg
+        return qwen_ndcg < legacy_ndcg
     return bool(legacy_top - qwen_top)
 
 

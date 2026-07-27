@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 from sqlalchemy import and_, delete, func, select, text, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.sql.dml import Update
 
 from .agent import AgentRunAudit, AgentStep, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
@@ -373,12 +373,16 @@ def evaluation_hit_from_dict(payload: dict[str, Any]) -> EvaluationHitModel:
     )
 
 
-def evaluation_run_from_record(record: EvaluationRunRecord) -> EvaluationRunModel:
+def evaluation_run_from_record(
+    record: EvaluationRunRecord,
+    *,
+    top_k: int,
+) -> EvaluationRunModel:
     hits = [evaluation_hit_from_dict(payload) for payload in record.hits or []]
     ranking_metrics = calculate_ranking_metrics(
         (hit.source_id for hit in hits),
         record.expected_source_ids or [],
-        len(hits),
+        top_k,
     )
     return EvaluationRunModel(
         id=record.id,
@@ -987,10 +991,13 @@ class SqlChatRepository:
         with self._database.session() as session:
             records = session.scalars(
                 select(EvaluationRunRecord)
+                .options(joinedload(EvaluationRunRecord.case))
                 .order_by(EvaluationRunRecord.sequence.desc())
                 .limit(max(0, limit))
             ).all()
-            return [evaluation_run_from_record(record) for record in records]
+            return [
+                evaluation_run_from_record(record, top_k=record.case.top_k) for record in records
+            ]
 
     def create_evaluation_batch(
         self,
@@ -1175,10 +1182,13 @@ class SqlChatRepository:
                 raise HTTPException(status_code=404, detail="评测批次不存在")
             records = session.scalars(
                 select(EvaluationRunRecord)
+                .options(joinedload(EvaluationRunRecord.case))
                 .where(EvaluationRunRecord.batch_id == batch_id)
                 .order_by(EvaluationRunRecord.sequence)
             ).all()
-            return [evaluation_run_from_record(record) for record in records]
+            return [
+                evaluation_run_from_record(record, top_k=record.case.top_k) for record in records
+            ]
 
     def list_knowledge_sources(self) -> list[KnowledgeSourceModel]:
         with self._database.session() as session:

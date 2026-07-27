@@ -643,10 +643,10 @@ class EvaluationBatchComparisonTest(unittest.TestCase):
 
 
 class RetrievalQualityGateTest(unittest.TestCase):
-    def test_quality_gates_fail_closed_and_target_is_reported_not_hard_gated(self) -> None:
+    def test_quality_gates_fail_when_ndcg_improvement_is_below_target(self) -> None:
         from app.evaluation_batches import evaluate_retrieval_quality
 
-        passing = evaluate_retrieval_quality(
+        below_target = evaluate_retrieval_quality(
             recall_at_50=0.90,
             legacy_ndcg_at_8=0.60,
             qwen3_ndcg_at_8=0.63,
@@ -663,21 +663,39 @@ class RetrievalQualityGateTest(unittest.TestCase):
             structured_aggregate_mismatches=1,
         )
 
-        self.assertTrue(passing.passed)
-        self.assertEqual(passing.ndcg_at_8_delta, 0.03)
-        self.assertFalse(passing.ndcg_improvement_target_met)
-        self.assertEqual(passing.failed_gates, ())
+        self.assertFalse(below_target.passed)
+        self.assertEqual(below_target.ndcg_at_8_delta, 0.03)
+        self.assertFalse(below_target.ndcg_improvement_target_met)
+        self.assertEqual(below_target.failed_gates, ("ndcg_at_8_improvement_target",))
         self.assertFalse(failing.passed)
         self.assertEqual(
             failing.failed_gates,
             (
                 "recall_at_50",
                 "ndcg_at_8_not_worse_than_legacy",
+                "ndcg_at_8_improvement_target",
                 "critical_top_8_regressions",
                 "permission_leaks",
                 "structured_aggregate_mismatches",
             ),
         )
+
+    def test_quality_gate_accepts_exact_ndcg_improvement_target(self) -> None:
+        from app.evaluation_batches import evaluate_retrieval_quality
+
+        result = evaluate_retrieval_quality(
+            recall_at_50=0.90,
+            legacy_ndcg_at_8=0.60,
+            qwen3_ndcg_at_8=0.65,
+            critical_top_8_regressions=0,
+            permission_leaks=0,
+            structured_aggregate_mismatches=0,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.ndcg_at_8_delta, 0.05)
+        self.assertTrue(result.ndcg_improvement_target_met)
+        self.assertEqual(result.failed_gates, ())
 
     def test_quality_gates_reject_nan_and_infinity(self) -> None:
         from app.evaluation_batches import evaluate_retrieval_quality

@@ -177,6 +177,53 @@ class ShadowReportPrivacyTest(unittest.TestCase):
         self.assertNotIn("internal.example", serialized)
         self.assertNotIn("raw passage", serialized)
 
+    def test_critical_top_8_detects_partial_relevant_set_loss(self) -> None:
+        from app.evaluation_batches import build_shadow_report
+
+        report = build_shadow_report(
+            [
+                {
+                    "case_id": "case-critical",
+                    "legacy_chunk_ids": ("a", "b"),
+                    "qwen_chunk_ids": ("a",),
+                    "relevant_chunk_ids": ("a", "b"),
+                    "legacy_ms": 1.0,
+                    "qwen_ms": 1.0,
+                    "status": "completed",
+                }
+            ],
+            recall_at_50=0.90,
+            legacy_ndcg_at_8=0.60,
+            qwen3_ndcg_at_8=0.65,
+            critical_case_ids={"case-critical"},
+        )
+
+        self.assertEqual(report["quality"]["criticalTop8Regressions"], ["case-critical"])
+        self.assertIn("critical_top_8_regressions", report["failedGates"])
+
+    def test_critical_top_8_detects_relevant_ranking_quality_drop(self) -> None:
+        from app.evaluation_batches import build_shadow_report
+
+        report = build_shadow_report(
+            [
+                {
+                    "case_id": "case-critical",
+                    "legacy_chunk_ids": ("a", "wrong", "b"),
+                    "qwen_chunk_ids": ("wrong", "b", "a"),
+                    "relevant_chunk_ids": ("a", "b"),
+                    "legacy_ms": 1.0,
+                    "qwen_ms": 1.0,
+                    "status": "completed",
+                }
+            ],
+            recall_at_50=0.90,
+            legacy_ndcg_at_8=0.60,
+            qwen3_ndcg_at_8=0.65,
+            critical_case_ids={"case-critical"},
+        )
+
+        self.assertEqual(report["quality"]["criticalTop8Regressions"], ["case-critical"])
+
 
 def add_indexed_source(
     repository: InMemoryChatRepository | SqlChatRepository,
@@ -1713,6 +1760,62 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
         self.assertEqual(persisted_runs[0].recall_at_k, 1.0)
         self.assertEqual(persisted_runs[0].mrr, 1.0)
         self.assertEqual(persisted_runs[0].ndcg_at_k, 1.0)
+
+    def test_sql_reload_uses_case_top_k_for_ranking_metrics(self) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        database.create_schema()
+        repository = SqlChatRepository(database)
+        case = repository.create_evaluation_case(
+            question="ranking reload",
+            expected_source_ids=["source-a", "source-b", "source-c"],
+            expected_terms=[],
+            top_k=8,
+        )
+        with database.session() as session:
+            session.add(
+                EvaluationRunRecord(
+                    id="run-ranking-reload",
+                    case_id=case.id,
+                    question=case.question,
+                    status="failed",
+                    expect_answer=True,
+                    answerable=True,
+                    false_positive=False,
+                    expected_source_ids=list(case.expected_source_ids),
+                    matched_source_ids=["source-a"],
+                    missing_source_ids=["source-b", "source-c"],
+                    expected_terms=[],
+                    found_terms=[],
+                    missing_terms=[],
+                    source_recall=0.3333,
+                    term_recall=1.0,
+                    top_score=1.0,
+                    hit_count=1,
+                    started_at="2026-07-28 10:00:00",
+                    completed_at="2026-07-28 10:00:01",
+                    sequence=1,
+                    hits=[
+                        {
+                            "rank": 1,
+                            "sourceId": "source-a",
+                            "sourceName": "source-a",
+                            "chunkId": "chunk-a",
+                            "chunkIndex": 0,
+                            "score": 1.0,
+                            "keywordScore": 0.0,
+                            "vectorScore": 1.0,
+                            "matchedTerms": [],
+                            "excerpt": "",
+                        }
+                    ],
+                )
+            )
+
+        reloaded = repository.list_evaluation_runs()[0]
+
+        self.assertEqual(reloaded.recall_at_k, 0.3333)
+        self.assertEqual(reloaded.mrr, 1.0)
+        self.assertEqual(reloaded.ndcg_at_k, 0.4693)
 
 
 if __name__ == "__main__":
