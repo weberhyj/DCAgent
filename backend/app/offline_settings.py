@@ -100,6 +100,7 @@ def require_private_url(value: str, field: str) -> str:
         "qdrant",
         "redis",
         "embedding-service",
+        "reranker-service",
         "llama",
     }:
         return candidate.rstrip("/")
@@ -127,6 +128,7 @@ class OfflineSettings:
     redis_url: str
     clamav_host: str
     embedding_service_url: str
+    reranker_service_url: str
     llama_server_url: str
     raw_data_root: Path
     parquet_root: Path
@@ -155,6 +157,7 @@ class OfflineSettings:
             "qdrant_url": environ.get("QDRANT_URL", "http://127.0.0.1:6333"),
             "redis_url": environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"),
             "embedding_service_url": environ.get("EMBEDDING_SERVICE_URL", "http://127.0.0.1:8081"),
+            "reranker_service_url": environ.get("RERANKER_SERVICE_URL", "http://127.0.0.1:8082"),
             "llama_server_url": environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080"),
         }
         if offline_mode:

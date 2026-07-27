@@ -38,6 +38,7 @@ class OfflineSettingsTest(unittest.TestCase):
         for value, expected in (
             ("http://localhost:8080/", "http://localhost:8080"),
             ("http://embedding-service:8081/", "http://embedding-service:8081"),
+            ("http://reranker-service:8082/", "http://reranker-service:8082"),
             ("http://192.168.1.10:6333/", "http://192.168.1.10:6333"),
         ):
             with self.subTest(value=value):
@@ -53,6 +54,7 @@ class OfflineSettingsTest(unittest.TestCase):
                 "REDIS_URL": "redis://redis:6379/0",
                 "CLAMAV_HOST": "clamav",
                 "EMBEDDING_SERVICE_URL": "http://embedding-service:8081",
+                "RERANKER_SERVICE_URL": "http://reranker-service:8082",
                 "LLAMA_SERVER_URL": "http://llama:8080",
                 "RAW_DATA_ROOT": "/data/raw",
                 "PARQUET_ROOT": "/data/parquet",
@@ -65,6 +67,7 @@ class OfflineSettingsTest(unittest.TestCase):
         self.assertEqual(settings.model_slots, 2)
         self.assertEqual(settings.clickhouse_url, "http://clickhouse:8123")
         self.assertEqual(settings.embedding_service_url, "http://embedding-service:8081")
+        self.assertEqual(settings.reranker_service_url, "http://reranker-service:8082")
         self.assertEqual(settings.raw_data_root, Path("/data/raw"))
 
     def test_public_service_urls_are_allowed_when_offline_mode_is_disabled(self) -> None:
