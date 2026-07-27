@@ -229,6 +229,54 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         self.assertEqual(self.repository.get_publication(first.id).status, "active")
         self.assertEqual(self.repository.get_publication(second.id).status, "failed")
 
+    def test_activation_recovery_atomically_reactivates_previous_and_fails_target(
+        self,
+    ) -> None:
+        first = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v1",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-1",
+            sparse_profile_sha256="a" * 64,
+            dimensions=1024,
+        )
+        self.repository.mark_publication_validated(first.id, point_count=12)
+        self.repository.mark_publication_active(first.id, point_count=12)
+        second = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v2",
+            alias_name="knowledge_chunks_current",
+            embedding_model_version="qwen3-0.6b-2",
+            sparse_profile_sha256="b" * 64,
+            dimensions=1024,
+        )
+        self.repository.mark_publication_validated(second.id, point_count=13)
+        self.repository.mark_publication_active(second.id, point_count=13)
+
+        with self.repository.alias_publication_lock("knowledge_chunks_current") as fence:
+            snapshot = self.repository.publication_recovery_state(second.id, fence=fence)
+            self.assertEqual(snapshot.target.id, second.id)
+            self.assertEqual(snapshot.active.id, second.id)
+            recovered = self.repository.recover_publication_activation(
+                second.id,
+                previous_publication_id=first.id,
+                error_message="RuntimeError",
+                fence=fence,
+            )
+
+        self.assertEqual(recovered.status, "failed")
+        self.assertEqual(self.repository.get_publication(first.id).status, "active")
+        self.assertEqual(self.repository.get_publication(second.id).status, "failed")
+
+        with self.repository.alias_publication_lock("knowledge_chunks_current") as fence:
+            repeated = self.repository.recover_publication_activation(
+                second.id,
+                previous_publication_id=first.id,
+                error_message="RuntimeError",
+                fence=fence,
+            )
+
+        self.assertEqual(repeated.status, "failed")
+        self.assertEqual(self.repository.get_publication(first.id).status, "active")
+
     def test_activation_integrity_failure_is_sanitized_and_rolls_back_retirement(self) -> None:
         first = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",

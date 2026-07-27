@@ -3,10 +3,14 @@ from __future__ import annotations
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from qdrant_client.http import models
+from sqlalchemy.orm import Session
 
 from app.database import (
     Database,
@@ -19,7 +23,7 @@ from app.database import (
 from app.embedding_contracts import EmbeddingModelMetadata
 from app.models import KnowledgeChunkModel, KnowledgeSourceModel
 from app.qdrant_retrieval import IndexMaintenanceScope
-from app.retrieval_audit import RetrievalPublication
+from app.retrieval_audit import RetrievalAuditRepository, RetrievalPublication
 from app.retrieval_publication import (
     IndexValidationError,
     PublicationRecoveryError,
@@ -317,6 +321,8 @@ class RecordingAudit:
         self.alias_lock = Lock()
         self.second_alias_wait = Event()
         self.timeline: list[str] = []
+        self.fail_next_fence_exit: str | None = None
+        self.fence_exit_callback = None
 
     @contextmanager
     def source_maintenance_lock(self, source_id):
@@ -344,6 +350,21 @@ class RecordingAudit:
                 yield SimpleNamespace(alias_name=alias_name)
             finally:
                 self.timeline.append("alias-lock-release")
+        failure_mode = self.fail_next_fence_exit
+        if failure_mode is not None:
+            self.fail_next_fence_exit = None
+            if failure_mode == "alias_target_audit_previous":
+                assert self.publication is not None
+                assert self.previous is not None
+                target = replace(self.publication, status="validated")
+                previous = replace(self.previous, status="active")
+                self.publications[target.id] = target
+                self.publications[previous.id] = previous
+                self.publication = target
+                self.previous = previous
+            if self.fence_exit_callback is not None:
+                self.fence_exit_callback(failure_mode)
+            raise RuntimeError("PRIVATE-COMMIT-FAILURE")
 
     def create_publication(self, **values):
         publication = RetrievalPublication(
@@ -417,6 +438,46 @@ class RecordingAudit:
             None,
         )
 
+    def publication_recovery_state(self, publication_id, *, fence):
+        target = self.publications[publication_id]
+        if target.alias_name != fence.alias_name:
+            raise AssertionError("alias fence mismatch")
+        return SimpleNamespace(
+            target=target,
+            active=self.active_publication(fence.alias_name),
+        )
+
+    def recover_publication_activation(
+        self,
+        publication_id,
+        *,
+        previous_publication_id,
+        error_message,
+        fence,
+    ):
+        target = self.publications[publication_id]
+        if target.alias_name != fence.alias_name:
+            raise AssertionError("alias fence mismatch")
+        active = self.active_publication(fence.alias_name)
+        permitted = {publication_id, previous_publication_id}
+        if active is not None and active.id not in permitted:
+            raise RuntimeError("newer active publication")
+        target = replace(
+            target,
+            status="failed",
+            error_message=error_message,
+        )
+        self.publications[publication_id] = target
+        if previous_publication_id is not None:
+            previous = replace(
+                self.publications[previous_publication_id],
+                status="active",
+            )
+            self.publications[previous_publication_id] = previous
+            self.previous = previous
+        self.publication = target
+        return target
+
 
 def build_publisher(
     *,
@@ -436,6 +497,7 @@ def build_publisher(
     unrelated_authorized_hits=False,
     wrong_point_identity_hits=False,
     repository=None,
+    audit=None,
     structured_catalog_provider=None,
 ):
     gateway = RecordingGateway(
@@ -451,7 +513,7 @@ def build_publisher(
         unrelated_authorized_hits=unrelated_authorized_hits,
         wrong_point_identity_hits=wrong_point_identity_hits,
     )
-    audit = RecordingAudit(
+    audit = audit or RecordingAudit(
         fail_activation=fail_activation,
         fail_mark_failed=fail_mark_failed,
         fail_alias_lock=fail_alias_lock,
@@ -473,7 +535,17 @@ def build_publisher(
     publisher.gateway = gateway
     publisher.audit = audit
     publisher.embedding = embedding
-    gateway.timeline = audit.timeline
+    if isinstance(audit, RecordingAudit):
+        gateway.timeline = audit.timeline
+
+        def apply_fence_exit_state(failure_mode):
+            if failure_mode == "audit_target_alias_previous":
+                assert audit.previous is not None
+                gateway.alias = audit.previous.collection_name
+            elif failure_mode == "newer_alias":
+                gateway.alias = "knowledge_chunks_qwen3_v8"
+
+        audit.fence_exit_callback = apply_fence_exit_state
     return publisher
 
 
@@ -1193,6 +1265,122 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertLess(acquire, timeline.index("resolve"))
         self.assertLess(activate, audit_active)
         self.assertIn("resolve", timeline[audit_active + 1 : release])
+
+    def test_fence_exit_failure_returns_verified_success_when_alias_and_audit_committed(
+        self,
+    ) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.audit.fail_next_fence_exit = "both_target"
+
+        publication = publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertEqual(publication.collection_name, "knowledge_chunks_qwen3_v7")
+        self.assertEqual(publication.status, "active")
+        self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v7")
+        self.assertEqual(
+            publisher.audit.active_publication("knowledge_chunks_current").id,
+            publication.id,
+        )
+
+    def test_outer_commit_failure_after_commit_returns_verified_persisted_success(
+        self,
+    ) -> None:
+        temp_directory = TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+        database_path = Path(temp_directory.name, "retrieval-audit.db").as_posix()
+        database = Database(f"sqlite+pysqlite:///{database_path}")
+        self.addCleanup(database.engine.dispose)
+        database.create_schema()
+        audit = RetrievalAuditRepository(database)
+        publisher = build_publisher(chunks=sample_chunks(1), audit=audit)
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        original_commit = Session.commit
+        armed = True
+        commit_count = 0
+
+        def fail_after_target_commit(session: Session) -> None:
+            nonlocal armed, commit_count
+            commit_count += 1
+            if armed and commit_count == 4:
+                armed = False
+                original_commit(session)
+                raise RuntimeError("PRIVATE-POST-COMMIT-FAILURE")
+            original_commit(session)
+
+        with patch.object(
+            Session,
+            "commit",
+            autospec=True,
+            side_effect=fail_after_target_commit,
+        ):
+            publication = publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertFalse(armed)
+        self.assertEqual(publication.status, "active")
+        self.assertEqual(publisher.gateway.alias, publication.collection_name)
+        self.assertEqual(audit.active_publication("knowledge_chunks_current").id, publication.id)
+
+    def test_fence_exit_failure_restores_alias_when_only_alias_committed(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        previous = publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.audit.fail_next_fence_exit = "alias_target_audit_previous"
+
+        with self.assertRaisesRegex(
+            RetrievalPublicationError,
+            "retrieval publication activation did not commit",
+        ):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        target = publisher.audit.publication
+        assert target is not None
+        self.assertEqual(publisher.gateway.alias, previous.collection_name)
+        self.assertEqual(target.status, "failed")
+        self.assertEqual(
+            publisher.audit.active_publication("knowledge_chunks_current").id,
+            previous.id,
+        )
+        self.assertNotIn(target.collection_name, publisher.gateway.existing_collections)
+
+    def test_fence_exit_failure_restores_audit_when_only_audit_committed(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        previous = publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.audit.fail_next_fence_exit = "audit_target_alias_previous"
+
+        with self.assertRaisesRegex(
+            RetrievalPublicationError,
+            "retrieval publication activation did not commit",
+        ):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        target = publisher.audit.publication
+        assert target is not None
+        self.assertEqual(publisher.gateway.alias, previous.collection_name)
+        self.assertEqual(target.status, "failed")
+        self.assertEqual(
+            publisher.audit.active_publication("knowledge_chunks_current").id,
+            previous.id,
+        )
+        self.assertNotIn(target.collection_name, publisher.gateway.existing_collections)
+
+    def test_fence_exit_failure_does_not_overwrite_or_delete_newer_aliased_generation(
+        self,
+    ) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.build_and_activate("knowledge_chunks_qwen3_v6")
+        publisher.gateway.other_alias_collections.append("knowledge_chunks_qwen3_v7")
+        publisher.audit.fail_next_fence_exit = "newer_alias"
+
+        with self.assertRaises(PublicationRecoveryError) as captured:
+            publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+
+        self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v8")
+        self.assertIn("alias_generation_changed", captured.exception.recovery_codes)
+        self.assertIn(
+            "knowledge_chunks_qwen3_v7",
+            publisher.gateway.existing_collections,
+        )
+        self.assertNotIn("delete_collection", publisher.gateway.events[-2:])
 
     def test_build_entry_fails_closed_after_crash_between_alias_switch_and_audit(self) -> None:
         publisher = build_publisher(

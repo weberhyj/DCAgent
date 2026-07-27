@@ -18,7 +18,11 @@ from .embedding_contracts import (
 )
 from .models import KnowledgeChunkModel, KnowledgeSourceModel
 from .qdrant_retrieval import IndexMaintenanceScope
-from .retrieval_audit import AliasPublicationFence, RetrievalPublication
+from .retrieval_audit import (
+    AliasPublicationFence,
+    PublicationRecoverySnapshot,
+    RetrievalPublication,
+)
 from .retrieval_models import RetrievalScope
 from .sparse_embedding import SparseVector
 from .structured_models import (
@@ -128,6 +132,22 @@ class PublicationAudit(Protocol):
     ) -> RetrievalPublication: ...
 
     def active_publication(self, alias_name: str | None = None) -> RetrievalPublication | None: ...
+
+    def publication_recovery_state(
+        self,
+        publication_id: str,
+        *,
+        fence: AliasPublicationFence,
+    ) -> PublicationRecoverySnapshot: ...
+
+    def recover_publication_activation(
+        self,
+        publication_id: str,
+        *,
+        previous_publication_id: str | None,
+        error_message: str,
+        fence: AliasPublicationFence,
+    ) -> RetrievalPublication: ...
 
     def source_maintenance_lock(self, source_id: str) -> AbstractContextManager[None]: ...
 
@@ -243,6 +263,18 @@ class _ValidationSample:
     source_id: str
     chunk_id: str
     source_type: str
+
+
+@dataclass(slots=True)
+class _BuildFenceState:
+    previous_alias: str | None = None
+    previous_publication_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CommitRecoveryOutcome:
+    publication: RetrievalPublication | None = None
+    recovery_codes: tuple[str, ...] = ()
 
 
 class StructuredMetadataPointBuilder:
@@ -399,19 +431,35 @@ class RetrievalIndexPublisher:
             dimensions=self._embedding_metadata.dimensions,
         )
         alias_fence_acquired = False
+        body_completed = False
+        fence_state = _BuildFenceState()
         try:
             with self.audit.alias_publication_lock(self._alias_name) as alias_fence:
                 alias_fence_acquired = True
-                return self._build_with_alias_fence(
+                result = self._build_with_alias_fence(
                     publication,
                     publication_version=publication_version,
                     activate=activate,
                     batch_limit=batch_limit,
                     sample_limit=sample_limit,
                     alias_fence=alias_fence,
+                    fence_state=fence_state,
                 )
+                body_completed = True
+                return result
         except Exception as error:
             if alias_fence_acquired:
+                if body_completed and activate:
+                    return self._recover_fence_exit_failure(
+                        publication,
+                        previous_alias=fence_state.previous_alias,
+                        previous_publication_id=fence_state.previous_publication_id,
+                        primary_error=error,
+                    )
+                if body_completed:
+                    raise RetrievalPublicationError(
+                        "retrieval publication coordination failed"
+                    ) from None
                 raise
             try:
                 self.audit.mark_publication_failed(
@@ -434,6 +482,7 @@ class RetrievalIndexPublisher:
         batch_limit: int,
         sample_limit: int,
         alias_fence: AliasPublicationFence,
+        fence_state: _BuildFenceState,
     ) -> RetrievalPublication:
         collection_name = publication.collection_name
         previous_alias: str | None = None
@@ -443,8 +492,12 @@ class RetrievalIndexPublisher:
         validation_samples: list[_ValidationSample] = []
         alias_switch_attempted = False
         try:
-            self._reconcile_alias_audit()
+            previous_publication = self._reconcile_alias_audit()
             previous_alias = self.gateway.resolve_alias()
+            fence_state.previous_alias = previous_alias
+            fence_state.previous_publication_id = (
+                None if previous_publication is None else previous_publication.id
+            )
             alias_state_known = True
             collection_may_exist = True
             self.gateway.create_collection(
@@ -522,6 +575,97 @@ class RetrievalIndexPublisher:
                     recovery_codes,
                 ) from error
             raise
+
+    def _recover_fence_exit_failure(
+        self,
+        publication: RetrievalPublication,
+        *,
+        previous_alias: str | None,
+        previous_publication_id: str | None,
+        primary_error: Exception,
+    ) -> RetrievalPublication:
+        primary_code = primary_error.__class__.__name__
+        for _attempt in range(2):
+            try:
+                outcome = self._reconcile_fence_exit_failure(
+                    publication,
+                    previous_alias=previous_alias,
+                    previous_publication_id=previous_publication_id,
+                    primary_code=primary_code,
+                )
+            except Exception:
+                continue
+            if outcome.publication is not None:
+                return outcome.publication
+            if outcome.recovery_codes:
+                raise PublicationRecoveryError(
+                    primary_code,
+                    outcome.recovery_codes,
+                ) from None
+            raise RetrievalPublicationError(
+                "retrieval publication activation did not commit"
+            ) from None
+        raise PublicationRecoveryError(
+            primary_code,
+            ("commit_reconciliation_failed",),
+        ) from None
+
+    def _reconcile_fence_exit_failure(
+        self,
+        publication: RetrievalPublication,
+        *,
+        previous_alias: str | None,
+        previous_publication_id: str | None,
+        primary_code: str,
+    ) -> _CommitRecoveryOutcome:
+        outcome = _CommitRecoveryOutcome()
+        with self.audit.alias_publication_lock(self._alias_name) as recovery_fence:
+            live_collection = self.gateway.resolve_alias()
+            snapshot = self.audit.publication_recovery_state(
+                publication.id,
+                fence=recovery_fence,
+            )
+            active = snapshot.active
+            target = snapshot.target
+            if (
+                live_collection == target.collection_name
+                and target.status == "active"
+                and active is not None
+                and active.id == target.id
+            ):
+                outcome = _CommitRecoveryOutcome(publication=target)
+            else:
+                recovery_codes: list[str] = []
+                if live_collection == target.collection_name:
+                    try:
+                        self._restore_alias(
+                            previous_alias,
+                            expected_current=target.collection_name,
+                        )
+                    except _AliasGenerationChangedError:
+                        recovery_codes.append("alias_generation_changed")
+                    except _AliasRestorationError:
+                        recovery_codes.append("alias_restore_failed")
+                elif live_collection != previous_alias:
+                    recovery_codes.append("alias_generation_changed")
+                if not recovery_codes:
+                    try:
+                        self.audit.recover_publication_activation(
+                            target.id,
+                            previous_publication_id=previous_publication_id,
+                            error_message=primary_code,
+                            fence=recovery_fence,
+                        )
+                    except Exception:
+                        recovery_codes.append("audit_recovery_failed")
+                try:
+                    self._delete_if_unaliased(target.collection_name)
+                except Exception:
+                    recovery_codes.append("collection_cleanup_failed")
+                outcome = _CommitRecoveryOutcome(
+                    recovery_codes=tuple(recovery_codes),
+                )
+        return outcome
 
     def upsert_source(
         self,
@@ -852,7 +996,7 @@ class RetrievalIndexPublisher:
             raise ActiveIndexUnavailableError("no active retrieval publication is available")
         return publication
 
-    def _reconcile_alias_audit(self) -> None:
+    def _reconcile_alias_audit(self) -> RetrievalPublication | None:
         try:
             live_collection = self.gateway.resolve_alias()
             active = self.audit.active_publication(self._alias_name)
@@ -861,7 +1005,7 @@ class RetrievalIndexPublisher:
                 "retrieval index reconciliation required"
             ) from error
         if live_collection is None and active is None:
-            return
+            return None
         if active is not None and live_collection == active.collection_name:
             try:
                 collection_publication_version(active.collection_name)
@@ -869,7 +1013,7 @@ class RetrievalIndexPublisher:
                 raise RetrievalReconciliationRequiredError(
                     "retrieval index reconciliation required"
                 ) from error
-            return
+            return active
         raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
 
     def _verify_activation(

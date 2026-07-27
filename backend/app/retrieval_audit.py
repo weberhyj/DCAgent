@@ -83,6 +83,12 @@ class AliasPublicationFence:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicationRecoverySnapshot:
+    target: RetrievalPublication
+    active: RetrievalPublication | None
+
+
+@dataclass(frozen=True, slots=True)
 class RetrievalShadowComparison:
     id: str
     request_id: str
@@ -258,6 +264,63 @@ class RetrievalAuditRepository:
             completed=True,
         )
 
+    def publication_recovery_state(
+        self,
+        publication_id: str,
+        *,
+        fence: AliasPublicationFence,
+    ) -> PublicationRecoverySnapshot:
+        target = _locked_publication(fence.session, publication_id)
+        if target.alias_name != fence.alias_name:
+            raise RetrievalAuditValidationError("Alias publication fence mismatch")
+        active = _locked_active_publication(fence.session, fence.alias_name)
+        return PublicationRecoverySnapshot(
+            target=_publication_from_record(target),
+            active=None if active is None else _publication_from_record(active),
+        )
+
+    def recover_publication_activation(
+        self,
+        publication_id: str,
+        *,
+        previous_publication_id: str | None,
+        error_message: str,
+        fence: AliasPublicationFence,
+    ) -> RetrievalPublication:
+        bounded_error = _bounded_text("error_message", error_message, 4000)
+        target = _locked_publication(fence.session, publication_id)
+        if target.alias_name != fence.alias_name:
+            raise RetrievalAuditValidationError("Alias publication fence mismatch")
+        if target.status not in {"validated", "active", "failed"}:
+            raise RetrievalAuditValidationError("Publication is not recoverable after activation")
+        previous = None
+        if previous_publication_id is not None:
+            if previous_publication_id == publication_id:
+                raise RetrievalAuditValidationError(
+                    "Previous publication must differ from recovery target"
+                )
+            previous = _locked_publication(fence.session, previous_publication_id)
+            if previous.alias_name != fence.alias_name:
+                raise RetrievalAuditValidationError("Alias publication fence mismatch")
+            if previous.status not in {"active", "retired"}:
+                raise RetrievalAuditValidationError("Previous publication is not recoverable")
+        active = _locked_active_publication(fence.session, fence.alias_name)
+        permitted_active_ids = {publication_id}
+        if previous_publication_id is not None:
+            permitted_active_ids.add(previous_publication_id)
+        if active is not None and active.id not in permitted_active_ids:
+            raise RetrievalAuditValidationError("A newer active publication prevents recovery")
+        if target.status != "failed":
+            target.status = "failed"
+            target.error_message = bounded_error
+            target.completed_at = _timestamp()
+            fence.session.flush()
+        if previous is not None and previous.status != "active":
+            previous.status = "active"
+            previous.error_message = None
+            fence.session.flush()
+        return _publication_from_record(target)
+
     def _transition_publication(
         self,
         publication_id: str,
@@ -342,6 +405,20 @@ def _locked_publication(session, publication_id: str) -> RetrievalPublicationRec
     if record is None:
         raise RetrievalAuditNotFoundError("Retrieval publication not found")
     return record
+
+
+def _locked_active_publication(
+    session: Session,
+    alias_name: str,
+) -> RetrievalPublicationRecord | None:
+    return session.scalar(
+        select(RetrievalPublicationRecord)
+        .where(
+            RetrievalPublicationRecord.alias_name == alias_name,
+            RetrievalPublicationRecord.status == "active",
+        )
+        .with_for_update()
+    )
 
 
 def _transition_locked_publication(
