@@ -99,20 +99,20 @@ class BackendUvContractTest(unittest.TestCase):
         self.assert_exact_requirements(
             project["dependencies"],
             {
-                "alembic>=1.16,<2",
+                "alembic>=1.16",
                 "asynctor>=0.13.2",
-                "clickhouse-connect>=0.8,<1",
+                "clickhouse-connect>=0.8",
                 "fastapi>=0.116.0",
                 "gunicorn>=26.0.0",
                 "httpx>=0.28.0",
-                "langgraph>=0.2.0,<2.0.0",
+                "langgraph>=0.2.0",
                 "openpyxl>=3.1.0",
                 "psycopg[binary]>=3.2.0",
                 "pypdf>=5.0.0",
                 "python-docx>=1.1.0",
                 "python-multipart>=0.0.20",
-                "redis>=5,<7",
-                "sqlglot>=27,<30",
+                "redis>=5",
+                "sqlglot>=27",
                 "sqlalchemy>=2.0.0",
                 "uvicorn[standard]>=0.35.0",
             },
@@ -124,18 +124,18 @@ class BackendUvContractTest(unittest.TestCase):
         self.assert_exact_requirements(
             dependency_groups["offline"],
             {
-                "qdrant-client>=1.14,<2",
-                "polars>=1.30,<2",
-                "pyarrow>=19,<22",
-                "pyxlsb>=1.0,<2",
-                "docling>=2.40,<3",
-                "paddlepaddle>=3,<4",
-                "paddleocr>=3,<4",
-                "jieba>=0.42,<1",
-                "FlagEmbedding>=1.3,<2",
-                "onnxruntime>=1.22,<2",
-                "psycopg[binary]>=3.2,<4",
-                "psutil>=7,<8",
+                "qdrant-client>=1.14",
+                "polars>=1.30",
+                "pyarrow>=19",
+                "pyxlsb>=1.0",
+                "docling>=2.40",
+                "paddlepaddle>=3",
+                "paddleocr>=3",
+                "jieba>=0.42",
+                "FlagEmbedding>=1.3",
+                "onnxruntime>=1.22",
+                "psycopg[binary]>=3.2",
+                "psutil>=7",
             },
         )
 
@@ -154,12 +154,21 @@ class BackendUvContractTest(unittest.TestCase):
             for dependency in benchmark_dependencies
             if isinstance(dependency, str)
         ]
-        self.assertEqual(benchmark_strings, ["locust>=2.37,<3"])
+        self.assertEqual(benchmark_strings, ["locust>=2.37"])
 
         self.assert_exact_requirements(
             dependency_groups["dev"],
             {"fastapi-cli>=0.0.32"},
         )
+
+    def test_dependency_packages_have_no_upper_version_bounds(self) -> None:
+        pyproject = self.load_pyproject()
+        requirements = list(pyproject["project"]["dependencies"])
+        for group in pyproject["dependency-groups"].values():
+            requirements.extend(item for item in group if isinstance(item, str))
+
+        bounded = [requirement for requirement in requirements if "<" in requirement]
+        self.assertEqual([], bounded)
 
     def test_api_runtime_dependencies_are_available_without_dependency_groups(self) -> None:
         pyproject = self.load_pyproject()
