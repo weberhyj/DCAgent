@@ -16,7 +16,11 @@ from time import monotonic
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from ..embedding_contracts import EmbeddingMetadataResponse
 from ..offline_settings import OfflineSettings, parse_bool
+from ..reranker_contracts import RerankerMetadataResponse
+from ..retrieval_models import RetrievalMode
+from ..retrieval_settings import RetrievalSettings
 
 DependencyCheckCallable = Callable[[], tuple[bool, str]]
 DependencyReport = dict[str, dict[str, bool | str]]
@@ -735,9 +739,120 @@ def _generation_enabled(environ: Mapping[str, str]) -> bool:
     )
 
 
+def _qdrant_retrieval_check(
+    readiness_check: DependencyCheckCallable,
+    gateway: Any | None,
+    *,
+    dense_dimensions: int,
+) -> DependencyCheckCallable:
+    def check() -> tuple[bool, str]:
+        ready, detail = readiness_check()
+        if not ready:
+            return ready, detail
+        if gateway is None:
+            return False, "unavailable"
+        try:
+            collection_name = gateway.resolve_alias()
+            if not isinstance(collection_name, str) or not collection_name.strip():
+                return False, "alias unavailable"
+            gateway.validate_collection(
+                collection_name,
+                dense_dimensions=dense_dimensions,
+            )
+        except Exception:
+            return False, "schema mismatch"
+        return True, "ready"
+
+    return check
+
+
+def _metadata_payload(client: Any, endpoint: str) -> Mapping[str, object] | None:
+    try:
+        response = client.get(endpoint)
+        if getattr(response, "status_code", None) != 200:
+            return None
+        if _response_uses_unsupported_encoding(response):
+            return None
+        content_length = _response_content_length(response)
+        if content_length is not None and not (0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES):
+            return None
+        payload = response.json()
+    except Exception:
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _embedding_metadata_check(
+    service_url: str,
+    expected: Any,
+    *,
+    client: Any,
+) -> DependencyCheckCallable:
+    endpoint = _root_endpoint(service_url, "/v1/metadata")
+
+    def check() -> tuple[bool, str]:
+        payload = _metadata_payload(client, endpoint)
+        if payload is None:
+            return False, "unavailable"
+        try:
+            actual = EmbeddingMetadataResponse.model_validate(payload)
+        except Exception:
+            return False, "invalid metadata response"
+        pinned = (
+            actual.model_name == expected.name
+            and actual.model_version == expected.version
+            and actual.model_checksum == expected.sha256
+            and actual.dimensions == expected.dimensions
+            and actual.normalized is expected.normalized
+            and actual.encoding_profile_sha256 == expected.encoding_profile_sha256
+            and actual.protocol_version == expected.protocol_version
+        )
+        return (True, "ready") if pinned else (False, "metadata mismatch")
+
+    return check
+
+
+def _reranker_metadata_check(
+    service_url: str,
+    expected: Any,
+    *,
+    client: Any,
+) -> DependencyCheckCallable:
+    endpoint = _root_endpoint(service_url, "/v1/metadata")
+
+    def check() -> tuple[bool, str]:
+        payload = _metadata_payload(client, endpoint)
+        if payload is None:
+            return False, "unavailable"
+        try:
+            actual = RerankerMetadataResponse.model_validate(payload)
+        except Exception:
+            return False, "invalid metadata response"
+        pinned = (
+            actual.model_name == expected.name
+            and actual.model_version == expected.version
+            and actual.model_checksum == expected.sha256
+            and actual.prompt_profile_sha256 == expected.prompt_profile_sha256
+            and actual.protocol_version == expected.protocol_version
+        )
+        return (True, "ready") if pinned else (False, "metadata mismatch")
+
+    return check
+
+
+def _degraded_dependency(check: DependencyCheckCallable) -> DependencyCheckCallable:
+    def degraded_check() -> tuple[bool, str]:
+        ok, detail = check()
+        return (True, detail) if ok else (True, "degraded")
+
+    return degraded_check
+
+
 def validate_health_service_urls(
     settings: OfflineSettings,
     environ: Mapping[str, str],
+    *,
+    retrieval_settings: RetrievalSettings | None = None,
 ) -> None:
     services = [
         (
@@ -780,6 +895,15 @@ def validate_health_service_urls(
                 frozenset({"llama", "localhost"}),
             )
         )
+    if retrieval_settings is not None and retrieval_settings.mode is not RetrievalMode.LEGACY:
+        services.append(
+            (
+                "RERANKER_SERVICE_URL",
+                settings.reranker_service_url,
+                frozenset({"http", "https"}),
+                frozenset({"reranker-service", "localhost"}),
+            )
+        )
 
     for field, value, allowed_schemes, allowed_hosts in services:
         scheme = ""
@@ -811,9 +935,47 @@ def build_dependency_checks(
     http_client: Any | None = None,
     redis_client: Any | None = None,
     http_client_factory: HttpClientFactory | None = None,
+    retrieval_settings: RetrievalSettings | None = None,
+    retrieval_gateway: Any | None = None,
 ) -> list[DependencyCheck]:
-    validate_health_service_urls(settings, environ)
+    validate_health_service_urls(
+        settings,
+        environ,
+        retrieval_settings=retrieval_settings,
+    )
     timeout_seconds = _bounded_timeout(settings.dependency_timeout_seconds)
+    retrieval_enabled = (
+        retrieval_settings is not None and retrieval_settings.mode is not RetrievalMode.LEGACY
+    )
+    qdrant_check = _http_status_check(
+        settings.qdrant_url,
+        "/readyz",
+        timeout_seconds,
+        client=http_client,
+        client_factory=http_client_factory,
+    )
+    embedding_check = _http_status_check(
+        settings.embedding_service_url,
+        "/readyz",
+        timeout_seconds,
+        client=http_client,
+        client_factory=http_client_factory,
+        require_ready_json=True,
+    )
+    if retrieval_enabled:
+        assert retrieval_settings is not None
+        assert retrieval_settings.embedding is not None
+        assert retrieval_settings.reranker is not None
+        qdrant_check = _qdrant_retrieval_check(
+            qdrant_check,
+            retrieval_gateway,
+            dense_dimensions=retrieval_settings.embedding.dimensions,
+        )
+        embedding_check = _embedding_metadata_check(
+            settings.embedding_service_url,
+            retrieval_settings.embedding,
+            client=http_client,
+        )
     raw_checks = [
         DependencyCheck(
             "postgresql",
@@ -835,13 +997,7 @@ def build_dependency_checks(
         ),
         DependencyCheck(
             "qdrant",
-            _http_status_check(
-                settings.qdrant_url,
-                "/readyz",
-                timeout_seconds,
-                client=http_client,
-                client_factory=http_client_factory,
-            ),
+            qdrant_check,
         ),
         DependencyCheck(
             "redis",
@@ -861,16 +1017,31 @@ def build_dependency_checks(
         ),
         DependencyCheck(
             "embedding",
-            _http_status_check(
-                settings.embedding_service_url,
-                "/readyz",
-                timeout_seconds,
-                client=http_client,
-                client_factory=http_client_factory,
-                require_ready_json=True,
-            ),
+            embedding_check,
         ),
     ]
+    if retrieval_enabled:
+        assert retrieval_settings is not None
+        assert retrieval_settings.reranker is not None
+        raw_checks.append(
+            DependencyCheck(
+                "reranker",
+                _reranker_metadata_check(
+                    settings.reranker_service_url,
+                    retrieval_settings.reranker,
+                    client=http_client,
+                ),
+            )
+        )
+        if retrieval_settings.mode is RetrievalMode.SHADOW:
+            retrieval_names = {"qdrant", "embedding", "reranker"}
+            raw_checks = [
+                DependencyCheck(item.name, _degraded_dependency(item.check))
+                if item.name in retrieval_names
+                else item
+                for item in raw_checks
+            ]
+            raw_checks.append(DependencyCheck("retrieval_shadow", lambda: (True, "ready")))
     if _generation_enabled(environ):
         raw_checks.append(
             DependencyCheck(

@@ -419,9 +419,7 @@ class SqlChatRepository:
         retrieval_scope: RetrievalScope | None = None,
     ) -> None:
         if (retrieval_router is None) != (retrieval_scope is None):
-            raise ValueError(
-                "retrieval_router and retrieval_scope must be configured together"
-            )
+            raise ValueError("retrieval_router and retrieval_scope must be configured together")
         self._database = database
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service
@@ -456,6 +454,21 @@ class SqlChatRepository:
         finally:
             if self._owns_database:
                 self._database.engine.dispose()
+
+    def configure_retrieval(
+        self,
+        router: RetrievalRouter,
+        scope: RetrievalScope,
+    ) -> None:
+        if router is None or scope is None:
+            raise ValueError("retrieval_router and retrieval_scope must be configured together")
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("repository is closed")
+            if self.retrieval_router is not None or self._retrieval_scope is not None:
+                raise RuntimeError("retrieval is already configured")
+            self.retrieval_router = router
+            self._retrieval_scope = scope
 
     def seed_if_empty(self, state: ChatState) -> None:
         with self._database.session() as session:

@@ -9,14 +9,187 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.infra import health as health_module
-from app.infra.health import DependencyCheck, DependencyHealthRegistry
+from app.infra.health import DependencyCheck, DependencyHealthRegistry, build_dependency_checks
 from app.main import create_app
+from app.offline_settings import OfflineSettings
 from app.repository import InMemoryChatRepository
+from app.retrieval_settings import RetrievalSettings
 from app.routes import router as app_router
 from app.seed import build_seed_state
 
 
+def retrieval_health_environment(mode: str = "qwen3") -> dict[str, str]:
+    checksum = "a" * 64
+    return {
+        "OFFLINE_MODE": "true",
+        "DATABASE_URL": "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent",
+        "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+        "QDRANT_URL": "http://127.0.0.1:6333",
+        "REDIS_URL": "redis://127.0.0.1:6379/0",
+        "CLAMAV_HOST": "127.0.0.1",
+        "EMBEDDING_SERVICE_URL": "http://127.0.0.1:8081",
+        "RERANKER_SERVICE_URL": "http://127.0.0.1:8082",
+        "LLAMA_SERVER_URL": "http://127.0.0.1:8080",
+        "LLM_PROVIDER": "physoc_deepseek",
+        "RETRIEVAL_MODE": mode,
+        "RETRIEVAL_PERMISSION_TAGS": "internal",
+        "EMBEDDING_MODEL_NAME": "Qwen/Qwen3-Embedding-0.6B",
+        "EMBEDDING_MODEL_VERSION": "1.0.0",
+        "EMBEDDING_MODEL_SHA256": checksum,
+        "EMBEDDING_MODEL_DIMENSIONS": "1024",
+        "EMBEDDING_MODEL_NORMALIZED": "true",
+        "EMBEDDING_ENCODING_PROFILE_SHA256": checksum,
+        "EMBEDDING_PROTOCOL_VERSION": "v1",
+        "RERANKER_MODEL_NAME": "Qwen/Qwen3-Reranker-0.6B",
+        "RERANKER_MODEL_VERSION": "1.0.0",
+        "RERANKER_MODEL_SHA256": checksum,
+        "RERANKER_PROMPT_PROFILE_SHA256": checksum,
+        "RERANKER_PROTOCOL_VERSION": "v1",
+    }
+
+
+class MetadataResponse:
+    status_code = 200
+    headers: dict[str, str] = {}
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def json(self) -> dict[str, object]:
+        return dict(self.payload)
+
+
+class RetrievalHealthHttpClient:
+    def __init__(self, responses: dict[str, MetadataResponse]) -> None:
+        self.responses = responses
+        self.urls: list[str] = []
+
+    def get(self, url: str) -> MetadataResponse:
+        self.urls.append(url)
+        return self.responses[url]
+
+
+class RetrievalHealthGateway:
+    def __init__(self, *, alias: str | None = "knowledge_chunks_qwen3_v1") -> None:
+        self.alias = alias
+        self.validations: list[tuple[str, int]] = []
+
+    def resolve_alias(self) -> str | None:
+        return self.alias
+
+    def validate_collection(
+        self,
+        collection_name: str,
+        *,
+        dense_dimensions: int,
+    ) -> int:
+        self.validations.append((collection_name, dense_dimensions))
+        return 10
+
+
+def retrieval_health_responses(*, reranker_version: str = "1.0.0") -> dict[str, MetadataResponse]:
+    checksum = "a" * 64
+    return {
+        "http://127.0.0.1:6333/readyz": MetadataResponse({"status": "ready"}),
+        "http://127.0.0.1:8081/v1/metadata": MetadataResponse(
+            {
+                "modelName": "Qwen/Qwen3-Embedding-0.6B",
+                "modelVersion": "1.0.0",
+                "modelChecksum": checksum,
+                "dimensions": 1024,
+                "normalized": True,
+                "encodingProfileSha256": checksum,
+                "protocolVersion": "v1",
+            }
+        ),
+        "http://127.0.0.1:8082/v1/metadata": MetadataResponse(
+            {
+                "modelName": "Qwen/Qwen3-Reranker-0.6B",
+                "modelVersion": reranker_version,
+                "modelChecksum": checksum,
+                "promptProfileSha256": checksum,
+                "protocolVersion": "v1",
+            }
+        ),
+    }
+
+
 class InfraHealthTest(unittest.TestCase):
+    def test_qwen3_retrieval_health_checks_metadata_alias_and_dimension(self) -> None:
+        environ = retrieval_health_environment()
+        offline = OfflineSettings.from_environ(environ)
+        retrieval = RetrievalSettings.from_environ(environ)
+        http_client = RetrievalHealthHttpClient(retrieval_health_responses())
+        gateway = RetrievalHealthGateway()
+
+        checks = build_dependency_checks(
+            offline,
+            database=object(),
+            environ=environ,
+            http_client=http_client,
+            retrieval_settings=retrieval,
+            retrieval_gateway=gateway,
+        )
+        retrieval_checks = {
+            check.name: check.check()
+            for check in checks
+            if check.name in {"qdrant", "embedding", "reranker"}
+        }
+
+        self.assertEqual(
+            retrieval_checks,
+            {
+                "qdrant": (True, "ready"),
+                "embedding": (True, "ready"),
+                "reranker": (True, "ready"),
+            },
+        )
+        self.assertEqual(gateway.validations, [("knowledge_chunks_qwen3_v1", 1024)])
+        self.assertIn("http://127.0.0.1:8081/v1/metadata", http_client.urls)
+        self.assertIn("http://127.0.0.1:8082/v1/metadata", http_client.urls)
+
+    def test_qwen3_metadata_mismatch_is_not_ready(self) -> None:
+        environ = retrieval_health_environment()
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=RetrievalHealthHttpClient(
+                retrieval_health_responses(reranker_version="unexpected")
+            ),
+            retrieval_settings=RetrievalSettings.from_environ(environ),
+            retrieval_gateway=RetrievalHealthGateway(),
+        )
+        reranker = next(check for check in checks if check.name == "reranker")
+
+        self.assertEqual(reranker.check(), (False, "metadata mismatch"))
+
+    def test_shadow_retrieval_dependency_failure_is_degraded_but_ready(self) -> None:
+        environ = retrieval_health_environment("shadow")
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=RetrievalHealthHttpClient(
+                retrieval_health_responses(reranker_version="unexpected")
+            ),
+            retrieval_settings=RetrievalSettings.from_environ(environ),
+            retrieval_gateway=RetrievalHealthGateway(),
+        )
+        registry = DependencyHealthRegistry(
+            [
+                check
+                for check in checks
+                if check.name in {"qdrant", "embedding", "reranker", "retrieval_shadow"}
+            ]
+        )
+
+        report = registry.report()
+
+        self.assertTrue(registry.ready())
+        self.assertEqual(report["reranker"], {"ok": True, "detail": "degraded"})
+        self.assertEqual(report["retrieval_shadow"], {"ok": True, "detail": "ready"})
+
     def test_liveness_does_not_require_external_services(self) -> None:
         calls = 0
 

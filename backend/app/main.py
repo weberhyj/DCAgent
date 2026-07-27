@@ -30,12 +30,130 @@ from .llm import LLMProvider, create_llm_provider
 from .llm_runtime import validate_production_llm_provider
 from .offline_settings import OfflineSettings, parse_bool, require_secret_file
 from .repository import ChatRepository
+from .retrieval_models import RetrievalMode, RetrievalScope
+from .retrieval_settings import RetrievalSettings
 from .routes import router
 from .runtime_env import load_runtime_environment
 from .sql_repository import SqlChatRepository
 from .storage import KnowledgeFileStorage
 from .structured_answer import StructuredAnswerService
 from .structured_repository import StructuredRepository
+
+
+class _DefaultRetrievalResourceFactory:
+    def create_qdrant_client(self, settings: RetrievalSettings) -> object:
+        from qdrant_client import QdrantClient
+
+        return QdrantClient(
+            url=settings.qdrant_url,
+            timeout=settings.total_timeout_seconds,
+        )
+
+    def create_gateway(self, client: object, settings: RetrievalSettings) -> object:
+        from .qdrant_retrieval import QdrantRetrievalGateway
+
+        return QdrantRetrievalGateway(
+            client,  # type: ignore[arg-type]
+            alias_name=settings.qdrant_collection_alias,
+        )
+
+    def create_embedding_client(self, settings: RetrievalSettings) -> object:
+        from .embedding_client import SyncHttpEmbeddingClient
+
+        assert settings.embedding_service_url is not None
+        return SyncHttpEmbeddingClient(
+            settings.embedding_service_url,
+            timeout_seconds=settings.total_timeout_seconds,
+        )
+
+    def create_reranker_client(self, settings: RetrievalSettings) -> object:
+        from .reranker_client import SyncHttpRerankerClient
+
+        assert settings.reranker_service_url is not None
+        return SyncHttpRerankerClient(
+            settings.reranker_service_url,
+            timeout_seconds=settings.total_timeout_seconds,
+        )
+
+    def create_sparse_encoder(self, environ: Mapping[str, str]) -> object:
+        from .sparse_embedding import LocalBm25Encoder
+
+        return LocalBm25Encoder.from_environ(dict(environ))
+
+    def create_hybrid_retriever(self, **dependencies: object) -> object:
+        from .hybrid_retriever import HybridRetriever
+
+        settings = dependencies.pop("settings")
+        assert isinstance(settings, RetrievalSettings)
+        assert settings.embedding is not None
+        assert settings.reranker is not None
+        return HybridRetriever(
+            embedding=dependencies["embedding"],  # type: ignore[arg-type]
+            sparse=dependencies["sparse"],  # type: ignore[arg-type]
+            gateway=dependencies["gateway"],  # type: ignore[arg-type]
+            reranker=dependencies["reranker"],  # type: ignore[arg-type]
+            embedding_metadata=settings.embedding,
+            reranker_metadata=settings.reranker,
+            dense_top_k=settings.dense_top_k,
+            sparse_top_k=settings.sparse_top_k,
+            rerank_top_k=settings.rerank_top_k,
+            degraded_rerank_top_k=settings.degraded_rerank_top_k,
+            final_top_k=settings.final_top_k,
+            rrf_k=settings.rrf_k,
+            total_timeout_seconds=settings.total_timeout_seconds,
+        )
+
+    def create_audit(self, database: object) -> object:
+        from .retrieval_audit import RetrievalAuditRepository
+
+        return RetrievalAuditRepository(database)  # type: ignore[arg-type]
+
+    def create_router(self, **dependencies: object) -> object:
+        from .retrieval_router import RetrievalRouter
+
+        settings = dependencies.pop("settings")
+        assert isinstance(settings, RetrievalSettings)
+        return RetrievalRouter(
+            mode=settings.mode,
+            legacy_search=dependencies["legacy_search"],  # type: ignore[arg-type]
+            hybrid=dependencies["hybrid"],  # type: ignore[arg-type]
+            audit=dependencies["audit"],  # type: ignore[arg-type]
+            shadow_percent=settings.shadow_percent,
+            canary_percent=settings.canary_percent,
+            close_timeout_seconds=min(settings.total_timeout_seconds, 1.0),
+            embedding_model_version=(
+                settings.embedding.version if settings.embedding is not None else None
+            ),
+            reranker_model_version=(
+                settings.reranker.version if settings.reranker is not None else None
+            ),
+            qdrant_alias=settings.qdrant_collection_alias,
+        )
+
+    def create_index_lifecycle(self, **dependencies: object) -> object:
+        from .retrieval_publication import RetrievalIndexPublisher
+
+        settings = dependencies.pop("settings")
+        environ = dependencies.pop("environ")
+        assert isinstance(settings, RetrievalSettings)
+        assert isinstance(environ, Mapping)
+        assert settings.embedding is not None
+        sparse_profile_sha256 = str(environ.get("SPARSE_PROFILE_SHA256", "")).strip()
+        if not sparse_profile_sha256:
+            raise ValueError("SPARSE_PROFILE_SHA256 is required")
+        return RetrievalIndexPublisher(
+            repository=dependencies["repository"],  # type: ignore[arg-type]
+            audit=dependencies["audit"],  # type: ignore[arg-type]
+            gateway=dependencies["gateway"],  # type: ignore[arg-type]
+            embedding=dependencies["embedding"],  # type: ignore[arg-type]
+            sparse=dependencies["sparse"],  # type: ignore[arg-type]
+            embedding_metadata=settings.embedding,
+            sparse_profile_sha256=sparse_profile_sha256,
+            alias_name=settings.qdrant_collection_alias,
+            knowledge_base_id=settings.knowledge_base_id,
+            permission_tags=settings.permission_tags,
+            structured_catalog_provider=dependencies["structured_repository"],  # type: ignore[arg-type]
+        )
 
 
 def create_default_repository(
@@ -216,6 +334,7 @@ def create_production_app(
     postgres_health_engine_factory: Callable[..., object] | None = None,
     health_redis_client_factory: Callable[..., object] | None = None,
     clickhouse_client_factory: Callable[..., object] | None = None,
+    retrieval_resource_factory: object | None = None,
     upload_dir: Path | None = None,
 ) -> FastAPI:
     environment_override = dict(environ) if environ is not None else None
@@ -240,6 +359,7 @@ def create_production_app(
 
             validate_production_llm_provider(source)
             settings = OfflineSettings.from_environ(source)
+            retrieval_settings = RetrievalSettings.from_environ(source)
             query_password = (
                 require_secret_file(
                     settings.clickhouse_query_password_file,
@@ -249,7 +369,11 @@ def create_production_app(
                 else None
             )
             if health_registry_factory is None:
-                validate_health_service_urls(settings, source)
+                validate_health_service_urls(
+                    settings,
+                    source,
+                    retrieval_settings=retrieval_settings,
+                )
             provider_builder = llm_provider_factory or create_llm_provider
             llm_provider = own(provider_builder(source))
 
@@ -277,6 +401,7 @@ def create_production_app(
                     database,  # type: ignore[arg-type]
                     llm_provider=llm_provider,  # type: ignore[arg-type]
                     structured_service=structured_service,
+                    retrieval_permission_tags=retrieval_settings.permission_tags,
                 )
             else:
                 repository = repository_factory()
@@ -288,12 +413,25 @@ def create_production_app(
                         )
                     repository._structured_service = structured_service  # type: ignore[attr-defined]
             own(repository)
+            retrieval_gateway = None
+            index_lifecycle = None
+            if retrieval_settings.mode is not RetrievalMode.LEGACY:
+                retrieval_gateway, index_lifecycle = _configure_retrieval_runtime(
+                    factory=retrieval_resource_factory or _DefaultRetrievalResourceFactory(),
+                    settings=retrieval_settings,
+                    environ=source,
+                    database=database,
+                    repository=repository,
+                    structured_repository=structured_repository,
+                    own=own,
+                )
             if ingestion_queue_factory is None:
                 ingestion_queue = own(
                     KnowledgeIngestionQueue(
                         repository,
                         structured_repository=structured_repository,
                         structured_query_enabled=settings.structured_query_enabled,
+                        index_lifecycle=index_lifecycle,  # type: ignore[arg-type]
                     )
                 )
             else:
@@ -303,6 +441,7 @@ def create_production_app(
                         repository,
                         structured_repository,
                         settings.structured_query_enabled,
+                        index_lifecycle,
                     )
                 )
 
@@ -348,6 +487,8 @@ def create_production_app(
                         environ=source,
                         http_client=health_http_client,
                         redis_client=health_redis_client,
+                        retrieval_settings=retrieval_settings,
+                        retrieval_gateway=retrieval_gateway,
                     ),
                     cache_ttl_seconds=0.5,
                     max_stale_seconds=bounded_health_timeout + 0.5,
@@ -367,6 +508,8 @@ def create_production_app(
             application.state.repository = repository
             application.state.structured_repository = structured_repository
             application.state.structured_query_enabled = settings.structured_query_enabled
+            application.state.retrieval_settings = retrieval_settings
+            application.state.retrieval_gateway = retrieval_gateway
             application.state.knowledge_ingestion_queue = ingestion_queue
             application.state.knowledge_file_storage = storage
             application.state.evaluation_import_service = evaluation_service
@@ -532,42 +675,132 @@ def _close_clickhouse_clients(clients: tuple[object, ...]) -> None:
                 pass
 
 
+def _configure_retrieval_runtime(
+    *,
+    factory: object,
+    settings: RetrievalSettings,
+    environ: Mapping[str, str],
+    database: object,
+    repository: ChatRepository,
+    structured_repository: StructuredRepository,
+    own: Callable[[object], object],
+) -> tuple[object, object]:
+    qdrant = own(factory.create_qdrant_client(settings))  # type: ignore[attr-defined]
+    gateway = factory.create_gateway(qdrant, settings)  # type: ignore[attr-defined]
+    embedding = own(factory.create_embedding_client(settings))  # type: ignore[attr-defined]
+    reranker = own(factory.create_reranker_client(settings))  # type: ignore[attr-defined]
+    sparse = factory.create_sparse_encoder(environ)  # type: ignore[attr-defined]
+    hybrid = own(  # type: ignore[assignment]
+        factory.create_hybrid_retriever(  # type: ignore[attr-defined]
+            settings=settings,
+            embedding=embedding,
+            sparse=sparse,
+            gateway=gateway,
+            reranker=reranker,
+        )
+    )
+    audit = factory.create_audit(database)  # type: ignore[attr-defined]
+    active_publication = audit.active_publication(settings.qdrant_collection_alias)
+    if active_publication is None:
+        raise RuntimeError("active retrieval publication is unavailable")
+    publication_id = str(getattr(active_publication, "id", "")).strip()
+    if not publication_id:
+        raise RuntimeError("active retrieval publication is unavailable")
+    scope = RetrievalScope(
+        settings.knowledge_base_id,
+        settings.permission_tags,
+        publication_id,
+    )
+    router = own(
+        factory.create_router(  # type: ignore[attr-defined]
+            settings=settings,
+            legacy_search=repository.search_knowledge_chunks,
+            hybrid=hybrid,
+            audit=audit,
+        )
+    )
+    configure_retrieval = getattr(repository, "configure_retrieval", None)
+    if not callable(configure_retrieval):
+        raise TypeError("Shadow/Qwen3 repository_factory must return a retrieval-aware repository")
+    configure_retrieval(router, scope)
+    index_lifecycle = factory.create_index_lifecycle(  # type: ignore[attr-defined]
+        settings=settings,
+        environ=environ,
+        repository=repository,
+        structured_repository=structured_repository,
+        audit=audit,
+        gateway=gateway,
+        embedding=embedding,
+        sparse=sparse,
+    )
+    return gateway, index_lifecycle
+
+
 def _create_custom_ingestion_queue(
     factory: Callable[..., object],
     repository: ChatRepository,
     structured_repository: StructuredRepository,
     structured_query_enabled: bool,
+    index_lifecycle: object | None = None,
 ) -> object:
-    if not structured_query_enabled:
+    if not structured_query_enabled and index_lifecycle is None:
         return factory(repository)
 
     try:
         signature = inspect.signature(factory)
     except (TypeError, ValueError) as error:
         raise TypeError(
-            "When STRUCTURED_QUERY_ENABLED=true, ingestion_queue_factory must be "
-            "structured-aware and expose an inspectable three-argument signature"
+            _ingestion_factory_requirement(
+                structured_query_enabled=structured_query_enabled,
+                index_lifecycle=index_lifecycle,
+                inspectable=True,
+            )
         ) from error
 
-    keyword_arguments = {
-        "repository": repository,
-        "structured_repository": structured_repository,
-        "structured_query_enabled": True,
-    }
+    keyword_arguments: dict[str, object] = {"repository": repository}
+    if structured_query_enabled:
+        keyword_arguments.update(
+            {
+                "structured_repository": structured_repository,
+                "structured_query_enabled": True,
+            }
+        )
+    if index_lifecycle is not None:
+        keyword_arguments["index_lifecycle"] = index_lifecycle
     try:
         signature.bind(**keyword_arguments)
     except TypeError:
-        positional_arguments = (repository, structured_repository, True)
+        positional_arguments = tuple(keyword_arguments.values())
         try:
             signature.bind(*positional_arguments)
         except TypeError as error:
             raise TypeError(
-                "When STRUCTURED_QUERY_ENABLED=true, ingestion_queue_factory must be "
-                "structured-aware and accept repository, structured_repository, and "
-                "structured_query_enabled"
+                _ingestion_factory_requirement(
+                    structured_query_enabled=structured_query_enabled,
+                    index_lifecycle=index_lifecycle,
+                )
             ) from error
         return factory(*positional_arguments)
     return factory(**keyword_arguments)
+
+
+def _ingestion_factory_requirement(
+    *,
+    structured_query_enabled: bool,
+    index_lifecycle: object | None,
+    inspectable: bool = False,
+) -> str:
+    capabilities: list[str] = []
+    if structured_query_enabled:
+        capabilities.append(
+            "be structured-aware and accept repository, structured_repository, "
+            "and structured_query_enabled"
+        )
+    if index_lifecycle is not None:
+        capabilities.append("be retrieval-aware and accept index_lifecycle")
+    requirement = " and ".join(capabilities)
+    suffix = " with an inspectable signature" if inspectable else ""
+    return f"ingestion_queue_factory must {requirement}{suffix}"
 
 
 # Legacy development commands still import ``app.main:app``.  This construction

@@ -444,15 +444,11 @@ class SqlRepositoryTest(unittest.TestCase):
             ),
             (
                 "memory-router-only",
-                lambda: InMemoryChatRepository(
-                    build_seed_state(), retrieval_router=object()
-                ),
+                lambda: InMemoryChatRepository(build_seed_state(), retrieval_router=object()),
             ),
             (
                 "memory-scope-only",
-                lambda: InMemoryChatRepository(
-                    build_seed_state(), retrieval_scope=scope
-                ),
+                lambda: InMemoryChatRepository(build_seed_state(), retrieval_scope=scope),
             ),
         )
 
@@ -472,6 +468,18 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertIsNone(sql.retrieval_router)
         self.assertIsInstance(memory.search_knowledge_chunks("policy"), list)
         self.assertIsInstance(sql.search_knowledge_chunks("policy"), list)
+
+    def test_sql_repository_allows_one_startup_retrieval_configuration(self) -> None:
+        repository = SqlChatRepository(self.database)
+        router = object()
+        scope = RetrievalScope("default", ("internal",), "publication-v1")
+
+        repository.configure_retrieval(router, scope)
+
+        self.assertIs(repository.retrieval_router, router)
+        self.assertIs(repository._retrieval_scope, scope)
+        with self.assertRaisesRegex(RuntimeError, "retrieval is already configured"):
+            repository.configure_retrieval(object(), scope)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ from threading import Lock, Thread
 from typing import Protocol
 from uuid import uuid4
 
+from loguru import logger
+
 from .embedding_client import EmbeddingServiceError
 from .hybrid_retriever import HybridRetrievalOutcome, HybridRetrievalTimeout
 from .models import KnowledgeSearchHitModel
@@ -147,6 +149,10 @@ class _ShadowTask:
 _STOP = object()
 
 
+def _new_request_id() -> str:
+    return uuid4().hex
+
+
 class ShadowQueue:
     """One bounded, non-blocking Shadow worker for an API process."""
 
@@ -218,9 +224,7 @@ class ShadowQueue:
                 self._queue.put_nowait(_STOP)
         self.worker.join(self._close_timeout_seconds)
         if self.worker.is_alive():
-            raise ShadowQueueCloseError(
-                "shadow worker did not stop before close timeout"
-            ) from None
+            raise ShadowQueueCloseError("shadow worker did not stop before close timeout") from None
         with self._lock:
             self._closed = True
 
@@ -249,6 +253,7 @@ class ShadowQueue:
 
     def _run_task(self, task: _ShadowTask) -> None:
         started = self._monotonic()
+        request_id = f"shadow-{uuid4().hex}"
         status = "completed"
         fallback_reason: str | None = None
         qwen_chunk_ids: tuple[str, ...] = ()
@@ -261,12 +266,18 @@ class ShadowQueue:
         except Exception as error:
             status = "failed"
             fallback_reason = _fallback_code(error)
+            logger.bind(
+                request_id=request_id,
+                mode=RetrievalMode.SHADOW.value,
+                fallback_code=fallback_reason,
+                fallback_reason=fallback_reason,
+            ).exception("shadow hybrid retrieval failed")
         qwen_ms = _elapsed_ms(started, self._monotonic())
         if self._audit is None:
             return
         try:
             self._audit.record_shadow(
-                request_id=f"shadow-{uuid4().hex}",
+                request_id=request_id,
                 routing_key_hash=_sha256_hex(task.request.routing_key),
                 query_hash=_sha256_hex(task.request.query),
                 legacy_chunk_ids=tuple(item.chunk.id for item in task.legacy_hits),
@@ -295,6 +306,10 @@ class RetrievalRouter:
         shadow_queue_size: int = 32,
         close_timeout_seconds: float = 1.0,
         monotonic: Callable[[], float] = time.monotonic,
+        embedding_model_version: str | None = None,
+        reranker_model_version: str | None = None,
+        qdrant_alias: str | None = None,
+        request_id_factory: Callable[[], str] = _new_request_id,
     ) -> None:
         try:
             self.mode = RetrievalMode(mode)
@@ -309,6 +324,12 @@ class RetrievalRouter:
         self._shadow_percent = _percentage(shadow_percent, "shadow_percent")
         self._canary_percent = _percentage(canary_percent, "canary_percent")
         self._monotonic = monotonic
+        self._embedding_model_version = embedding_model_version
+        self._reranker_model_version = reranker_model_version
+        self._qdrant_alias = qdrant_alias
+        if not callable(request_id_factory):
+            raise TypeError("request_id_factory must be callable")
+        self._request_id_factory = request_id_factory
         if self.mode is RetrievalMode.SHADOW and audit is None:
             raise ValueError("shadow mode requires an audit repository")
         self._circuit = _CircuitBreaker(
@@ -341,47 +362,97 @@ class RetrievalRouter:
     def search(self, request: RetrievalRequest) -> RoutedRetrievalOutcome:
         if not isinstance(request, RetrievalRequest):
             raise TypeError("request must be a RetrievalRequest")
+        request_id = self._request_id_factory()
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("request_id_factory must return a non-empty string")
+        outcome, candidate_counts = self._search(request, request_id=request_id)
+        logger.bind(
+            request_id=request_id,
+            mode=self.mode.value,
+            embedding_model_version=self._embedding_model_version,
+            reranker_model_version=self._reranker_model_version,
+            model_versions={
+                "embedding": self._embedding_model_version,
+                "reranker": self._reranker_model_version,
+            },
+            alias=self._qdrant_alias,
+            qdrant_alias=self._qdrant_alias,
+            candidate_counts=candidate_counts,
+            stage_timings=dict(outcome.stage_ms),
+            stage_timings_ms=dict(outcome.stage_ms),
+            fallback_code=outcome.fallback_reason,
+            fallback_reason=outcome.fallback_reason,
+            result_count=len(outcome.hits),
+        ).info("retrieval completed")
+        return outcome
+
+    def _search(
+        self,
+        request: RetrievalRequest,
+        *,
+        request_id: str,
+    ) -> tuple[RoutedRetrievalOutcome, dict[str, int]]:
         if self.mode is RetrievalMode.LEGACY:
-            return self._legacy(request)
+            legacy = self._legacy(request)
+            return legacy, {"qwen": 0, "legacy": len(legacy.hits)}
         if self.mode is RetrievalMode.SHADOW:
             legacy = self._legacy(request)
             if self.uses_qwen(request.routing_key):
                 assert self.shadow_queue is not None
                 self.shadow_queue.submit(request, legacy.hits, legacy.stage_ms["legacy"])
-            return legacy
+            return legacy, {"qwen": 0, "legacy": len(legacy.hits)}
         if not self.uses_qwen(request.routing_key):
-            return self._legacy(request)
+            legacy = self._legacy(request)
+            return legacy, {"qwen": 0, "legacy": len(legacy.hits)}
 
         permit = self._circuit.acquire()
         if permit is None:
-            return self._legacy(request, fallback_reason="circuit_open")
+            legacy = self._legacy(request, fallback_reason="circuit_open")
+            return legacy, {"qwen": 0, "legacy": len(legacy.hits)}
         try:
             qwen = self._hybrid.retrieve(request)
         except Exception as error:
             self._circuit.record_failure(permit)
-            return self._legacy(request, fallback_reason=_fallback_code(error))
+            fallback_code = _fallback_code(error)
+            logger.bind(
+                request_id=request_id,
+                mode=self.mode.value,
+                fallback_code=fallback_code,
+                fallback_reason=fallback_code,
+            ).exception("hybrid retrieval failed")
+            legacy = self._legacy(request, fallback_reason=fallback_code)
+            return legacy, {"qwen": 0, "legacy": len(legacy.hits)}
         except BaseException:
             self._circuit.abandon(permit)
             raise
         self._circuit.record_success(permit)
         if qwen.hits:
-            return RoutedRetrievalOutcome(
-                mode=RetrievalMode.QWEN3,
-                hits=tuple(qwen.hits),
-                stage_ms=dict(qwen.stage_ms),
+            return (
+                RoutedRetrievalOutcome(
+                    mode=RetrievalMode.QWEN3,
+                    hits=tuple(qwen.hits),
+                    stage_ms=dict(qwen.stage_ms),
+                ),
+                {"qwen": len(qwen.candidates), "legacy": 0},
             )
         legacy = self._legacy(request)
         if legacy.hits:
-            return RoutedRetrievalOutcome(
-                mode=RetrievalMode.LEGACY,
-                hits=legacy.hits,
-                stage_ms=legacy.stage_ms,
-                fallback_reason="qwen_empty_legacy_nonempty",
+            return (
+                RoutedRetrievalOutcome(
+                    mode=RetrievalMode.LEGACY,
+                    hits=legacy.hits,
+                    stage_ms=legacy.stage_ms,
+                    fallback_reason="qwen_empty_legacy_nonempty",
+                ),
+                {"qwen": len(qwen.candidates), "legacy": len(legacy.hits)},
             )
-        return RoutedRetrievalOutcome(
-            mode=RetrievalMode.QWEN3,
-            hits=(),
-            stage_ms=dict(qwen.stage_ms),
+        return (
+            RoutedRetrievalOutcome(
+                mode=RetrievalMode.QWEN3,
+                hits=(),
+                stage_ms=dict(qwen.stage_ms),
+            ),
+            {"qwen": len(qwen.candidates), "legacy": 0},
         )
 
     def _legacy(

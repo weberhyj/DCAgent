@@ -4,6 +4,7 @@ import hashlib
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import app.retrieval_router as retrieval_router_module
 from app.hybrid_retriever import HybridRetrievalOutcome, HybridRetrievalTimeout
@@ -153,9 +154,7 @@ class RetrievalRouterTest(unittest.TestCase):
 
     def test_stable_bucket_uses_sha256_first_eight_bytes_big_endian(self) -> None:
         routing_key = "conv-stable-7"
-        expected = int.from_bytes(
-            hashlib.sha256(routing_key.encode()).digest()[:8], "big"
-        ) % 100
+        expected = int.from_bytes(hashlib.sha256(routing_key.encode()).digest()[:8], "big") % 100
 
         self.assertEqual(stable_percentage_bucket(routing_key), expected)
 
@@ -171,9 +170,7 @@ class RetrievalRouterTest(unittest.TestCase):
     def test_shadow_not_selected_returns_legacy_without_queueing(self) -> None:
         hybrid = RecordingHybrid()
         audit = RecordingAudit()
-        router = self.build_router(
-            mode="shadow", hybrid=hybrid, audit=audit, shadow_percent=0
-        )
+        router = self.build_router(mode="shadow", hybrid=hybrid, audit=audit, shadow_percent=0)
 
         result = router.search(request())
         router.shadow_queue.drain_for_test()
@@ -185,9 +182,7 @@ class RetrievalRouterTest(unittest.TestCase):
     def test_shadow_selected_returns_legacy_and_records_qwen_off_thread(self) -> None:
         hybrid = RecordingHybrid()
         audit = RecordingAudit()
-        router = self.build_router(
-            mode="shadow", hybrid=hybrid, audit=audit, shadow_percent=100
-        )
+        router = self.build_router(mode="shadow", hybrid=hybrid, audit=audit, shadow_percent=100)
 
         result = router.search(request("policy", routing_key="conv-shadow"))
         router.shadow_queue.drain_for_test()
@@ -310,7 +305,9 @@ class RetrievalRouterTest(unittest.TestCase):
 
         self.assertEqual(router.search(request("initial")).fallback_reason, "hybrid_unavailable")
         clock.advance(5)
-        self.assertEqual(router.search(request("probe-fails")).fallback_reason, "hybrid_unavailable")
+        self.assertEqual(
+            router.search(request("probe-fails")).fallback_reason, "hybrid_unavailable"
+        )
         self.assertEqual(router.search(request("still-open")).fallback_reason, "circuit_open")
         clock.advance(5)
         self.assertEqual(router.search(request("probe-succeeds")).mode, RetrievalMode.QWEN3)
@@ -405,6 +402,66 @@ class RetrievalRouterTest(unittest.TestCase):
         self.assertEqual(result.mode, RetrievalMode.LEGACY)
         self.assertEqual(result.fallback_reason, "hybrid_unavailable")
 
+    def test_completion_log_is_structured_once_and_does_not_leak_failure_detail(
+        self,
+    ) -> None:
+        secret = "secret passage http://reranker-service:8082"
+        events: list[tuple[str, str, dict[str, object]]] = []
+
+        class RecordingLogger:
+            def __init__(self, extra: dict[str, object] | None = None) -> None:
+                self.extra = dict(extra or {})
+
+            def bind(self, **extra: object) -> RecordingLogger:
+                return RecordingLogger({**self.extra, **extra})
+
+            def exception(self, message: str) -> None:
+                events.append(("exception", message, dict(self.extra)))
+
+            def info(self, message: str) -> None:
+                events.append(("info", message, dict(self.extra)))
+
+        router = self.build_router(
+            mode="qwen3",
+            hybrid=RecordingHybrid([RuntimeError(secret)]),
+            canary_percent=100,
+            embedding_model_version="embedding-v1",
+            reranker_model_version="reranker-v1",
+            qdrant_alias="knowledge_chunks_current",
+            request_id_factory=lambda: "request-123",
+        )
+
+        with patch.object(retrieval_router_module, "logger", RecordingLogger()):
+            result = router.search(request("private user query"))
+
+        self.assertEqual(result.mode, RetrievalMode.LEGACY)
+        completion = [event for event in events if event[1] == "retrieval completed"]
+        self.assertEqual(len(completion), 1)
+        extra = completion[0][2]
+        self.assertEqual(extra["request_id"], "request-123")
+        self.assertEqual(extra["mode"], "qwen3")
+        self.assertEqual(
+            extra["model_versions"],
+            {"embedding": "embedding-v1", "reranker": "reranker-v1"},
+        )
+        self.assertEqual(extra["embedding_model_version"], "embedding-v1")
+        self.assertEqual(extra["reranker_model_version"], "reranker-v1")
+        self.assertEqual(extra["alias"], "knowledge_chunks_current")
+        self.assertEqual(extra["qdrant_alias"], "knowledge_chunks_current")
+        self.assertEqual(extra["candidate_counts"], {"qwen": 0, "legacy": 1})
+        self.assertEqual(extra["stage_timings"], result.stage_ms)
+        self.assertEqual(extra["stage_timings_ms"], result.stage_ms)
+        self.assertEqual(extra["fallback_code"], "hybrid_unavailable")
+        self.assertEqual(extra["fallback_reason"], "hybrid_unavailable")
+        self.assertEqual(extra["result_count"], 1)
+        exception_events = [event for event in events if event[0] == "exception"]
+        self.assertEqual(len(exception_events), 1)
+        self.assertEqual(exception_events[0][1], "hybrid retrieval failed")
+        structured = repr([(message, extra) for _, message, extra in events])
+        self.assertNotIn(secret, structured)
+        self.assertNotIn("http://", structured)
+        self.assertNotIn("private user query", structured)
+
     def test_half_open_allows_exactly_one_concurrent_probe_and_closes_on_success(self) -> None:
         clock = FakeClock()
         hybrid = BlockingHybrid(RuntimeError("initial failure"))
@@ -489,9 +546,7 @@ class RetrievalRouterTest(unittest.TestCase):
         self.assertNotIn("http://", serialized)
 
     def test_close_joins_the_single_daemon_worker_and_rejects_new_shadow_work(self) -> None:
-        router = self.build_router(
-            mode="shadow", audit=RecordingAudit(), shadow_percent=100
-        )
+        router = self.build_router(mode="shadow", audit=RecordingAudit(), shadow_percent=100)
         worker = router.shadow_queue.worker
         self.assertTrue(worker.daemon)
         self.assertTrue(worker.is_alive())
@@ -582,9 +637,7 @@ class RetrievalRouterTest(unittest.TestCase):
             self.assertFalse(closer.is_alive())
             self.assertLess(elapsed, 0.5)
             self.assertEqual(len(errors), 1)
-            self.assertIsInstance(
-                errors[0], retrieval_router_module.ShadowQueueCloseError
-            )
+            self.assertIsInstance(errors[0], retrieval_router_module.ShadowQueueCloseError)
             self.assertEqual(
                 str(errors[0]),
                 "shadow worker did not stop before close timeout",
@@ -626,8 +679,7 @@ class RetrievalRouterTest(unittest.TestCase):
         self.assertTrue(hybrid.started.wait(1.0))
         errors: list[BaseException] = []
         closers = [
-            threading.Thread(target=lambda: self._capture_close(router, errors))
-            for _ in range(4)
+            threading.Thread(target=lambda: self._capture_close(router, errors)) for _ in range(4)
         ]
 
         for closer in closers:

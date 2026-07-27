@@ -7,6 +7,7 @@ import unittest
 from collections.abc import Mapping
 from pathlib import Path
 from threading import Event, Thread
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -34,6 +35,102 @@ class ClosableFake:
         self.close_calls += 1
 
 
+class RecordingClosable:
+    def __init__(self, name: str, closed: list[str]) -> None:
+        self.name = name
+        self.closed = closed
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed.append(self.name)
+
+
+class ConfigurableRepository(ClosableFake):
+    def __init__(self) -> None:
+        super().__init__("repository")
+        self.retrieval_router = None
+        self.retrieval_scope = None
+
+    def configure_retrieval(self, router: object, scope: object) -> None:
+        self.retrieval_router = router
+        self.retrieval_scope = scope
+
+    def search_knowledge_chunks(self, query: str, limit: int = 5) -> list[object]:
+        del query, limit
+        return []
+
+
+class RecordingRetrievalResourceFactory:
+    def __init__(self, *, fail_at: str | None = None, shared_clients: bool = False) -> None:
+        self.fail_at = fail_at
+        self.calls: list[str] = []
+        self.closed: list[str] = []
+        self.qdrant = RecordingClosable("qdrant", self.closed)
+        self.embedding = (
+            self.qdrant if shared_clients else RecordingClosable("embedding", self.closed)
+        )
+        self.reranker = RecordingClosable("reranker", self.closed)
+        self.hybrid = RecordingClosable("hybrid", self.closed)
+        self.router = RecordingClosable("shadow_queue", self.closed)
+        self.gateway = SimpleNamespace(name="gateway")
+        self.sparse = SimpleNamespace(name="sparse")
+        self.audit = SimpleNamespace(
+            active_publication=lambda alias: SimpleNamespace(id="publication-v1")
+        )
+        self.index_lifecycle = SimpleNamespace(name="index-lifecycle")
+
+    def _record(self, name: str) -> None:
+        self.calls.append(name)
+        if self.fail_at == name:
+            raise RuntimeError(f"failed at {name}")
+
+    def create_qdrant_client(self, settings: object) -> object:
+        del settings
+        self._record("qdrant")
+        return self.qdrant
+
+    def create_gateway(self, client: object, settings: object) -> object:
+        del client, settings
+        self._record("gateway")
+        return self.gateway
+
+    def create_embedding_client(self, settings: object) -> object:
+        del settings
+        self._record("embedding")
+        return self.embedding
+
+    def create_reranker_client(self, settings: object) -> object:
+        del settings
+        self._record("reranker")
+        return self.reranker
+
+    def create_sparse_encoder(self, environ: Mapping[str, str]) -> object:
+        del environ
+        self._record("sparse")
+        return self.sparse
+
+    def create_hybrid_retriever(self, **dependencies: object) -> object:
+        self._record("hybrid")
+        self.hybrid.dependencies = dependencies  # type: ignore[attr-defined]
+        return self.hybrid
+
+    def create_audit(self, database: object) -> object:
+        del database
+        self._record("audit")
+        return self.audit
+
+    def create_router(self, **dependencies: object) -> object:
+        self._record("router")
+        self.router.dependencies = dependencies  # type: ignore[attr-defined]
+        return self.router
+
+    def create_index_lifecycle(self, **dependencies: object) -> object:
+        self._record("index_lifecycle")
+        self.index_lifecycle.dependencies = dependencies
+        return self.index_lifecycle
+
+
 def private_environment(**changes: str) -> dict[str, str]:
     values = {
         "OFFLINE_MODE": "true",
@@ -49,6 +146,31 @@ def private_environment(**changes: str) -> dict[str, str]:
         "LLM_STREAM_PATH": "/api/physoc/deepseeks/stream",
         "LLM_MODEL": "my_deepseek_r1_7b",
     }
+    values.update(changes)
+    return values
+
+
+def private_qwen_environment(mode: str = "qwen3", **changes: str) -> dict[str, str]:
+    checksum = "a" * 64
+    values = private_environment(
+        RETRIEVAL_MODE=mode,
+        RETRIEVAL_PERMISSION_TAGS="internal,restricted",
+        RERANKER_SERVICE_URL="http://127.0.0.1:8082",
+        EMBEDDING_MODEL_NAME="Qwen/Qwen3-Embedding-0.6B",
+        EMBEDDING_MODEL_VERSION="1.0.0",
+        EMBEDDING_MODEL_SHA256=checksum,
+        EMBEDDING_MODEL_DIMENSIONS="1024",
+        EMBEDDING_MODEL_NORMALIZED="true",
+        EMBEDDING_ENCODING_PROFILE_SHA256=checksum,
+        EMBEDDING_PROTOCOL_VERSION="v1",
+        RERANKER_MODEL_NAME="Qwen/Qwen3-Reranker-0.6B",
+        RERANKER_MODEL_VERSION="1.0.0",
+        RERANKER_MODEL_SHA256=checksum,
+        RERANKER_PROMPT_PROFILE_SHA256=checksum,
+        RERANKER_PROTOCOL_VERSION="v1",
+        SPARSE_MODEL_ROOT="C:/models/bm25",
+        SPARSE_PROFILE_SHA256=checksum,
+    )
     values.update(changes)
     return values
 
@@ -223,6 +345,179 @@ class LazyStartupTest(unittest.TestCase):
             {name: 1 for name in resources},
         )
         self.assertEqual(registry.close_calls, 1)
+
+    def test_qwen3_startup_injects_and_closes_owned_retrieval_resources(self) -> None:
+        module = importlib.import_module("app.main")
+        resources = RecordingRetrievalResourceFactory()
+        repository = ConfigurableRepository()
+        observed_queue: dict[str, object] = {}
+
+        def build_queue(*, repository: object, index_lifecycle: object) -> ClosableFake:
+            observed_queue["repository"] = repository
+            observed_queue["index_lifecycle"] = index_lifecycle
+            return ClosableFake("queue")
+
+        app = module.create_production_app(
+            environ=private_qwen_environment(),
+            repository_factory=lambda: repository,
+            retrieval_resource_factory=resources,
+            health_registry_factory=DependencyHealthRegistry,
+            ingestion_queue_factory=build_queue,
+            database_factory=lambda _url: ClosableFake("database"),
+            llm_provider_factory=lambda _environment: ClosableFake("llm"),
+            storage_factory=lambda _root: ClosableFake("storage"),
+            evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
+        )
+
+        with TestClient(app):
+            self.assertIs(repository.retrieval_router, resources.router)
+            self.assertEqual(
+                repository.retrieval_scope.publication_version,
+                "publication-v1",
+            )
+            self.assertIs(observed_queue["repository"], repository)
+            self.assertIs(observed_queue["index_lifecycle"], resources.index_lifecycle)
+            self.assertIs(app.state.retrieval_gateway, resources.gateway)
+
+        self.assertEqual(
+            resources.calls,
+            [
+                "qdrant",
+                "gateway",
+                "embedding",
+                "reranker",
+                "sparse",
+                "hybrid",
+                "audit",
+                "router",
+                "index_lifecycle",
+            ],
+        )
+        self.assertEqual(
+            resources.closed,
+            ["shadow_queue", "hybrid", "reranker", "embedding", "qdrant"],
+        )
+
+    def test_legacy_startup_does_not_construct_retrieval_resources(self) -> None:
+        module = importlib.import_module("app.main")
+        resources = RecordingRetrievalResourceFactory(fail_at="qdrant")
+
+        app = module.create_production_app(
+            environ=private_environment(RETRIEVAL_MODE="legacy"),
+            repository_factory=ConfigurableRepository,
+            retrieval_resource_factory=resources,
+            health_registry_factory=DependencyHealthRegistry,
+            ingestion_queue_factory=lambda _repository: ClosableFake("queue"),
+            database_factory=lambda _url: ClosableFake("database"),
+            llm_provider_factory=lambda _environment: ClosableFake("llm"),
+            storage_factory=lambda _root: ClosableFake("storage"),
+            evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
+        )
+
+        with TestClient(app):
+            self.assertIsNone(app.state.repository.retrieval_router)
+
+        self.assertEqual(resources.calls, [])
+        self.assertEqual(resources.closed, [])
+
+    def test_retrieval_partial_factory_failure_closes_constructed_resources(self) -> None:
+        module = importlib.import_module("app.main")
+        resources = RecordingRetrievalResourceFactory(fail_at="reranker")
+        app = module.create_production_app(
+            environ=private_qwen_environment(),
+            repository_factory=ConfigurableRepository,
+            retrieval_resource_factory=resources,
+            health_registry_factory=DependencyHealthRegistry,
+            database_factory=lambda _url: ClosableFake("database"),
+            llm_provider_factory=lambda _environment: ClosableFake("llm"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "failed at reranker"):
+            with TestClient(app):
+                pass
+
+        self.assertEqual(resources.closed, ["embedding", "qdrant"])
+
+    def test_retrieval_owned_resources_are_registered_only_once(self) -> None:
+        module = importlib.import_module("app.main")
+        resources = RecordingRetrievalResourceFactory(shared_clients=True)
+        app = module.create_production_app(
+            environ=private_qwen_environment(),
+            repository_factory=ConfigurableRepository,
+            retrieval_resource_factory=resources,
+            health_registry_factory=DependencyHealthRegistry,
+            ingestion_queue_factory=lambda **_kwargs: ClosableFake("queue"),
+            database_factory=lambda _url: ClosableFake("database"),
+            llm_provider_factory=lambda _environment: ClosableFake("llm"),
+            storage_factory=lambda _root: ClosableFake("storage"),
+            evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
+        )
+
+        with TestClient(app):
+            pass
+
+        self.assertEqual(resources.qdrant.close_calls, 1)
+        self.assertEqual(resources.closed.count("qdrant"), 1)
+
+    def test_production_readiness_uses_mode_aware_retrieval_health(self) -> None:
+        module = importlib.import_module("app.main")
+
+        for mode, expected_status, expected_detail in (
+            ("qwen3", 503, "unavailable"),
+            ("shadow", 200, "degraded"),
+        ):
+            with self.subTest(mode=mode):
+                resources = RecordingRetrievalResourceFactory()
+                captured: dict[str, object] = {}
+
+                def build_checks(
+                    _settings: object,
+                    **dependencies: object,
+                ) -> list[DependencyCheck]:
+                    captured.update(dependencies)
+                    retrieval = dependencies["retrieval_settings"]
+                    detail = (
+                        "degraded"
+                        if getattr(retrieval, "mode").value == "shadow"
+                        else "unavailable"
+                    )
+                    return [
+                        DependencyCheck(
+                            "reranker",
+                            lambda: (mode == "shadow", detail),
+                        )
+                    ]
+
+                app = module.create_production_app(
+                    environ=private_qwen_environment(mode),
+                    repository_factory=ConfigurableRepository,
+                    retrieval_resource_factory=resources,
+                    ingestion_queue_factory=lambda **_kwargs: ClosableFake("queue"),
+                    database_factory=lambda _url: ClosableFake("database"),
+                    llm_provider_factory=lambda _environment: ClosableFake("llm"),
+                    storage_factory=lambda _root: ClosableFake("storage"),
+                    evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
+                    health_http_client_factory=lambda **_kwargs: ClosableFake("http"),
+                    health_redis_client_factory=lambda *_args, **_kwargs: ClosableFake("redis"),
+                    postgres_health_engine_factory=lambda *_args, **_kwargs: ClosableFake(
+                        "health-database"
+                    ),
+                )
+
+                with patch.object(module, "build_dependency_checks", side_effect=build_checks):
+                    with TestClient(app) as client:
+                        response = client.get("/api/readyz")
+
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(
+                    response.json()["dependencies"]["reranker"]["detail"],
+                    expected_detail,
+                )
+                self.assertIs(captured["retrieval_gateway"], resources.gateway)
+                self.assertEqual(
+                    getattr(captured["retrieval_settings"], "mode").value,
+                    mode,
+                )
 
     def test_production_lifespan_reuses_and_closes_health_clients(self) -> None:
         module = importlib.import_module("app.main")
