@@ -599,7 +599,11 @@ class RetrievalIndexPublisher:
                 recovery_codes.append("audit_mark_failed_failed")
             if collection_may_exist:
                 try:
-                    self._delete_if_unaliased(collection_name)
+                    self._delete_if_unreferenced_by_alias_or_active_audit(
+                        collection_name,
+                        publication.id,
+                        fence=alias_fence,
+                    )
                 except Exception:
                     recovery_codes.append("collection_cleanup_failed")
             if recovery_codes:
@@ -633,10 +637,18 @@ class RetrievalIndexPublisher:
                 continue
             if outcome.publication is not None:
                 return outcome.publication
-            if outcome.recovery_codes:
+            recovery_codes = list(outcome.recovery_codes)
+            try:
+                self._delete_if_unreferenced_by_alias_or_active_audit(
+                    publication.collection_name,
+                    publication.id,
+                )
+            except Exception:
+                recovery_codes.append("collection_cleanup_failed")
+            if recovery_codes:
                 raise PublicationRecoveryError(
                     primary_code,
-                    outcome.recovery_codes,
+                    recovery_codes,
                 ) from None
             raise RetrievalPublicationError(
                 "retrieval publication activation did not commit"
@@ -694,10 +706,6 @@ class RetrievalIndexPublisher:
                         )
                     except Exception:
                         recovery_codes.append("audit_recovery_failed")
-                try:
-                    self._delete_if_unaliased(target.collection_name)
-                except Exception:
-                    recovery_codes.append("collection_cleanup_failed")
                 outcome = _CommitRecoveryOutcome(
                     recovery_codes=tuple(recovery_codes),
                 )
@@ -1186,6 +1194,29 @@ class RetrievalIndexPublisher:
         if any(getattr(alias, "collection_name", None) == collection_name for alias in aliases):
             return
         self.gateway.delete_collection(collection_name)
+
+    def _delete_if_unreferenced_by_alias_or_active_audit(
+        self,
+        collection_name: str,
+        publication_id: str,
+        *,
+        fence: AliasPublicationFence | None = None,
+    ) -> None:
+        if fence is not None:
+            snapshot = self.audit.publication_recovery_state(
+                publication_id,
+                fence=fence,
+            )
+            if snapshot.active is not None and snapshot.active.collection_name == collection_name:
+                return
+            self._delete_if_unaliased(collection_name)
+            return
+        with self.audit.alias_publication_lock(self._alias_name) as cleanup_fence:
+            self._delete_if_unreferenced_by_alias_or_active_audit(
+                collection_name,
+                publication_id,
+                fence=cleanup_fence,
+            )
 
 
 def deterministic_point_id(source_id: str, chunk_id: object, publication_version: str) -> str:

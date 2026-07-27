@@ -1388,25 +1388,46 @@ class RetrievalPublicationTest(unittest.TestCase):
             previous.id,
         )
         self.assertNotIn(target.collection_name, publisher.gateway.existing_collections)
+        self.assertIn("delete_collection", publisher.gateway.events)
 
-    def test_fence_exit_failure_does_not_overwrite_or_delete_newer_aliased_generation(
+    def test_fence_exit_failure_retains_target_active_in_audit_after_newer_alias_wins(
         self,
     ) -> None:
+        secret_marker = "SECRET-NEWER-GENERATION-d720"
         publisher = build_publisher(chunks=sample_chunks(1))
         publisher.build_and_activate("knowledge_chunks_qwen3_v6")
-        publisher.gateway.other_alias_collections.append("knowledge_chunks_qwen3_v7")
         publisher.audit.fail_next_fence_exit = "newer_alias"
+        publisher.audit.fence_exit_error_message = secret_marker
 
-        with self.assertRaises(PublicationRecoveryError) as captured:
+        raised: PublicationRecoveryError | None = None
+        try:
             publisher.build_and_activate("knowledge_chunks_qwen3_v7")
+        except PublicationRecoveryError as error:
+            raised = error
 
+        self.assertIsNotNone(raised)
+        assert raised is not None
+        self.assert_context_free_sanitized(
+            raised,
+            secret_marker=secret_marker,
+            expected_message=(
+                "retrieval publication failed with RuntimeError; "
+                "recovery failures: alias_generation_changed"
+            ),
+        )
+        target = publisher.audit.publication
+        assert target is not None
         self.assertEqual(publisher.gateway.alias, "knowledge_chunks_qwen3_v8")
-        self.assertIn("alias_generation_changed", captured.exception.recovery_codes)
+        self.assertEqual(target.status, "active")
+        self.assertEqual(
+            publisher.audit.active_publication("knowledge_chunks_current").id,
+            target.id,
+        )
         self.assertIn(
             "knowledge_chunks_qwen3_v7",
             publisher.gateway.existing_collections,
         )
-        self.assertNotIn("delete_collection", publisher.gateway.events[-2:])
+        self.assertNotIn("delete_collection", publisher.gateway.events)
 
     def test_build_entry_fails_closed_after_crash_between_alias_switch_and_audit(self) -> None:
         publisher = build_publisher(
