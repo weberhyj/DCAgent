@@ -4,6 +4,7 @@ import unittest
 
 from fastapi.testclient import TestClient
 
+from app.qwen3_reranker_runtime import Qwen3RerankerMalformedOutput
 from app.reranker_contracts import RerankerModelMetadata
 from app.reranker_service import create_reranker_app
 
@@ -44,8 +45,15 @@ class AlwaysMalformedBackend(Backend):
 class MalformedRuntimeBackend(Backend):
     def score_pairs(self, pairs: list[tuple[str, str]]) -> list[float]:
         if pairs[0][0] == "q":
-            raise ValueError("secret malformed model logits")
+            raise Qwen3RerankerMalformedOutput("secret malformed model logits")
         return [0.5 for _ in pairs]
+
+
+class GenericValueErrorBackend(Backend):
+    def rerank(self, query: str, passages: list[str]) -> list[float]:
+        if query == "q":
+            raise ValueError("secret tokenizer/session failure")
+        return super().rerank(query, passages)
 
 
 class RerankerServiceTest(unittest.TestCase):
@@ -63,6 +71,7 @@ class RerankerServiceTest(unittest.TestCase):
             (FailingBackend(), 503),
             (MalformedBackend(), 500),
             (MalformedRuntimeBackend(), 500),
+            (GenericValueErrorBackend(), 503),
         )
         for backend, status in cases:
             with (

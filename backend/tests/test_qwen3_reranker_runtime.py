@@ -10,6 +10,7 @@ import numpy
 from app.qwen3_reranker_runtime import (
     RERANK_PROFILE_SHA256,
     Qwen3RerankerBackend,
+    Qwen3RerankerMalformedOutput,
     format_rerank_pair,
     load_qwen3_reranker_backend,
     yes_probability,
@@ -22,6 +23,28 @@ class Qwen3RerankerRuntimeTest(unittest.TestCase):
         scores = yes_probability(numpy.array([[1.0, 3.0], [4.0, 2.0]]))
         self.assertGreater(scores[0], 0.8)
         self.assertLess(scores[1], 0.2)
+
+    def test_malformed_model_output_uses_dedicated_exception(self) -> None:
+        with self.assertRaises(Qwen3RerankerMalformedOutput):
+            yes_probability(numpy.zeros((1, 3)))
+
+        class Tokenizer:
+            def convert_tokens_to_ids(self, token: str) -> int:
+                return {"no": 0, "yes": 1}[token]
+
+            def __call__(self, texts: list[str], **kwargs: object) -> dict[str, numpy.ndarray]:
+                return {
+                    "input_ids": numpy.ones((1, 2)),
+                    "attention_mask": numpy.ones((1, 2)),
+                }
+
+        class MissingLogitsModel:
+            def __call__(self, **kwargs: object) -> dict[str, numpy.ndarray]:
+                return {}
+
+        backend = Qwen3RerankerBackend(Tokenizer(), MissingLogitsModel(), reranker_metadata())
+        with self.assertRaises(Qwen3RerankerMalformedOutput):
+            backend.rerank("q", ["p"])
 
     def test_prompt_profile_is_pinned(self) -> None:
         self.assertIn("<Query>: q", format_rerank_pair("q", "p"))

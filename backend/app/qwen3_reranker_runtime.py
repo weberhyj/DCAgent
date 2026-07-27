@@ -26,15 +26,24 @@ RERANK_PROFILE = f"{RERANK_PREFIX}<Instruct>: {DEFAULT_RETRIEVAL_INSTRUCTION}\n<
 RERANK_PROFILE_SHA256 = hashlib.sha256(RERANK_PROFILE.encode("utf-8")).hexdigest()
 
 
+class Qwen3RerankerMalformedOutput(ValueError):
+    """The local model returned logits or scores outside its pinned contract."""
+
+
 def format_rerank_pair(query: str, passage: str) -> str:
     body = f"<Instruct>: {DEFAULT_RETRIEVAL_INSTRUCTION}\n<Query>: {query}\n<Document>: {passage}"
     return f"{RERANK_PREFIX}{body}{RERANK_SUFFIX}"
 
 
 def yes_probability(no_yes_logits: Any) -> list[float]:
-    logits = numpy.asarray(_to_numpy(no_yes_logits), dtype=float)
+    try:
+        logits = numpy.asarray(_to_numpy(no_yes_logits), dtype=float)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise Qwen3RerankerMalformedOutput("yes/no logits are not numeric") from error
     if logits.ndim != 2 or logits.shape[1] != 2:
-        raise ValueError("yes probability expects [no, yes] logits")
+        raise Qwen3RerankerMalformedOutput("yes probability expects [no, yes] logits")
+    if not numpy.all(numpy.isfinite(logits)):
+        raise Qwen3RerankerMalformedOutput("yes/no logits must be finite")
     shifted = logits - numpy.max(logits, axis=1, keepdims=True)
     probabilities = numpy.exp(shifted)
     probabilities /= numpy.sum(probabilities, axis=1, keepdims=True)
@@ -75,19 +84,28 @@ class Qwen3RerankerBackend:
             return_tensors=tensor_type,
         )
         outputs = self.model(**encoded)
-        logits = numpy.asarray(_to_numpy(_extract_logits(outputs)), dtype=float)
+        try:
+            logits = numpy.asarray(_to_numpy(_extract_logits(outputs)), dtype=float)
+            attention_mask = numpy.asarray(_to_numpy(encoded["attention_mask"]))
+        except Qwen3RerankerMalformedOutput:
+            raise
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise Qwen3RerankerMalformedOutput(
+                "reranker logits or attention mask are malformed"
+            ) from error
         if logits.ndim != 3 or logits.shape[0] != len(prompts):
-            raise ValueError("reranker model returned malformed logits")
-        attention_mask = numpy.asarray(_to_numpy(encoded["attention_mask"]))
+            raise Qwen3RerankerMalformedOutput("reranker model returned malformed logits")
+        if attention_mask.ndim != 2 or attention_mask.shape != logits.shape[:2]:
+            raise Qwen3RerankerMalformedOutput("reranker attention mask does not match logits")
         lengths = attention_mask.astype(bool).sum(axis=1)
         if numpy.any(lengths <= 0):
-            raise ValueError("reranker attention mask contains an empty input")
+            raise Qwen3RerankerMalformedOutput("reranker attention mask contains an empty input")
         if bool(numpy.all(attention_mask[:, -1] == 1)):
             final_logits = logits[:, -1, :]
         else:
             final_logits = logits[numpy.arange(logits.shape[0]), lengths.astype(int) - 1, :]
         if max(self.no_token_id, self.yes_token_id) >= final_logits.shape[1]:
-            raise ValueError("yes/no token ID exceeds reranker vocabulary")
+            raise Qwen3RerankerMalformedOutput("yes/no token ID exceeds reranker vocabulary")
         return yes_probability(final_logits[:, [self.no_token_id, self.yes_token_id]])
 
 
@@ -137,7 +155,9 @@ def load_qwen3_reranker_backend(
 def _token_id(tokenizer: Any, token: str) -> int:
     value = tokenizer.convert_tokens_to_ids(token)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"reranker tokenizer does not expose a valid {token!r} token ID")
+        raise Qwen3RerankerMalformedOutput(
+            f"reranker tokenizer does not expose a valid {token!r} token ID"
+        )
     return value
 
 
@@ -156,7 +176,7 @@ def _extract_logits(outputs: Any) -> Any:
         return outputs["logits"]
     if isinstance(outputs, (tuple, list)) and outputs:
         return outputs[0]
-    raise ValueError("model output does not contain logits")
+    raise Qwen3RerankerMalformedOutput("model output does not contain logits")
 
 
 def _is_torch_model(model: Any) -> bool:
@@ -168,6 +188,7 @@ __all__ = [
     "RERANK_PREFIX",
     "RERANK_PROFILE_SHA256",
     "RERANK_SUFFIX",
+    "Qwen3RerankerMalformedOutput",
     "Qwen3RerankerBackend",
     "format_rerank_pair",
     "load_qwen3_reranker_backend",

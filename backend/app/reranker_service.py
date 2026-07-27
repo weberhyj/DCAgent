@@ -19,7 +19,10 @@ from pydantic import ValidationError
 
 from .inference_batching import DynamicBatcher, InferenceQueueFull
 from .offline_artifacts import is_local_filesystem_path
-from .qwen3_reranker_runtime import load_qwen3_reranker_backend
+from .qwen3_reranker_runtime import (
+    Qwen3RerankerMalformedOutput,
+    load_qwen3_reranker_backend,
+)
 from .reranker_contracts import (
     MAX_RERANK_PASSAGES,
     MAX_RERANK_REQUEST_BYTES,
@@ -246,7 +249,7 @@ def _invoke_backend_pairs(
     if callable(pair_method):
         try:
             raw_scores = pair_method(list(pairs))
-        except (TypeError, ValueError):
+        except Qwen3RerankerMalformedOutput:
             raise
         except Exception as error:
             raise _RerankerBackendFailure("reranker backend failed") from error
@@ -255,7 +258,7 @@ def _invoke_backend_pairs(
     for query, passage in pairs:
         try:
             raw_scores = backend.rerank(query, [passage])
-        except (TypeError, ValueError):
+        except Qwen3RerankerMalformedOutput:
             raise
         except Exception as error:
             raise _RerankerBackendFailure("reranker backend failed") from error
