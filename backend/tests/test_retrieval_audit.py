@@ -227,6 +227,7 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         assert raised is not None
         self.assertEqual(str(raised), "Retrieval publication activation conflict")
         self.assertIsNone(raised.__cause__)
+        self.assertIsNone(raised.__context__)
         formatted_traceback = "".join(
             traceback.format_exception(type(raised), raised, raised.__traceback__)
         )

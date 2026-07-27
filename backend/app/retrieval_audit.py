@@ -158,6 +158,7 @@ class RetrievalAuditRepository:
         self, publication_id: str, *, point_count: int
     ) -> RetrievalPublication:
         point_count = _count("point_count", point_count)
+        conflict_error: RetrievalAuditError | None = None
         try:
             with self._database.session() as session:
                 alias_name = session.scalar(
@@ -190,7 +191,10 @@ class RetrievalAuditRepository:
                 session.flush()
                 return _publication_from_record(target)
         except IntegrityError:
-            raise RetrievalAuditError("Retrieval publication activation conflict") from None
+            conflict_error = RetrievalAuditError("Retrieval publication activation conflict")
+        if conflict_error is not None:
+            raise conflict_error
+        raise AssertionError("Publication activation reached an invalid state")
 
     def mark_publication_retired(self, publication_id: str) -> RetrievalPublication:
         return self._transition_publication(publication_id, target_status="retired")
