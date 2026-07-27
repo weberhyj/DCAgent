@@ -24,6 +24,7 @@ from app.infra.health import (
 )
 from app.main import _database_url_with_connect_timeout, create_app
 from app.offline_settings import OfflineSettings
+from app.qdrant_retrieval import QdrantRetrievalGateway
 
 
 class ClosableFake:
@@ -76,7 +77,10 @@ class RecordingRetrievalResourceFactory:
         self.gateway = SimpleNamespace(name="gateway")
         self.sparse = SimpleNamespace(name="sparse")
         self.audit = SimpleNamespace(
-            active_publication=lambda alias: SimpleNamespace(id="publication-v1")
+            active_publication=lambda alias: SimpleNamespace(
+                id="publication-uuid-must-not-be-scope",
+                collection_name="knowledge_chunks_qwen3_v17",
+            )
         )
         self.index_lifecycle = SimpleNamespace(name="index-lifecycle")
 
@@ -129,6 +133,53 @@ class RecordingRetrievalResourceFactory:
         self._record("index_lifecycle")
         self.index_lifecycle.dependencies = dependencies
         return self.index_lifecycle
+
+
+class ScopeRecordingQdrant(RecordingClosable):
+    def __init__(self, closed: list[str]) -> None:
+        super().__init__("qdrant", closed)
+        self.query_calls: list[SimpleNamespace] = []
+        self.indexed_payload = {
+            "knowledge_base_id": "default",
+            "publication_version": "v17",
+            "permission_tags": ["internal"],
+            "source_id": "source-1",
+            "source_name": "Policy.txt",
+            "source_type": "TXT",
+            "classification": "internal",
+            "chunk_id": "chunk-1",
+            "chunk_index": 0,
+            "text": "Safe evidence",
+            "parent_chunk_id": None,
+            "previous_chunk_id": None,
+            "next_chunk_id": None,
+        }
+
+    def query_points(self, **kwargs: object) -> object:
+        self.query_calls.append(SimpleNamespace(**kwargs))
+        return SimpleNamespace(
+            points=[
+                SimpleNamespace(
+                    id="point-1",
+                    score=0.9,
+                    payload=dict(self.indexed_payload),
+                )
+            ]
+        )
+
+
+class ScopeQueryingRetrievalResourceFactory(RecordingRetrievalResourceFactory):
+    def __init__(self) -> None:
+        super().__init__()
+        self.qdrant = ScopeRecordingQdrant(self.closed)
+
+    def create_gateway(self, client: object, settings: object) -> object:
+        self._record("gateway")
+        self.gateway = QdrantRetrievalGateway(
+            client,  # type: ignore[arg-type]
+            alias_name=getattr(settings, "qdrant_collection_alias"),
+        )
+        return self.gateway
 
 
 def private_environment(**changes: str) -> dict[str, str]:
@@ -373,7 +424,7 @@ class LazyStartupTest(unittest.TestCase):
             self.assertIs(repository.retrieval_router, resources.router)
             self.assertEqual(
                 repository.retrieval_scope.publication_version,
-                "publication-v1",
+                "v17",
             )
             self.assertIs(observed_queue["repository"], repository)
             self.assertIs(observed_queue["index_lifecycle"], resources.index_lifecycle)
@@ -396,6 +447,40 @@ class LazyStartupTest(unittest.TestCase):
         self.assertEqual(
             resources.closed,
             ["shadow_queue", "hybrid", "reranker", "embedding", "qdrant"],
+        )
+
+    def test_startup_scope_matches_the_version_in_qdrant_payload_filters(self) -> None:
+        module = importlib.import_module("app.main")
+        resources = ScopeQueryingRetrievalResourceFactory()
+        repository = ConfigurableRepository()
+        app = module.create_production_app(
+            environ=private_qwen_environment(),
+            repository_factory=lambda: repository,
+            retrieval_resource_factory=resources,
+            health_registry_factory=DependencyHealthRegistry,
+            ingestion_queue_factory=lambda **_kwargs: ClosableFake("queue"),
+            database_factory=lambda _url: ClosableFake("database"),
+            llm_provider_factory=lambda _environment: ClosableFake("llm"),
+            storage_factory=lambda _root: ClosableFake("storage"),
+            evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
+        )
+
+        with TestClient(app):
+            hits = resources.gateway.search_dense(
+                [1.0],
+                scope=repository.retrieval_scope,
+                limit=1,
+            )
+
+        self.assertEqual([item.chunk_id for item in hits], ["chunk-1"])
+        query_filter = resources.qdrant.query_calls[0].query_filter
+        version_condition = next(
+            condition for condition in query_filter.must if condition.key == "publication_version"
+        )
+        self.assertEqual(version_condition.match.value, "v17")
+        self.assertEqual(
+            version_condition.match.value,
+            resources.qdrant.indexed_payload["publication_version"],
         )
 
     def test_legacy_startup_does_not_construct_retrieval_resources(self) -> None:

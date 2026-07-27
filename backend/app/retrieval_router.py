@@ -153,6 +153,50 @@ def _new_request_id() -> str:
     return uuid4().hex
 
 
+class _SanitizedRetrievalFailure(RuntimeError):
+    pass
+
+
+def _log_sanitized_failure_in_isolated_frame(
+    *,
+    request_id: str,
+    mode: str,
+    fallback_code: str,
+    shadow: bool,
+) -> None:
+    try:
+        raise _SanitizedRetrievalFailure(f"{fallback_code} request_id={request_id}") from None
+    except _SanitizedRetrievalFailure:
+        logger.bind(
+            request_id=request_id,
+            mode=mode,
+            fallback_code=fallback_code,
+            fallback_reason=fallback_code,
+        ).exception("shadow hybrid retrieval failed" if shadow else "hybrid retrieval failed")
+
+
+def _emit_sanitized_failure(
+    *,
+    request_id: str,
+    mode: str,
+    fallback_code: str,
+    shadow: bool = False,
+) -> None:
+    worker = Thread(
+        target=_log_sanitized_failure_in_isolated_frame,
+        kwargs={
+            "request_id": request_id,
+            "mode": mode,
+            "fallback_code": fallback_code,
+            "shadow": shadow,
+        },
+        name="retrieval-sanitized-error-logger",
+        daemon=True,
+    )
+    worker.start()
+    worker.join()
+
+
 class ShadowQueue:
     """One bounded, non-blocking Shadow worker for an API process."""
 
@@ -256,6 +300,7 @@ class ShadowQueue:
         request_id = f"shadow-{uuid4().hex}"
         status = "completed"
         fallback_reason: str | None = None
+        failure_code: str | None = None
         qwen_chunk_ids: tuple[str, ...] = ()
         try:
             outcome = self._hybrid.retrieve(task.request)
@@ -265,13 +310,15 @@ class ShadowQueue:
                 fallback_reason = "qwen_empty_legacy_nonempty"
         except Exception as error:
             status = "failed"
-            fallback_reason = _fallback_code(error)
-            logger.bind(
+            failure_code = _fallback_code(error)
+            fallback_reason = failure_code
+        if failure_code is not None:
+            _emit_sanitized_failure(
                 request_id=request_id,
                 mode=RetrievalMode.SHADOW.value,
-                fallback_code=fallback_reason,
-                fallback_reason=fallback_reason,
-            ).exception("shadow hybrid retrieval failed")
+                fallback_code=failure_code,
+                shadow=True,
+            )
         qwen_ms = _elapsed_ms(started, self._monotonic())
         if self._audit is None:
             return
@@ -409,22 +456,25 @@ class RetrievalRouter:
         if permit is None:
             legacy = self._legacy(request, fallback_reason="circuit_open")
             return legacy, {"qwen": 0, "legacy": len(legacy.hits)}
+        qwen: HybridRetrievalOutcome | None = None
+        failure_code: str | None = None
         try:
             qwen = self._hybrid.retrieve(request)
         except Exception as error:
             self._circuit.record_failure(permit)
-            fallback_code = _fallback_code(error)
-            logger.bind(
-                request_id=request_id,
-                mode=self.mode.value,
-                fallback_code=fallback_code,
-                fallback_reason=fallback_code,
-            ).exception("hybrid retrieval failed")
-            legacy = self._legacy(request, fallback_reason=fallback_code)
-            return legacy, {"qwen": 0, "legacy": len(legacy.hits)}
+            failure_code = _fallback_code(error)
         except BaseException:
             self._circuit.abandon(permit)
             raise
+        if failure_code is not None:
+            _emit_sanitized_failure(
+                request_id=request_id,
+                mode=self.mode.value,
+                fallback_code=failure_code,
+            )
+            legacy = self._legacy(request, fallback_reason=failure_code)
+            return legacy, {"qwen": 0, "legacy": len(legacy.hits)}
+        assert qwen is not None
         self._circuit.record_success(permit)
         if qwen.hits:
             return (

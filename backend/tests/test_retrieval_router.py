@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import threading
 import time
 import unittest
 from unittest.mock import patch
+
+from loguru import logger as loguru_logger
 
 import app.retrieval_router as retrieval_router_module
 from app.hybrid_retriever import HybridRetrievalOutcome, HybridRetrievalTimeout
@@ -461,6 +464,101 @@ class RetrievalRouterTest(unittest.TestCase):
         self.assertNotIn(secret, structured)
         self.assertNotIn("http://", structured)
         self.assertNotIn("private user query", structured)
+
+    def test_real_loguru_diagnostics_never_render_foreground_upstream_secrets(
+        self,
+    ) -> None:
+        secret_query = "private query sentinel"
+        secret_error = "secret passage http://reranker-service:8082"
+        records: list[dict[str, object]] = []
+        rendered = io.StringIO()
+        router = self.build_router(
+            mode="qwen3",
+            hybrid=RecordingHybrid([RuntimeError(secret_error)]),
+            canary_percent=100,
+            request_id_factory=lambda: "request-safe-123",
+        )
+        record_sink = loguru_logger.add(
+            lambda message: records.append(dict(message.record)),
+            level="DEBUG",
+            backtrace=True,
+            diagnose=True,
+        )
+        rendered_sink = loguru_logger.add(
+            rendered,
+            format="{message} | {extra}",
+            level="DEBUG",
+            backtrace=True,
+            diagnose=True,
+            colorize=False,
+        )
+        try:
+            result = router.search(request(secret_query))
+        finally:
+            loguru_logger.remove(record_sink)
+            loguru_logger.remove(rendered_sink)
+
+        self.assertEqual(result.fallback_reason, "hybrid_unavailable")
+        output = rendered.getvalue()
+        self.assertIn("request-safe-123", output)
+        self.assertIn("hybrid_unavailable", output)
+        self.assertNotIn(secret_query, output)
+        self.assertNotIn(secret_error, output)
+        self.assertNotIn("http://", output)
+        failure = next(
+            record for record in records if record["message"] == "hybrid retrieval failed"
+        )
+        exception = failure["exception"].value  # type: ignore[union-attr]
+        self.assertIsNone(exception.__cause__)
+        self.assertIsNone(exception.__context__)
+
+    def test_real_loguru_diagnostics_never_render_shadow_upstream_secrets(self) -> None:
+        secret_query = "private shadow query sentinel"
+        secret_error = "secret shadow passage http://embedding-service:8081"
+        records: list[dict[str, object]] = []
+        rendered = io.StringIO()
+        router = self.build_router(
+            mode="shadow",
+            hybrid=RecordingHybrid([RuntimeError(secret_error)]),
+            audit=RecordingAudit(),
+            shadow_percent=100,
+            request_id_factory=lambda: "request-shadow-123",
+        )
+        record_sink = loguru_logger.add(
+            lambda message: records.append(dict(message.record)),
+            level="DEBUG",
+            backtrace=True,
+            diagnose=True,
+        )
+        rendered_sink = loguru_logger.add(
+            rendered,
+            format="{message} | {extra}",
+            level="DEBUG",
+            backtrace=True,
+            diagnose=True,
+            colorize=False,
+        )
+        try:
+            router.search(request(secret_query))
+            router.shadow_queue.drain_for_test()
+        finally:
+            loguru_logger.remove(record_sink)
+            loguru_logger.remove(rendered_sink)
+
+        output = rendered.getvalue()
+        self.assertIn("hybrid_unavailable", output)
+        self.assertNotIn(secret_query, output)
+        self.assertNotIn(secret_error, output)
+        self.assertNotIn("http://", output)
+        failure = next(
+            record for record in records if record["message"] == "shadow hybrid retrieval failed"
+        )
+        request_id = failure["extra"]["request_id"]  # type: ignore[index]
+        self.assertIsInstance(request_id, str)
+        self.assertTrue(request_id)
+        exception = failure["exception"].value  # type: ignore[union-attr]
+        self.assertIsNone(exception.__cause__)
+        self.assertIsNone(exception.__context__)
 
     def test_half_open_allows_exactly_one_concurrent_probe_and_closes_on_success(self) -> None:
         clock = FakeClock()

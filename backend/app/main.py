@@ -703,13 +703,15 @@ def _configure_retrieval_runtime(
     active_publication = audit.active_publication(settings.qdrant_collection_alias)
     if active_publication is None:
         raise RuntimeError("active retrieval publication is unavailable")
-    publication_id = str(getattr(active_publication, "id", "")).strip()
-    if not publication_id:
+    collection_name = str(getattr(active_publication, "collection_name", "")).strip()
+    if not collection_name:
         raise RuntimeError("active retrieval publication is unavailable")
+    from .retrieval_publication import collection_publication_version
+
     scope = RetrievalScope(
         settings.knowledge_base_id,
         settings.permission_tags,
-        publication_id,
+        collection_publication_version(collection_name),
     )
     router = own(
         factory.create_router(  # type: ignore[attr-defined]
