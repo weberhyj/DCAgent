@@ -19,7 +19,11 @@ from app.retrieval_models import (
     RetrievalRequest,
     RetrievalScope,
 )
-from app.retrieval_router import RetrievalRouter, stable_percentage_bucket
+from app.retrieval_router import (
+    RetrievalRouter,
+    RoutedRetrievalOutcome,
+    stable_percentage_bucket,
+)
 
 SCOPE = RetrievalScope("default", ("internal",), "v1")
 
@@ -436,6 +440,7 @@ class RetrievalRouterTest(unittest.TestCase):
 
         with patch.object(retrieval_router_module, "logger", RecordingLogger()):
             result = router.search(request("private user query"))
+            router.sanitized_log_queue.drain_for_test()
 
         self.assertEqual(result.mode, RetrievalMode.LEGACY)
         completion = [event for event in events if event[1] == "retrieval completed"]
@@ -494,6 +499,7 @@ class RetrievalRouterTest(unittest.TestCase):
         )
         try:
             result = router.search(request(secret_query))
+            router.sanitized_log_queue.drain_for_test()
         finally:
             loguru_logger.remove(record_sink)
             loguru_logger.remove(rendered_sink)
@@ -541,6 +547,7 @@ class RetrievalRouterTest(unittest.TestCase):
         try:
             router.search(request(secret_query))
             router.shadow_queue.drain_for_test()
+            router.sanitized_log_queue.drain_for_test()
         finally:
             loguru_logger.remove(record_sink)
             loguru_logger.remove(rendered_sink)
@@ -559,6 +566,88 @@ class RetrievalRouterTest(unittest.TestCase):
         exception = failure["exception"].value  # type: ignore[union-attr]
         self.assertIsNone(exception.__cause__)
         self.assertIsNone(exception.__context__)
+
+    def test_sanitized_logging_is_one_bounded_nonblocking_worker_under_failure_load(
+        self,
+    ) -> None:
+        blocked = threading.Event()
+        release = threading.Event()
+
+        def blocked_log(**safe_fields: object) -> None:
+            self.assertNotIn("query", safe_fields)
+            self.assertNotIn("error", safe_fields)
+            blocked.set()
+            release.wait(2.0)
+
+        with patch.object(
+            retrieval_router_module,
+            "_log_sanitized_failure_in_isolated_frame",
+            side_effect=blocked_log,
+        ):
+            router = self.build_router(
+                mode="qwen3",
+                hybrid=RecordingHybrid([RuntimeError("private upstream")]),
+                canary_percent=100,
+                failure_threshold=100,
+                sanitized_log_queue_size=2,
+            )
+            try:
+                results: list[RoutedRetrievalOutcome] = []
+                callers = [
+                    threading.Thread(
+                        target=lambda index=index: results.append(
+                            router.search(
+                                request(
+                                    f"private-query-{index}",
+                                    routing_key=f"conversation-{index}",
+                                )
+                            )
+                        )
+                    )
+                    for index in range(24)
+                ]
+                for caller in callers:
+                    caller.start()
+                self.assertTrue(blocked.wait(1.0))
+                for caller in callers:
+                    caller.join(0.5)
+
+                self.assertTrue(all(not caller.is_alive() for caller in callers))
+                self.assertEqual(len(results), 24)
+                self.assertTrue(
+                    all(result.fallback_reason == "hybrid_unavailable" for result in results)
+                )
+                self.assertEqual(
+                    sum(
+                        thread.name == "retrieval-sanitized-log-worker"
+                        for thread in threading.enumerate()
+                    ),
+                    1,
+                )
+                self.assertGreater(router.sanitized_log_queue.dropped_count, 0)
+            finally:
+                release.set()
+
+    def test_sanitized_logger_start_failure_never_breaks_legacy_fallback(self) -> None:
+        original_start = threading.Thread.start
+
+        def fail_sanitized_worker(thread: threading.Thread) -> None:
+            if thread.name == "retrieval-sanitized-log-worker":
+                raise RuntimeError("cannot start logger")
+            original_start(thread)
+
+        with patch.object(threading.Thread, "start", fail_sanitized_worker):
+            router = self.build_router(
+                mode="qwen3",
+                hybrid=RecordingHybrid([RuntimeError("private upstream")]),
+                canary_percent=100,
+            )
+
+        result = router.search(request("private-query"))
+
+        self.assertEqual(result.mode, RetrievalMode.LEGACY)
+        self.assertEqual(result.fallback_reason, "hybrid_unavailable")
+        self.assertEqual(router.sanitized_log_queue.dropped_count, 1)
 
     def test_half_open_allows_exactly_one_concurrent_probe_and_closes_on_success(self) -> None:
         clock = FakeClock()

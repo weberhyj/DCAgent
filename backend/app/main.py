@@ -30,7 +30,8 @@ from .llm import LLMProvider, create_llm_provider
 from .llm_runtime import validate_production_llm_provider
 from .offline_settings import OfflineSettings, parse_bool, require_secret_file
 from .repository import ChatRepository
-from .retrieval_models import RetrievalMode, RetrievalScope
+from .retrieval_models import RetrievalMode
+from .retrieval_scope import DynamicRetrievalScopeProvider
 from .retrieval_settings import RetrievalSettings
 from .routes import router
 from .runtime_env import load_runtime_environment
@@ -415,8 +416,13 @@ def create_production_app(
             own(repository)
             retrieval_gateway = None
             index_lifecycle = None
+            retrieval_scope_provider = None
             if retrieval_settings.mode is not RetrievalMode.LEGACY:
-                retrieval_gateway, index_lifecycle = _configure_retrieval_runtime(
+                (
+                    retrieval_gateway,
+                    index_lifecycle,
+                    retrieval_scope_provider,
+                ) = _configure_retrieval_runtime(
                     factory=retrieval_resource_factory or _DefaultRetrievalResourceFactory(),
                     settings=retrieval_settings,
                     environ=source,
@@ -489,6 +495,7 @@ def create_production_app(
                         redis_client=health_redis_client,
                         retrieval_settings=retrieval_settings,
                         retrieval_gateway=retrieval_gateway,
+                        retrieval_scope_provider=retrieval_scope_provider,
                     ),
                     cache_ttl_seconds=0.5,
                     max_stale_seconds=bounded_health_timeout + 0.5,
@@ -510,6 +517,7 @@ def create_production_app(
             application.state.structured_query_enabled = settings.structured_query_enabled
             application.state.retrieval_settings = retrieval_settings
             application.state.retrieval_gateway = retrieval_gateway
+            application.state.retrieval_scope_provider = retrieval_scope_provider
             application.state.knowledge_ingestion_queue = ingestion_queue
             application.state.knowledge_file_storage = storage
             application.state.evaluation_import_service = evaluation_service
@@ -684,7 +692,7 @@ def _configure_retrieval_runtime(
     repository: ChatRepository,
     structured_repository: StructuredRepository,
     own: Callable[[object], object],
-) -> tuple[object, object]:
+) -> tuple[object, object, DynamicRetrievalScopeProvider]:
     qdrant = own(factory.create_qdrant_client(settings))  # type: ignore[attr-defined]
     gateway = factory.create_gateway(qdrant, settings)  # type: ignore[attr-defined]
     embedding = own(factory.create_embedding_client(settings))  # type: ignore[attr-defined]
@@ -700,18 +708,12 @@ def _configure_retrieval_runtime(
         )
     )
     audit = factory.create_audit(database)  # type: ignore[attr-defined]
-    active_publication = audit.active_publication(settings.qdrant_collection_alias)
-    if active_publication is None:
-        raise RuntimeError("active retrieval publication is unavailable")
-    collection_name = str(getattr(active_publication, "collection_name", "")).strip()
-    if not collection_name:
-        raise RuntimeError("active retrieval publication is unavailable")
-    from .retrieval_publication import collection_publication_version
-
-    scope = RetrievalScope(
-        settings.knowledge_base_id,
-        settings.permission_tags,
-        collection_publication_version(collection_name),
+    scope_provider = DynamicRetrievalScopeProvider(
+        audit=audit,
+        gateway=gateway,
+        alias_name=settings.qdrant_collection_alias,
+        knowledge_base_id=settings.knowledge_base_id,
+        permission_tags=settings.permission_tags,
     )
     router = own(
         factory.create_router(  # type: ignore[attr-defined]
@@ -724,7 +726,7 @@ def _configure_retrieval_runtime(
     configure_retrieval = getattr(repository, "configure_retrieval", None)
     if not callable(configure_retrieval):
         raise TypeError("Shadow/Qwen3 repository_factory must return a retrieval-aware repository")
-    configure_retrieval(router, scope)
+    configure_retrieval(router, scope_provider)
     index_lifecycle = factory.create_index_lifecycle(  # type: ignore[attr-defined]
         settings=settings,
         environ=environ,
@@ -735,7 +737,7 @@ def _configure_retrieval_runtime(
         embedding=embedding,
         sparse=sparse,
     )
-    return gateway, index_lifecycle
+    return gateway, index_lifecycle, scope_provider
 
 
 def _create_custom_ingestion_queue(

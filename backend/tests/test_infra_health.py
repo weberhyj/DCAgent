@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import inspect
+import json
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -13,6 +17,7 @@ from app.infra.health import DependencyCheck, DependencyHealthRegistry, build_de
 from app.main import create_app
 from app.offline_settings import OfflineSettings
 from app.repository import InMemoryChatRepository
+from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.retrieval_settings import RetrievalSettings
 from app.routes import router as app_router
 from app.seed import build_seed_state
@@ -52,11 +57,37 @@ class MetadataResponse:
     status_code = 200
     headers: dict[str, str] = {}
 
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(
+        self,
+        payload: dict[str, object] | None = None,
+        *,
+        chunks: list[bytes] | None = None,
+        read_delay_seconds: float = 0.0,
+    ) -> None:
         self.payload = payload
+        body = json.dumps(payload or {}).encode("utf-8")
+        self.chunks = list(chunks or [body])
+        self.read_delay_seconds = read_delay_seconds
+        self.closed = False
+        self.read_timeouts: list[float] = []
 
-    def json(self) -> dict[str, object]:
-        return dict(self.payload)
+    def __enter__(self) -> MetadataResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def iter_raw(self) -> object:
+        for chunk in self.chunks:
+            if self.read_delay_seconds:
+                time.sleep(self.read_delay_seconds)
+            yield chunk
+
+    def set_read_timeout(self, timeout_seconds: float) -> None:
+        self.read_timeouts.append(timeout_seconds)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class RetrievalHealthHttpClient:
@@ -64,9 +95,13 @@ class RetrievalHealthHttpClient:
         self.responses = responses
         self.urls: list[str] = []
 
-    def get(self, url: str) -> MetadataResponse:
+    def stream(self, method: str, url: str, **kwargs: object) -> MetadataResponse:
+        del method, kwargs
         self.urls.append(url)
         return self.responses[url]
+
+    def get(self, url: str) -> MetadataResponse:
+        raise AssertionError(f"metadata health must stream instead of buffering {url}")
 
 
 class RetrievalHealthGateway:
@@ -85,6 +120,34 @@ class RetrievalHealthGateway:
     ) -> int:
         self.validations.append((collection_name, dense_dimensions))
         return 10
+
+
+class RetrievalHealthAudit:
+    def __init__(self, collection_name: str | None = "knowledge_chunks_qwen3_v1") -> None:
+        self.collection_name = collection_name
+
+    def active_publication(self, alias_name: str) -> object | None:
+        del alias_name
+        if self.collection_name is None:
+            return None
+        return SimpleNamespace(
+            id="publication-id-not-used-as-scope",
+            collection_name=self.collection_name,
+        )
+
+
+def retrieval_scope_provider(
+    gateway: RetrievalHealthGateway,
+    *,
+    active_collection: str | None = "knowledge_chunks_qwen3_v1",
+) -> DynamicRetrievalScopeProvider:
+    return DynamicRetrievalScopeProvider(
+        audit=RetrievalHealthAudit(active_collection),
+        gateway=gateway,
+        alias_name="knowledge_chunks_current",
+        knowledge_base_id="default",
+        permission_tags=("internal",),
+    )
 
 
 def retrieval_health_responses(*, reranker_version: str = "1.0.0") -> dict[str, MetadataResponse]:
@@ -121,6 +184,7 @@ class InfraHealthTest(unittest.TestCase):
         retrieval = RetrievalSettings.from_environ(environ)
         http_client = RetrievalHealthHttpClient(retrieval_health_responses())
         gateway = RetrievalHealthGateway()
+        scope_provider = retrieval_scope_provider(gateway)
 
         checks = build_dependency_checks(
             offline,
@@ -129,6 +193,7 @@ class InfraHealthTest(unittest.TestCase):
             http_client=http_client,
             retrieval_settings=retrieval,
             retrieval_gateway=gateway,
+            retrieval_scope_provider=scope_provider,
         )
         retrieval_checks = {
             check.name: check.check()
@@ -147,9 +212,11 @@ class InfraHealthTest(unittest.TestCase):
         self.assertEqual(gateway.validations, [("knowledge_chunks_qwen3_v1", 1024)])
         self.assertIn("http://127.0.0.1:8081/v1/metadata", http_client.urls)
         self.assertIn("http://127.0.0.1:8082/v1/metadata", http_client.urls)
+        self.assertTrue(all(response.closed for response in http_client.responses.values()))
 
     def test_qwen3_metadata_mismatch_is_not_ready(self) -> None:
         environ = retrieval_health_environment()
+        gateway = RetrievalHealthGateway()
         checks = build_dependency_checks(
             OfflineSettings.from_environ(environ),
             database=object(),
@@ -158,7 +225,8 @@ class InfraHealthTest(unittest.TestCase):
                 retrieval_health_responses(reranker_version="unexpected")
             ),
             retrieval_settings=RetrievalSettings.from_environ(environ),
-            retrieval_gateway=RetrievalHealthGateway(),
+            retrieval_gateway=gateway,
+            retrieval_scope_provider=retrieval_scope_provider(gateway),
         )
         reranker = next(check for check in checks if check.name == "reranker")
 
@@ -166,6 +234,7 @@ class InfraHealthTest(unittest.TestCase):
 
     def test_shadow_retrieval_dependency_failure_is_degraded_but_ready(self) -> None:
         environ = retrieval_health_environment("shadow")
+        gateway = RetrievalHealthGateway()
         checks = build_dependency_checks(
             OfflineSettings.from_environ(environ),
             database=object(),
@@ -174,7 +243,8 @@ class InfraHealthTest(unittest.TestCase):
                 retrieval_health_responses(reranker_version="unexpected")
             ),
             retrieval_settings=RetrievalSettings.from_environ(environ),
-            retrieval_gateway=RetrievalHealthGateway(),
+            retrieval_gateway=gateway,
+            retrieval_scope_provider=retrieval_scope_provider(gateway),
         )
         registry = DependencyHealthRegistry(
             [
@@ -189,6 +259,98 @@ class InfraHealthTest(unittest.TestCase):
         self.assertTrue(registry.ready())
         self.assertEqual(report["reranker"], {"ok": True, "detail": "degraded"})
         self.assertEqual(report["retrieval_shadow"], {"ok": True, "detail": "ready"})
+
+    def test_retrieval_health_fails_closed_when_alias_and_audit_diverge(self) -> None:
+        environ = retrieval_health_environment()
+        gateway = RetrievalHealthGateway(alias="knowledge_chunks_qwen3_v2")
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=RetrievalHealthHttpClient(retrieval_health_responses()),
+            retrieval_settings=RetrievalSettings.from_environ(environ),
+            retrieval_gateway=gateway,
+            retrieval_scope_provider=retrieval_scope_provider(
+                gateway,
+                active_collection="knowledge_chunks_qwen3_v1",
+            ),
+        )
+        qdrant = next(check for check in checks if check.name == "qdrant")
+
+        self.assertEqual(qdrant.check(), (False, "scope unavailable"))
+
+    def test_metadata_stream_rejects_chunked_body_over_cap_and_closes_response(self) -> None:
+        environ = retrieval_health_environment()
+        gateway = RetrievalHealthGateway()
+        responses = retrieval_health_responses()
+        oversized = MetadataResponse(chunks=[b"{" + b"x" * 700, b"y" * 700 + b"}"])
+        responses["http://127.0.0.1:8081/v1/metadata"] = oversized
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=RetrievalHealthHttpClient(responses),
+            retrieval_settings=RetrievalSettings.from_environ(environ),
+            retrieval_gateway=gateway,
+            retrieval_scope_provider=retrieval_scope_provider(gateway),
+        )
+        embedding = next(check for check in checks if check.name == "embedding")
+
+        self.assertEqual(embedding.check(), (False, "invalid metadata response"))
+        self.assertTrue(oversized.closed)
+
+    def test_metadata_stream_enforces_absolute_deadline_and_leaves_no_probe_thread(
+        self,
+    ) -> None:
+        environ = retrieval_health_environment()
+        environ["DEPENDENCY_TIMEOUT_SECONDS"] = "0.03"
+        gateway = RetrievalHealthGateway()
+        responses = retrieval_health_responses()
+        trickle = MetadataResponse(
+            chunks=[b"{" if index == 0 else b" " for index in range(8)],
+            read_delay_seconds=0.01,
+        )
+        responses["http://127.0.0.1:8081/v1/metadata"] = trickle
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=RetrievalHealthHttpClient(responses),
+            retrieval_settings=RetrievalSettings.from_environ(environ),
+            retrieval_gateway=gateway,
+            retrieval_scope_provider=retrieval_scope_provider(gateway),
+        )
+        embedding = next(check for check in checks if check.name == "embedding")
+
+        self.assertEqual(embedding.check(), (False, "unavailable"))
+        time.sleep(0.05)
+        self.assertFalse(
+            any(
+                thread.name == "dependency-probe-embedding" and thread.is_alive()
+                for thread in threading.enumerate()
+            )
+        )
+        self.assertTrue(trickle.closed)
+        self.assertTrue(trickle.read_timeouts)
+
+    def test_metadata_stream_deadline_also_applies_when_the_final_read_ends(self) -> None:
+        class SlowEndResponse(MetadataResponse):
+            def iter_raw(self) -> object:
+                time.sleep(0.04)
+                return
+                yield b""  # pragma: no cover
+
+        slow_end = SlowEndResponse()
+        endpoint = "http://127.0.0.1:8081/v1/metadata"
+        payload, detail = health_module._metadata_payload(
+            RetrievalHealthHttpClient({endpoint: slow_end}),
+            endpoint,
+            0.03,
+        )
+
+        self.assertIsNone(payload)
+        self.assertEqual(detail, "unavailable")
+        self.assertTrue(slow_end.closed)
 
     def test_liveness_does_not_require_external_services(self) -> None:
         calls = 0

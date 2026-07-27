@@ -742,6 +742,7 @@ def _generation_enabled(environ: Mapping[str, str]) -> bool:
 def _qdrant_retrieval_check(
     readiness_check: DependencyCheckCallable,
     gateway: Any | None,
+    scope_provider: Any | None,
     *,
     dense_dimensions: int,
 ) -> DependencyCheckCallable:
@@ -749,12 +750,13 @@ def _qdrant_retrieval_check(
         ready, detail = readiness_check()
         if not ready:
             return ready, detail
-        if gateway is None:
+        if gateway is None or scope_provider is None:
             return False, "unavailable"
         try:
-            collection_name = gateway.resolve_alias()
-            if not isinstance(collection_name, str) or not collection_name.strip():
-                return False, "alias unavailable"
+            resolution = scope_provider.resolve()
+            collection_name = resolution.collection_name
+            if resolution.scope is None or not isinstance(collection_name, str):
+                return False, "scope unavailable"
             gateway.validate_collection(
                 collection_name,
                 dense_dimensions=dense_dimensions,
@@ -766,20 +768,91 @@ def _qdrant_retrieval_check(
     return check
 
 
-def _metadata_payload(client: Any, endpoint: str) -> Mapping[str, object] | None:
+def _metadata_payload(
+    client: Any,
+    endpoint: str,
+    timeout_seconds: float,
+) -> tuple[Mapping[str, object] | None, str]:
+    deadline = monotonic() + timeout_seconds
+    stream = getattr(client, "stream", None)
+    if not callable(stream):
+        return None, "unavailable"
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        return None, "unavailable"
     try:
-        response = client.get(endpoint)
-        if getattr(response, "status_code", None) != 200:
-            return None
-        if _response_uses_unsupported_encoding(response):
-            return None
-        content_length = _response_content_length(response)
-        if content_length is not None and not (0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES):
-            return None
-        payload = response.json()
+        stream_context = stream(
+            "GET",
+            endpoint,
+            headers={"accept-encoding": "identity"},
+            timeout=max(0.001, remaining),
+        )
+        enter = getattr(stream_context, "__enter__", None)
+        if callable(enter):
+            with stream_context as response:
+                return _inspect_metadata_response(response, deadline)
+        try:
+            return _inspect_metadata_response(stream_context, deadline)
+        finally:
+            close = getattr(stream_context, "close", None)
+            if callable(close):
+                with suppress(Exception):
+                    close()
     except Exception:
-        return None
-    return payload if isinstance(payload, Mapping) else None
+        return None, "unavailable"
+
+
+def _inspect_metadata_response(
+    response: Any,
+    deadline: float,
+) -> tuple[Mapping[str, object] | None, str]:
+    if getattr(response, "status_code", None) != 200:
+        return None, "unavailable"
+    if _response_uses_unsupported_encoding(response):
+        return None, "invalid metadata response"
+    content_length = _response_content_length(response)
+    if content_length is not None and not (0 <= content_length <= _MAX_HTTP_HEALTH_BODY_BYTES):
+        return None, "invalid metadata response"
+    raw_iterator = getattr(response, "iter_raw", None)
+    bytes_iterator = getattr(response, "iter_bytes", None)
+    if callable(raw_iterator):
+        iterator = iter(raw_iterator())
+    elif callable(bytes_iterator):
+        iterator = iter(bytes_iterator())
+    else:
+        return None, "invalid metadata response"
+
+    body = bytearray()
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return None, "unavailable"
+        set_read_timeout = getattr(response, "set_read_timeout", None)
+        if callable(set_read_timeout):
+            set_read_timeout(max(0.001, remaining))
+        try:
+            chunk = next(iterator)
+        except StopIteration:
+            if deadline - monotonic() <= 0:
+                return None, "unavailable"
+            break
+        except Exception:
+            return None, "unavailable"
+        if deadline - monotonic() <= 0:
+            return None, "unavailable"
+        if not isinstance(chunk, (bytes, bytearray)):
+            return None, "invalid metadata response"
+        if len(body) + len(chunk) > _MAX_HTTP_HEALTH_BODY_BYTES:
+            return None, "invalid metadata response"
+        body.extend(chunk)
+
+    try:
+        payload = json.loads(bytes(body).decode("utf-8"))
+    except (UnicodeDecodeError, TypeError, ValueError):
+        return None, "invalid metadata response"
+    if not isinstance(payload, Mapping):
+        return None, "invalid metadata response"
+    return payload, "ready"
 
 
 def _embedding_metadata_check(
@@ -787,13 +860,14 @@ def _embedding_metadata_check(
     expected: Any,
     *,
     client: Any,
+    timeout_seconds: float,
 ) -> DependencyCheckCallable:
     endpoint = _root_endpoint(service_url, "/v1/metadata")
 
     def check() -> tuple[bool, str]:
-        payload = _metadata_payload(client, endpoint)
+        payload, detail = _metadata_payload(client, endpoint, timeout_seconds)
         if payload is None:
-            return False, "unavailable"
+            return False, detail
         try:
             actual = EmbeddingMetadataResponse.model_validate(payload)
         except Exception:
@@ -817,13 +891,14 @@ def _reranker_metadata_check(
     expected: Any,
     *,
     client: Any,
+    timeout_seconds: float,
 ) -> DependencyCheckCallable:
     endpoint = _root_endpoint(service_url, "/v1/metadata")
 
     def check() -> tuple[bool, str]:
-        payload = _metadata_payload(client, endpoint)
+        payload, detail = _metadata_payload(client, endpoint, timeout_seconds)
         if payload is None:
-            return False, "unavailable"
+            return False, detail
         try:
             actual = RerankerMetadataResponse.model_validate(payload)
         except Exception:
@@ -937,6 +1012,7 @@ def build_dependency_checks(
     http_client_factory: HttpClientFactory | None = None,
     retrieval_settings: RetrievalSettings | None = None,
     retrieval_gateway: Any | None = None,
+    retrieval_scope_provider: Any | None = None,
 ) -> list[DependencyCheck]:
     validate_health_service_urls(
         settings,
@@ -969,12 +1045,14 @@ def build_dependency_checks(
         qdrant_check = _qdrant_retrieval_check(
             qdrant_check,
             retrieval_gateway,
+            retrieval_scope_provider,
             dense_dimensions=retrieval_settings.embedding.dimensions,
         )
         embedding_check = _embedding_metadata_check(
             settings.embedding_service_url,
             retrieval_settings.embedding,
             client=http_client,
+            timeout_seconds=timeout_seconds,
         )
     raw_checks = [
         DependencyCheck(
@@ -1030,6 +1108,7 @@ def build_dependency_checks(
                     settings.reranker_service_url,
                     retrieval_settings.reranker,
                     client=http_client,
+                    timeout_seconds=timeout_seconds,
                 ),
             )
         )

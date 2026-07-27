@@ -51,11 +51,17 @@ class ConfigurableRepository(ClosableFake):
     def __init__(self) -> None:
         super().__init__("repository")
         self.retrieval_router = None
-        self.retrieval_scope = None
+        self.retrieval_scope_provider = None
 
-    def configure_retrieval(self, router: object, scope: object) -> None:
+    def configure_retrieval(self, router: object, scope_provider: object) -> None:
         self.retrieval_router = router
-        self.retrieval_scope = scope
+        self.retrieval_scope_provider = scope_provider
+
+    @property
+    def retrieval_scope(self) -> object | None:
+        if self.retrieval_scope_provider is None:
+            return None
+        return self.retrieval_scope_provider.resolve().scope
 
     def search_knowledge_chunks(self, query: str, limit: int = 5) -> list[object]:
         del query, limit
@@ -74,14 +80,17 @@ class RecordingRetrievalResourceFactory:
         self.reranker = RecordingClosable("reranker", self.closed)
         self.hybrid = RecordingClosable("hybrid", self.closed)
         self.router = RecordingClosable("shadow_queue", self.closed)
-        self.gateway = SimpleNamespace(name="gateway")
-        self.sparse = SimpleNamespace(name="sparse")
-        self.audit = SimpleNamespace(
-            active_publication=lambda alias: SimpleNamespace(
-                id="publication-uuid-must-not-be-scope",
-                collection_name="knowledge_chunks_qwen3_v17",
-            )
+        self.alias_collection: str | None = "knowledge_chunks_qwen3_v17"
+        self.gateway = SimpleNamespace(
+            name="gateway",
+            resolve_alias=lambda: self.alias_collection,
         )
+        self.sparse = SimpleNamespace(name="sparse")
+        self.active_publication: object | None = SimpleNamespace(
+            id="publication-uuid-must-not-be-scope",
+            collection_name="knowledge_chunks_qwen3_v17",
+        )
+        self.audit = SimpleNamespace(active_publication=lambda alias: self.active_publication)
         self.index_lifecycle = SimpleNamespace(name="index-lifecycle")
 
     def _record(self, name: str) -> None:
@@ -163,6 +172,16 @@ class ScopeRecordingQdrant(RecordingClosable):
                     id="point-1",
                     score=0.9,
                     payload=dict(self.indexed_payload),
+                )
+            ]
+        )
+
+    def get_aliases(self) -> object:
+        return SimpleNamespace(
+            aliases=[
+                SimpleNamespace(
+                    alias_name="knowledge_chunks_current",
+                    collection_name="knowledge_chunks_qwen3_v17",
                 )
             ]
         )
@@ -429,6 +448,10 @@ class LazyStartupTest(unittest.TestCase):
             self.assertIs(observed_queue["repository"], repository)
             self.assertIs(observed_queue["index_lifecycle"], resources.index_lifecycle)
             self.assertIs(app.state.retrieval_gateway, resources.gateway)
+            self.assertIs(
+                repository.retrieval_scope_provider,
+                app.state.retrieval_scope_provider,
+            )
 
         self.assertEqual(
             resources.calls,
@@ -466,9 +489,10 @@ class LazyStartupTest(unittest.TestCase):
         )
 
         with TestClient(app):
+            scope = repository.retrieval_scope_provider.resolve().scope
             hits = resources.gateway.search_dense(
                 [1.0],
-                scope=repository.retrieval_scope,
+                scope=scope,
                 limit=1,
             )
 
@@ -482,6 +506,42 @@ class LazyStartupTest(unittest.TestCase):
             version_condition.match.value,
             resources.qdrant.indexed_payload["publication_version"],
         )
+
+    def test_shadow_and_qwen3_start_without_active_publication_and_transition_live(
+        self,
+    ) -> None:
+        module = importlib.import_module("app.main")
+
+        for mode in ("shadow", "qwen3"):
+            with self.subTest(mode=mode):
+                resources = RecordingRetrievalResourceFactory()
+                resources.active_publication = None
+                resources.alias_collection = None
+                repository = ConfigurableRepository()
+                app = module.create_production_app(
+                    environ=private_qwen_environment(mode),
+                    repository_factory=lambda: repository,
+                    retrieval_resource_factory=resources,
+                    health_registry_factory=DependencyHealthRegistry,
+                    ingestion_queue_factory=lambda **_kwargs: ClosableFake("queue"),
+                    database_factory=lambda _url: ClosableFake("database"),
+                    llm_provider_factory=lambda _environment: ClosableFake("llm"),
+                    storage_factory=lambda _root: ClosableFake("storage"),
+                    evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
+                )
+
+                with TestClient(app):
+                    unavailable = repository.retrieval_scope_provider.resolve()
+                    self.assertIsNone(unavailable.scope)
+                    self.assertEqual(unavailable.detail, "unavailable")
+
+                    resources.active_publication = SimpleNamespace(
+                        id="later-publication-id",
+                        collection_name="knowledge_chunks_qwen3_v18",
+                    )
+                    resources.alias_collection = "knowledge_chunks_qwen3_v18"
+                    available = repository.retrieval_scope_provider.resolve()
+                    self.assertEqual(available.scope.publication_version, "v18")
 
     def test_legacy_startup_does_not_construct_retrieval_resources(self) -> None:
         module = importlib.import_module("app.main")

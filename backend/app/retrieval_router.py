@@ -147,6 +147,14 @@ class _ShadowTask:
 
 
 _STOP = object()
+_SANITIZED_FALLBACK_CODES = frozenset(
+    {
+        "qwen_timeout",
+        "embedding_unavailable",
+        "reranker_unavailable",
+        "hybrid_unavailable",
+    }
+)
 
 
 def _new_request_id() -> str:
@@ -175,26 +183,121 @@ def _log_sanitized_failure_in_isolated_frame(
         ).exception("shadow hybrid retrieval failed" if shadow else "hybrid retrieval failed")
 
 
-def _emit_sanitized_failure(
-    *,
-    request_id: str,
-    mode: str,
-    fallback_code: str,
-    shadow: bool = False,
-) -> None:
-    worker = Thread(
-        target=_log_sanitized_failure_in_isolated_frame,
-        kwargs={
-            "request_id": request_id,
-            "mode": mode,
-            "fallback_code": fallback_code,
-            "shadow": shadow,
-        },
-        name="retrieval-sanitized-error-logger",
-        daemon=True,
-    )
-    worker.start()
-    worker.join()
+@dataclass(frozen=True, slots=True)
+class _SanitizedLogTask:
+    request_id: str
+    mode: str
+    fallback_code: str
+    shadow: bool
+
+
+class SanitizedLogQueue:
+    """One bounded, non-blocking sanitized failure logger per router."""
+
+    def __init__(self, *, max_size: int, close_timeout_seconds: float) -> None:
+        if isinstance(max_size, bool) or not isinstance(max_size, int) or max_size <= 0:
+            raise ValueError("sanitized log queue size must be a positive integer")
+        if not math.isfinite(close_timeout_seconds) or close_timeout_seconds <= 0:
+            raise ValueError("close_timeout_seconds must be positive and finite")
+        self._queue: queue.Queue[_SanitizedLogTask | object] = queue.Queue(maxsize=max_size)
+        self._close_timeout_seconds = float(close_timeout_seconds)
+        self._lock = Lock()
+        self._closing = False
+        self._closed = False
+        self._started = False
+        self._dropped_count = 0
+        self.worker = Thread(
+            target=self._run,
+            name="retrieval-sanitized-log-worker",
+            daemon=True,
+        )
+        try:
+            self.worker.start()
+        except Exception:
+            return
+        self._started = True
+
+    @property
+    def dropped_count(self) -> int:
+        with self._lock:
+            return self._dropped_count
+
+    def submit(
+        self,
+        *,
+        request_id: str,
+        mode: str,
+        fallback_code: str,
+        shadow: bool = False,
+    ) -> bool:
+        if fallback_code not in _SANITIZED_FALLBACK_CODES:
+            fallback_code = "hybrid_unavailable"
+        task = _SanitizedLogTask(
+            request_id=request_id,
+            mode=mode,
+            fallback_code=fallback_code,
+            shadow=shadow,
+        )
+        with self._lock:
+            if self._closing or self._closed or not self._started or not self.worker.is_alive():
+                self._dropped_count += 1
+                return False
+            try:
+                self._queue.put_nowait(task)
+            except queue.Full:
+                self._dropped_count += 1
+                return False
+            return True
+
+    def drain_for_test(self) -> None:
+        self._queue.join()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if not self._closing:
+                self._closing = True
+                self._dropped_count += self._discard_pending_locked()
+                if not self._started or not self.worker.is_alive():
+                    self._closed = True
+                    return
+                self._queue.put_nowait(_STOP)
+        self.worker.join(self._close_timeout_seconds)
+        with self._lock:
+            if not self.worker.is_alive():
+                self._closed = True
+
+    def _discard_pending_locked(self) -> int:
+        discarded = 0
+        while True:
+            try:
+                task = self._queue.get_nowait()
+            except queue.Empty:
+                return discarded
+            else:
+                self._queue.task_done()
+                if task is not _STOP:
+                    discarded += 1
+
+    def _run(self) -> None:
+        while True:
+            task = self._queue.get()
+            try:
+                if task is _STOP:
+                    return
+                assert isinstance(task, _SanitizedLogTask)
+                try:
+                    _log_sanitized_failure_in_isolated_frame(
+                        request_id=task.request_id,
+                        mode=task.mode,
+                        fallback_code=task.fallback_code,
+                        shadow=task.shadow,
+                    )
+                except Exception:
+                    continue
+            finally:
+                self._queue.task_done()
 
 
 class ShadowQueue:
@@ -208,6 +311,7 @@ class ShadowQueue:
         max_size: int,
         close_timeout_seconds: float,
         monotonic: Callable[[], float],
+        sanitized_log_queue: SanitizedLogQueue,
     ) -> None:
         if isinstance(max_size, bool) or not isinstance(max_size, int) or max_size <= 0:
             raise ValueError("shadow queue size must be a positive integer")
@@ -217,6 +321,7 @@ class ShadowQueue:
         self._audit = audit
         self._monotonic = monotonic
         self._close_timeout_seconds = float(close_timeout_seconds)
+        self._sanitized_log_queue = sanitized_log_queue
         self._queue: queue.Queue[_ShadowTask | object] = queue.Queue(maxsize=max_size)
         self._lock = Lock()
         self._closing = False
@@ -313,7 +418,7 @@ class ShadowQueue:
             failure_code = _fallback_code(error)
             fallback_reason = failure_code
         if failure_code is not None:
-            _emit_sanitized_failure(
+            self._sanitized_log_queue.submit(
                 request_id=request_id,
                 mode=RetrievalMode.SHADOW.value,
                 fallback_code=failure_code,
@@ -351,6 +456,7 @@ class RetrievalRouter:
         failure_threshold: int = 3,
         reset_interval_seconds: float = 30.0,
         shadow_queue_size: int = 32,
+        sanitized_log_queue_size: int = 64,
         close_timeout_seconds: float = 1.0,
         monotonic: Callable[[], float] = time.monotonic,
         embedding_model_version: str | None = None,
@@ -384,6 +490,10 @@ class RetrievalRouter:
             reset_interval_seconds=reset_interval_seconds,
             monotonic=monotonic,
         )
+        self.sanitized_log_queue = SanitizedLogQueue(
+            max_size=sanitized_log_queue_size,
+            close_timeout_seconds=close_timeout_seconds,
+        )
         self.shadow_queue = (
             ShadowQueue(
                 hybrid=hybrid,
@@ -391,14 +501,18 @@ class RetrievalRouter:
                 max_size=shadow_queue_size,
                 close_timeout_seconds=close_timeout_seconds,
                 monotonic=monotonic,
+                sanitized_log_queue=self.sanitized_log_queue,
             )
             if self.mode is RetrievalMode.SHADOW
             else None
         )
 
     def close(self) -> None:
-        if self.shadow_queue is not None:
-            self.shadow_queue.close()
+        try:
+            if self.shadow_queue is not None:
+                self.shadow_queue.close()
+        finally:
+            self.sanitized_log_queue.close()
 
     def uses_qwen(self, routing_key: str) -> bool:
         percentage = (
@@ -467,7 +581,7 @@ class RetrievalRouter:
             self._circuit.abandon(permit)
             raise
         if failure_code is not None:
-            _emit_sanitized_failure(
+            self.sanitized_log_queue.submit(
                 request_id=request_id,
                 mode=self.mode.value,
                 fallback_code=failure_code,
@@ -558,6 +672,7 @@ def _fallback_code(error: Exception) -> str:
 __all__ = [
     "RetrievalRouter",
     "RoutedRetrievalOutcome",
+    "SanitizedLogQueue",
     "ShadowQueue",
     "ShadowQueueCloseError",
     "stable_percentage_bucket",

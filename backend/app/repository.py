@@ -49,11 +49,13 @@ from .retrieval import (
     resolve_effective_retrieval_min_score,
     resolve_retrieval_min_score,
 )
+from .retrieval_scope import StaticRetrievalScopeProvider
 from .time_utils import display_datetime_label
 
 if TYPE_CHECKING:
     from .retrieval_models import RetrievalScope
     from .retrieval_router import RetrievalRouter
+    from .retrieval_scope import RetrievalScopeProvider
     from .structured_answer import StructuredAnswerService
 
 STATUS_INDEXED = "已索引"
@@ -447,16 +449,20 @@ class InMemoryChatRepository:
         *,
         retrieval_router: RetrievalRouter | None = None,
         retrieval_scope: RetrievalScope | None = None,
+        retrieval_scope_provider: RetrievalScopeProvider | None = None,
     ) -> None:
-        if (retrieval_router is None) != (retrieval_scope is None):
-            raise ValueError(
-                "retrieval_router and retrieval_scope must be configured together"
-            )
+        if retrieval_scope is not None and retrieval_scope_provider is not None:
+            raise ValueError("retrieval_scope and retrieval_scope_provider are mutually exclusive")
+        effective_scope_provider = retrieval_scope_provider
+        if retrieval_scope is not None:
+            effective_scope_provider = StaticRetrievalScopeProvider(retrieval_scope)
+        if (retrieval_router is None) != (effective_scope_provider is None):
+            raise ValueError("retrieval_router and retrieval_scope must be configured together")
         self._state = state
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service
         self.retrieval_router = retrieval_router
-        self._retrieval_scope = retrieval_scope
+        self._retrieval_scope_provider = effective_scope_provider
         self._lock = Lock()
         self._agent_runs: list[AgentRunAudit] = []
         self._evaluation_cases: list[EvaluationCaseModel] = []
@@ -477,6 +483,21 @@ class InMemoryChatRepository:
         close = getattr(self._structured_service, "close", None)
         if callable(close):
             close()
+
+    def configure_retrieval(
+        self,
+        router: RetrievalRouter,
+        scope_provider: RetrievalScopeProvider,
+    ) -> None:
+        if router is None or scope_provider is None:
+            raise ValueError("retrieval_router and retrieval_scope must be configured together")
+        if not callable(getattr(scope_provider, "resolve", None)):
+            raise TypeError("retrieval_scope_provider must expose resolve()")
+        with self._lock:
+            if self.retrieval_router is not None or self._retrieval_scope_provider is not None:
+                raise RuntimeError("retrieval is already configured")
+            self.retrieval_router = router
+            self._retrieval_scope_provider = scope_provider
 
     def list_conversations(self) -> list[ConversationModel]:
         with self._lock:
@@ -1066,16 +1087,19 @@ class InMemoryChatRepository:
         limit: int,
         routing_key: str,
     ) -> list[KnowledgeSearchHitModel]:
-        if self.retrieval_router is None or self._retrieval_scope is None:
+        if self.retrieval_router is None or self._retrieval_scope_provider is None:
             return self.search_knowledge_chunks(query, limit)
         from .retrieval_models import RetrievalRequest
 
+        resolution = self._retrieval_scope_provider.resolve()
+        if resolution.scope is None:
+            return self.search_knowledge_chunks(query, limit)
         outcome = self.retrieval_router.search(
             RetrievalRequest(
                 query=query,
                 limit=limit,
                 routing_key=routing_key,
-                scope=self._retrieval_scope,
+                scope=resolution.scope,
             )
         )
         return list(outcome.hits)

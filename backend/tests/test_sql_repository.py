@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.agent import AgentRunResult
@@ -472,14 +473,64 @@ class SqlRepositoryTest(unittest.TestCase):
     def test_sql_repository_allows_one_startup_retrieval_configuration(self) -> None:
         repository = SqlChatRepository(self.database)
         router = object()
-        scope = RetrievalScope("default", ("internal",), "publication-v1")
+        scope = RetrievalScope("default", ("internal",), "v1")
+        provider = SimpleNamespace(resolve=lambda: SimpleNamespace(scope=scope, detail="ready"))
 
-        repository.configure_retrieval(router, scope)
+        repository.configure_retrieval(router, provider)
 
         self.assertIs(repository.retrieval_router, router)
-        self.assertIs(repository._retrieval_scope, scope)
+        self.assertIs(repository._retrieval_scope_provider, provider)
         with self.assertRaisesRegex(RuntimeError, "retrieval is already configured"):
-            repository.configure_retrieval(object(), scope)
+            repository.configure_retrieval(object(), provider)
+
+    def test_repository_resolves_scope_for_every_request_and_falls_back_when_unavailable(
+        self,
+    ) -> None:
+        class RecordingRouter:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def search(self, request):
+                self.requests.append(request)
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.LEGACY,
+                    hits=(),
+                    stage_ms={},
+                )
+
+        class MutableProvider:
+            def __init__(self) -> None:
+                self.scope = RetrievalScope("default", ("internal",), "v1")
+
+            def resolve(self):
+                return SimpleNamespace(
+                    scope=self.scope,
+                    detail="ready" if self.scope is not None else "unavailable",
+                )
+
+        router = RecordingRouter()
+        provider = MutableProvider()
+        repository = SqlChatRepository(
+            self.database,
+            retrieval_router=router,
+            retrieval_scope_provider=provider,
+        )
+
+        repository._search_routed_knowledge_chunks("first", 8, "conversation-1")
+        provider.scope = RetrievalScope("default", ("internal",), "v2")
+        repository._search_routed_knowledge_chunks("second", 8, "conversation-1")
+        provider.scope = None
+        fallback = repository._search_routed_knowledge_chunks(
+            "third",
+            8,
+            "conversation-1",
+        )
+
+        self.assertEqual(
+            [item.scope.publication_version for item in router.requests],
+            ["v1", "v2"],
+        )
+        self.assertEqual(fallback, repository.search_knowledge_chunks("third", 8))
 
 
 if __name__ == "__main__":
