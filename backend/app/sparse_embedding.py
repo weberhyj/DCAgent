@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import operator
 import os
+import stat
 from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
+
+from .offline_artifacts import is_local_filesystem_path
 
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 OFFLINE_SPARSE_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
@@ -83,9 +87,11 @@ class LocalBm25Encoder:
         root_value = target.get("SPARSE_MODEL_ROOT")
         if not isinstance(root_value, str) or not root_value.strip():
             raise ValueError("SPARSE_MODEL_ROOT is required")
-        model_root = Path(root_value.strip()).expanduser()
-        if model_root.is_symlink() or not model_root.exists() or not model_root.is_dir():
-            raise ValueError("SPARSE_MODEL_ROOT must reference an existing local directory")
+        normalized_root = root_value.strip()
+        if not is_local_filesystem_path(normalized_root):
+            raise ValueError("SPARSE_MODEL_ROOT must reference a local filesystem path")
+        model_root = Path(normalized_root).expanduser()
+        _validate_local_model_tree(model_root)
 
         target.update(OFFLINE_SPARSE_ENVIRONMENT)
 
@@ -134,6 +140,139 @@ def _required_text(value: object, *, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must contain non-empty text")
     return value.strip()
+
+
+def _validate_local_model_tree(model_root: Path) -> str:
+    """Read and fingerprint a stable, link-free local artifact tree."""
+
+    root = Path(model_root)
+    if _is_link_or_reparse(root):
+        raise ValueError("SPARSE_MODEL_ROOT must not be a link or reparse point")
+    try:
+        root_stat = _path_stat(root)
+    except ValueError as error:
+        raise ValueError("SPARSE_MODEL_ROOT must reference an existing local directory") from error
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("SPARSE_MODEL_ROOT must reference an existing local directory")
+
+    digest = hashlib.sha256()
+    digest.update(b"dc-agent-sparse-model-tree-v1\0")
+    _hash_directory(root, root, digest)
+    return digest.hexdigest()
+
+
+def _hash_directory(root: Path, directory: Path, digest: Any) -> None:
+    before = _path_stat(directory)
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError(f"sparse model tree path is not a directory: {directory}")
+    try:
+        with os.scandir(directory) as iterator:
+            entries = sorted(entry.name for entry in iterator)
+    except OSError as error:
+        raise ValueError(f"cannot read sparse model directory: {directory}") from error
+
+    for name in entries:
+        path = directory / name
+        if _is_link_or_reparse(path):
+            raise ValueError(f"sparse model tree contains a link or reparse point: {path}")
+        snapshot = _path_stat(path)
+        if stat.S_ISDIR(snapshot.st_mode):
+            _hash_directory(root, path, digest)
+        elif stat.S_ISREG(snapshot.st_mode):
+            _hash_regular_file(root, path, snapshot, digest)
+        else:
+            raise ValueError(f"sparse model tree contains a special file: {path}")
+
+    try:
+        with os.scandir(directory) as iterator:
+            after_entries = sorted(entry.name for entry in iterator)
+    except OSError as error:
+        raise ValueError(f"cannot re-read sparse model directory: {directory}") from error
+    after = _path_stat(directory)
+    if entries != after_entries or not _same_snapshot(before, after):
+        raise ValueError(f"sparse model directory changed while validating: {directory}")
+
+
+def _hash_regular_file(root: Path, path: Path, before: os.stat_result, digest: Any) -> None:
+    try:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+    except (ValueError, UnicodeEncodeError) as error:
+        raise ValueError(
+            "sparse model paths must stay inside the root and be valid UTF-8"
+        ) from error
+    digest.update(len(relative).to_bytes(8, "big"))
+    digest.update(relative)
+    digest.update(before.st_size.to_bytes(8, "big"))
+
+    bytes_read = 0
+    try:
+        with path.open("rb") as file_handle:
+            opened_before = os.fstat(file_handle.fileno())
+            if not _same_snapshot(before, opened_before):
+                raise ValueError(f"sparse model file changed while validating: {path}")
+            while chunk := file_handle.read(1024 * 1024):
+                digest.update(chunk)
+                bytes_read += len(chunk)
+            opened_after = os.fstat(file_handle.fileno())
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError(f"cannot read sparse model file: {path}") from error
+
+    if _is_link_or_reparse(path):
+        raise ValueError(f"sparse model tree contains a link or reparse point: {path}")
+    after = _path_stat(path)
+    if (
+        bytes_read != before.st_size
+        or not _same_snapshot(before, opened_after)
+        or not _same_snapshot(before, after)
+    ):
+        raise ValueError(f"sparse model file changed while validating: {path}")
+
+
+def _path_stat(path: Path) -> os.stat_result:
+    try:
+        snapshot = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"cannot inspect sparse model path: {path}") from error
+    if _snapshot_is_link_or_reparse(snapshot):
+        raise ValueError(f"sparse model tree contains a link or reparse point: {path}")
+    return snapshot
+
+
+def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    identity_matches = (
+        not left.st_ino
+        or not right.st_ino
+        or (left.st_dev == right.st_dev and left.st_ino == right.st_ino)
+    )
+    return (
+        identity_matches
+        and left.st_mode == right.st_mode
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+    )
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        snapshot = path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return _snapshot_is_link_or_reparse(snapshot)
+
+
+def _snapshot_is_link_or_reparse(snapshot: os.stat_result) -> bool:
+    if stat.S_ISLNK(snapshot.st_mode):
+        return True
+    reparse_mask = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(snapshot, "st_file_attributes", 0) or 0
+    return bool(reparse_mask and file_attributes & reparse_mask)
 
 
 def _canonical_sparse_vector(raw_vector: object) -> SparseVector:

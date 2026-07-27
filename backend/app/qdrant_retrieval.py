@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
 from qdrant_client.http import models
@@ -29,6 +30,26 @@ _OPTIONAL_CHUNK_LINK_FIELDS = (
     "previous_chunk_id",
     "next_chunk_id",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class IndexMaintenanceScope:
+    """Trusted publication identity for destructive index maintenance."""
+
+    knowledge_base_id: str
+    publication_version: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "knowledge_base_id",
+            _required_name(self.knowledge_base_id, name="knowledge_base_id"),
+        )
+        object.__setattr__(
+            self,
+            "publication_version",
+            _required_name(self.publication_version, name="publication_version"),
+        )
 
 
 class QdrantClientProtocol(Protocol):
@@ -112,19 +133,19 @@ class QdrantRetrievalGateway:
         self,
         source_id: str,
         *,
-        scope: RetrievalScope | None,
+        maintenance_scope: IndexMaintenanceScope | None,
         collection_name: str | None = None,
     ) -> None:
-        retrieval_scope = _require_scope(scope)
+        index_scope = _require_maintenance_scope(maintenance_scope)
         source = _required_name(source_id, name="source_id")
         must: list[models.Condition] = [
             models.FieldCondition(
                 key="knowledge_base_id",
-                match=models.MatchValue(value=retrieval_scope.knowledge_base_id),
+                match=models.MatchValue(value=index_scope.knowledge_base_id),
             ),
             models.FieldCondition(
                 key="publication_version",
-                match=models.MatchValue(value=retrieval_scope.publication_version),
+                match=models.MatchValue(value=index_scope.publication_version),
             ),
             models.FieldCondition(key="source_id", match=models.MatchValue(value=source)),
         ]
@@ -462,6 +483,14 @@ def _require_scope(scope: RetrievalScope | None) -> RetrievalScope:
     return scope
 
 
+def _require_maintenance_scope(
+    scope: IndexMaintenanceScope | None,
+) -> IndexMaintenanceScope:
+    if not isinstance(scope, IndexMaintenanceScope):
+        raise ValueError("a valid index maintenance scope is required")
+    return scope
+
+
 def _required_name(value: object, *, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
@@ -482,6 +511,7 @@ def _nonnegative_integer(value: object, *, name: str) -> int:
 
 __all__ = [
     "DENSE_VECTOR_NAME",
+    "IndexMaintenanceScope",
     "QdrantRetrievalGateway",
     "SPARSE_VECTOR_NAME",
 ]

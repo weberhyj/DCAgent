@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from qdrant_client.http import models
 
-from app.qdrant_retrieval import QdrantRetrievalGateway
+from app.qdrant_retrieval import IndexMaintenanceScope, QdrantRetrievalGateway
 from app.retrieval_models import RetrievalScope
 from app.sparse_embedding import SparseVector
 
@@ -56,6 +56,7 @@ class FakeQdrantClient:
         self.retrieve_result: list[object] = []
         self.collection_info: object | None = None
         self.count_value = 0
+        self.stored_payloads: list[dict[str, object]] = []
 
     def create_collection(self, **kwargs: object) -> bool:
         self.created.append(dict(kwargs))
@@ -71,6 +72,12 @@ class FakeQdrantClient:
 
     def delete(self, **kwargs: object) -> object:
         self.delete_calls.append(SimpleNamespace(**kwargs))
+        selector = kwargs["points_selector"]
+        self.stored_payloads = [
+            item
+            for item in self.stored_payloads
+            if not payload_matches_filter(item, selector.filter)
+        ]
         return SimpleNamespace(status=models.UpdateStatus.COMPLETED)
 
     def query_points(self, **kwargs: object) -> object:
@@ -99,6 +106,19 @@ class FakeQdrantClient:
 
 def filter_keys(query_filter: models.Filter) -> set[str]:
     return {condition.key for condition in query_filter.must or []}
+
+
+def payload_matches_filter(point_payload: dict[str, object], query_filter: models.Filter) -> bool:
+    for condition in query_filter.must or []:
+        if not isinstance(condition, models.FieldCondition):
+            return False
+        match = condition.match
+        if (
+            not isinstance(match, models.MatchValue)
+            or point_payload.get(condition.key) != match.value
+        ):
+            return False
+    return True
 
 
 class QdrantRetrievalTest(unittest.TestCase):
@@ -225,7 +245,7 @@ class QdrantRetrievalTest(unittest.TestCase):
         self.assertEqual([candidate.chunk_id for candidate in candidates], ["first", "second"])
         self.assertEqual(self.client.retrieve_calls[0].collection_name, "knowledge_chunks_current")
 
-    def test_upserts_named_vectors_and_deletes_source_with_scoped_filter(self) -> None:
+    def test_upserts_named_vectors_and_deletes_source_with_maintenance_scope(self) -> None:
         point = models.PointStruct(
             id=str(uuid4()),
             vector={
@@ -235,9 +255,12 @@ class QdrantRetrievalTest(unittest.TestCase):
             payload=payload(),
         )
         self.gateway.upsert_points("knowledge_chunks_qwen3_v1", [point])
-        self.gateway.delete_source("source-1", scope=self.scope)
+        maintenance_scope = IndexMaintenanceScope(" default ", " v1 ")
+        self.gateway.delete_source("source-1", maintenance_scope=maintenance_scope)
 
         self.assertTrue(self.client.upsert_calls[0].wait)
+        self.assertEqual(maintenance_scope.knowledge_base_id, "default")
+        self.assertEqual(maintenance_scope.publication_version, "v1")
         selector = self.client.delete_calls[0].points_selector
         self.assertIsInstance(selector, models.FilterSelector)
         self.assertEqual(
@@ -248,6 +271,59 @@ class QdrantRetrievalTest(unittest.TestCase):
                 "source_id",
             },
         )
+
+    def test_user_retrieval_scope_cannot_authorize_source_deletion(self) -> None:
+        for invalid_scope in (None, self.scope):
+            with self.subTest(invalid_scope=invalid_scope):
+                with self.assertRaisesRegex(ValueError, "maintenance"):
+                    self.gateway.delete_source(
+                        "source-1",
+                        maintenance_scope=invalid_scope,
+                    )
+        self.assertEqual(self.client.delete_calls, [])
+
+    def test_maintenance_deletion_removes_all_permissions_only_in_one_publication(self) -> None:
+        self.client.stored_payloads = [
+            {
+                "knowledge_base_id": "default",
+                "publication_version": "v1",
+                "permission_tags": ["internal"],
+                "source_id": "source-1",
+            },
+            {
+                "knowledge_base_id": "default",
+                "publication_version": "v1",
+                "permission_tags": ["finance"],
+                "source_id": "source-1",
+            },
+            {
+                "knowledge_base_id": "default",
+                "publication_version": "v2",
+                "permission_tags": ["internal"],
+                "source_id": "source-1",
+            },
+            {
+                "knowledge_base_id": "other",
+                "publication_version": "v1",
+                "permission_tags": ["internal"],
+                "source_id": "source-1",
+            },
+        ]
+
+        self.gateway.delete_source(
+            "source-1",
+            maintenance_scope=IndexMaintenanceScope("default", "v1"),
+        )
+
+        self.assertEqual(
+            [
+                (item["knowledge_base_id"], item["publication_version"])
+                for item in self.client.stored_payloads
+            ],
+            [("default", "v2"), ("other", "v1")],
+        )
+        selector = self.client.delete_calls[0].points_selector
+        self.assertNotIn("permission_tags", filter_keys(selector.filter))
 
     def test_rejects_non_finite_dense_vectors_and_invalid_limits(self) -> None:
         with self.assertRaisesRegex(ValueError, "finite"):
