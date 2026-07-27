@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 import unittest
 from unittest.mock import patch
 
@@ -192,10 +193,11 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
             dimensions=1024,
         )
         self.repository.mark_publication_validated(second.id, point_count=13)
+        secret_marker = "UNIQUE-ACTIVATION-SECRET-7f04"
         integrity_error = IntegrityError(
-            "INSERT secret publication",
-            {"secret": "value"},
-            RuntimeError("duplicate active alias with internal details"),
+            f"INSERT publication {secret_marker}",
+            {"private_parameter": secret_marker},
+            RuntimeError(f"duplicate alias {secret_marker}"),
         )
 
         original_flush = Session.flush
@@ -210,18 +212,27 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
                 raise integrity_error
             original_flush(session, *args, **kwargs)
 
+        raised: RetrievalAuditError | None = None
         with patch(
             "sqlalchemy.orm.Session.flush",
             autospec=True,
             side_effect=fail_target_activation,
         ):
-            with self.assertRaisesRegex(
-                RetrievalAuditError,
-                "Retrieval publication activation conflict",
-            ) as raised:
+            try:
                 self.repository.mark_publication_active(second.id, point_count=13)
+            except RetrievalAuditError as error:
+                raised = error
 
-        self.assertNotIn("secret", str(raised.exception).lower())
+        self.assertIsNotNone(raised)
+        assert raised is not None
+        self.assertEqual(str(raised), "Retrieval publication activation conflict")
+        self.assertIsNone(raised.__cause__)
+        formatted_traceback = "".join(
+            traceback.format_exception(type(raised), raised, raised.__traceback__)
+        )
+        self.assertNotIn(secret_marker, formatted_traceback)
+        self.assertNotIn("private_parameter", formatted_traceback)
+        self.assertNotIn("INSERT publication", formatted_traceback)
         self.assertEqual(self.repository.get_publication(first.id).status, "active")
         self.assertEqual(self.repository.get_publication(second.id).status, "validated")
 

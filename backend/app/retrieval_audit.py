@@ -189,8 +189,8 @@ class RetrievalAuditRepository:
                     target.completed_at = _timestamp()
                 session.flush()
                 return _publication_from_record(target)
-        except IntegrityError as error:
-            raise RetrievalAuditError("Retrieval publication activation conflict") from error
+        except IntegrityError:
+            raise RetrievalAuditError("Retrieval publication activation conflict") from None
 
     def mark_publication_retired(self, publication_id: str) -> RetrievalPublication:
         return self._transition_publication(publication_id, target_status="retired")
