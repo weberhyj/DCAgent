@@ -12,6 +12,7 @@ from app.embedding_client import (
     EmbeddingResponseError,
     EmbeddingServiceError,
     HttpEmbeddingClient,
+    SyncHttpEmbeddingClient,
 )
 from app.embedding_contracts import EmbeddingModelMetadata
 
@@ -72,6 +73,58 @@ class FakeTransport:
         }
         response.update(self.overrides)
         return response
+
+
+class FakeSyncEmbeddingTransport:
+    def __init__(
+        self,
+        *,
+        overrides: dict[str, Any] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.overrides = overrides or {}
+        self.error = error
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.close_calls = 0
+
+    def post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((url, payload))
+        if self.error is not None:
+            raise self.error
+        response: dict[str, Any] = {
+            "modelName": "bge-test",
+            "modelVersion": "1",
+            "modelChecksum": "a" * 64,
+            "dimensions": 4,
+            "normalized": True,
+            "encodingProfileSha256": "e" * 64,
+            "protocolVersion": "1",
+            "purpose": payload["purpose"],
+            "vectors": [
+                [float(index * 10 + coordinate) for coordinate in range(4)]
+                for index in range(len(payload["texts"]))
+            ],
+        }
+        response.update(self.overrides)
+        return response
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class RecordingSyncHttpxClient:
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+        self.close_calls = 0
+
+    def post(self, url: str, json: dict[str, Any]) -> httpx.Response:
+        self.requests.append((url, json))
+        payload = FakeSyncEmbeddingTransport().post_json(url, json)
+        return httpx.Response(200, request=httpx.Request("POST", url), json=payload)
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class FakeHttpxResponse:
@@ -348,6 +401,75 @@ class EmbeddingClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(async_client.requests), 2)
         self.assertTrue(async_client.entered)
         self.assertTrue(async_client.exited)
+
+
+class SyncEmbeddingClientTest(unittest.TestCase):
+    def test_sync_client_scores_in_order_and_checks_metadata(self) -> None:
+        transport = FakeSyncEmbeddingTransport()
+        client = SyncHttpEmbeddingClient("http://embedding-service:8081", transport=transport)
+
+        vectors = client.embed(["one", "two"], purpose="query", expected=metadata())
+
+        self.assertEqual(len(vectors), 2)
+        self.assertEqual(vectors[1][0], 10.0)
+        self.assertEqual(transport.calls[0][0], "http://embedding-service:8081/v1/embeddings")
+
+    def test_sync_client_splits_batches_and_does_not_retry_metadata_mismatch(self) -> None:
+        transport = FakeSyncEmbeddingTransport()
+        client = SyncHttpEmbeddingClient("http://embedding-service:8081", transport=transport)
+
+        vectors = client.embed(
+            [f"text-{index}" for index in range(65)],
+            purpose="document",
+            expected=metadata(),
+        )
+
+        self.assertEqual(len(vectors), 65)
+        self.assertEqual([len(call[1]["texts"]) for call in transport.calls], [64, 1])
+
+        mismatch = FakeSyncEmbeddingTransport(overrides={"modelChecksum": "b" * 64})
+        with self.assertRaises(EmbeddingModelMismatch):
+            SyncHttpEmbeddingClient("http://embedding-service:8081", transport=mismatch).embed(
+                ["one"], purpose="query", expected=metadata()
+            )
+        self.assertEqual(len(mismatch.calls), 1)
+
+    def test_sync_client_maps_transport_failures_without_leaking_details(self) -> None:
+        request = httpx.Request("POST", "http://embedding-service:8081/v1/embeddings")
+        response = httpx.Response(503, request=request, text="secret vector")
+        errors = (
+            httpx.HTTPStatusError("private", request=request, response=response),
+            httpx.ConnectError("private", request=request),
+            httpx.ReadTimeout("private", request=request),
+        )
+        for upstream_error in errors:
+            with self.subTest(error=type(upstream_error).__name__):
+                client = SyncHttpEmbeddingClient(
+                    "http://embedding-service:8081",
+                    transport=FakeSyncEmbeddingTransport(error=upstream_error),
+                )
+                with self.assertRaises(EmbeddingServiceError) as caught:
+                    client.embed(["one"], purpose="query", expected=metadata())
+                self.assertNotIn("private", str(caught.exception))
+                self.assertNotIn("secret vector", str(caught.exception))
+
+    def test_sync_client_reuses_persistent_httpx_client_and_closes_once(self) -> None:
+        http_client = RecordingSyncHttpxClient()
+        with patch("app.embedding_client.httpx.Client", return_value=http_client) as factory:
+            client = SyncHttpEmbeddingClient("http://embedding-service:8081", timeout_seconds=4)
+            self.assertEqual(len(client.embed(["one"], purpose="query", expected=metadata())), 1)
+            self.assertEqual(len(client.embed(["two"], purpose="query", expected=metadata())), 1)
+            client.close()
+            client.close()
+
+        self.assertEqual(factory.call_count, 1)
+        self.assertEqual(len(http_client.requests), 2)
+        self.assertEqual(http_client.close_calls, 1)
+        kwargs = factory.call_args.kwargs
+        self.assertFalse(kwargs["follow_redirects"])
+        self.assertFalse(kwargs["trust_env"])
+        self.assertEqual(kwargs["limits"].max_connections, 32)
+        self.assertEqual(kwargs["limits"].max_keepalive_connections, 16)
 
 
 if __name__ == "__main__":

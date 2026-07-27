@@ -48,6 +48,16 @@ class EmbeddingTransport(Protocol):
     ) -> Mapping[str, object]: ...
 
 
+class SyncEmbeddingTransport(Protocol):
+    def post_json(
+        self,
+        url: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]: ...
+
+    def close(self) -> None: ...
+
+
 class _ScopedHttpxTransport:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
@@ -108,6 +118,29 @@ class HttpxEmbeddingTransport:
     ) -> Mapping[str, object]:
         async with self.request_scope() as transport:
             return await transport.post_json(url, payload)
+
+
+class _SyncHttpxEmbeddingTransport:
+    def __init__(self, client: httpx.Client) -> None:
+        self._client = client
+
+    def post_json(
+        self,
+        url: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        response = self._client.post(url, json=dict(payload))
+        response.raise_for_status()
+        try:
+            result = response.json()
+        except (TypeError, ValueError) as error:
+            raise EmbeddingResponseError("embedding service returned invalid JSON") from error
+        if not isinstance(result, Mapping):
+            raise EmbeddingResponseError("embedding service returned a non-object JSON payload")
+        return result
+
+    def close(self) -> None:
+        self._client.close()
 
 
 class HttpEmbeddingClient:
@@ -192,6 +225,90 @@ class HttpEmbeddingClient:
                 raise EmbeddingResponseError("embedding response vector count mismatch")
             vectors.extend([list(vector) for vector in response.vectors])
         return vectors
+
+
+class SyncHttpEmbeddingClient:
+    """Persistent synchronous Embedding client for retrieval worker threads."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        transport: SyncEmbeddingTransport | None = None,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        self.base_url = _validate_base_url(base_url)
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive and finite")
+        if transport is None:
+            client = httpx.Client(
+                timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 2.0)),
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+                follow_redirects=False,
+                trust_env=False,
+            )
+            self._transport: SyncEmbeddingTransport = _SyncHttpxEmbeddingTransport(client)
+        else:
+            self._transport = transport
+        self._closed = False
+
+    def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        purpose: EmbeddingPurpose,
+        expected: EmbeddingMetadataExpectation,
+    ) -> list[list[float]]:
+        if self._closed:
+            raise EmbeddingServiceError("embedding client is closed")
+        values = _validate_texts(texts)
+        if purpose not in {"query", "document"}:
+            raise ValueError("purpose must be 'query' or 'document'")
+        expected_metadata = _metadata_from_expectation(expected)
+
+        vectors: list[list[float]] = []
+        endpoint = f"{self.base_url}/embeddings"
+        for batch in _split_batches(values, purpose):
+            payload = {"texts": list(batch), "purpose": purpose}
+            try:
+                raw_response = self._transport.post_json(endpoint, payload)
+            except EmbeddingClientError:
+                raise
+            except httpx.HTTPStatusError as error:
+                raise EmbeddingServiceError(
+                    "embedding service returned an unsuccessful status"
+                ) from error
+            except (httpx.TimeoutException, httpx.RequestError) as error:
+                raise EmbeddingServiceError("embedding service request failed") from error
+            except Exception as error:
+                raise EmbeddingServiceError("embedding service request failed") from error
+
+            try:
+                response = EmbeddingResponse.model_validate(raw_response)
+            except Exception as error:
+                raise EmbeddingResponseError(
+                    "embedding service returned malformed embedding data"
+                ) from error
+            if response.purpose != purpose:
+                raise EmbeddingResponseError("embedding response purpose mismatch")
+            actual = response.to_metadata()
+            mismatches = _metadata_mismatches(expected_metadata, actual)
+            if mismatches:
+                raise EmbeddingModelMismatch(
+                    "embedding model metadata mismatch: " + ", ".join(mismatches)
+                )
+            if len(response.vectors) != len(batch):
+                raise EmbeddingResponseError("embedding response vector count mismatch")
+            vectors.extend([list(vector) for vector in response.vectors])
+        return vectors
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._transport, "close", None)
+        if callable(close):
+            close()
 
 
 def _validate_base_url(base_url: str) -> str:
@@ -331,4 +448,6 @@ __all__ = [
     "EmbeddingTransport",
     "HttpEmbeddingClient",
     "HttpxEmbeddingTransport",
+    "SyncEmbeddingTransport",
+    "SyncHttpEmbeddingClient",
 ]
