@@ -345,6 +345,22 @@ class ChatRepository(Protocol):
         error_message: str | None = None,
     ) -> KnowledgeSourceModel: ...
 
+    def complete_retrieval_source_indexing(
+        self,
+        source_id: str,
+        publication_id: str,
+        indexed_chunk_count: int,
+    ) -> None: ...
+
+    def fail_retrieval_source_indexing(
+        self,
+        source_id: str,
+        error_message: str,
+        publication_id: str | None = None,
+    ) -> None: ...
+
+    def get_source_index_status(self, source_id: str) -> str | None: ...
+
     def reindex_knowledge_source(self, source_id: str) -> KnowledgeSourceModel: ...
 
     def list_knowledge_chunks(self, source_id: str) -> list[KnowledgeChunkModel]: ...
@@ -437,6 +453,7 @@ class InMemoryChatRepository:
         self._evaluation_run_sequence = 1
         self._evaluation_batches: list[EvaluationBatchModel] = []
         self._evaluation_import_batches: list[EvaluationImportBatchModel] = []
+        self._retrieval_source_indexes: dict[str, dict[str, object]] = {}
         self._agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
                 search_knowledge=self.search_knowledge_chunks,
@@ -963,6 +980,43 @@ class InMemoryChatRepository:
             source.updated_at = today_label()
             self._state.knowledge_chunks_by_source[source_id] = []
             return deepcopy(source)
+
+    def complete_retrieval_source_indexing(
+        self,
+        source_id: str,
+        publication_id: str,
+        indexed_chunk_count: int,
+    ) -> None:
+        with self._lock:
+            self._find_knowledge_source(source_id)
+            self._retrieval_source_indexes[source_id] = {
+                "publication_id": publication_id,
+                "status": "indexed",
+                "indexed_chunk_count": indexed_chunk_count,
+                "error_message": None,
+            }
+
+    def fail_retrieval_source_indexing(
+        self,
+        source_id: str,
+        error_message: str,
+        publication_id: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._find_knowledge_source(source_id)
+            current = self._retrieval_source_indexes.get(source_id, {})
+            self._retrieval_source_indexes[source_id] = {
+                "publication_id": publication_id or current.get("publication_id"),
+                "status": "failed",
+                "indexed_chunk_count": current.get("indexed_chunk_count", 0),
+                "error_message": (error_message.strip() or "retrieval_index_failed")[:2000],
+            }
+
+    def get_source_index_status(self, source_id: str) -> str | None:
+        with self._lock:
+            self._find_knowledge_source(source_id)
+            record = self._retrieval_source_indexes.get(source_id)
+            return None if record is None else str(record["status"])
 
     def reindex_knowledge_source(self, source_id: str) -> KnowledgeSourceModel:
         with self._lock:

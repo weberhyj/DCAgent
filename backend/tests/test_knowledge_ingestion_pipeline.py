@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.ingestion import KnowledgeIngestionQueue
+from app.ingestion import KnowledgeIndexUnavailableError, KnowledgeIngestionQueue
 from app.main import create_app
 from app.repository import InMemoryChatRepository
 from app.seed import build_seed_state
@@ -81,6 +81,102 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         self.assertTrue(all("\x00" not in chunk.text for chunk in chunks))
         self.assertIn("差旅制度", chunks[0].text)
         self.assertIn("审批流程", chunks[0].text)
+
+    def test_new_document_updates_postgres_then_active_qdrant_collection(self) -> None:
+        events = []
+
+        class Lifecycle:
+            def upsert_source(inner_self, source_id):
+                events.append(("qdrant", len(self.repository.list_knowledge_chunks(source_id))))
+                return "publication-1", 1
+
+        source_id = "source-lifecycle"
+        path = Path(self.temp_dir.name) / "lifecycle.txt"
+        path.write_text("one searchable passage", encoding="utf-8")
+        self.repository.add_uploaded_knowledge_source(
+            source_id, "lifecycle.txt", "TXT", "internal", 0, str(path), 22, "text/plain"
+        )
+        queue = KnowledgeIngestionQueue(self.repository, index_lifecycle=Lifecycle())
+
+        queue.enqueue(source_id, path, "TXT")
+        queue.drain()
+
+        self.assertEqual(events, [("qdrant", 1)])
+        self.assertEqual(self.repository.get_source_index_status(source_id), "indexed")
+
+    def test_qdrant_failure_does_not_delete_postgres_chunks(self) -> None:
+        class FailingLifecycle:
+            def upsert_source(self, source_id):
+                raise RuntimeError("qdrant unavailable")
+
+        source_id = "source-failed-index"
+        path = Path(self.temp_dir.name) / "failed-index.txt"
+        path.write_text("legacy passage remains available", encoding="utf-8")
+        self.repository.add_uploaded_knowledge_source(
+            source_id,
+            "failed-index.txt",
+            "TXT",
+            "internal",
+            0,
+            str(path),
+            32,
+            "text/plain",
+        )
+        queue = KnowledgeIngestionQueue(self.repository, index_lifecycle=FailingLifecycle())
+
+        queue.enqueue(source_id, path, "TXT")
+        queue.drain()
+
+        self.assertEqual(len(self.repository.list_knowledge_chunks(source_id)), 1)
+        self.assertEqual(self.repository.get_source_index_status(source_id), "failed")
+
+    def test_source_deletion_stops_before_postgres_when_qdrant_delete_fails(self) -> None:
+        class FailingDeleteLifecycle:
+            def delete_source(self, source_id):
+                raise RuntimeError("qdrant unavailable")
+
+        source_id = "source-delete"
+        self.repository.add_knowledge_source("delete.txt", "TXT", "internal")
+        self.repository._state.knowledge_sources[0].id = source_id
+        queue = KnowledgeIngestionQueue(
+            self.repository,
+            index_lifecycle=FailingDeleteLifecycle(),
+        )
+
+        with self.assertRaises(KnowledgeIndexUnavailableError) as captured:
+            queue.discard_source(source_id)
+
+        self.assertEqual(captured.exception.status_code, 503)
+        self.assertTrue(
+            any(source.id == source_id for source in self.repository.list_knowledge_sources())
+        )
+
+    def test_delete_endpoint_returns_503_and_preserves_source_when_qdrant_fails(self) -> None:
+        class FailingDeleteLifecycle:
+            def delete_source(self, source_id):
+                raise RuntimeError("qdrant unavailable")
+
+        source_id = "source-api-delete"
+        self.repository.add_knowledge_source("delete.txt", "TXT", "internal")
+        self.repository._state.knowledge_sources[0].id = source_id
+        queue = KnowledgeIngestionQueue(
+            self.repository,
+            index_lifecycle=FailingDeleteLifecycle(),
+        )
+        client = TestClient(
+            create_app(
+                repository=self.repository,
+                upload_dir=Path(self.temp_dir.name),
+                ingestion_queue=queue,
+            )
+        )
+
+        response = client.delete(f"/api/knowledge/sources/{source_id}")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertTrue(
+            any(source.id == source_id for source in self.repository.list_knowledge_sources())
+        )
 
 
 if __name__ == "__main__":

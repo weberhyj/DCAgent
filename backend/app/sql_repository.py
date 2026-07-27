@@ -24,6 +24,7 @@ from .database import (
     KnowledgeChunkRecord,
     KnowledgeSourceRecord,
     MessageRecord,
+    RetrievalSourceIndexRecord,
     has_seed_data,
 )
 from .embeddings import DEFAULT_EMBEDDING_PROVIDER
@@ -1248,6 +1249,71 @@ class SqlChatRepository:
             source.error_message = error_message
             source.updated_at = today_label()
             return knowledge_source_from_record(source)
+
+    def complete_retrieval_source_indexing(
+        self,
+        source_id: str,
+        publication_id: str,
+        indexed_chunk_count: int,
+    ) -> None:
+        if (
+            isinstance(indexed_chunk_count, bool)
+            or not isinstance(indexed_chunk_count, int)
+            or indexed_chunk_count < 0
+        ):
+            raise ValueError("indexed_chunk_count must be a non-negative integer")
+        with self._database.session() as session:
+            self._get_knowledge_source_record(session, source_id)
+            record = session.get(RetrievalSourceIndexRecord, source_id)
+            if record is None:
+                record = RetrievalSourceIndexRecord(
+                    source_id=source_id,
+                    publication_id=publication_id,
+                    status="indexed",
+                    indexed_chunk_count=indexed_chunk_count,
+                    error_message=None,
+                    updated_at=today_label(),
+                )
+                session.add(record)
+            else:
+                record.publication_id = publication_id
+                record.status = "indexed"
+                record.indexed_chunk_count = indexed_chunk_count
+                record.error_message = None
+                record.updated_at = today_label()
+
+    def fail_retrieval_source_indexing(
+        self,
+        source_id: str,
+        error_message: str,
+        publication_id: str | None = None,
+    ) -> None:
+        message = (error_message.strip() or "retrieval_index_failed")[:2000]
+        with self._database.session() as session:
+            self._get_knowledge_source_record(session, source_id)
+            record = session.get(RetrievalSourceIndexRecord, source_id)
+            if record is None:
+                record = RetrievalSourceIndexRecord(
+                    source_id=source_id,
+                    publication_id=publication_id,
+                    status="failed",
+                    indexed_chunk_count=0,
+                    error_message=message,
+                    updated_at=today_label(),
+                )
+                session.add(record)
+            else:
+                if publication_id is not None:
+                    record.publication_id = publication_id
+                record.status = "failed"
+                record.error_message = message
+                record.updated_at = today_label()
+
+    def get_source_index_status(self, source_id: str) -> str | None:
+        with self._database.session() as session:
+            self._get_knowledge_source_record(session, source_id)
+            record = session.get(RetrievalSourceIndexRecord, source_id)
+            return None if record is None else record.status
 
     def reindex_knowledge_source(self, source_id: str) -> KnowledgeSourceModel:
         with self._database.session() as session:

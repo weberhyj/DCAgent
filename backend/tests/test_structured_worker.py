@@ -508,6 +508,57 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertEqual(status.job.checkpoint_row, 2)
         self.assertEqual(status.source_status, INDEXED)
 
+    def test_structured_publication_indexes_only_after_clickhouse_completion(self) -> None:
+        events = []
+        original_complete = self.repository.complete_publication
+
+        def complete(*args, **kwargs):
+            result = original_complete(*args, **kwargs)
+            events.append("clickhouse_complete")
+            return result
+
+        self.repository.complete_publication = complete
+
+        class MetadataIndexer:
+            def index_publication(inner_self, schema, result):
+                events.append("qdrant_metadata")
+                return "retrieval-publication-1", 1
+
+        self.enqueue()
+        worker = StructuredIngestionWorker(
+            self.repository,
+            RecordingPublisher(self.publication_result()),
+            metadata_indexer=MetadataIndexer(),
+            worker_id="worker-1",
+            lease_seconds=60,
+        )
+
+        self.assertTrue(worker.run_once())
+
+        self.assertEqual(events, ["clickhouse_complete", "qdrant_metadata"])
+        self.assertEqual(self.repository.get_source_index_status(self.source_id), "indexed")
+
+    def test_metadata_index_failure_does_not_roll_back_clickhouse_publication(self) -> None:
+        class FailingMetadataIndexer:
+            def index_publication(self, schema, result):
+                raise RuntimeError("qdrant unavailable")
+
+        self.enqueue()
+        worker = StructuredIngestionWorker(
+            self.repository,
+            RecordingPublisher(self.publication_result()),
+            metadata_indexer=FailingMetadataIndexer(),
+            worker_id="worker-1",
+            lease_seconds=60,
+        )
+
+        self.assertTrue(worker.run_once())
+
+        active = self.repository.get_active_publication(self.dataset_id)
+        self.assertIsNotNone(active)
+        self.assertEqual(active.publication_id, "pub-new")
+        self.assertEqual(self.repository.get_source_index_status(self.source_id), "failed")
+
     def test_worker_retry_uses_a_new_staging_owner_for_same_publication(self) -> None:
         self.enqueue()
         publisher = FailOncePublisher(self.publication_result())

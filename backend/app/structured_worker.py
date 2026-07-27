@@ -35,12 +35,17 @@ class StructuredPublisher(Protocol):
     ) -> StructuredPublicationResult: ...
 
 
+class StructuredMetadataIndexer(Protocol):
+    def index_publication(self, schema: object, result: StructuredPublicationResult): ...
+
+
 class StructuredIngestionWorker:
     def __init__(
         self,
         repository: StructuredRepository,
         publisher: StructuredPublisher,
         *,
+        metadata_indexer: StructuredMetadataIndexer | None = None,
         worker_id: str,
         lease_seconds: int = 60,
         retry_delay_seconds: int = 60,
@@ -55,6 +60,7 @@ class StructuredIngestionWorker:
             raise ValueError("poll_interval_seconds must be positive")
         self._repository = repository
         self._publisher = publisher
+        self.metadata_indexer = metadata_indexer
         self._worker_id = worker_id
         self._lease_seconds = lease_seconds
         self._retry_delay_seconds = retry_delay_seconds
@@ -134,6 +140,22 @@ class StructuredIngestionWorker:
             _validate_publication_result(result, job, len(publication_input.schema.columns))
             renew(force=True, checkpoint_row=result.row_count)
             self._repository.complete_publication(job.id, lease_token, result)
+            if self.metadata_indexer is not None:
+                try:
+                    publication_id, indexed_point_count = self.metadata_indexer.index_publication(
+                        publication_input.schema,
+                        result,
+                    )
+                    self._repository.complete_retrieval_source_indexing(
+                        job.source_id,
+                        publication_id,
+                        indexed_point_count,
+                    )
+                except Exception as index_error:
+                    self._repository.fail_retrieval_source_indexing(
+                        job.source_id,
+                        index_error.__class__.__name__,
+                    )
         except Exception as error:
             if not lease_lost.is_set():
                 try:

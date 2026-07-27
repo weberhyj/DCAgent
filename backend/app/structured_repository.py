@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from .database import (
     Database,
     KnowledgeSourceRecord,
+    RetrievalSourceIndexRecord,
     StructuredColumnRecord,
     StructuredDatasetRecord,
     StructuredIngestionJobRecord,
@@ -753,6 +754,76 @@ class StructuredRepository:
                 )
             )
             return None if record is None else _publication_from_record(record)
+
+    def complete_retrieval_source_indexing(
+        self,
+        source_id: str,
+        publication_id: str | None,
+        indexed_point_count: int,
+    ) -> None:
+        if (
+            isinstance(indexed_point_count, bool)
+            or not isinstance(indexed_point_count, int)
+            or indexed_point_count < 0
+        ):
+            raise ValueError("indexed_point_count must be a non-negative integer")
+        with self._database.session() as session:
+            source = session.get(KnowledgeSourceRecord, source_id)
+            if source is None:
+                raise StructuredNotFoundError("Knowledge source not found")
+            record = session.get(RetrievalSourceIndexRecord, source_id)
+            if record is None:
+                record = RetrievalSourceIndexRecord(
+                    source_id=source_id,
+                    publication_id=publication_id,
+                    status="indexed",
+                    indexed_chunk_count=indexed_point_count,
+                    error_message=None,
+                    updated_at=_timestamp(_utc_now()),
+                )
+                session.add(record)
+            else:
+                record.publication_id = publication_id
+                record.status = "indexed"
+                record.indexed_chunk_count = indexed_point_count
+                record.error_message = None
+                record.updated_at = _timestamp(_utc_now())
+
+    def fail_retrieval_source_indexing(
+        self,
+        source_id: str,
+        error_message: str,
+        publication_id: str | None = None,
+    ) -> None:
+        message = (error_message.strip() or "retrieval_index_failed")[:2000]
+        with self._database.session() as session:
+            source = session.get(KnowledgeSourceRecord, source_id)
+            if source is None:
+                raise StructuredNotFoundError("Knowledge source not found")
+            record = session.get(RetrievalSourceIndexRecord, source_id)
+            if record is None:
+                record = RetrievalSourceIndexRecord(
+                    source_id=source_id,
+                    publication_id=publication_id,
+                    status="failed",
+                    indexed_chunk_count=0,
+                    error_message=message,
+                    updated_at=_timestamp(_utc_now()),
+                )
+                session.add(record)
+            else:
+                if publication_id is not None:
+                    record.publication_id = publication_id
+                record.status = "failed"
+                record.error_message = message
+                record.updated_at = _timestamp(_utc_now())
+
+    def get_source_index_status(self, source_id: str) -> str | None:
+        with self._database.session() as session:
+            if session.get(KnowledgeSourceRecord, source_id) is None:
+                raise StructuredNotFoundError("Knowledge source not found")
+            record = session.get(RetrievalSourceIndexRecord, source_id)
+            return None if record is None else record.status
 
     def get_catalog(self) -> StructuredCatalog:
         with self._database.session() as session:
