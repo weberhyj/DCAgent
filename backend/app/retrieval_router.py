@@ -7,6 +7,7 @@ import queue
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from hashlib import sha256
 from threading import Lock, Thread
 from typing import Protocol
@@ -46,6 +47,10 @@ LegacySearch = Callable[[str, int], Sequence[KnowledgeSearchHitModel]]
 
 class ShadowQueueCloseError(RuntimeError):
     """The daemon Shadow worker did not stop within the bounded close interval."""
+
+
+class RetrievalFallbackReason(StrEnum):
+    RETRIEVAL_SCOPE_UNAVAILABLE = "retrieval_scope_unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -523,10 +528,53 @@ class RetrievalRouter:
     def search(self, request: RetrievalRequest) -> RoutedRetrievalOutcome:
         if not isinstance(request, RetrievalRequest):
             raise TypeError("request must be a RetrievalRequest")
+        request_id = self._request_id()
+        outcome, candidate_counts = self._search(request, request_id=request_id)
+        self._log_completion(
+            request_id=request_id,
+            outcome=outcome,
+            candidate_counts=candidate_counts,
+        )
+        return outcome
+
+    def fallback_to_legacy(
+        self,
+        *,
+        query: str,
+        limit: int,
+        routing_key: str,
+        fallback_reason: RetrievalFallbackReason,
+    ) -> RoutedRetrievalOutcome:
+        if not isinstance(routing_key, str) or not routing_key.strip():
+            raise ValueError("routing_key must be a non-empty string")
+        if not isinstance(fallback_reason, RetrievalFallbackReason):
+            raise TypeError("fallback_reason must be a RetrievalFallbackReason")
+        request_id = self._request_id()
+        outcome = self._legacy_query(
+            query,
+            limit,
+            fallback_reason=fallback_reason.value,
+        )
+        self._log_completion(
+            request_id=request_id,
+            outcome=outcome,
+            candidate_counts={"qwen": 0, "legacy": len(outcome.hits)},
+        )
+        return outcome
+
+    def _request_id(self) -> str:
         request_id = self._request_id_factory()
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("request_id_factory must return a non-empty string")
-        outcome, candidate_counts = self._search(request, request_id=request_id)
+        return request_id
+
+    def _log_completion(
+        self,
+        *,
+        request_id: str,
+        outcome: RoutedRetrievalOutcome,
+        candidate_counts: Mapping[str, int],
+    ) -> None:
         logger.bind(
             request_id=request_id,
             mode=self.mode.value,
@@ -545,7 +593,6 @@ class RetrievalRouter:
             fallback_reason=outcome.fallback_reason,
             result_count=len(outcome.hits),
         ).info("retrieval completed")
-        return outcome
 
     def _search(
         self,
@@ -625,8 +672,21 @@ class RetrievalRouter:
         *,
         fallback_reason: str | None = None,
     ) -> RoutedRetrievalOutcome:
+        return self._legacy_query(
+            request.query,
+            request.limit,
+            fallback_reason=fallback_reason,
+        )
+
+    def _legacy_query(
+        self,
+        query: str,
+        limit: int,
+        *,
+        fallback_reason: str | None = None,
+    ) -> RoutedRetrievalOutcome:
         started = self._monotonic()
-        hits = tuple(self._legacy_search(request.query, request.limit))
+        hits = tuple(self._legacy_search(query, limit))
         return RoutedRetrievalOutcome(
             mode=RetrievalMode.LEGACY,
             hits=hits,
@@ -670,6 +730,7 @@ def _fallback_code(error: Exception) -> str:
 
 
 __all__ = [
+    "RetrievalFallbackReason",
     "RetrievalRouter",
     "RoutedRetrievalOutcome",
     "SanitizedLogQueue",

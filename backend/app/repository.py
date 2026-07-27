@@ -1093,7 +1093,15 @@ class InMemoryChatRepository:
 
         resolution = self._retrieval_scope_provider.resolve()
         if resolution.scope is None:
-            return self.search_knowledge_chunks(query, limit)
+            from .retrieval_router import RetrievalFallbackReason
+
+            outcome = self.retrieval_router.fallback_to_legacy(
+                query=query,
+                limit=limit,
+                routing_key=routing_key,
+                fallback_reason=RetrievalFallbackReason.RETRIEVAL_SCOPE_UNAVAILABLE,
+            )
+            return list(outcome.hits)
         outcome = self.retrieval_router.search(
             RetrievalRequest(
                 query=query,

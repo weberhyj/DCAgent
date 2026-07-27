@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import io
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from loguru import logger as loguru_logger
 
 from app.agent import AgentRunResult
 from app.database import Database
 from app.models import ChatMessageModel, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
 from app.retrieval_models import RetrievalMode, RetrievalScope
-from app.retrieval_router import RoutedRetrievalOutcome
+from app.retrieval_router import (
+    RetrievalFallbackReason,
+    RetrievalRouter,
+    RoutedRetrievalOutcome,
+)
+from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.seed import build_seed_state
 from app.sql_repository import SqlChatRepository
 
@@ -489,6 +497,7 @@ class SqlRepositoryTest(unittest.TestCase):
         class RecordingRouter:
             def __init__(self) -> None:
                 self.requests = []
+                self.fallbacks = []
 
             def search(self, request):
                 self.requests.append(request)
@@ -496,6 +505,15 @@ class SqlRepositoryTest(unittest.TestCase):
                     mode=RetrievalMode.LEGACY,
                     hits=(),
                     stage_ms={},
+                )
+
+            def fallback_to_legacy(self, **values):
+                self.fallbacks.append(values)
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.LEGACY,
+                    hits=(),
+                    stage_ms={"legacy": 0.0},
+                    fallback_reason=values["fallback_reason"].value,
                 )
 
         class MutableProvider:
@@ -530,7 +548,146 @@ class SqlRepositoryTest(unittest.TestCase):
             [item.scope.publication_version for item in router.requests],
             ["v1", "v2"],
         )
-        self.assertEqual(fallback, repository.search_knowledge_chunks("third", 8))
+        self.assertEqual(fallback, [])
+        self.assertEqual(
+            router.fallbacks,
+            [
+                {
+                    "query": "third",
+                    "limit": 8,
+                    "routing_key": "conversation-1",
+                    "fallback_reason": RetrievalFallbackReason.RETRIEVAL_SCOPE_UNAVAILABLE,
+                }
+            ],
+        )
+
+    def test_sql_no_active_scope_uses_router_legacy_completion_without_leaking(self) -> None:
+        repository = SqlChatRepository(self.database)
+        provider = DynamicRetrievalScopeProvider(
+            audit=SimpleNamespace(active_publication=lambda _alias: None),
+            gateway=SimpleNamespace(
+                resolve_alias=lambda: "private-alias http://qdrant-internal:6333"
+            ),
+            alias_name="knowledge_chunks_current",
+            knowledge_base_id="default",
+            permission_tags=("internal",),
+        )
+        hybrid = SimpleNamespace(calls=0)
+
+        def never_retrieve(_request):
+            hybrid.calls += 1
+            raise AssertionError("hybrid must not run without a trusted scope")
+
+        hybrid.retrieve = never_retrieve
+        router = RetrievalRouter(
+            mode="qwen3",
+            legacy_search=repository.search_knowledge_chunks,
+            hybrid=hybrid,
+            canary_percent=100,
+            request_id_factory=lambda: "scope-fallback-sql",
+        )
+        self.addCleanup(router.close)
+        repository.configure_retrieval(router, provider)
+
+        self._assert_scope_unavailable_completion(
+            repository,
+            router,
+            hybrid,
+            query="private no-active query sentinel",
+            routing_key="conversation-sql",
+            forbidden=("private-alias", "http://qdrant-internal:6333"),
+        )
+
+    def test_memory_divergent_scope_uses_router_legacy_completion_without_leaking(
+        self,
+    ) -> None:
+        repository = InMemoryChatRepository(build_seed_state())
+        active_collection = "knowledge_chunks_qwen3_v41"
+        alias_collection = "knowledge_chunks_qwen3_v42"
+        provider = DynamicRetrievalScopeProvider(
+            audit=SimpleNamespace(
+                active_publication=lambda _alias: SimpleNamespace(collection_name=active_collection)
+            ),
+            gateway=SimpleNamespace(resolve_alias=lambda: alias_collection),
+            alias_name="knowledge_chunks_current",
+            knowledge_base_id="default",
+            permission_tags=("internal",),
+        )
+        hybrid = SimpleNamespace(calls=0)
+
+        def never_retrieve(_request):
+            hybrid.calls += 1
+            raise AssertionError("hybrid must not run for divergent publication state")
+
+        hybrid.retrieve = never_retrieve
+        router = RetrievalRouter(
+            mode="qwen3",
+            legacy_search=repository.search_knowledge_chunks,
+            hybrid=hybrid,
+            canary_percent=100,
+            request_id_factory=lambda: "scope-fallback-memory",
+        )
+        self.addCleanup(router.close)
+        repository.configure_retrieval(router, provider)
+
+        self._assert_scope_unavailable_completion(
+            repository,
+            router,
+            hybrid,
+            query="private divergence query sentinel",
+            routing_key="conversation-memory",
+            forbidden=(active_collection, alias_collection),
+        )
+
+    def _assert_scope_unavailable_completion(
+        self,
+        repository,
+        router,
+        hybrid,
+        *,
+        query: str,
+        routing_key: str,
+        forbidden: tuple[str, ...],
+    ) -> None:
+        expected = repository.search_knowledge_chunks(query, 8)
+        records: list[dict[str, object]] = []
+        rendered = io.StringIO()
+        record_sink = loguru_logger.add(
+            lambda message: records.append(dict(message.record)),
+            level="INFO",
+        )
+        rendered_sink = loguru_logger.add(
+            rendered,
+            format="{message} | {extra}",
+            level="INFO",
+            backtrace=True,
+            diagnose=True,
+            colorize=False,
+        )
+        try:
+            with patch.object(router, "search", wraps=router.search) as routed_search:
+                actual = repository._search_routed_knowledge_chunks(query, 8, routing_key)
+        finally:
+            loguru_logger.remove(record_sink)
+            loguru_logger.remove(rendered_sink)
+
+        self.assertEqual(actual, expected)
+        routed_search.assert_not_called()
+        self.assertEqual(hybrid.calls, 0)
+        completions = [record for record in records if record["message"] == "retrieval completed"]
+        self.assertEqual(len(completions), 1)
+        extra = completions[0]["extra"]
+        self.assertEqual(extra["mode"], "qwen3")
+        self.assertEqual(extra["fallback_code"], "retrieval_scope_unavailable")
+        self.assertEqual(extra["fallback_reason"], "retrieval_scope_unavailable")
+        self.assertEqual(extra["candidate_counts"], {"qwen": 0, "legacy": len(expected)})
+        self.assertEqual(extra["result_count"], len(expected))
+        self.assertEqual(extra["stage_timings"], extra["stage_timings_ms"])
+        self.assertIn("legacy", extra["stage_timings"])
+        output = rendered.getvalue()
+        self.assertNotIn(query, output)
+        for detail in forbidden:
+            self.assertNotIn(detail, output)
 
 
 if __name__ == "__main__":
