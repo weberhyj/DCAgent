@@ -316,6 +316,38 @@ class RetrievalRouterTest(unittest.TestCase):
         self.assertEqual(router.search(request("probe-succeeds")).mode, RetrievalMode.QWEN3)
         self.assertEqual(hybrid.calls, 3)
 
+    def test_interrupted_half_open_probe_reopens_and_allows_one_later_probe(self) -> None:
+        clock = FakeClock()
+        hybrid = RecordingHybrid(
+            [
+                RuntimeError("initial failure"),
+                KeyboardInterrupt("operator interrupt"),
+                hybrid_outcome("qwen-recovered"),
+                hybrid_outcome("qwen-after-recovery"),
+            ]
+        )
+        router = self.build_router(
+            mode="qwen3",
+            hybrid=hybrid,
+            canary_percent=100,
+            failure_threshold=1,
+            reset_interval_seconds=5,
+            monotonic=clock,
+        )
+        self.assertEqual(router.search(request("open")).fallback_reason, "hybrid_unavailable")
+        clock.advance(5)
+
+        with self.assertRaises(KeyboardInterrupt):
+            router.search(request("interrupted-probe"))
+
+        self.assertEqual(router.search(request("freshly-reopened")).fallback_reason, "circuit_open")
+        self.assertEqual(hybrid.calls, 2)
+        clock.advance(5)
+        self.assertEqual(router.search(request("later-probe")).mode, RetrievalMode.QWEN3)
+        self.assertEqual(hybrid.calls, 3)
+        self.assertEqual(router.search(request("closed-again")).mode, RetrievalMode.QWEN3)
+        self.assertEqual(hybrid.calls, 4)
+
     def test_timeout_and_busy_use_sanitized_fallback_codes(self) -> None:
         timeout_router = self.build_router(
             mode="qwen3",
@@ -357,6 +389,9 @@ class RetrievalRouterTest(unittest.TestCase):
 
         self.assertFalse(router.shadow_queue.worker.is_alive())
         self.assertEqual(audit.records, [])
+        dropped = router.shadow_queue.dropped_count
+        self.assertFalse(router.shadow_queue.submit(request(), (), 0.0))
+        self.assertEqual(router.shadow_queue.dropped_count, dropped + 1)
 
     def test_ordinary_exception_still_uses_sanitized_fallback(self) -> None:
         router = self.build_router(

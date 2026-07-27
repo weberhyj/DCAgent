@@ -123,6 +123,13 @@ class _CircuitBreaker:
             if self._consecutive_failures >= self._failure_threshold:
                 self._open_locked()
 
+    def abandon(self, permit: _CircuitPermit) -> None:
+        with self._lock:
+            if permit.epoch != self._epoch:
+                return
+            if self._state == "half_open" and permit.half_open_probe:
+                self._open_locked()
+
     def _open_locked(self) -> None:
         self._state = "open"
         self._opened_at = self._monotonic()
@@ -185,7 +192,7 @@ class ShadowQueue:
     ) -> bool:
         task = _ShadowTask(request, tuple(legacy_hits), float(legacy_ms))
         with self._lock:
-            if self._closing or self._closed:
+            if self._closing or self._closed or not self.worker.is_alive():
                 self._dropped_count += 1
                 return False
             try:
@@ -353,6 +360,9 @@ class RetrievalRouter:
         except Exception as error:
             self._circuit.record_failure(permit)
             return self._legacy(request, fallback_reason=_fallback_code(error))
+        except BaseException:
+            self._circuit.abandon(permit)
+            raise
         self._circuit.record_success(permit)
         if qwen.hits:
             return RoutedRetrievalOutcome(
