@@ -315,6 +315,41 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertEqual(hits[0].chunk.id, "chunk-travel-receipts")
         self.assertEqual(hits[0].rank, 1)
 
+    def test_legacy_search_filters_sources_to_configured_permission_classifications(self) -> None:
+        for source_id, classification in (
+            ("kb-allowed", "internal"),
+            ("kb-denied", "executive"),
+        ):
+            self.repository.add_uploaded_knowledge_source(
+                source_id=source_id,
+                name=f"{source_id}.txt",
+                source_type="TXT",
+                classification=classification,
+                records=0,
+                file_path=f"{source_id}.txt",
+                file_size=64,
+                mime_type="text/plain",
+            )
+            self.repository.complete_knowledge_source_indexing(
+                source_id,
+                [
+                    KnowledgeChunkModel(
+                        id=f"chunk-{source_id}",
+                        source_id=source_id,
+                        chunk_index=0,
+                        text="unique fallback policy evidence",
+                        token_count=4,
+                    )
+                ],
+            )
+
+        scoped = SqlChatRepository(self.database, retrieval_permission_tags=("internal",))
+
+        hits = scoped.search_knowledge_chunks("unique fallback policy evidence", limit=10)
+
+        self.assertEqual([hit.source.id for hit in hits], ["kb-allowed"])
+        self.assertTrue(hasattr(scoped, "_search_legacy_knowledge_chunks"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+import threading
+import time
+import unittest
+from dataclasses import replace
+
+from app.embedding_contracts import EmbeddingModelMetadata
+from app.hybrid_retriever import (
+    HybridRetrievalTimeout,
+    HybridRetriever,
+    reciprocal_rank_fusion,
+)
+from app.models import knowledge_search_hit_from_candidate
+from app.reranker_client import RerankerBusy, RerankerServiceError
+from app.retrieval_models import RetrievalCandidate, RetrievalRequest, RetrievalScope
+from app.retrieval_publication import deterministic_point_id
+from app.retrieval_settings import RerankerModelSettings
+from app.sparse_embedding import SparseVector
+
+EMBEDDING = EmbeddingModelMetadata(
+    name="Qwen/Qwen3-Embedding-0.6B",
+    version="embedding-v1",
+    sha256="a" * 64,
+    dimensions=3,
+    normalized=True,
+    encoding_profile_sha256="b" * 64,
+    protocol_version="v1",
+)
+RERANKER = RerankerModelSettings(
+    name="Qwen/Qwen3-Reranker-0.6B",
+    version="reranker-v1",
+    sha256="c" * 64,
+    prompt_profile_sha256="d" * 64,
+    protocol_version="v1",
+)
+
+
+def candidate(
+    chunk_id: str,
+    *,
+    source_name: str = "policy.txt",
+    chunk_index: int = 0,
+    text: str | None = None,
+    point_id: str | None = None,
+    parent_chunk_id: str | None = None,
+    previous_chunk_id: str | None = None,
+    next_chunk_id: str | None = None,
+) -> RetrievalCandidate:
+    return RetrievalCandidate(
+        source_id="source-1",
+        source_name=source_name,
+        source_type="TXT",
+        classification="internal",
+        chunk_id=chunk_id,
+        chunk_index=chunk_index,
+        text=text or f"passage {chunk_id}",
+        point_id=point_id or f"point-{chunk_id}",
+        parent_chunk_id=parent_chunk_id,
+        previous_chunk_id=previous_chunk_id,
+        next_chunk_id=next_chunk_id,
+    )
+
+
+def request(query: str = "policy", *, limit: int = 8) -> RetrievalRequest:
+    return RetrievalRequest(
+        query=query,
+        limit=limit,
+        routing_key="conversation-1",
+        scope=RetrievalScope(
+            knowledge_base_id="default",
+            permission_tags=("internal",),
+            publication_version="v7",
+        ),
+    )
+
+
+class RecordingEmbedding:
+    def __init__(self, *, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.calls: list[tuple[tuple[str, ...], str, object]] = []
+        self.thread_names: list[str] = []
+
+    def embed(self, texts, *, purpose, expected):
+        self.calls.append((tuple(texts), purpose, expected))
+        self.thread_names.append(threading.current_thread().name)
+        if self.delay:
+            time.sleep(self.delay)
+        return [[0.1, 0.2, 0.3]]
+
+
+class RecordingSparse:
+    def __init__(self, *, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.calls: list[str] = []
+        self.thread_names: list[str] = []
+
+    def embed_query(self, query):
+        self.calls.append(query)
+        self.thread_names.append(threading.current_thread().name)
+        if self.delay:
+            time.sleep(self.delay)
+        return SparseVector(indices=(1,), values=(1.0,))
+
+
+class RecordingGateway:
+    def __init__(
+        self,
+        dense: tuple[RetrievalCandidate, ...],
+        sparse: tuple[RetrievalCandidate, ...],
+        adjacent: tuple[RetrievalCandidate, ...] = (),
+        *,
+        delay: float = 0.0,
+    ) -> None:
+        self.dense = dense
+        self.sparse = sparse
+        self.adjacent = adjacent
+        self.delay = delay
+        self.dense_calls: list[tuple[object, RetrievalScope, int]] = []
+        self.sparse_calls: list[tuple[object, RetrievalScope, int]] = []
+        self.retrieve_calls: list[tuple[tuple[str, ...], RetrievalScope]] = []
+        self.search_threads: list[str] = []
+
+    def search_dense(self, vector, *, scope, limit, collection_name=None):
+        self.dense_calls.append((vector, scope, limit))
+        self.search_threads.append(threading.current_thread().name)
+        if self.delay:
+            time.sleep(self.delay)
+        return self.dense[:limit]
+
+    def search_sparse(self, vector, *, scope, limit, collection_name=None):
+        self.sparse_calls.append((vector, scope, limit))
+        self.search_threads.append(threading.current_thread().name)
+        if self.delay:
+            time.sleep(self.delay)
+        return self.sparse[:limit]
+
+    def retrieve_points(self, point_ids, *, scope, collection_name=None):
+        self.retrieve_calls.append((tuple(point_ids), scope))
+        return self.adjacent
+
+
+class RecordingReranker:
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+        self.passage_count = 0
+
+    def rerank(self, query, passages, *, expected):
+        self.batch_sizes.append(len(passages))
+        self.passage_count = len(passages)
+        return [1.0 - index / 100 for index in range(len(passages))]
+
+
+class BusyOnceReranker(RecordingReranker):
+    def rerank(self, query, passages, *, expected):
+        self.batch_sizes.append(len(passages))
+        if len(self.batch_sizes) == 1:
+            raise RerankerBusy("busy")
+        self.passage_count = len(passages)
+        return [1.0 - index / 100 for index in range(len(passages))]
+
+
+class FailingReranker(RecordingReranker):
+    def rerank(self, query, passages, *, expected):
+        self.batch_sizes.append(len(passages))
+        raise RerankerServiceError("unavailable")
+
+
+def build_retriever(
+    *,
+    dense: tuple[RetrievalCandidate, ...] | None = None,
+    sparse: tuple[RetrievalCandidate, ...] | None = None,
+    adjacent: tuple[RetrievalCandidate, ...] = (),
+    embedding: RecordingEmbedding | None = None,
+    sparse_encoder: RecordingSparse | None = None,
+    reranker: RecordingReranker | None = None,
+    gateway_delay: float = 0.0,
+    timeout: float = 5.0,
+    final_top_k: int = 8,
+    evidence_char_budget: int = 24_000,
+) -> HybridRetriever:
+    dense_values = dense or tuple(
+        candidate(f"c{index:02d}", chunk_index=index) for index in range(50)
+    )
+    sparse_values = sparse or tuple(
+        candidate(f"c{index:02d}", chunk_index=index) for index in range(49, -1, -1)
+    )
+    return HybridRetriever(
+        embedding=embedding or RecordingEmbedding(),
+        sparse=sparse_encoder or RecordingSparse(),
+        gateway=RecordingGateway(
+            dense_values,
+            sparse_values,
+            adjacent,
+            delay=gateway_delay,
+        ),
+        reranker=reranker or RecordingReranker(),
+        embedding_metadata=EMBEDDING,
+        reranker_metadata=RERANKER,
+        dense_top_k=50,
+        sparse_top_k=50,
+        rerank_top_k=24,
+        degraded_rerank_top_k=12,
+        final_top_k=final_top_k,
+        rrf_k=60,
+        total_timeout_seconds=timeout,
+        evidence_char_budget=evidence_char_budget,
+    )
+
+
+class ReciprocalRankFusionTest(unittest.TestCase):
+    def test_fuses_by_chunk_id_records_one_based_ranks_and_keeps_better_payload(self) -> None:
+        dense_b = candidate("b", text="dense b")
+        sparse_b = candidate("b", text="sparse b")
+
+        fused = reciprocal_rank_fusion(
+            dense=(candidate("a"), dense_b),
+            sparse=(sparse_b, candidate("c")),
+            k=60,
+        )
+
+        self.assertEqual([item.chunk_id for item in fused], ["b", "a", "c"])
+        self.assertEqual(fused[0].dense_rank, 2)
+        self.assertEqual(fused[0].sparse_rank, 1)
+        self.assertEqual(fused[0].text, "sparse b")
+        self.assertAlmostEqual(fused[0].rrf_score, 1 / 62 + 1 / 61)
+
+    def test_sorts_exact_score_ties_by_source_name_chunk_index_then_chunk_id(self) -> None:
+        fused = reciprocal_rank_fusion(
+            dense=(
+                candidate("z", source_name="Beta", chunk_index=0),
+                candidate("b", source_name="Alpha", chunk_index=2),
+                candidate("a", source_name="Alpha", chunk_index=2),
+            ),
+            sparse=(),
+            k=60,
+        )
+
+        tied = [item.chunk_id for item in fused if item.dense_rank in {2, 3}]
+        self.assertEqual(tied, ["b", "a"])
+
+        exact_ties = reciprocal_rank_fusion(
+            dense=(candidate("z", source_name="Beta", chunk_index=0),),
+            sparse=(candidate("a", source_name="Alpha", chunk_index=2),),
+            k=60,
+        )
+        self.assertEqual([item.chunk_id for item in exact_ties], ["a", "z"])
+
+    def test_rejects_duplicate_chunk_ids_inside_either_input_list(self) -> None:
+        for dense, sparse in (
+            ((candidate("a"), candidate("a")), ()),
+            ((), (candidate("a"), candidate("a"))),
+        ):
+            with self.subTest(dense=bool(dense)):
+                with self.assertRaisesRegex(ValueError, "duplicate chunk_id"):
+                    reciprocal_rank_fusion(dense=dense, sparse=sparse, k=60)
+
+    def test_converts_internal_candidate_to_existing_search_hit_without_diagnostics(self) -> None:
+        fused = replace(
+            candidate("a", text="authorized evidence"),
+            dense_rank=1,
+            sparse_rank=2,
+            rrf_score=0.25,
+            rerank_score=0.91,
+        )
+
+        hit = knowledge_search_hit_from_candidate(fused, rank=3)
+
+        self.assertEqual(hit.chunk.id, "a")
+        self.assertEqual(hit.source.classification, "internal")
+        self.assertEqual(hit.score, 0.91)
+        self.assertEqual(hit.rank, 3)
+        self.assertFalse(hasattr(hit, "dense_rank"))
+
+
+class HybridRetrieverTest(unittest.TestCase):
+    def addCleanupFor(self, retriever: HybridRetriever) -> HybridRetriever:
+        self.addCleanup(retriever.close)
+        return retriever
+
+    def test_runs_parallel_dense_and_sparse_stages_then_reranks_top_24(self) -> None:
+        retriever = self.addCleanupFor(build_retriever())
+
+        outcome = retriever.retrieve(request())
+
+        self.assertEqual(retriever.reranker.passage_count, 24)
+        self.assertLessEqual(len(outcome.candidates), 8)
+        self.assertEqual(len(outcome.hits), len(outcome.candidates))
+        self.assertEqual(outcome.hits[0].score, outcome.candidates[0].rerank_score)
+        self.assertEqual(outcome.hits[0].chunk.id, outcome.candidates[0].chunk_id)
+        self.assertEqual(outcome.hits[0].rank, 1)
+        self.assertEqual(retriever.gateway.dense_calls[0][2], 50)
+        self.assertEqual(retriever.gateway.sparse_calls[0][2], 50)
+        self.assertEqual(retriever.gateway.dense_calls[0][1], request().scope)
+        self.assertIn("embedding", outcome.stage_ms)
+        self.assertIn("qdrant", outcome.stage_ms)
+        self.assertIn("rrf", outcome.stage_ms)
+        self.assertIn("reranker", outcome.stage_ms)
+        self.assertIn("adjacency", outcome.stage_ms)
+        self.assertEqual(retriever._executor._max_workers, 4)
+
+    def test_reuses_one_persistent_executor_across_requests(self) -> None:
+        retriever = self.addCleanupFor(build_retriever())
+        executor = retriever._executor
+
+        retriever.retrieve(request("first"))
+        retriever.retrieve(request("second"))
+
+        self.assertIs(retriever._executor, executor)
+        self.assertTrue(all(name != "MainThread" for name in retriever.embedding.thread_names))
+        self.assertTrue(all(name != "MainThread" for name in retriever.sparse.thread_names))
+        self.assertTrue(all(name != "MainThread" for name in retriever.gateway.search_threads))
+
+    def test_retries_busy_reranker_once_with_top_12(self) -> None:
+        reranker = BusyOnceReranker()
+        retriever = self.addCleanupFor(build_retriever(reranker=reranker))
+
+        outcome = retriever.retrieve(request())
+
+        self.assertEqual(reranker.batch_sizes, [24, 12])
+        self.assertTrue(outcome.candidates)
+
+    def test_does_not_retry_non_busy_reranker_failures(self) -> None:
+        reranker = FailingReranker()
+        retriever = self.addCleanupFor(build_retriever(reranker=reranker))
+
+        with self.assertRaises(RerankerServiceError):
+            retriever.retrieve(request())
+
+        self.assertEqual(reranker.batch_sizes, [24])
+
+    def test_uses_one_absolute_deadline_across_encoding_and_search(self) -> None:
+        retriever = self.addCleanupFor(
+            build_retriever(
+                embedding=RecordingEmbedding(delay=0.06),
+                sparse_encoder=RecordingSparse(delay=0.06),
+                gateway_delay=0.06,
+                timeout=0.09,
+            )
+        )
+
+        started = time.monotonic()
+        with self.assertRaises(HybridRetrievalTimeout):
+            retriever.retrieve(request())
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.14)
+
+    def test_fetches_all_referenced_neighbors_once_and_deduplicates_evidence(self) -> None:
+        top = candidate(
+            "c2",
+            chunk_index=2,
+            parent_chunk_id="parent",
+            previous_chunk_id="c1",
+            next_chunk_id="c3",
+        )
+        duplicate_neighbor = replace(candidate("c1", chunk_index=1), text="neighbor c1")
+        adjacent = (
+            candidate("parent", chunk_index=0),
+            duplicate_neighbor,
+            candidate("c3", chunk_index=3),
+        )
+        retriever = self.addCleanupFor(
+            build_retriever(
+                dense=(top, duplicate_neighbor),
+                sparse=(top,),
+                adjacent=adjacent,
+                final_top_k=4,
+            )
+        )
+
+        outcome = retriever.retrieve(request(limit=4))
+
+        self.assertEqual(
+            [item.chunk_id for item in outcome.candidates], ["c2", "parent", "c1", "c3"]
+        )
+        self.assertEqual(len(retriever.gateway.retrieve_calls), 1)
+        point_ids, scope = retriever.gateway.retrieve_calls[0]
+        self.assertEqual(
+            point_ids,
+            (
+                deterministic_point_id("source-1", "parent", "v7"),
+                deterministic_point_id("source-1", "c3", "v7"),
+            ),
+        )
+        self.assertEqual(scope, request().scope)
+        self.assertEqual(len({item.chunk_id for item in outcome.candidates}), 4)
+
+    def test_stops_at_evidence_count_and_utf8_character_budget(self) -> None:
+        top = candidate("c2", text="x" * 10, next_chunk_id="c3")
+        adjacent = (candidate("c3", text="y" * 11),)
+        retriever = self.addCleanupFor(
+            build_retriever(
+                dense=(top,),
+                sparse=(top,),
+                adjacent=adjacent,
+                final_top_k=2,
+                evidence_char_budget=20,
+            )
+        )
+
+        outcome = retriever.retrieve(request(limit=2))
+
+        self.assertEqual([item.chunk_id for item in outcome.candidates], ["c2"])
+        self.assertLessEqual(sum(len(item.text) for item in outcome.candidates), 20)
+
+    def test_passes_the_exact_scope_to_every_qdrant_operation(self) -> None:
+        top = candidate("c2", next_chunk_id="c3")
+        retriever = self.addCleanupFor(
+            build_retriever(
+                dense=(top,),
+                sparse=(top,),
+                adjacent=(candidate("c3"),),
+            )
+        )
+        expected_scope = request().scope
+
+        retriever.retrieve(request())
+
+        self.assertEqual(retriever.gateway.dense_calls[0][1], expected_scope)
+        self.assertEqual(retriever.gateway.sparse_calls[0][1], expected_scope)
+        self.assertEqual(retriever.gateway.retrieve_calls[0][1], expected_scope)
+
+
+if __name__ == "__main__":
+    unittest.main()

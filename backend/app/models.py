@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from .retrieval_models import RetrievalCandidate
 
 ComposerMode = Literal["quick", "deep", "source"]
 MessageRole = Literal["user", "assistant"]
@@ -130,6 +133,42 @@ class KnowledgeSearchHitModel:
     vector_score: float = 0.0
     rank: int = 0
     matched_terms: list[str] = field(default_factory=list)
+
+
+def knowledge_search_hit_from_candidate(
+    candidate: RetrievalCandidate,
+    *,
+    rank: int,
+) -> KnowledgeSearchHitModel:
+    """Drop internal retrieval diagnostics at the existing Physoc evidence boundary."""
+
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+        raise ValueError("rank must be a positive integer")
+    source = KnowledgeSourceModel(
+        id=candidate.source_id,
+        name=candidate.source_name,
+        source_type=candidate.source_type,
+        records=1,
+        status="已索引",
+        updated_at="",
+        classification=candidate.classification,
+    )
+    chunk = KnowledgeChunkModel(
+        id=candidate.chunk_id,
+        source_id=candidate.source_id,
+        chunk_index=candidate.chunk_index,
+        text=candidate.text,
+        token_count=0,
+    )
+    score = candidate.rerank_score
+    if score is None:
+        score = candidate.rrf_score
+    return KnowledgeSearchHitModel(
+        source=source,
+        chunk=chunk,
+        score=score,
+        rank=rank,
+    )
 
 
 @dataclass(slots=True)

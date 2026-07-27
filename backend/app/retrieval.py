@@ -5,6 +5,7 @@ import os
 from collections.abc import Mapping
 
 DEFAULT_RETRIEVAL_MIN_SCORE = 2.2
+DEFAULT_HYBRID_EVIDENCE_CHAR_BUDGET = 24_000
 
 
 def resolve_retrieval_min_score(environ: Mapping[str, str] | None = None) -> float:
@@ -27,6 +28,16 @@ def resolve_effective_retrieval_min_score(minimum_score: float | None) -> float:
     if not math.isfinite(minimum_score):
         raise ValueError("minimum_score must be finite")
     return max(0.0, minimum_score)
+
+
+def resolve_hybrid_evidence_limit(requested_limit: int, *, final_top_k: int) -> int:
+    for value, name in (
+        (requested_limit, "requested_limit"),
+        (final_top_k, "final_top_k"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    return min(requested_limit, final_top_k)
 
 
 def is_reliable_knowledge_score(

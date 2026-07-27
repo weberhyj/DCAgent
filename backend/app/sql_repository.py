@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -85,6 +85,12 @@ from .retrieval import is_reliable_knowledge_score, resolve_effective_retrieval_
 
 if TYPE_CHECKING:
     from .structured_answer import StructuredAnswerService
+
+
+def _required_permission_tag(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("retrieval permission tags must contain non-empty strings")
+    return value.strip()
 
 
 def citation_to_dict(citation: CitationModel) -> dict[str, Any]:
@@ -406,11 +412,17 @@ class SqlChatRepository:
         structured_service: StructuredAnswerService | None = None,
         *,
         owns_database: bool = False,
+        retrieval_permission_tags: Sequence[str] = (),
     ) -> None:
         self._database = database
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service
         self._owns_database = owns_database
+        if isinstance(retrieval_permission_tags, (str, bytes, bytearray)):
+            raise TypeError("retrieval_permission_tags must be a sequence")
+        self._retrieval_permission_tags = tuple(
+            _required_permission_tag(tag) for tag in retrieval_permission_tags
+        )
         self._close_lock = Lock()
         self._closed = False
         self._agent = ReadOnlyKnowledgeAgent(
@@ -1345,7 +1357,7 @@ class SqlChatRepository:
     ) -> list[KnowledgeSearchHitModel]:
         effective_minimum_score = resolve_effective_retrieval_min_score(minimum_score)
         with self._database.session() as session:
-            return self._search_knowledge_chunks(
+            return self._search_legacy_knowledge_chunks(
                 session,
                 query,
                 limit,
@@ -1417,18 +1429,30 @@ class SqlChatRepository:
             raise HTTPException(status_code=404, detail="Knowledge source not found")
         return source
 
-    def _search_knowledge_chunks(
+    def _search_legacy_knowledge_chunks(
         self,
         session,
         query: str,
         limit: int,
         minimum_score: float,
+        *,
+        permission_tags: Sequence[str] | None = None,
     ) -> list[KnowledgeSearchHitModel]:
-        rows = session.execute(
+        effective_permission_tags = (
+            self._retrieval_permission_tags
+            if permission_tags is None
+            else tuple(_required_permission_tag(tag) for tag in permission_tags)
+        )
+        statement = (
             select(KnowledgeChunkRecord, KnowledgeSourceRecord)
             .join(KnowledgeSourceRecord, KnowledgeChunkRecord.source_id == KnowledgeSourceRecord.id)
             .where(KnowledgeSourceRecord.status == STATUS_INDEXED)
-        ).all()
+        )
+        if effective_permission_tags:
+            statement = statement.where(
+                KnowledgeSourceRecord.classification.in_(effective_permission_tags)
+            )
+        rows = session.execute(statement).all()
 
         hits: list[KnowledgeSearchHitModel] = []
         query_embedding = DEFAULT_EMBEDDING_PROVIDER.embed(query)
