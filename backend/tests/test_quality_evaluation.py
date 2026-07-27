@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,6 +20,162 @@ from app.main import create_app
 from app.models import ChatState, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
+
+
+class RankingMetricTest(unittest.TestCase):
+    def test_recall_mrr_and_ndcg(self) -> None:
+        from app.evaluation import calculate_ranking_metrics
+
+        metrics = calculate_ranking_metrics(
+            ranked_chunk_ids=["wrong", "relevant-a", "relevant-b"],
+            relevant_chunk_ids={"relevant-a", "relevant-b"},
+            k=3,
+        )
+
+        self.assertEqual(metrics.recall, 1.0)
+        self.assertEqual(metrics.mrr, 0.5)
+        self.assertAlmostEqual(metrics.ndcg, 0.6934, places=4)
+
+    def test_metrics_deduplicate_ranked_ids_before_truncation(self) -> None:
+        from app.evaluation import calculate_ranking_metrics
+
+        metrics = calculate_ranking_metrics(
+            ranked_chunk_ids=["a", "a", "wrong", "b"],
+            relevant_chunk_ids={"a", "b"},
+            k=3,
+        )
+
+        self.assertEqual(metrics.recall, 1.0)
+        self.assertEqual(metrics.mrr, 1.0)
+        self.assertAlmostEqual(metrics.ndcg, 0.9197, places=4)
+
+    def test_metrics_handle_non_positive_k_and_empty_relevance(self) -> None:
+        from app.evaluation import calculate_ranking_metrics
+
+        for k in (0, -1):
+            with self.subTest(k=k):
+                self.assertEqual(
+                    calculate_ranking_metrics(["a"], {"a"}, k),
+                    calculate_ranking_metrics([], set(), 0),
+                )
+        self.assertEqual(
+            calculate_ranking_metrics(["a"], set(), 8),
+            calculate_ranking_metrics([], set(), 8),
+        )
+
+    def test_metrics_are_finite_and_truncate_at_k(self) -> None:
+        from app.evaluation import calculate_ranking_metrics
+
+        metrics = calculate_ranking_metrics(
+            ranked_chunk_ids=["wrong", "relevant"],
+            relevant_chunk_ids={"relevant"},
+            k=1,
+        )
+
+        self.assertEqual((metrics.recall, metrics.mrr, metrics.ndcg), (0.0, 0.0, 0.0))
+        self.assertTrue(all(math.isfinite(value) for value in metrics))
+
+
+class ShadowReportPrivacyTest(unittest.TestCase):
+    def test_shadow_report_contains_only_redacted_rollout_data(self) -> None:
+        from app.evaluation_batches import build_shadow_report
+
+        secret_question = "secret quarterly forecast"
+        internal_url = "http://finance.internal.example/private"
+        upstream_error = "HTTP 502 Authorization: Bearer top-secret"
+        report = build_shadow_report(
+            [
+                {
+                    "case_id": "case-critical",
+                    "request_id": "request-1",
+                    "legacy_chunk_ids": ("legacy-1",),
+                    "qwen_chunk_ids": ("qwen-1",),
+                    "legacy_ms": 100.0,
+                    "qwen_ms": 80.0,
+                    "status": "fallback",
+                    "fallback_reason": "reranker_unavailable",
+                    "query": secret_question,
+                    "passage": "raw passage body",
+                    "source_text": "raw source body",
+                    "internal_url": internal_url,
+                    "exception": upstream_error,
+                }
+            ],
+            recall_at_50=0.91,
+            legacy_ndcg_at_8=0.60,
+            qwen3_ndcg_at_8=0.64,
+            critical_case_ids={"case-critical"},
+            permission_leaks=0,
+            structured_aggregate_mismatches=0,
+        )
+
+        serialized = json.dumps(report, ensure_ascii=False)
+        self.assertEqual(
+            set(report["records"][0]),
+            {
+                "caseId",
+                "legacyChunkIds",
+                "qwen3ChunkIds",
+                "mode",
+                "status",
+                "fallbackReason",
+            },
+        )
+        for secret in (
+            secret_question,
+            "raw passage body",
+            "raw source body",
+            internal_url,
+            upstream_error,
+            "top-secret",
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertEqual(report["fallbackReasons"], {"reranker_unavailable": 1})
+        self.assertEqual(report["quality"]["ndcgAt8Delta"], 0.04)
+        self.assertEqual(report["quality"]["criticalTop8Regressions"], ["case-critical"])
+        self.assertIn("critical_top_8_regressions", report["failedGates"])
+
+    def test_unknown_fallback_reason_is_sanitized_to_enum(self) -> None:
+        from app.evaluation_batches import build_shadow_report
+
+        report = build_shadow_report(
+            [
+                {
+                    "case_id": "case-1",
+                    "legacy_chunk_ids": (),
+                    "qwen_chunk_ids": (),
+                    "legacy_ms": 1.0,
+                    "qwen_ms": 2.0,
+                    "status": "failed",
+                    "fallback_reason": "database password leaked in exception",
+                }
+            ]
+        )
+
+        serialized = json.dumps(report)
+        self.assertNotIn("password", serialized)
+        self.assertEqual(report["records"][0]["fallbackReason"], "hybrid_unavailable")
+
+    def test_text_disguised_as_identifiers_is_not_serialized(self) -> None:
+        from app.evaluation_batches import build_shadow_report
+
+        report = build_shadow_report(
+            [
+                {
+                    "case_id": "secret question with spaces",
+                    "legacy_chunk_ids": ("http://internal.example/raw",),
+                    "qwen_chunk_ids": ("raw passage body",),
+                    "legacy_ms": 1.0,
+                    "qwen_ms": 2.0,
+                    "status": "completed",
+                }
+            ]
+        )
+
+        serialized = json.dumps(report)
+        self.assertNotIn("secret question", serialized)
+        self.assertNotIn("internal.example", serialized)
+        self.assertNotIn("raw passage", serialized)
 
 
 def add_indexed_source(
@@ -1552,6 +1710,9 @@ class QualityEvaluationSqlRepositoryTest(unittest.TestCase):
         self.assertEqual(persisted_runs[0].id, runs[0].id)
         self.assertEqual(persisted_runs[0].status, "passed")
         self.assertEqual(persisted_runs[0].hits[0].source_id, "kb-policy")
+        self.assertEqual(persisted_runs[0].recall_at_k, 1.0)
+        self.assertEqual(persisted_runs[0].mrr, 1.0)
+        self.assertEqual(persisted_runs[0].ndcg_at_k, 1.0)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, NamedTuple
 from uuid import uuid4
 
 from .models import KnowledgeSearchHitModel
@@ -21,6 +22,12 @@ EVALUATION_TAG_MAX_LENGTH = 80
 
 class EvaluationCaseDuplicateError(ValueError):
     pass
+
+
+class RankingMetrics(NamedTuple):
+    recall: float
+    mrr: float
+    ndcg: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +90,9 @@ class EvaluationRunModel:
     sequence: int = 0
     hits: list[EvaluationHitModel] = field(default_factory=list)
     batch_id: str | None = None
+    recall_at_k: float = 0.0
+    mrr: float = 0.0
+    ndcg_at_k: float = 0.0
 
 
 @dataclass(slots=True)
@@ -104,6 +114,33 @@ class EvaluationBatchModel:
 
 def normalized_unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+def calculate_ranking_metrics(
+    ranked_chunk_ids: Iterable[str],
+    relevant_chunk_ids: Iterable[str],
+    k: int,
+) -> RankingMetrics:
+    """Return binary Recall, MRR, and NDCG for a deduplicated Top-K ranking."""
+
+    if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+        return RankingMetrics(0.0, 0.0, 0.0)
+    relevant = set(relevant_chunk_ids)
+    if not relevant:
+        return RankingMetrics(0.0, 0.0, 0.0)
+    ranked = list(dict.fromkeys(ranked_chunk_ids))[:k]
+    relevant_ranks = [rank for rank, chunk_id in enumerate(ranked, 1) if chunk_id in relevant]
+    recall = len(relevant_ranks) / len(relevant)
+    mrr = 0.0 if not relevant_ranks else 1.0 / relevant_ranks[0]
+    dcg = sum(1.0 / math.log2(rank + 1) for rank in relevant_ranks)
+    ideal_hits = min(len(relevant), k)
+    ideal_dcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_hits + 1))
+    ndcg = 0.0 if ideal_dcg == 0 else dcg / ideal_dcg
+    return RankingMetrics(
+        round(recall, 4),
+        round(mrr, 4),
+        round(ndcg, 4),
+    )
 
 
 def normalize_evaluation_filter_value(value: str | None) -> str | None:
@@ -327,6 +364,11 @@ def build_evaluation_run(
         if case.expected_terms
         else 1.0
     )
+    ranking_metrics = calculate_ranking_metrics(
+        matched_source_ids,
+        case.expected_source_ids,
+        case.top_k,
+    )
     diagnostic_hits = [
         EvaluationHitModel(
             rank=hit.rank,
@@ -373,6 +415,9 @@ def build_evaluation_run(
         completed_at=display_datetime_label(),
         hits=diagnostic_hits,
         batch_id=batch_id,
+        recall_at_k=ranking_metrics.recall,
+        mrr=ranking_metrics.mrr,
+        ndcg_at_k=ranking_metrics.ndcg,
     )
 
 
@@ -403,4 +448,7 @@ def build_failed_evaluation_run(
         completed_at=timestamp,
         hits=[],
         batch_id=batch_id,
+        recall_at_k=0.0,
+        mrr=0.0,
+        ndcg_at_k=0.0,
     )

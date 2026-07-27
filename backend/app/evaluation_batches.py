@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal
@@ -12,6 +14,22 @@ EvaluationFailureReason = Literal[
     "missing_source",
     "missing_term",
 ]
+_SANITIZED_FALLBACK_REASONS = frozenset(
+    {
+        "alias_mismatch",
+        "circuit_open",
+        "embedding_unavailable",
+        "hybrid_unavailable",
+        "qdrant_timeout",
+        "qdrant_unavailable",
+        "qwen_empty_legacy_nonempty",
+        "qwen_timeout",
+        "reranker_unavailable",
+        "retrieval_scope_unavailable",
+        "shadow_queue_full",
+    }
+)
+_REPORT_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +54,9 @@ class EvaluationBatchSummaryModel:
     average_term_recall: float
     average_top_score: float
     maximum_top_score: float
+    recall_at_k: float = 0.0
+    mrr: float = 0.0
+    ndcg_at_k: float = 0.0
     category_breakdown: list[EvaluationMetricGroupModel] = field(default_factory=list)
     tag_breakdown: list[EvaluationMetricGroupModel] = field(default_factory=list)
 
@@ -54,6 +75,9 @@ class EvaluationBatchMetricDeltaModel:
     average_term_recall: float
     average_top_score: float
     maximum_top_score: float
+    recall_at_k: float = 0.0
+    mrr: float = 0.0
+    ndcg_at_k: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +90,15 @@ class EvaluationBatchComparisonModel:
     regressed_case_ids: list[str]
     left_only_case_ids: list[str]
     right_only_case_ids: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalQualityGateResult:
+    passed: bool
+    failed_gates: tuple[str, ...]
+    ndcg_at_8_delta: float
+    ndcg_improvement_target: float
+    ndcg_improvement_target_met: bool
 
 
 def ratio(numerator: int | float, denominator: int | float) -> float:
@@ -138,6 +171,9 @@ def summarize_evaluation_runs(
         ),
         average_top_score=average(run.top_score for run in runs),
         maximum_top_score=max((run.top_score for run in runs), default=0.0),
+        recall_at_k=average(run.recall_at_k for run in answer_runs),
+        mrr=average(run.mrr for run in answer_runs),
+        ndcg_at_k=average(run.ndcg_at_k for run in answer_runs),
         category_breakdown=_metric_groups(category_statuses),
         tag_breakdown=_metric_groups(tag_statuses),
     )
@@ -204,7 +240,203 @@ def _metric_delta(
             right.maximum_top_score,
             left.maximum_top_score,
         ),
+        recall_at_k=_float_delta(right.recall_at_k, left.recall_at_k),
+        mrr=_float_delta(right.mrr, left.mrr),
+        ndcg_at_k=_float_delta(right.ndcg_at_k, left.ndcg_at_k),
     )
+
+
+def evaluate_retrieval_quality(
+    *,
+    recall_at_50: float,
+    legacy_ndcg_at_8: float,
+    qwen3_ndcg_at_8: float,
+    critical_top_8_regressions: int,
+    permission_leaks: int,
+    structured_aggregate_mismatches: int,
+) -> RetrievalQualityGateResult:
+    failed: list[str] = []
+    valid_recall = _unit_interval(recall_at_50)
+    valid_legacy_ndcg = _unit_interval(legacy_ndcg_at_8)
+    valid_qwen_ndcg = _unit_interval(qwen3_ndcg_at_8)
+    if not valid_recall or recall_at_50 < 0.90:
+        failed.append("recall_at_50")
+    if not valid_legacy_ndcg or not valid_qwen_ndcg or qwen3_ndcg_at_8 < legacy_ndcg_at_8:
+        failed.append("ndcg_at_8_not_worse_than_legacy")
+    for name, value in (
+        ("critical_top_8_regressions", critical_top_8_regressions),
+        ("permission_leaks", permission_leaks),
+        ("structured_aggregate_mismatches", structured_aggregate_mismatches),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            failed.append(name)
+    delta = (
+        round(qwen3_ndcg_at_8 - legacy_ndcg_at_8, 4)
+        if valid_legacy_ndcg and valid_qwen_ndcg
+        else 0.0
+    )
+    return RetrievalQualityGateResult(
+        passed=not failed,
+        failed_gates=tuple(failed),
+        ndcg_at_8_delta=delta,
+        ndcg_improvement_target=0.05,
+        ndcg_improvement_target_met=delta >= 0.05,
+    )
+
+
+def build_shadow_report(
+    records: Iterable[object],
+    *,
+    recall_at_50: float = 0.0,
+    legacy_ndcg_at_8: float = 0.0,
+    qwen3_ndcg_at_8: float = 0.0,
+    critical_case_ids: Iterable[str] = (),
+    permission_leaks: int = 0,
+    structured_aggregate_mismatches: int = 0,
+) -> dict[str, object]:
+    safe_records: list[dict[str, object]] = []
+    legacy_latencies: list[float] = []
+    qwen_latencies: list[float] = []
+    fallback_counts: dict[str, int] = {}
+    critical = set(critical_case_ids)
+    critical_regressions: list[str] = []
+    error_count = 0
+    for record in records:
+        case_id = _safe_identifier(_record_value(record, "case_id", "request_id", default=""))
+        legacy_ids = _identifier_tuple(_record_value(record, "legacy_chunk_ids", default=()))
+        qwen_ids = _identifier_tuple(_record_value(record, "qwen_chunk_ids", default=()))
+        legacy_ms = _finite_nonnegative(_record_value(record, "legacy_ms", default=0.0))
+        qwen_ms = _finite_nonnegative(_record_value(record, "qwen_ms", default=0.0))
+        if legacy_ms is not None:
+            legacy_latencies.append(legacy_ms)
+        if qwen_ms is not None:
+            qwen_latencies.append(qwen_ms)
+        status = str(_record_value(record, "status", default="failed"))
+        if status not in {"completed", "failed", "fallback", "skipped"}:
+            status = "failed"
+        if status == "failed" or legacy_ms is None or qwen_ms is None:
+            error_count += 1
+        fallback = _sanitized_fallback_reason(
+            _record_value(record, "fallback_reason", default=None)
+        )
+        if fallback is not None:
+            fallback_counts[fallback] = fallback_counts.get(fallback, 0) + 1
+        safe_records.append(
+            {
+                "caseId": case_id,
+                "legacyChunkIds": list(legacy_ids),
+                "qwen3ChunkIds": list(qwen_ids),
+                "mode": "legacy-vs-qwen3",
+                "status": status,
+                "fallbackReason": fallback,
+            }
+        )
+        if case_id in critical and _is_top_8_regression(record, legacy_ids, qwen_ids):
+            critical_regressions.append(case_id)
+    critical_regressions = list(dict.fromkeys(critical_regressions))
+    gates = evaluate_retrieval_quality(
+        recall_at_50=recall_at_50,
+        legacy_ndcg_at_8=legacy_ndcg_at_8,
+        qwen3_ndcg_at_8=qwen3_ndcg_at_8,
+        critical_top_8_regressions=len(critical_regressions),
+        permission_leaks=permission_leaks,
+        structured_aggregate_mismatches=structured_aggregate_mismatches,
+    )
+    return {
+        "records": safe_records,
+        "latencyMs": {
+            "legacyP50": _percentile(legacy_latencies, 0.50),
+            "legacyP95": _percentile(legacy_latencies, 0.95),
+            "qwen3P50": _percentile(qwen_latencies, 0.50),
+            "qwen3P95": _percentile(qwen_latencies, 0.95),
+        },
+        "errorCount": error_count,
+        "fallbackReasons": dict(sorted(fallback_counts.items())),
+        "quality": {
+            "recallAt50": recall_at_50 if _unit_interval(recall_at_50) else 0.0,
+            "legacyNdcgAt8": legacy_ndcg_at_8 if _unit_interval(legacy_ndcg_at_8) else 0.0,
+            "qwen3NdcgAt8": qwen3_ndcg_at_8 if _unit_interval(qwen3_ndcg_at_8) else 0.0,
+            "ndcgAt8Delta": gates.ndcg_at_8_delta,
+            "ndcgImprovementTarget": gates.ndcg_improvement_target,
+            "ndcgImprovementTargetMet": gates.ndcg_improvement_target_met,
+            "criticalTop8Regressions": critical_regressions,
+            "permissionLeaks": permission_leaks,
+            "structuredAggregateMismatches": structured_aggregate_mismatches,
+        },
+        "passed": gates.passed,
+        "failedGates": list(gates.failed_gates),
+    }
+
+
+def _record_value(record: object, *names: str, default: object) -> object:
+    for name in names:
+        if isinstance(record, Mapping) and name in record:
+            return record[name]
+        if hasattr(record, name):
+            return getattr(record, name)
+    return default
+
+
+def _identifier_tuple(value: object) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes, bytearray)):
+        return ()
+    try:
+        return tuple(
+            identifier
+            for item in value  # type: ignore[union-attr]
+            if (identifier := _safe_identifier(item)) != "redacted"
+        )
+    except TypeError:
+        return ()
+
+
+def _safe_identifier(value: object) -> str:
+    normalized = str(value)
+    return normalized if _REPORT_IDENTIFIER_PATTERN.fullmatch(normalized) else "redacted"
+
+
+def _finite_nonnegative(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _unit_interval(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and 0.0 <= float(value) <= 1.0
+    )
+
+
+def _sanitized_fallback_reason(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value)
+    return normalized if normalized in _SANITIZED_FALLBACK_REASONS else "hybrid_unavailable"
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(0, math.ceil(len(ordered) * quantile) - 1)
+    return round(ordered[index], 4)
+
+
+def _is_top_8_regression(
+    record: object,
+    legacy_ids: tuple[str, ...],
+    qwen_ids: tuple[str, ...],
+) -> bool:
+    relevant = set(_identifier_tuple(_record_value(record, "relevant_chunk_ids", default=())))
+    legacy_top = set(legacy_ids[:8])
+    qwen_top = set(qwen_ids[:8])
+    if relevant:
+        return bool(legacy_top & relevant) and not bool(qwen_top & relevant)
+    return bool(legacy_top - qwen_top)
 
 
 def _stable_unique_case_ids(case_ids: Iterable[str]) -> list[str]:

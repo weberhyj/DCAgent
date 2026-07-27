@@ -83,6 +83,9 @@ def make_evaluation_run(
     missing_terms: list[str] | None = None,
     source_recall: float = 1.0,
     term_recall: float = 1.0,
+    recall_at_k: float = 1.0,
+    mrr: float = 1.0,
+    ndcg_at_k: float = 1.0,
     top_score: float | None = None,
     sequence: int = 0,
     completed_at: str = "2026-07-13 10:00:01",
@@ -119,6 +122,9 @@ def make_evaluation_run(
         completed_at=completed_at,
         sequence=sequence,
         hits=[],
+        recall_at_k=recall_at_k,
+        mrr=mrr,
+        ndcg_at_k=ndcg_at_k,
     )
 
 
@@ -318,6 +324,38 @@ class EvaluationBatchContractTest(unittest.TestCase):
 
 
 class EvaluationBatchSummaryTest(unittest.TestCase):
+    def test_summarizes_ranking_metrics_without_replacing_source_and_term_recall(self) -> None:
+        from app.evaluation_batches import summarize_evaluation_runs
+
+        runs = [
+            make_evaluation_run(
+                "case-a",
+                "passed",
+                source_recall=0.5,
+                term_recall=0.75,
+                recall_at_k=0.9,
+                mrr=0.5,
+                ndcg_at_k=0.6,
+            ),
+            make_evaluation_run(
+                "case-b",
+                "passed",
+                source_recall=1.0,
+                term_recall=1.0,
+                recall_at_k=1.0,
+                mrr=1.0,
+                ndcg_at_k=0.8,
+            ),
+        ]
+
+        summary = summarize_evaluation_runs(runs, {})
+
+        self.assertEqual(summary.average_source_recall, 0.75)
+        self.assertEqual(summary.average_term_recall, 0.875)
+        self.assertEqual(summary.recall_at_k, 0.95)
+        self.assertEqual(summary.mrr, 0.75)
+        self.assertEqual(summary.ndcg_at_k, 0.7)
+
     def test_summarizes_all_metrics_and_breakdowns(self) -> None:
         from app.evaluation import EvaluationCaseModel, EvaluationRunModel
 
@@ -571,6 +609,100 @@ class EvaluationBatchComparisonTest(unittest.TestCase):
         self.assertTrue(callable(compare))
         return compare
 
+    def test_reports_legacy_vs_qwen_ranking_metric_deltas(self) -> None:
+        compare = self.comparison_function()
+        legacy = make_evaluation_batch("legacy", ["case-1"])
+        qwen3 = make_evaluation_batch("qwen3", ["case-1"])
+
+        comparison = compare(
+            legacy,
+            [
+                make_evaluation_run(
+                    "case-1",
+                    "passed",
+                    recall_at_k=0.90,
+                    mrr=0.50,
+                    ndcg_at_k=0.60,
+                )
+            ],
+            qwen3,
+            [
+                make_evaluation_run(
+                    "case-1",
+                    "passed",
+                    recall_at_k=0.95,
+                    mrr=0.75,
+                    ndcg_at_k=0.65,
+                )
+            ],
+        )
+
+        self.assertEqual(comparison.metric_delta.recall_at_k, 0.05)
+        self.assertEqual(comparison.metric_delta.mrr, 0.25)
+        self.assertEqual(comparison.metric_delta.ndcg_at_k, 0.05)
+
+
+class RetrievalQualityGateTest(unittest.TestCase):
+    def test_quality_gates_fail_closed_and_target_is_reported_not_hard_gated(self) -> None:
+        from app.evaluation_batches import evaluate_retrieval_quality
+
+        passing = evaluate_retrieval_quality(
+            recall_at_50=0.90,
+            legacy_ndcg_at_8=0.60,
+            qwen3_ndcg_at_8=0.63,
+            critical_top_8_regressions=0,
+            permission_leaks=0,
+            structured_aggregate_mismatches=0,
+        )
+        failing = evaluate_retrieval_quality(
+            recall_at_50=0.8999,
+            legacy_ndcg_at_8=0.60,
+            qwen3_ndcg_at_8=0.59,
+            critical_top_8_regressions=1,
+            permission_leaks=1,
+            structured_aggregate_mismatches=1,
+        )
+
+        self.assertTrue(passing.passed)
+        self.assertEqual(passing.ndcg_at_8_delta, 0.03)
+        self.assertFalse(passing.ndcg_improvement_target_met)
+        self.assertEqual(passing.failed_gates, ())
+        self.assertFalse(failing.passed)
+        self.assertEqual(
+            failing.failed_gates,
+            (
+                "recall_at_50",
+                "ndcg_at_8_not_worse_than_legacy",
+                "critical_top_8_regressions",
+                "permission_leaks",
+                "structured_aggregate_mismatches",
+            ),
+        )
+
+    def test_quality_gates_reject_nan_and_infinity(self) -> None:
+        from app.evaluation_batches import evaluate_retrieval_quality
+
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                result = evaluate_retrieval_quality(
+                    recall_at_50=value,
+                    legacy_ndcg_at_8=0.6,
+                    qwen3_ndcg_at_8=0.7,
+                    critical_top_8_regressions=0,
+                    permission_leaks=0,
+                    structured_aggregate_mismatches=0,
+                )
+                self.assertFalse(result.passed)
+                self.assertIn("recall_at_50", result.failed_gates)
+
+
+class EvaluationBatchComparisonBehaviorTest(unittest.TestCase):
+    def comparison_function(self):
+        module = importlib.import_module("app.evaluation_batches")
+        compare = getattr(module, "compare_evaluation_batches", None)
+        self.assertTrue(callable(compare))
+        return compare
+
     def test_compares_shared_case_status_changes_and_batch_only_cases(self) -> None:
         compare = self.comparison_function()
         left_runs = [
@@ -748,6 +880,9 @@ class EvaluationBatchComparisonTest(unittest.TestCase):
                 "average_term_recall": 0.0,
                 "average_top_score": 0.0,
                 "maximum_top_score": 0.0,
+                "recall_at_k": 0.0,
+                "mrr": 0.0,
+                "ndcg_at_k": 0.0,
             },
         )
 
@@ -858,6 +993,9 @@ class EvaluationBatchComparisonTest(unittest.TestCase):
                 "average_term_recall": 0.0,
                 "average_top_score": 0.0,
                 "maximum_top_score": 0.0,
+                "recall_at_k": 0.0,
+                "mrr": 0.0,
+                "ndcg_at_k": 0.0,
             },
         )
 

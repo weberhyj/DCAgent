@@ -3,15 +3,50 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from app.llm import LLMProviderError
 from app.main import create_app
 from app.models import ChatState
 from app.repository import InMemoryChatRepository
 
 
 class RagAcceptanceTest(unittest.TestCase):
+    def test_model_failure_returns_explicit_unavailable_without_raw_retrieval_chunks(self) -> None:
+        raw_chunk = "CONFIDENTIAL raw retrieved payroll passage"
+        internal_url = "http://physoc.internal.example/private"
+
+        class FailingPhysocProvider:
+            def generate_reply(self, request):
+                raise LLMProviderError("大模型服务暂时不可用，请稍后重试。")
+
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[]),
+            llm_provider=FailingPhysocProvider(),
+        )
+        client = TestClient(create_app(repository=repository, upload_dir=Path(self.temp_dir.name)))
+        upload = client.post(
+            "/api/knowledge/uploads",
+            data={"classification": "internal"},
+            files={"file": ("policy.txt", raw_chunk.encode(), "text/plain")},
+        )
+        self.assertEqual(upload.status_code, 200)
+        conversation_id = client.post("/api/conversations").json()["activeConversationId"]
+
+        with patch("app.routes.logger"):
+            response = client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                json={"content": "payroll policy", "mode": "source"},
+            )
+
+        self.assertEqual(response.status_code, 502)
+        serialized = response.text
+        self.assertIn("大模型服务暂时不可用", serialized)
+        self.assertNotIn(raw_chunk, serialized)
+        self.assertNotIn(internal_url, serialized)
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         repository = InMemoryChatRepository(

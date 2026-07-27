@@ -21,6 +21,15 @@ class _ImmediateProcess:
 
 
 class BenchmarkReportTest(unittest.TestCase):
+    def test_hybrid_benchmark_bootstraps_backend_before_app_imports(self) -> None:
+        source = (ROOT / "hybrid_retrieval_benchmark.py").read_text(encoding="utf-8")
+
+        path_insert = source.index("sys.path.insert")
+        first_app_import = source.index("from app.")
+
+        self.assertLess(path_insert, first_app_import)
+        self.assertIn("Path(__file__).resolve()", source)
+
     def test_metric_gate_validates_shape_and_is_frozen_with_slots(self) -> None:
         from tools.benchmarks.report import MetricGate
 

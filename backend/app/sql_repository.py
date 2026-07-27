@@ -38,6 +38,7 @@ from .evaluation import (
     build_evaluation_case_facets,
     build_evaluation_run,
     build_failed_evaluation_run,
+    calculate_ranking_metrics,
     evaluation_case_dedup_key,
     evaluation_case_lookup_keys,
     filter_evaluation_cases,
@@ -373,6 +374,12 @@ def evaluation_hit_from_dict(payload: dict[str, Any]) -> EvaluationHitModel:
 
 
 def evaluation_run_from_record(record: EvaluationRunRecord) -> EvaluationRunModel:
+    hits = [evaluation_hit_from_dict(payload) for payload in record.hits or []]
+    ranking_metrics = calculate_ranking_metrics(
+        (hit.source_id for hit in hits),
+        record.expected_source_ids or [],
+        len(hits),
+    )
     return EvaluationRunModel(
         id=record.id,
         case_id=record.case_id,
@@ -394,8 +401,11 @@ def evaluation_run_from_record(record: EvaluationRunRecord) -> EvaluationRunMode
         started_at=record.started_at,
         completed_at=record.completed_at,
         sequence=record.sequence,
-        hits=[evaluation_hit_from_dict(payload) for payload in record.hits or []],
+        hits=hits,
         batch_id=record.batch_id,
+        recall_at_k=ranking_metrics.recall,
+        mrr=ranking_metrics.mrr,
+        ndcg_at_k=ranking_metrics.ndcg,
     )
 
 
