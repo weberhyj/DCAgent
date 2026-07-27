@@ -135,6 +135,13 @@ class BackendUvContractTest(unittest.TestCase):
                 "jieba>=0.42",
                 "FlagEmbedding>=1.3",
                 "onnxruntime>=1.22",
+                "fastembed>=0.7",
+                "numpy>=2",
+                "openvino>=2025",
+                "optimum[onnxruntime]>=1.27",
+                "optimum-intel[openvino]>=1.24",
+                "torch>=2.7",
+                "transformers>=4.53",
                 "psycopg[binary]>=3.2",
                 "psutil>=7",
             },
@@ -171,7 +178,9 @@ class BackendUvContractTest(unittest.TestCase):
         bounded = [requirement for requirement in requirements if "<" in requirement]
         self.assertEqual([], bounded)
 
-    def test_api_runtime_dependencies_are_available_without_dependency_groups(self) -> None:
+    def test_api_runtime_dependencies_are_available_without_dependency_groups(
+        self,
+    ) -> None:
         pyproject = self.load_pyproject()
         dependency_names = {
             self.requirement_name_and_specifier(requirement)[0]
@@ -253,6 +262,7 @@ class BackendUvContractTest(unittest.TestCase):
         for filename in (
             "backend.Dockerfile",
             "embedding.Dockerfile",
+            "reranker.Dockerfile",
             "worker.Dockerfile",
         ):
             with self.subTest(filename=filename):
@@ -339,6 +349,30 @@ class BackendUvContractTest(unittest.TestCase):
             ),
             "The Docker build context must not allowlist any requirements file",
         )
+
+    def test_model_service_images_use_single_offline_qwen3_factories(self) -> None:
+        expected_commands = {
+            "embedding.Dockerfile": (
+                "app.embedding_service:create_production_app",
+                "8081",
+            ),
+            "reranker.Dockerfile": (
+                "app.reranker_service:create_production_app",
+                "8082",
+            ),
+        }
+        for filename, (factory, port) in expected_commands.items():
+            with self.subTest(filename=filename):
+                text = (REPOSITORY_ROOT / "deploy" / "docker" / filename).read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn(
+                    f'CMD ["python", "-m", "uvicorn", "{factory}", "--factory", '
+                    f'"--host", "0.0.0.0", "--port", "{port}"]',
+                    text,
+                )
+                self.assertNotRegex(text, r"(?m)^EXPOSE\s+")
+                self.assertEqual(text.count('"--workers"'), 0)
 
     def test_uv_lock_uses_only_approved_hashed_registry_artifacts(self) -> None:
         packages = self.load_uv_lock()["package"]

@@ -31,8 +31,7 @@ RUN case "$DCAGENT_UID" in ''|*[!0-9]*) exit 1 ;; esac \
     && groupadd --gid "$DCAGENT_GID" dcagent \
     && useradd --uid "$DCAGENT_UID" --gid "$DCAGENT_GID" --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin dcagent \
     && test "$(id -u dcagent)" = "$DCAGENT_UID" \
-    && test "$(id -g dcagent)" = "$DCAGENT_GID" \
-    && install -d -o dcagent -g dcagent /app/uploads/knowledge
+    && test "$(id -g dcagent)" = "$DCAGENT_GID"
 ENV HOME=/nonexistent \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
@@ -40,4 +39,4 @@ ENV HOME=/nonexistent \
     TOKENIZERS_PARALLELISM=false
 USER dcagent
 
-CMD ["python", "-m", "uvicorn", "app.embedding_service:create_production_app", "--factory", "--host", "0.0.0.0", "--port", "8081"]
+CMD ["python", "-m", "uvicorn", "app.reranker_service:create_production_app", "--factory", "--host", "0.0.0.0", "--port", "8082"]

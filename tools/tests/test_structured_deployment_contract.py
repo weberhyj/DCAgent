@@ -23,6 +23,15 @@ REQUIRED_ENV_KEYS = (
     "PARQUET_ROOT",
     "STRUCTURED_QUERY_TIMEOUT_SECONDS",
     "STRUCTURED_INGEST_BATCH_ROWS",
+    "RETRIEVAL_MODE",
+    "RETRIEVAL_SHADOW_PERCENT",
+    "RETRIEVAL_CANARY_PERCENT",
+    "RETRIEVAL_PERMISSION_TAGS",
+    "QDRANT_COLLECTION_ALIAS",
+    "EMBEDDING_MODEL_DIR",
+    "RERANKER_MODEL_DIR",
+    "EMBEDDING_RUNTIME",
+    "RERANKER_RUNTIME",
 )
 
 
@@ -56,6 +65,46 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(values["STRUCTURED_QUERY_ENABLED"].lower(), "false")
                 self.assertEqual(values["STRUCTURED_QUERY_TIMEOUT_SECONDS"], "4")
                 self.assertEqual(values["STRUCTURED_INGEST_BATCH_ROWS"], "50000")
+                self.assertEqual(values["RETRIEVAL_MODE"], "shadow")
+                self.assertEqual(values["RETRIEVAL_SHADOW_PERCENT"], "10")
+                self.assertEqual(values["RETRIEVAL_CANARY_PERCENT"], "0")
+                self.assertEqual(values["RETRIEVAL_PERMISSION_TAGS"], "internal")
+                self.assertEqual(
+                    values["QDRANT_COLLECTION_ALIAS"], "knowledge_chunks_current"
+                )
+                self.assertEqual(values["EMBEDDING_MODEL_DIR"], "qwen3-embedding-0.6b")
+                self.assertEqual(values["RERANKER_MODEL_DIR"], "qwen3-reranker-0.6b")
+                self.assertEqual(values["EMBEDDING_RUNTIME"], "openvino")
+                self.assertEqual(values["RERANKER_RUNTIME"], "openvino")
+
+    def test_api_receives_retrieval_rollout_and_pinned_metadata(self) -> None:
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        api = service_block(compose, "api")
+        for key in (
+            "RETRIEVAL_MODE",
+            "RETRIEVAL_SHADOW_PERCENT",
+            "RETRIEVAL_CANARY_PERCENT",
+            "RETRIEVAL_PERMISSION_TAGS",
+            "QDRANT_COLLECTION_ALIAS",
+            "EMBEDDING_SERVICE_URL",
+            "RERANKER_SERVICE_URL",
+            "EMBEDDING_MODEL_NAME",
+            "EMBEDDING_MODEL_VERSION",
+            "EMBEDDING_MODEL_SHA256",
+            "EMBEDDING_MODEL_DIMENSIONS",
+            "EMBEDDING_MODEL_NORMALIZED",
+            "EMBEDDING_ENCODING_PROFILE_SHA256",
+            "EMBEDDING_PROTOCOL_VERSION",
+            "RERANKER_MODEL_NAME",
+            "RERANKER_MODEL_VERSION",
+            "RERANKER_MODEL_SHA256",
+            "RERANKER_PROMPT_PROFILE_SHA256",
+            "RERANKER_PROTOCOL_VERSION",
+        ):
+            with self.subTest(key=key):
+                self.assertRegex(api, rf"(?m)^\s+{key}:")
 
     def test_env_examples_do_not_embed_password_values(self) -> None:
         for path in ENV_EXAMPLES:

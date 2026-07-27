@@ -14,6 +14,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def service_block(compose: str, service: str) -> str:
+    match = re.search(
+        rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|^networks:)",
+        compose,
+    )
+    if match is None:
+        raise AssertionError(f"service {service!r} is missing")
+    return match.group("body")
+
+
 class ComposeContractTest(unittest.TestCase):
     def test_declares_required_offline_services_and_private_network(self) -> None:
         compose_path = REPO_ROOT / "deploy" / "offline" / "compose.yaml"
@@ -26,6 +36,7 @@ class ComposeContractTest(unittest.TestCase):
             "clamav:",
             "schema-migration:",
             "embedding-service:",
+            "reranker-service:",
             "api:",
             "ingestion-worker:",
             "llama:",
@@ -42,6 +53,44 @@ class ComposeContractTest(unittest.TestCase):
         self.assertIn('CLAMAV_NO_FRESHCLAMD: "true"', text)
         self.assertNotIn("wget -qO- http://127.0.0.1:6333", text)
         self.assertNotIn("/var/lib/clamav:ro", text)
+
+    def test_compose_has_independent_cpu_bounded_model_services(self) -> None:
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        service_requirements = {
+            "embedding-service": (
+                "EMBEDDING_MODEL_ROOT",
+                "EMBEDDING_MODEL_SHA256",
+                "EMBEDDING_RUNTIME",
+                "EMBEDDING_BATCH_MAX_ITEMS",
+                "EMBEDDING_QUEUE_MAX_ITEMS",
+                "EMBEDDING_BATCH_WAIT_MS",
+            ),
+            "reranker-service": (
+                "RERANKER_MODEL_ROOT",
+                "RERANKER_MODEL_SHA256",
+                "RERANKER_RUNTIME",
+                "RERANKER_BATCH_MAX_ITEMS",
+                "RERANKER_QUEUE_MAX_ITEMS",
+                "RERANKER_BATCH_WAIT_MS",
+            ),
+        }
+        for service, variables in service_requirements.items():
+            block = service_block(compose, service)
+            with self.subTest(service=service):
+                self.assertIn('HF_HUB_OFFLINE: "1"', block)
+                self.assertIn('TRANSFORMERS_OFFLINE: "1"', block)
+                self.assertIn("networks:\n      - offline", block)
+                self.assertNotRegex(block, r"(?m)^\s+ports:")
+                self.assertRegex(block, r"(?m)^\s+cpus:")
+                self.assertRegex(block, r"(?m)^\s+mem_limit:")
+                self.assertRegex(block, r"(?m)^\s+OMP_NUM_THREADS:")
+                self.assertRegex(block, r"(?m)^\s+OPENVINO_NUM_THREADS:")
+                self.assertIn("target: /models", block)
+                self.assertIn("read_only: true", block)
+                for variable in variables:
+                    self.assertRegex(block, rf"(?m)^\s+{variable}:")
 
     def test_compose_limits_physoc_egress_to_api(self) -> None:
         compose_text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
@@ -75,6 +124,7 @@ class ComposeContractTest(unittest.TestCase):
             "clamav",
             "schema-migration",
             "embedding-service",
+            "reranker-service",
             "ingestion-worker",
             "llama",
         ):
@@ -1743,7 +1793,7 @@ class ComposeContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertEqual(
-            4,
+            5,
             len(
                 re.findall(
                     r"DCAGENT_UID: \$\{DCAGENT_UID:\?[^}]+\}",
@@ -1752,7 +1802,7 @@ class ComposeContractTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            4,
+            5,
             len(
                 re.findall(
                     r"DCAGENT_GID: \$\{DCAGENT_GID:\?[^}]+\}",
@@ -1766,6 +1816,7 @@ class ComposeContractTest(unittest.TestCase):
             "backend.Dockerfile",
             "worker.Dockerfile",
             "embedding.Dockerfile",
+            "reranker.Dockerfile",
         ):
             dockerfile = REPO_ROOT / "deploy" / "docker" / dockerfile_name
             text = dockerfile.read_text(encoding="utf-8")
@@ -1782,8 +1833,12 @@ class ComposeContractTest(unittest.TestCase):
             writable_directory_command = (
                 "install -d -o dcagent -g dcagent /app/uploads/knowledge"
             )
-            self.assertIn(writable_directory_command, text)
-            self.assertEqual(text.count("install -d -o dcagent -g dcagent"), 1)
+            if dockerfile_name == "reranker.Dockerfile":
+                self.assertNotIn(writable_directory_command, text)
+                self.assertNotIn("install -d -o dcagent -g dcagent", text)
+            else:
+                self.assertIn(writable_directory_command, text)
+                self.assertEqual(text.count("install -d -o dcagent -g dcagent"), 1)
             self.assertNotIn("COPY --chown", text)
             self.assertNotRegex(text, r"\bchown\b")
             self.assertNotRegex(text, r"\bchown\s+-R\b[^\n]*\s/app(?:\s|$)")
@@ -1823,28 +1878,29 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn(useradd_command, text)
             self.assertNotRegex(text, r"(?<!no-)--create-home\b")
             self.assertIn("ENV HOME=/nonexistent", text)
-            self.assertLess(
-                text.index("useradd --uid"), text.index(writable_directory_command)
-            )
             self.assertLess(text.index("useradd --uid"), text.rindex("USER dcagent"))
-            self.assertLess(
-                text.index(writable_directory_command), text.rindex("USER dcagent")
-            )
+            if dockerfile_name != "reranker.Dockerfile":
+                self.assertLess(
+                    text.index("useradd --uid"), text.index(writable_directory_command)
+                )
+                self.assertLess(
+                    text.index(writable_directory_command), text.rindex("USER dcagent")
+                )
             self.assertLess(
                 text.index("ENV HOME=/nonexistent"), text.rindex("USER dcagent")
             )
             commands.add(
                 next(line for line in text.splitlines() if line.startswith("CMD "))
             )
-        self.assertEqual(3, len(commands))
+        self.assertEqual(4, len(commands))
 
     def test_bind_mounts_never_implicitly_create_host_paths(self) -> None:
         compose_text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
             encoding="utf-8"
         )
         self.assertNotRegex(compose_text, r"(?m)^\s*-\s+\$\{[^}]+\}[^\n]*:")
-        self.assertEqual(13, compose_text.count("type: bind"))
-        self.assertEqual(13, compose_text.count("create_host_path: false"))
+        self.assertEqual(14, compose_text.count("type: bind"))
+        self.assertEqual(14, compose_text.count("create_host_path: false"))
 
     def test_linux_identity_and_path_hardening_contract(self) -> None:
         script_text = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(

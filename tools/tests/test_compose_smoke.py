@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -268,6 +269,22 @@ class ComposeSmokeTest(unittest.TestCase):
             self.assertNotIn(
                 forbidden,
                 compose_smoke.build_compose_command("up", wrapper_path=wrapper),
+            )
+
+    def test_standard_api_smoke_starts_both_private_model_dependencies(self) -> None:
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        api = re.search(
+            r"(?ms)^  api:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|^networks:)",
+            compose,
+        )
+        self.assertIsNotNone(api)
+        assert api is not None
+        for service in ("embedding-service", "reranker-service"):
+            self.assertRegex(
+                api.group("body"),
+                rf"(?ms)^\s+{re.escape(service)}:\n\s+condition: service_healthy",
             )
 
     def test_production_runner_rejects_non_repository_wrapper(self) -> None:

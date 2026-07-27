@@ -19,7 +19,7 @@
   },
   "$defs": {
     "artifact": {
-      "description": "Local Docling artifacts, PaddleOCR detection models, PaddleOCR recognition models, PaddleOCR classification models, PaddlePaddle CPU wheels, LibreOffice binaries, and Poppler/native libraries, each with identity, license, checksum, and path metadata.",
+      "description": "Local embedding-model, reranker-model, and sparse-embedding-model directories, Docling artifacts, PaddleOCR detection models, PaddleOCR recognition models, PaddleOCR classification models, PaddlePaddle CPU wheels, LibreOffice binaries, and Poppler/native libraries, each with identity, license, local path, and SHA-256 checksum metadata.",
       "type": "object",
       "additionalProperties": false,
       "required": [

@@ -176,6 +176,9 @@ class OfflineArtifactManifestTest(unittest.TestCase):
         description = artifact_schema["description"].lower()
         for artifact_family in (
             "docling",
+            "embedding-model",
+            "reranker-model",
+            "sparse-embedding-model",
             "paddleocr detection",
             "paddleocr recognition",
             "paddleocr classification",
@@ -185,6 +188,8 @@ class OfflineArtifactManifestTest(unittest.TestCase):
         ):
             with self.subTest(artifact_family=artifact_family):
                 self.assertIn(artifact_family, description)
+
+        self.assertNotRegex(json.dumps(schema).lower(), r"download(?:url|uri)")
 
 
 if __name__ == "__main__":
