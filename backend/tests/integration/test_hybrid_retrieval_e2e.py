@@ -49,11 +49,13 @@ class _FakeHarnessClient:
         upload_source_ids: list[str] | None = None,
         fail_upload_at: int | None = None,
         fail_delete_ids: set[str] | None = None,
+        fail_reset: bool = False,
     ) -> None:
         self.readiness = list(readiness or [])
         self.upload_source_ids = list(upload_source_ids or [])
         self.fail_upload_at = fail_upload_at
         self.fail_delete_ids = set(fail_delete_ids or set())
+        self.fail_reset = fail_reset
         self.get_calls: list[str] = []
         self.post_calls: list[str] = []
         self.delete_calls: list[str] = []
@@ -68,7 +70,8 @@ class _FakeHarnessClient:
                 return _FakeResponse({}, RuntimeError("fixture upload failed"))
             source_id = self.upload_source_ids.pop(0)
             return _FakeResponse([{"id": source_id}])
-        return _FakeResponse({"status": "reset"})
+        error = RuntimeError("secret reset response") if self.fail_reset else None
+        return _FakeResponse({"status": "secret reset body"}, error)
 
     def get(self, url: str) -> _FakeResponse:
         self.get_calls.append(url)
@@ -77,8 +80,10 @@ class _FakeHarnessClient:
     def delete(self, url: str) -> _FakeResponse:
         self.delete_calls.append(url)
         source_id = url.rsplit("/", 1)[-1]
-        error = RuntimeError("fixture delete failed") if source_id in self.fail_delete_ids else None
-        response = _FakeResponse({"deleted": source_id}, error)
+        error = (
+            RuntimeError("secret delete response") if source_id in self.fail_delete_ids else None
+        )
+        response = _FakeResponse({"deleted": source_id, "body": "secret"}, error)
         self.delete_responses.append(response)
         return response
 
@@ -150,11 +155,11 @@ class HybridE2EContractTest(unittest.TestCase):
             2,
         )
 
-    def test_fixture_cleanup_deletes_reverse_order_best_effort_and_verifies_responses(
+    def test_fixture_cleanup_reports_failures_after_reset_and_all_reverse_deletes(
         self,
     ) -> None:
         case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
-        client = _FakeHarnessClient(fail_delete_ids={"source-b"})
+        client = _FakeHarnessClient(fail_delete_ids={"source-b"}, fail_reset=True)
         case.client = client
         case.control_base = "http://harness.internal"
         case.api_base = "http://api.internal"
@@ -162,7 +167,11 @@ class HybridE2EContractTest(unittest.TestCase):
         cleanup = getattr(case, "_cleanup_test_fixtures", None)
         self.assertTrue(callable(cleanup))
 
-        cleanup()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"^fixture cleanup failed \(fault_reset=1, source_delete=1\)$",
+        ) as raised:
+            cleanup()
 
         self.assertEqual(
             client.delete_calls,
@@ -172,6 +181,8 @@ class HybridE2EContractTest(unittest.TestCase):
             ],
         )
         self.assertEqual([response.raise_calls for response in client.delete_responses], [1, 1])
+        self.assertEqual(case._created_source_ids, [])
+        self.assertNotIn("secret", str(raised.exception))
 
     def test_set_up_discards_fixture_ids_from_previous_test_instance_state(self) -> None:
         case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
@@ -421,17 +432,24 @@ class HybridRetrievalEndToEndTest(unittest.TestCase):
         response.raise_for_status()
 
     def _cleanup_test_fixtures(self) -> None:
+        reset_failures = 0
+        delete_failures = 0
         try:
             self._reset_faults()
         except Exception:
-            pass
+            reset_failures += 1
         for source_id in reversed(self._created_source_ids):
             try:
                 response = self.client.delete(f"{self.api_base}/api/knowledge/sources/{source_id}")
                 response.raise_for_status()
             except Exception:
-                continue
+                delete_failures += 1
         self._created_source_ids.clear()
+        if reset_failures or delete_failures:
+            raise RuntimeError(
+                "fixture cleanup failed "
+                f"(fault_reset={reset_failures}, source_delete={delete_failures})"
+            ) from None
 
     def _provision_fixtures(self) -> None:
         self.narrative = self._publish_fixture(self.narrative_fixture)

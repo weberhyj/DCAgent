@@ -109,6 +109,28 @@ def _production_runtime_probe(results) -> None:
                 )
             ],
         )
+        setup_repository.add_uploaded_knowledge_source(
+            source_id="benchmark-restricted-source",
+            name="restricted-benchmark.txt",
+            source_type="TXT",
+            classification="restricted",
+            records=0,
+            file_path="restricted-benchmark.txt",
+            file_size=128,
+            mime_type="text/plain",
+        )
+        setup_repository.complete_knowledge_source_indexing(
+            "benchmark-restricted-source",
+            [
+                KnowledgeChunkModel(
+                    id="benchmark-restricted-chunk",
+                    source_id="benchmark-restricted-source",
+                    chunk_index=0,
+                    text="benchmark policy evidence",
+                    token_count=3,
+                )
+            ],
+        )
         events: list[str] = []
 
         class FailingHybrid(_ClosingResource):
@@ -199,6 +221,7 @@ def _production_runtime_probe(results) -> None:
                     factory.legacy_repository._llm_provider, TemplateLLMProvider
                 ),
                 "physoc_calls": physoc.call_count,
+                "scope_permission_tags": runtime.scope.permission_tags,
                 "report": report,
             }
         )
@@ -348,6 +371,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
         self.assertTrue(result["router"])
         self.assertTrue(result["template"])
         self.assertEqual(result["physoc_calls"], 0)
+        self.assertEqual(result["scope_permission_tags"], ("internal",))
         report = result["report"]
         self.assertEqual(report["summary"]["errorRate"], 0.0)
         self.assertEqual(report["summary"]["fallbackRate"], 1.0)
@@ -365,7 +389,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
         dependencies = _fake_runtime_dependencies(
             settings=SimpleNamespace(mode="shadow"),
             database_factory=lambda url: database_calls.append(url),
-            repository_factory=lambda _database: object(),
+            repository_factory=lambda _database, _permission_tags: object(),
             resource_factory=lambda: object(),
         )
         with self.assertRaisesRegex(ValueError, "RETRIEVAL_MODE=qwen3"):
@@ -395,7 +419,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
                         canary_percent=canary_percent,
                     ),
                     database_factory=allocate_database,
-                    repository_factory=lambda _database: object(),
+                    repository_factory=lambda _database, _permission_tags: object(),
                     resource_factory=lambda: object(),
                 )
                 with self.assertRaisesRegex(ValueError, "100% Qwen3 routing"):
@@ -417,7 +441,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
         dependencies = _fake_runtime_dependencies(
             settings=SimpleNamespace(mode="qwen3", canary_percent=100.0),
             database_factory=allocate_database,
-            repository_factory=lambda _database: object(),
+            repository_factory=lambda _database, _permission_tags: object(),
             resource_factory=lambda: object(),
         )
         with self.assertRaisesRegex(RuntimeError, "database allocated"):
@@ -505,7 +529,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
                     def create_router(self, **_dependencies):
                         return self.create("router")
 
-                def repository_factory(_database):
+                def repository_factory(_database, _permission_tags):
                     if stage == "repository":
                         raise RuntimeError("repository failed")
                     return repository

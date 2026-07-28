@@ -90,6 +90,7 @@ class ShadowReportPrivacyTest(unittest.TestCase):
                     "request_id": "request-1",
                     "legacy_chunk_ids": ("legacy-1",),
                     "qwen_chunk_ids": ("qwen-1",),
+                    "relevant_chunk_ids": ("legacy-1",),
                     "legacy_ms": 100.0,
                     "qwen_ms": 80.0,
                     "status": "fallback",
@@ -195,6 +196,28 @@ class ShadowReportPrivacyTest(unittest.TestCase):
         )
 
         self.assertEqual(report["records"][0]["caseId"], "redacted")
+        self.assertEqual(report["quality"]["criticalTop8Regressions"], [])
+
+    def test_term_only_critical_case_without_relevance_is_not_a_top_8_regression(
+        self,
+    ) -> None:
+        from app.evaluation_batches import build_shadow_report
+
+        report = build_shadow_report(
+            [
+                {
+                    "evaluation_case_id": "case-term-only",
+                    "legacy_chunk_ids": ("legacy",),
+                    "qwen_chunk_ids": ("qwen",),
+                    "relevant_chunk_ids": (),
+                    "legacy_ms": 1.0,
+                    "qwen_ms": 1.0,
+                    "status": "completed",
+                }
+            ],
+            critical_case_ids={"case-term-only"},
+        )
+
         self.assertEqual(report["quality"]["criticalTop8Regressions"], [])
 
     def test_critical_top_8_detects_partial_relevant_set_loss(self) -> None:

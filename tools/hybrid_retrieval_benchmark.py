@@ -85,7 +85,7 @@ class _RuntimeDependencies:
     settings_from_environ: Callable[[Mapping[str, str]], object]
     database_url_resolver: Callable[[Mapping[str, str]], str]
     database_factory: Callable[[str], object]
-    repository_factory: Callable[[object], object]
+    repository_factory: Callable[[object, tuple[str, ...]], object]
     resource_factory: Callable[[], object]
     publication_version: Callable[[str], str]
     production_scope_factory: Callable[[str, tuple[str, ...], str], object]
@@ -394,7 +394,8 @@ def build_production_runtime(
             dependencies.database_url_resolver(environment)
         )
         resources.append(database)
-        repository = dependencies.repository_factory(database)
+        permission_tags = tuple(settings.permission_tags)
+        repository = dependencies.repository_factory(database, permission_tags)
         resources.append(repository)
         qdrant = factory.create_qdrant_client(settings)
         resources.append(qdrant)
@@ -464,7 +465,10 @@ def _default_runtime_dependencies() -> _RuntimeDependencies:
         settings_from_environ=RetrievalSettings.from_environ,
         database_url_resolver=resolve_database_url,
         database_factory=Database,
-        repository_factory=SqlChatRepository,
+        repository_factory=lambda database, permission_tags: SqlChatRepository(
+            database,
+            retrieval_permission_tags=permission_tags,
+        ),
         resource_factory=_DefaultRetrievalResourceFactory,
         publication_version=collection_publication_version,
         production_scope_factory=ProductionRetrievalScope,

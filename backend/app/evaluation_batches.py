@@ -455,17 +455,17 @@ def _is_top_8_regression(
     qwen_ids: tuple[str, ...],
 ) -> bool:
     relevant = set(_identifier_tuple(_record_value(record, "relevant_chunk_ids", default=())))
+    if not relevant:
+        return False
     legacy_top = set(legacy_ids[:8])
     qwen_top = set(qwen_ids[:8])
-    if relevant:
-        legacy_relevant = legacy_top & relevant
-        qwen_relevant = qwen_top & relevant
-        if legacy_relevant - qwen_relevant:
-            return True
-        legacy_ndcg = calculate_ranking_metrics(legacy_ids, relevant, 8).ndcg
-        qwen_ndcg = calculate_ranking_metrics(qwen_ids, relevant, 8).ndcg
-        return qwen_ndcg < legacy_ndcg
-    return bool(legacy_top - qwen_top)
+    legacy_relevant = legacy_top & relevant
+    qwen_relevant = qwen_top & relevant
+    if legacy_relevant - qwen_relevant:
+        return True
+    legacy_ndcg = calculate_ranking_metrics(legacy_ids, relevant, 8).ndcg
+    qwen_ndcg = calculate_ranking_metrics(qwen_ids, relevant, 8).ndcg
+    return qwen_ndcg < legacy_ndcg
 
 
 def _stable_unique_case_ids(case_ids: Iterable[str]) -> list[str]:
