@@ -160,6 +160,7 @@ def _production_runtime_probe(results) -> None:
         factory = Factory()
         settings = SimpleNamespace(
             mode=RetrievalMode.QWEN3,
+            canary_percent=100.0,
             knowledge_base_id="default",
             permission_tags=("internal",),
         )
@@ -375,6 +376,60 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
 
         self.assertEqual(database_calls, [])
 
+    def test_production_runtime_requires_100_percent_qwen3_before_allocating(
+        self,
+    ) -> None:
+        from tools.hybrid_retrieval_benchmark import build_production_runtime
+
+        for canary_percent in (0.0, 99.99):
+            with self.subTest(canary_percent=canary_percent):
+                database_calls: list[str] = []
+
+                def allocate_database(url: str):
+                    database_calls.append(url)
+                    raise RuntimeError("database allocated")
+
+                dependencies = _fake_runtime_dependencies(
+                    settings=SimpleNamespace(
+                        mode="qwen3",
+                        canary_percent=canary_percent,
+                    ),
+                    database_factory=allocate_database,
+                    repository_factory=lambda _database: object(),
+                    resource_factory=lambda: object(),
+                )
+                with self.assertRaisesRegex(ValueError, "100% Qwen3 routing"):
+                    build_production_runtime(
+                        {
+                            "RETRIEVAL_MODE": "qwen3",
+                            "RETRIEVAL_CANARY_PERCENT": str(canary_percent),
+                        },
+                        _dependencies=dependencies,
+                    )
+                self.assertEqual(database_calls, [])
+
+        database_calls = []
+
+        def allocate_database(url: str):
+            database_calls.append(url)
+            raise RuntimeError("database allocated")
+
+        dependencies = _fake_runtime_dependencies(
+            settings=SimpleNamespace(mode="qwen3", canary_percent=100.0),
+            database_factory=allocate_database,
+            repository_factory=lambda _database: object(),
+            resource_factory=lambda: object(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "database allocated"):
+            build_production_runtime(
+                {
+                    "RETRIEVAL_MODE": "qwen3",
+                    "RETRIEVAL_CANARY_PERCENT": "100",
+                },
+                _dependencies=dependencies,
+            )
+        self.assertEqual(database_calls, ["sqlite://"])
+
     def test_construction_failures_close_prior_resources_once_in_reverse_order(
         self,
     ) -> None:
@@ -406,6 +461,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
         ]
         settings = SimpleNamespace(
             mode="qwen3",
+            canary_percent=100.0,
             knowledge_base_id="default",
             permission_tags=("internal",),
         )

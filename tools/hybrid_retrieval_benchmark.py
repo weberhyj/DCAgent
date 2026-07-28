@@ -379,6 +379,14 @@ def build_production_runtime(
     )
     if mode != "qwen3":
         raise ValueError("hybrid benchmark requires RETRIEVAL_MODE=qwen3")
+    canary_percent = getattr(settings, "canary_percent", None)
+    if (
+        isinstance(canary_percent, bool)
+        or not isinstance(canary_percent, (int, float))
+        or not math.isfinite(float(canary_percent))
+        or float(canary_percent) != 100.0
+    ):
+        raise ValueError("capacity benchmark requires 100% Qwen3 routing")
     factory = dependencies.resource_factory()
     resources: list[object] = []
     try:
