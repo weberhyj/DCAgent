@@ -276,6 +276,88 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 6. 在目标服务器完成 Compose smoke、Physoc probe、Qwen3 索引发布、Shadow/Canary、真实文档
    问答、模型故障 HTTP 502、Alias/Legacy 回滚、结构化统计和 15 用户并发验收。
 
+### 本次 Qwen3 混合检索修改的部署准备
+
+如果目标环境已经部署过旧版 DC-Agent，本次升级不能只替换后端代码。新增的 Qwen3 Dense、
+BM25 Sparse、Reranker、版本化 Qdrant publication 和 Shadow/Canary 路由还要求补齐以下资源。
+
+1. **准备并审核三个本地模型目录。** 内网服务器不得在启动时访问 Hugging Face 或其他公网源：
+
+   ```text
+   artifacts/models/qwen3-embedding-0.6b/
+   artifacts/models/qwen3-reranker-0.6b/
+   artifacts/models/qdrant-bm25/
+   ```
+
+   前两个目录分别对应 `Qwen/Qwen3-Embedding-0.6B` 和
+   `Qwen/Qwen3-Reranker-0.6B`，必须包含批准的模型、tokenizer、metadata manifest 和模型目录
+   SHA-256；BM25 目录必须包含 FastEmbed Sparse 运行所需的批准文件和 profile SHA-256。
+
+2. **按最新锁文件重建离线 wheelhouse 和服务镜像。** `artifacts/wheels` 必须覆盖当前
+   `backend/uv.lock` 在目标 Linux/Python 3.12 平台上的全部依赖，尤其是 Qdrant、FastEmbed、
+   Transformers、Torch、OpenVINO、Optimum、ONNX Runtime、FlagEmbedding、NumPy 和 Jieba。
+   需要重新构建 API、ingestion worker、Embedding Service 和新增的 Reranker Service 镜像，
+   并把镜像 digest 写入 `deploy/offline/.env`，不能继续使用示例占位校验和。
+
+3. **备份 PostgreSQL 并执行新增迁移。** 本次升级新增：
+
+   ```text
+   20260727_04_qwen3_retrieval
+   20260728_05_shadow_evaluation_labels
+   ```
+
+   启动后必须确认 Alembic 当前 head 为 `20260728_05`。迁移前应完成数据库备份和恢复演练。
+
+4. **补齐检索与 Physoc 配置。** 第一次构建索引时使用零流量 Shadow：
+
+   ```env
+   RETRIEVAL_MODE=shadow
+   RETRIEVAL_SHADOW_PERCENT=0
+   RETRIEVAL_CANARY_PERCENT=0
+   RETRIEVAL_PERMISSION_TAGS=internal
+   RETRIEVAL_KNOWLEDGE_BASE_ID=default
+   QDRANT_COLLECTION_ALIAS=knowledge_chunks_current
+
+   EMBEDDING_MODEL_NAME=Qwen/Qwen3-Embedding-0.6B
+   EMBEDDING_MODEL_SHA256=<真实目录校验和>
+   RERANKER_MODEL_NAME=Qwen/Qwen3-Reranker-0.6B
+   RERANKER_MODEL_SHA256=<真实目录校验和>
+   SPARSE_PROFILE_SHA256=<真实 profile 校验和>
+
+   LLM_PROVIDER=physoc_deepseek
+   LLM_API_BASE=http://<API容器可访问的内网Physoc地址>:<端口>
+   LLM_STREAM_PATH=/api/physoc/deepseeks/stream
+   LLM_MODEL=my_deepseek_r1_7b
+   ```
+
+   Compose 容器内不得用 `127.0.0.1` 指代其他主机上的 Physoc。只使用 Physoc 时不要启用
+   `--profile generation`；当前 Compose 仍保留可选 llama.cpp profile，彻底移除该 profile
+   属于单独的部署清理任务。
+
+5. **重新构建并发布 Qdrant 索引。** 原有文档切片不会自动变成新的 Qdrant 索引。先完成一次
+   不激活的全量演练：
+
+   ```powershell
+   & tools/invoke_offline_compose.ps1 exec -T api `
+     python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v1
+   ```
+
+   审核点数、维度、权限过滤、Dense/Sparse 命中和模型校验和后，再用新集合版本重新验证并原子
+   激活 Alias：
+
+   ```powershell
+   & tools/invoke_offline_compose.ps1 exec -T api `
+     python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v2 --activate
+   ```
+
+6. **按门禁逐级切换流量。** 索引激活后执行 `Shadow 10 -> 50 -> 100`，再执行
+   `Canary 5 -> 25 -> 50 -> 100`。达到 100% Qwen3 后必须完成 15 用户、150 请求验收；任一阶段
+   出现权限泄漏、关键 Top-8 回归、P95 超过 5 秒、错误率或 fallback rate 超过 1%，立即把
+   `RETRIEVAL_MODE` 切回 `legacy`。
+
+详细的 artifact 校验、构建、索引发布、监控和回滚命令见
+[`deploy/offline/README.md`](deploy/offline/README.md)。
+
 当前开发机没有执行真实目标服务器门禁，因此仓库具备内网部署路线，但不能据此声明任意内网
 服务器均可“复制后立即使用”。
 

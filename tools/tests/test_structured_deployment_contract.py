@@ -460,6 +460,24 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertNotIn("BGE Reranker", phase_three.group(0))
         self.assertNotIn("averages are calculated from RAG chunks", combined)
 
+    def test_root_readme_lists_qwen3_change_deployment_inputs(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for phrase in (
+            "本次 Qwen3 混合检索修改的部署准备",
+            "artifacts/models/qwen3-embedding-0.6b",
+            "artifacts/models/qwen3-reranker-0.6b",
+            "artifacts/models/qdrant-bm25",
+            "20260727_04_qwen3_retrieval",
+            "20260728_05_shadow_evaluation_labels",
+            "原有文档切片不会自动变成新的 Qdrant 索引",
+            "RETRIEVAL_MODE=shadow",
+            "RETRIEVAL_CANARY_PERCENT=0",
+            "/api/physoc/deepseeks/stream",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, readme)
+
 
 if __name__ == "__main__":
     unittest.main()
