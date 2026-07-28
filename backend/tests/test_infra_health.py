@@ -479,22 +479,23 @@ class InfraHealthTest(unittest.TestCase):
         self.addCleanup(server.shutdown)
         service_url = f"http://127.0.0.1:{server.server_port}"
         environ = retrieval_health_environment()
-        # Creating a real httpx.Client can consume about 100 ms on a cold
-        # Windows runner. Leave enough time for the request handler to send
-        # its first byte so this test measures cancellation of a stalled
-        # response instead of scheduler/client-construction latency.
+        # Keep the production timeout realistic while excluding cold client
+        # construction from the behavior under test. This test measures
+        # cancellation of a stalled response and recovery on later probes.
         environ["DEPENDENCY_TIMEOUT_SECONDS"] = "0.5"
         environ["EMBEDDING_SERVICE_URL"] = service_url
-        clients: list[httpx.Client] = []
-
-        def metadata_client_factory() -> httpx.Client:
-            client = httpx.Client(
+        clients = [
+            httpx.Client(
                 timeout=httpx.Timeout(5.0),
                 follow_redirects=False,
                 trust_env=False,
             )
-            clients.append(client)
-            return client
+            for _ in range(3)
+        ]
+        available_clients = iter(clients)
+
+        def metadata_client_factory() -> httpx.Client:
+            return next(available_clients)
 
         gateway = RetrievalHealthGateway()
         checks = build_dependency_checks(
