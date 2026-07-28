@@ -26,10 +26,15 @@ _NUMERIC_TOKEN = re.compile(
 
 
 class _FakeResponse:
-    def __init__(self, payload: object) -> None:
+    def __init__(self, payload: object, error: Exception | None = None) -> None:
         self._payload = payload
+        self._error = error
+        self.raise_calls = 0
 
     def raise_for_status(self) -> None:
+        self.raise_calls += 1
+        if self._error is not None:
+            raise self._error
         return None
 
     def json(self) -> object:
@@ -37,28 +42,149 @@ class _FakeResponse:
 
 
 class _FakeHarnessClient:
-    def __init__(self, readiness: list[dict[str, object]] | None = None) -> None:
+    def __init__(
+        self,
+        readiness: list[dict[str, object]] | None = None,
+        *,
+        upload_source_ids: list[str] | None = None,
+        fail_upload_at: int | None = None,
+        fail_delete_ids: set[str] | None = None,
+    ) -> None:
         self.readiness = list(readiness or [])
+        self.upload_source_ids = list(upload_source_ids or [])
+        self.fail_upload_at = fail_upload_at
+        self.fail_delete_ids = set(fail_delete_ids or set())
         self.get_calls: list[str] = []
+        self.post_calls: list[str] = []
+        self.delete_calls: list[str] = []
+        self.delete_responses: list[_FakeResponse] = []
+        self.upload_count = 0
 
-    def post(self, _url: str) -> _FakeResponse:
+    def post(self, url: str, **_kwargs: object) -> _FakeResponse:
+        self.post_calls.append(url)
+        if url.endswith("/api/knowledge/uploads"):
+            self.upload_count += 1
+            if self.fail_upload_at == self.upload_count:
+                return _FakeResponse({}, RuntimeError("fixture upload failed"))
+            source_id = self.upload_source_ids.pop(0)
+            return _FakeResponse([{"id": source_id}])
         return _FakeResponse({"status": "reset"})
 
     def get(self, url: str) -> _FakeResponse:
         self.get_calls.append(url)
         return _FakeResponse(self.readiness.pop(0))
 
+    def delete(self, url: str) -> _FakeResponse:
+        self.delete_calls.append(url)
+        source_id = url.rsplit("/", 1)[-1]
+        error = RuntimeError("fixture delete failed") if source_id in self.fail_delete_ids else None
+        response = _FakeResponse({"deleted": source_id}, error)
+        self.delete_responses.append(response)
+        return response
+
 
 class HybridE2EContractTest(unittest.TestCase):
-    def test_set_up_provisions_fresh_fixtures_for_every_test(self) -> None:
+    def test_set_up_registers_cleanup_before_reset_and_provision(self) -> None:
         case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
         case.client = _FakeHarnessClient()
         case.control_base = "http://harness.internal"
+        events: list[str] = []
 
-        with patch.object(case, "_provision_fixtures", create=True) as provision:
+        with (
+            patch.object(case, "addCleanup", side_effect=lambda _cleanup: events.append("cleanup")),
+            patch.object(case, "_reset_faults", side_effect=lambda: events.append("reset")),
+            patch.object(
+                case, "_provision_fixtures", side_effect=lambda: events.append("provision")
+            ),
+        ):
             case.setUp()
 
-        provision.assert_called_once_with()
+        self.assertEqual(events, ["cleanup", "reset", "provision"])
+
+    def test_partial_provision_failure_cleans_created_source_and_resets_faults(self) -> None:
+        case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
+        client = _FakeHarnessClient(
+            upload_source_ids=["source-first"],
+            fail_upload_at=2,
+        )
+        case.client = client
+        case.api_base = "http://api.internal"
+        case.control_base = "http://harness.internal"
+        with TemporaryDirectory() as directory:
+            case.narrative_fixture = Path(directory, "narrative.txt")
+            case.spreadsheet_fixture = Path(directory, "spreadsheet.csv")
+            case.narrative_fixture.touch()
+            case.spreadsheet_fixture.touch()
+
+            with self.assertRaises(RuntimeError):
+                case.setUp()
+            case.doCleanups()
+
+        self.assertEqual(
+            client.delete_calls,
+            ["http://api.internal/api/knowledge/sources/source-first"],
+        )
+        self.assertEqual(
+            [url for url in client.post_calls if url.endswith("/faults/reset")],
+            [
+                "http://harness.internal/faults/reset",
+                "http://harness.internal/faults/reset",
+            ],
+        )
+
+    def test_faulted_test_cleanup_resets_faults_without_waiting_for_next_test(self) -> None:
+        case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
+        client = _FakeHarnessClient()
+        case.client = client
+        case.control_base = "http://harness.internal"
+        case.api_base = "http://api.internal"
+
+        with patch.object(case, "_provision_fixtures"):
+            case.setUp()
+        case._fault("embedding-unavailable")
+        case.doCleanups()
+
+        self.assertTrue(client.post_calls[-1].endswith("/faults/reset"))
+        self.assertEqual(
+            sum(url.endswith("/faults/reset") for url in client.post_calls),
+            2,
+        )
+
+    def test_fixture_cleanup_deletes_reverse_order_best_effort_and_verifies_responses(
+        self,
+    ) -> None:
+        case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
+        client = _FakeHarnessClient(fail_delete_ids={"source-b"})
+        case.client = client
+        case.control_base = "http://harness.internal"
+        case.api_base = "http://api.internal"
+        case._created_source_ids = ["source-a", "source-b"]
+        cleanup = getattr(case, "_cleanup_test_fixtures", None)
+        self.assertTrue(callable(cleanup))
+
+        cleanup()
+
+        self.assertEqual(
+            client.delete_calls,
+            [
+                "http://api.internal/api/knowledge/sources/source-b",
+                "http://api.internal/api/knowledge/sources/source-a",
+            ],
+        )
+        self.assertEqual([response.raise_calls for response in client.delete_responses], [1, 1])
+
+    def test_set_up_discards_fixture_ids_from_previous_test_instance_state(self) -> None:
+        case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
+        case.client = _FakeHarnessClient()
+        case.control_base = "http://harness.internal"
+        case.api_base = "http://api.internal"
+        case._created_source_ids = ["stale-source"]
+
+        with patch.object(case, "_provision_fixtures"):
+            case.setUp()
+
+        self.assertEqual(case._created_source_ids, [])
+        case.doCleanups()
 
     def test_harness_readiness_poll_waits_for_every_required_stage(self) -> None:
         case = HybridRetrievalEndToEndTest("test_embedding_unavailable_falls_back_to_legacy")
@@ -285,12 +411,27 @@ class HybridRetrievalEndToEndTest(unittest.TestCase):
         cls.client.close()
 
     def setUp(self) -> None:
+        self._created_source_ids: list[str] = []
+        self.addCleanup(self._cleanup_test_fixtures)
         self._reset_faults()
         self._provision_fixtures()
 
     def _reset_faults(self) -> None:
         response = self.client.post(f"{self.control_base}/faults/reset")
         response.raise_for_status()
+
+    def _cleanup_test_fixtures(self) -> None:
+        try:
+            self._reset_faults()
+        except Exception:
+            pass
+        for source_id in reversed(self._created_source_ids):
+            try:
+                response = self.client.delete(f"{self.api_base}/api/knowledge/sources/{source_id}")
+                response.raise_for_status()
+            except Exception:
+                continue
+        self._created_source_ids.clear()
 
     def _provision_fixtures(self) -> None:
         self.narrative = self._publish_fixture(self.narrative_fixture)
@@ -357,7 +498,9 @@ class HybridRetrievalEndToEndTest(unittest.TestCase):
         response.raise_for_status()
         sources = response.json()
         self.assertTrue(sources)
-        return sources[0]
+        source = sources[0]
+        self._created_source_ids.append(str(source["id"]))
+        return source
 
     def _ask(self, question: str) -> httpx.Response:
         conversation = self.client.post(f"{self.api_base}/api/conversations")

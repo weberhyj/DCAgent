@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+import multiprocessing
+import os
 import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +36,199 @@ class _FakeRetriever:
             candidates=(_Candidate(f"chunk-{request.routing_key}"),),
             stage_ms={"embedding": 10.0, "qdrant": 20.0, "reranker": 30.0},
         )
+
+
+class _ClosingResource:
+    def __init__(self, name: str, events: list[str], method: str = "close") -> None:
+        self.name = name
+        self.events = events
+        setattr(self, method, self._close)
+
+    def _close(self) -> None:
+        self.events.append(self.name)
+
+
+class _DatabaseResource:
+    def __init__(self, events: list[str]) -> None:
+        self.engine = SimpleNamespace(dispose=lambda: events.append("database"))
+
+
+class _GatewayResource(_ClosingResource):
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        fail_alias: bool = False,
+    ) -> None:
+        super().__init__("gateway", events)
+        self.fail_alias = fail_alias
+
+    def resolve_alias(self) -> str:
+        if self.fail_alias:
+            raise RuntimeError("alias failed")
+        return "knowledge_chunks_qwen3_v1"
+
+
+def _production_runtime_probe(results) -> None:
+    from tools.hybrid_retrieval_benchmark import (
+        BenchmarkQuestion,
+        build_production_runtime,
+        run_benchmark,
+    )
+
+    from app.database import Database
+    from app.llm import PhysocDeepSeekLLMProvider, TemplateLLMProvider
+    from app.models import KnowledgeChunkModel
+    from app.retrieval_models import RetrievalMode
+    from app.retrieval_router import RetrievalRouter
+    from app.sql_repository import SqlChatRepository
+
+    try:
+        database = Database("sqlite+pysqlite:///:memory:")
+        database.create_schema()
+        setup_repository = SqlChatRepository(database)
+        setup_repository.add_uploaded_knowledge_source(
+            source_id="benchmark-source",
+            name="benchmark.txt",
+            source_type="TXT",
+            classification="internal",
+            records=0,
+            file_path="benchmark.txt",
+            file_size=128,
+            mime_type="text/plain",
+        )
+        setup_repository.complete_knowledge_source_indexing(
+            "benchmark-source",
+            [
+                KnowledgeChunkModel(
+                    id="benchmark-legacy-chunk",
+                    source_id="benchmark-source",
+                    chunk_index=0,
+                    text="benchmark policy evidence",
+                    token_count=3,
+                )
+            ],
+        )
+        events: list[str] = []
+
+        class FailingHybrid(_ClosingResource):
+            def __init__(self) -> None:
+                super().__init__("hybrid", events)
+
+            def retrieve(self, _request):
+                raise RuntimeError("hybrid failed")
+
+        class Factory:
+            def __init__(self) -> None:
+                self.hybrid = FailingHybrid()
+                self.router = None
+                self.legacy_repository = None
+
+            def create_qdrant_client(self, _settings):
+                return _ClosingResource("qdrant", events)
+
+            def create_gateway(self, _qdrant, _settings):
+                return _GatewayResource(events)
+
+            def create_embedding_client(self, _settings):
+                return _ClosingResource("embedding", events)
+
+            def create_reranker_client(self, _settings):
+                return _ClosingResource("reranker", events)
+
+            def create_sparse_encoder(self, _environment):
+                return _ClosingResource("sparse", events)
+
+            def create_hybrid_retriever(self, **_dependencies):
+                return self.hybrid
+
+            def create_audit(self, _database):
+                return _ClosingResource("audit", events)
+
+            def create_router(self, **dependencies):
+                self.legacy_repository = dependencies["legacy_search"].__self__
+                self.router = RetrievalRouter(
+                    mode=RetrievalMode.QWEN3,
+                    legacy_search=dependencies["legacy_search"],
+                    hybrid=dependencies["hybrid"],
+                    audit=dependencies["audit"],
+                    canary_percent=100,
+                    request_id_factory=lambda: "benchmark-request",
+                )
+                return self.router
+
+        factory = Factory()
+        settings = SimpleNamespace(
+            mode=RetrievalMode.QWEN3,
+            knowledge_base_id="default",
+            permission_tags=("internal",),
+        )
+        with (
+            patch("app.database.Database", return_value=database),
+            patch(
+                "app.retrieval_settings.RetrievalSettings.from_environ",
+                return_value=settings,
+            ),
+            patch("app.main._DefaultRetrievalResourceFactory", return_value=factory),
+            patch.object(
+                PhysocDeepSeekLLMProvider,
+                "generate_reply",
+                side_effect=AssertionError("Physoc must not be called"),
+            ) as physoc,
+        ):
+            runtime = build_production_runtime({"RETRIEVAL_MODE": "qwen3"})
+            try:
+                report = run_benchmark(
+                    retriever=runtime.retriever,
+                    scope=runtime.scope,
+                    questions=[BenchmarkQuestion("case-router", "benchmark policy")],
+                    concurrency=1,
+                    requests=1,
+                    p95_limit=1.0,
+                    error_rate_limit=0.0,
+                    fallback_rate_limit=1.0,
+                )
+            finally:
+                runtime.close()
+        results.put(
+            {
+                "adapter": runtime.retriever is not factory.hybrid,
+                "router": isinstance(factory.router, RetrievalRouter),
+                "template": isinstance(
+                    factory.legacy_repository._llm_provider, TemplateLLMProvider
+                ),
+                "physoc_calls": physoc.call_count,
+                "report": report,
+            }
+        )
+    except BaseException as error:
+        results.put({"error": repr(error)})
+        raise
+
+
+def _fake_runtime_dependencies(
+    *,
+    settings: object,
+    database_factory,
+    repository_factory,
+    resource_factory,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        settings_from_environ=lambda _environment: settings,
+        database_url_resolver=lambda _environment: "sqlite://",
+        database_factory=database_factory,
+        repository_factory=repository_factory,
+        resource_factory=resource_factory,
+        publication_version=lambda _collection: "v1",
+        production_scope_factory=lambda knowledge_base_id, permission_tags, publication_version: (
+            SimpleNamespace(
+                knowledge_base_id=knowledge_base_id,
+                permission_tags=permission_tags,
+                publication_version=publication_version,
+            )
+        ),
+        production_request_factory=lambda **values: SimpleNamespace(**values),
+    )
 
 
 class HybridRetrievalBenchmarkTest(unittest.TestCase):
@@ -131,6 +328,177 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
         serialized = json.dumps(report, ensure_ascii=False)
         self.assertNotIn("sensitive question", serialized)
 
+    def test_production_runtime_uses_router_sql_fallback_and_routed_hit_ids(
+        self,
+    ) -> None:
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        process = context.Process(target=_production_runtime_probe, args=(results,))
+        process.start()
+        process.join(30.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(5.0)
+            self.fail("production runtime probe timed out")
+        self.assertEqual(process.exitcode, 0)
+        result = results.get(timeout=5.0)
+        self.assertNotIn("error", result)
+        self.assertTrue(result["adapter"])
+        self.assertTrue(result["router"])
+        self.assertTrue(result["template"])
+        self.assertEqual(result["physoc_calls"], 0)
+        report = result["report"]
+        self.assertEqual(report["summary"]["errorRate"], 0.0)
+        self.assertEqual(report["summary"]["fallbackRate"], 1.0)
+        self.assertEqual(
+            report["records"][0]["chunkIds"],
+            ["benchmark-legacy-chunk"],
+        )
+
+    def test_production_runtime_requires_exact_qwen3_mode_before_allocating(
+        self,
+    ) -> None:
+        from tools.hybrid_retrieval_benchmark import build_production_runtime
+
+        database_calls: list[str] = []
+        dependencies = _fake_runtime_dependencies(
+            settings=SimpleNamespace(mode="shadow"),
+            database_factory=lambda url: database_calls.append(url),
+            repository_factory=lambda _database: object(),
+            resource_factory=lambda: object(),
+        )
+        with self.assertRaisesRegex(ValueError, "RETRIEVAL_MODE=qwen3"):
+            build_production_runtime(
+                {"RETRIEVAL_MODE": "shadow"},
+                _dependencies=dependencies,
+            )
+
+        self.assertEqual(database_calls, [])
+
+    def test_construction_failures_close_prior_resources_once_in_reverse_order(
+        self,
+    ) -> None:
+        from tools.hybrid_retrieval_benchmark import build_production_runtime
+
+        stages = (
+            "repository",
+            "qdrant",
+            "gateway",
+            "embedding",
+            "reranker",
+            "sparse",
+            "hybrid",
+            "audit",
+            "router",
+            "alias",
+        )
+        resource_order = [
+            "database",
+            "repository",
+            "qdrant",
+            "gateway",
+            "embedding",
+            "reranker",
+            "sparse",
+            "hybrid",
+            "audit",
+            "router",
+        ]
+        settings = SimpleNamespace(
+            mode="qwen3",
+            knowledge_base_id="default",
+            permission_tags=("internal",),
+        )
+
+        for stage in stages:
+            with self.subTest(stage=stage):
+                events: list[str] = []
+                database = _DatabaseResource(events)
+                repository = _ClosingResource("repository", events)
+                repository.search_knowledge_chunks = lambda _query, _limit: []
+
+                class Factory:
+                    def create(self, name: str):
+                        if stage == name:
+                            raise RuntimeError(f"{name} failed")
+                        if name == "gateway":
+                            return _GatewayResource(events, fail_alias=stage == "alias")
+                        return _ClosingResource(name, events)
+
+                    def create_qdrant_client(self, _settings):
+                        return self.create("qdrant")
+
+                    def create_gateway(self, _qdrant, _settings):
+                        return self.create("gateway")
+
+                    def create_embedding_client(self, _settings):
+                        return self.create("embedding")
+
+                    def create_reranker_client(self, _settings):
+                        return self.create("reranker")
+
+                    def create_sparse_encoder(self, _environment):
+                        return self.create("sparse")
+
+                    def create_hybrid_retriever(self, **_dependencies):
+                        return self.create("hybrid")
+
+                    def create_audit(self, _database):
+                        return self.create("audit")
+
+                    def create_router(self, **_dependencies):
+                        return self.create("router")
+
+                def repository_factory(_database):
+                    if stage == "repository":
+                        raise RuntimeError("repository failed")
+                    return repository
+
+                dependencies = _fake_runtime_dependencies(
+                    settings=settings,
+                    database_factory=lambda _url: database,
+                    repository_factory=repository_factory,
+                    resource_factory=Factory,
+                )
+                with (
+                    self.assertRaisesRegex(RuntimeError, f"{stage} failed"),
+                ):
+                    build_production_runtime(
+                        {"RETRIEVAL_MODE": "qwen3"},
+                        _dependencies=dependencies,
+                    )
+
+                failure_index = (
+                    resource_order.index(stage)
+                    if stage != "alias"
+                    else len(resource_order)
+                )
+                expected = list(reversed(resource_order[:failure_index]))
+                self.assertEqual(events, expected)
+
+    def test_runtime_close_supports_close_shutdown_dispose_and_engine_once(
+        self,
+    ) -> None:
+        from tools.hybrid_retrieval_benchmark import ProductionRuntime, RetrievalScope
+
+        events: list[str] = []
+        close_resource = _ClosingResource("close", events)
+        runtime = ProductionRuntime(
+            retriever=_FakeRetriever(),
+            scope=RetrievalScope("kb", ("internal",), "v1"),
+            resources=(
+                _DatabaseResource(events),
+                _ClosingResource("shutdown", events, "shutdown"),
+                _ClosingResource("dispose", events, "dispose"),
+                close_resource,
+                close_resource,
+            ),
+        )
+
+        runtime.close()
+
+        self.assertEqual(events, ["close", "dispose", "shutdown", "database"])
+
     def test_written_json_excludes_question_credentials_and_upstream_exception(
         self,
     ) -> None:
@@ -170,6 +538,46 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
             "upstream stack trace",
         ):
             self.assertNotIn(secret, serialized)
+
+    def test_write_failure_removes_only_current_process_temporary_file(self) -> None:
+        from tools.hybrid_retrieval_benchmark import write_report
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "report.json"
+            temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+            unrelated = destination.with_name(f".{destination.name}.999999.tmp")
+            temporary.touch()
+            unrelated.touch()
+
+            with (
+                patch.object(Path, "write_text", side_effect=OSError("write failed")),
+                self.assertRaisesRegex(OSError, "write failed"),
+            ):
+                write_report(destination, {"summary": {}, "records": []})
+
+            self.assertFalse(temporary.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_replace_failure_removes_only_current_process_temporary_file(self) -> None:
+        from tools.hybrid_retrieval_benchmark import write_report
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "report.json"
+            temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+            unrelated = destination.with_name(f".{destination.name}.999999.tmp")
+            unrelated.touch()
+
+            with (
+                patch(
+                    "tools.hybrid_retrieval_benchmark.os.replace",
+                    side_effect=OSError("replace failed"),
+                ),
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                write_report(destination, {"summary": {}, "records": []})
+
+            self.assertFalse(temporary.exists())
+            self.assertTrue(unrelated.exists())
 
 
 if __name__ == "__main__":

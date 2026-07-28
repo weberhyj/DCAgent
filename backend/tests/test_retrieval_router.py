@@ -10,9 +10,12 @@ from unittest.mock import patch
 from loguru import logger as loguru_logger
 
 import app.retrieval_router as retrieval_router_module
+from app.database import Database
+from app.evaluation_batches import build_shadow_report
 from app.hybrid_retriever import HybridRetrievalOutcome, HybridRetrievalTimeout
 from app.models import KnowledgeChunkModel, KnowledgeSearchHitModel, KnowledgeSourceModel
 from app.reranker_client import RerankerBusy
+from app.retrieval_audit import RetrievalAuditRepository
 from app.retrieval_models import (
     RetrievalCandidate,
     RetrievalMode,
@@ -165,6 +168,33 @@ class RetrievalRouterTest(unittest.TestCase):
 
         self.assertEqual(stable_percentage_bucket(routing_key), expected)
 
+    def test_evaluation_labels_are_bounded_explicit_request_metadata(self) -> None:
+        labeled = RetrievalRequest(
+            query="policy",
+            limit=8,
+            routing_key="evaluation-routing",
+            scope=SCOPE,
+            evaluation_case_id="case-critical",
+            relevant_chunk_ids=("chunk-a", "chunk-b"),
+        )
+
+        self.assertEqual(labeled.evaluation_case_id, "case-critical")
+        self.assertEqual(labeled.relevant_chunk_ids, ("chunk-a", "chunk-b"))
+        for override in (
+            {"evaluation_case_id": "invalid case id"},
+            {"relevant_chunk_ids": ["chunk-a"]},
+            {"relevant_chunk_ids": tuple(f"chunk-{index}" for index in range(257))},
+            {"relevant_chunk_ids": ("invalid chunk id",)},
+        ):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                RetrievalRequest(
+                    query="policy",
+                    limit=8,
+                    routing_key="evaluation-routing",
+                    scope=SCOPE,
+                    **override,
+                )
+
     def test_legacy_never_calls_qwen(self) -> None:
         hybrid = RecordingHybrid()
         router = self.build_router(mode="legacy", hybrid=hybrid)
@@ -199,6 +229,64 @@ class RetrievalRouterTest(unittest.TestCase):
         self.assertEqual(audit.records[0]["status"], "completed")
         self.assertEqual(audit.records[0]["legacy_chunk_ids"], ("legacy-1",))
         self.assertEqual(audit.records[0]["qwen_chunk_ids"], ("qwen-1",))
+
+    def test_explicit_evaluation_labels_survive_shadow_persistence_and_drive_report(
+        self,
+    ) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        database.create_schema()
+        audit = RetrievalAuditRepository(database)
+        router = self.build_router(
+            mode="shadow",
+            hybrid=RecordingHybrid([hybrid_outcome("qwen-other")]),
+            audit=audit,
+            shadow_percent=100,
+        )
+
+        router.search(
+            RetrievalRequest(
+                query="policy",
+                limit=8,
+                routing_key="evaluation-routing",
+                scope=SCOPE,
+                evaluation_case_id="case-critical",
+                relevant_chunk_ids=("legacy-1",),
+            )
+        )
+        router.shadow_queue.drain_for_test()
+
+        stored = audit.list_shadow(limit=1)[0]
+        self.assertEqual(stored.evaluation_case_id, "case-critical")
+        self.assertEqual(stored.relevant_chunk_ids, ("legacy-1",))
+        report = build_shadow_report(
+            [stored],
+            critical_case_ids={"case-critical"},
+        )
+        self.assertEqual(report["records"][0]["caseId"], "case-critical")
+        self.assertEqual(
+            report["quality"]["criticalTop8Regressions"],
+            ["case-critical"],
+        )
+
+        audit.record_shadow(
+            request_id="case-unlabelled",
+            evaluation_case_id=None,
+            relevant_chunk_ids=("legacy-1",),
+            routing_key_hash="b" * 64,
+            query_hash="c" * 64,
+            legacy_chunk_ids=("legacy-1",),
+            qwen_chunk_ids=("qwen-other",),
+            legacy_ms=1.0,
+            qwen_ms=2.0,
+            status="completed",
+        )
+        unlabelled = audit.list_shadow(limit=1)[0]
+        negative = build_shadow_report(
+            [unlabelled],
+            critical_case_ids={"case-unlabelled"},
+        )
+        self.assertEqual(negative["records"][0]["caseId"], "redacted")
+        self.assertEqual(negative["quality"]["criticalTop8Regressions"], [])
 
     def test_canary_assignment_is_stable_and_unselected_returns_legacy(self) -> None:
         hybrid = RecordingHybrid()

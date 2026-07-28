@@ -86,7 +86,7 @@ class ShadowReportPrivacyTest(unittest.TestCase):
         report = build_shadow_report(
             [
                 {
-                    "case_id": "case-critical",
+                    "evaluation_case_id": "case-critical",
                     "request_id": "request-1",
                     "legacy_chunk_ids": ("legacy-1",),
                     "qwen_chunk_ids": ("qwen-1",),
@@ -141,7 +141,7 @@ class ShadowReportPrivacyTest(unittest.TestCase):
         report = build_shadow_report(
             [
                 {
-                    "case_id": "case-1",
+                    "evaluation_case_id": "case-1",
                     "legacy_chunk_ids": (),
                     "qwen_chunk_ids": (),
                     "legacy_ms": 1.0,
@@ -162,7 +162,7 @@ class ShadowReportPrivacyTest(unittest.TestCase):
         report = build_shadow_report(
             [
                 {
-                    "case_id": "secret question with spaces",
+                    "evaluation_case_id": "secret question with spaces",
                     "legacy_chunk_ids": ("http://internal.example/raw",),
                     "qwen_chunk_ids": ("raw passage body",),
                     "legacy_ms": 1.0,
@@ -177,13 +177,33 @@ class ShadowReportPrivacyTest(unittest.TestCase):
         self.assertNotIn("internal.example", serialized)
         self.assertNotIn("raw passage", serialized)
 
+    def test_unlabelled_record_never_matches_redacted_critical_identifier(self) -> None:
+        from app.evaluation_batches import build_shadow_report
+
+        report = build_shadow_report(
+            [
+                {
+                    "evaluation_case_id": None,
+                    "legacy_chunk_ids": ("legacy",),
+                    "qwen_chunk_ids": ("qwen",),
+                    "legacy_ms": 1.0,
+                    "qwen_ms": 1.0,
+                    "status": "completed",
+                }
+            ],
+            critical_case_ids={"redacted"},
+        )
+
+        self.assertEqual(report["records"][0]["caseId"], "redacted")
+        self.assertEqual(report["quality"]["criticalTop8Regressions"], [])
+
     def test_critical_top_8_detects_partial_relevant_set_loss(self) -> None:
         from app.evaluation_batches import build_shadow_report
 
         report = build_shadow_report(
             [
                 {
-                    "case_id": "case-critical",
+                    "evaluation_case_id": "case-critical",
                     "legacy_chunk_ids": ("a", "b"),
                     "qwen_chunk_ids": ("a",),
                     "relevant_chunk_ids": ("a", "b"),
@@ -207,7 +227,7 @@ class ShadowReportPrivacyTest(unittest.TestCase):
         report = build_shadow_report(
             [
                 {
-                    "case_id": "case-critical",
+                    "evaluation_case_id": "case-critical",
                     "legacy_chunk_ids": ("a", "wrong", "b"),
                     "qwen_chunk_ids": ("wrong", "b", "a"),
                     "relevant_chunk_ids": ("a", "b"),

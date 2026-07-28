@@ -140,6 +140,7 @@ def summarize_evaluation_runs(
 ) -> EvaluationBatchSummaryModel:
     passed_count = sum(run.status == "passed" for run in runs)
     answer_runs = [run for run in runs if run.expect_answer]
+    ranking_runs = [run for run in answer_runs if run.expected_source_ids]
     no_answer_runs = [run for run in runs if not run.expect_answer]
     false_positive_count = sum(run.false_positive for run in runs)
     category_statuses: dict[str, list[bool]] = {}
@@ -177,9 +178,9 @@ def summarize_evaluation_runs(
         ),
         average_top_score=average(run.top_score for run in runs),
         maximum_top_score=max((run.top_score for run in runs), default=0.0),
-        recall_at_k=average(run.recall_at_k for run in answer_runs),
-        mrr=average(run.mrr for run in answer_runs),
-        ndcg_at_k=average(run.ndcg_at_k for run in answer_runs),
+        recall_at_k=average(run.recall_at_k for run in ranking_runs),
+        mrr=average(run.mrr for run in ranking_runs),
+        ndcg_at_k=average(run.ndcg_at_k for run in ranking_runs),
         category_breakdown=_metric_groups(category_statuses),
         tag_breakdown=_metric_groups(tag_statuses),
     )
@@ -312,7 +313,10 @@ def build_shadow_report(
     critical_regressions: list[str] = []
     error_count = 0
     for record in records:
-        case_id = _safe_identifier(_record_value(record, "case_id", "request_id", default=""))
+        evaluation_case_id = _validated_identifier(
+            _record_value(record, "evaluation_case_id", default=None)
+        )
+        case_id = evaluation_case_id or "redacted"
         legacy_ids = _identifier_tuple(_record_value(record, "legacy_chunk_ids", default=()))
         qwen_ids = _identifier_tuple(_record_value(record, "qwen_chunk_ids", default=()))
         legacy_ms = _finite_nonnegative(_record_value(record, "legacy_ms", default=0.0))
@@ -341,8 +345,12 @@ def build_shadow_report(
                 "fallbackReason": fallback,
             }
         )
-        if case_id in critical and _is_top_8_regression(record, legacy_ids, qwen_ids):
-            critical_regressions.append(case_id)
+        if (
+            evaluation_case_id is not None
+            and evaluation_case_id in critical
+            and _is_top_8_regression(record, legacy_ids, qwen_ids)
+        ):
+            critical_regressions.append(evaluation_case_id)
     critical_regressions = list(dict.fromkeys(critical_regressions))
     gates = evaluate_retrieval_quality(
         recall_at_50=recall_at_50,
@@ -401,8 +409,13 @@ def _identifier_tuple(value: object) -> tuple[str, ...]:
 
 
 def _safe_identifier(value: object) -> str:
-    normalized = str(value)
-    return normalized if _REPORT_IDENTIFIER_PATTERN.fullmatch(normalized) else "redacted"
+    return _validated_identifier(value) or "redacted"
+
+
+def _validated_identifier(value: object) -> str | None:
+    if not isinstance(value, str) or _REPORT_IDENTIFIER_PATTERN.fullmatch(value) is None:
+        return None
+    return value
 
 
 def _finite_nonnegative(value: object) -> float | None:

@@ -379,6 +379,8 @@ class RetrievalShadowComparisonRecord(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     request_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    evaluation_case_id: Mapped[str | None] = mapped_column(String(128))
+    relevant_chunk_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     routing_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     legacy_chunk_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)

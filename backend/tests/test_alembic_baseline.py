@@ -13,6 +13,7 @@ from alembic import command
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 REVISION = "20260715_00"
 QWEN3_RETRIEVAL_REVISION = "20260727_04"
+SHADOW_EVALUATION_LABELS_REVISION = "20260728_05"
 
 EXPECTED_COLUMNS: dict[str, tuple[tuple[str, str, bool, bool], ...]] = {
     "agent_runs": (
@@ -272,6 +273,8 @@ class AlembicBaselineTest(unittest.TestCase):
                         "status",
                         "fallback_reason",
                         "created_at",
+                        "evaluation_case_id",
+                        "relevant_chunk_ids",
                     ),
                 }
                 for table_name, columns in expected_columns.items():
@@ -370,9 +373,63 @@ class AlembicBaselineTest(unittest.TestCase):
                 self.assertIn(("request_id",), shadow_unique_constraints)
                 with engine.connect() as connection:
                     self.assertEqual(
-                        QWEN3_RETRIEVAL_REVISION,
+                        SHADOW_EVALUATION_LABELS_REVISION,
                         connection.scalar(text("SELECT version_num FROM alembic_version")),
                     )
+            finally:
+                engine.dispose()
+
+    def test_shadow_evaluation_labels_migration_backfills_and_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite+pysqlite:///{(Path(temp_dir) / 'labels.db').as_posix()}"
+            config = make_config(database_url)
+            command.upgrade(config, QWEN3_RETRIEVAL_REVISION)
+            engine = create_engine(database_url)
+            try:
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "INSERT INTO retrieval_shadow_comparisons "
+                            "(id, request_id, routing_key_hash, query_hash, legacy_chunk_ids, "
+                            "qwen_chunk_ids, legacy_ms, qwen_ms, status, fallback_reason, created_at) "
+                            "VALUES ('shadow-1', 'request-1', :routing_hash, :query_hash, '[]', "
+                            "'[]', 1.0, 2.0, 'completed', NULL, '2026-07-28 10:00:00')"
+                        ),
+                        {"routing_hash": "b" * 64, "query_hash": "c" * 64},
+                    )
+            finally:
+                engine.dispose()
+
+            command.upgrade(config, "head")
+            engine = create_engine(database_url)
+            try:
+                columns = {
+                    column["name"]: column
+                    for column in inspect(engine).get_columns("retrieval_shadow_comparisons")
+                }
+                self.assertTrue(columns["evaluation_case_id"]["nullable"])
+                self.assertFalse(columns["relevant_chunk_ids"]["nullable"])
+                with engine.connect() as connection:
+                    row = connection.execute(
+                        text(
+                            "SELECT evaluation_case_id, relevant_chunk_ids "
+                            "FROM retrieval_shadow_comparisons WHERE id = 'shadow-1'"
+                        )
+                    ).one()
+                self.assertIsNone(row.evaluation_case_id)
+                self.assertEqual(row.relevant_chunk_ids, "[]")
+            finally:
+                engine.dispose()
+
+            command.downgrade(config, QWEN3_RETRIEVAL_REVISION)
+            engine = create_engine(database_url)
+            try:
+                column_names = {
+                    column["name"]
+                    for column in inspect(engine).get_columns("retrieval_shadow_comparisons")
+                }
+                self.assertNotIn("evaluation_case_id", column_names)
+                self.assertNotIn("relevant_chunk_ids", column_names)
             finally:
                 engine.dispose()
 

@@ -101,6 +101,8 @@ class RetrievalShadowComparison:
     status: str
     fallback_reason: str | None
     created_at: str
+    evaluation_case_id: str | None = None
+    relevant_chunk_ids: tuple[str, ...] = ()
 
 
 class RetrievalAuditRepository:
@@ -352,8 +354,12 @@ class RetrievalAuditRepository:
         qwen_ms: float,
         status: str,
         fallback_reason: str | None = None,
+        evaluation_case_id: str | None = None,
+        relevant_chunk_ids: tuple[str, ...] = (),
     ) -> RetrievalShadowComparison:
         request_id = _identifier("request_id", request_id)
+        evaluation_case_id = _optional_identifier("evaluation_case_id", evaluation_case_id)
+        relevant_ids = _identifiers("relevant_chunk_ids", relevant_chunk_ids)
         routing_key_hash = _hash("routing_key_hash", routing_key_hash)
         query_hash = _hash("query_hash", query_hash)
         legacy_ids = _identifiers("legacy_chunk_ids", legacy_chunk_ids)
@@ -367,6 +373,8 @@ class RetrievalAuditRepository:
         record = RetrievalShadowComparisonRecord(
             id=uuid4().hex,
             request_id=request_id,
+            evaluation_case_id=evaluation_case_id,
+            relevant_chunk_ids=list(relevant_ids),
             routing_key_hash=routing_key_hash,
             query_hash=query_hash,
             legacy_chunk_ids=list(legacy_ids),
@@ -536,6 +544,8 @@ def _shadow_from_record(record: RetrievalShadowComparisonRecord) -> RetrievalSha
     return RetrievalShadowComparison(
         id=record.id,
         request_id=record.request_id,
+        evaluation_case_id=record.evaluation_case_id,
+        relevant_chunk_ids=tuple(record.relevant_chunk_ids),
         routing_key_hash=record.routing_key_hash,
         query_hash=record.query_hash,
         legacy_chunk_ids=tuple(record.legacy_chunk_ids),
@@ -558,6 +568,10 @@ def _identifier(name: str, value: str) -> str:
     if not isinstance(value, str) or _IDENTIFIER_PATTERN.fullmatch(value) is None:
         raise RetrievalAuditValidationError(f"{name} must be a bounded identifier")
     return value
+
+
+def _optional_identifier(name: str, value: str | None) -> str | None:
+    return None if value is None else _identifier(name, value)
 
 
 def _identifiers(name: str, values: tuple[str, ...]) -> tuple[str, ...]:

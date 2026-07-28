@@ -363,6 +363,31 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
                 with self.assertRaises(RetrievalAuditValidationError):
                     self.repository.record_shadow(**(valid | override))
 
+    def test_rejects_unbounded_explicit_evaluation_labels(self) -> None:
+        valid = {
+            "routing_key_hash": "b" * 64,
+            "query_hash": "c" * 64,
+            "legacy_chunk_ids": ("legacy-1",),
+            "qwen_chunk_ids": ("qwen-1",),
+            "legacy_ms": 40.0,
+            "qwen_ms": 220.0,
+            "status": "completed",
+        }
+        invalid_cases = (
+            {"evaluation_case_id": "raw case text"},
+            {"relevant_chunk_ids": ["chunk-1"]},
+            {"relevant_chunk_ids": tuple(f"chunk-{index}" for index in range(257))},
+            {"relevant_chunk_ids": ("raw chunk text",)},
+        )
+
+        for index, override in enumerate(invalid_cases):
+            with self.subTest(override=override), self.assertRaises(RetrievalAuditValidationError):
+                self.repository.record_shadow(
+                    request_id=f"request-label-{index}",
+                    **valid,
+                    **override,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

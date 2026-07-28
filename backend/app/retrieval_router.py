@@ -31,6 +31,8 @@ class ShadowAuditProtocol(Protocol):
         self,
         *,
         request_id: str,
+        evaluation_case_id: str | None,
+        relevant_chunk_ids: tuple[str, ...],
         routing_key_hash: str,
         query_hash: str,
         legacy_chunk_ids: tuple[str, ...],
@@ -435,6 +437,8 @@ class ShadowQueue:
         try:
             self._audit.record_shadow(
                 request_id=request_id,
+                evaluation_case_id=task.request.evaluation_case_id,
+                relevant_chunk_ids=task.request.relevant_chunk_ids,
                 routing_key_hash=_sha256_hex(task.request.routing_key),
                 query_hash=_sha256_hex(task.request.query),
                 legacy_chunk_ids=tuple(item.chunk.id for item in task.legacy_hits),

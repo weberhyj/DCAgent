@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class RetrievalMode(StrEnum):
@@ -40,6 +43,22 @@ class RetrievalRequest:
     limit: int
     routing_key: str
     scope: RetrievalScope
+    evaluation_case_id: str | None = None
+    relevant_chunk_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.evaluation_case_id is not None and (
+            not isinstance(self.evaluation_case_id, str)
+            or _IDENTIFIER_PATTERN.fullmatch(self.evaluation_case_id) is None
+        ):
+            raise ValueError("evaluation_case_id must be a bounded identifier or None")
+        if not isinstance(self.relevant_chunk_ids, tuple) or len(self.relevant_chunk_ids) > 256:
+            raise ValueError("relevant_chunk_ids must be a tuple of at most 256 identifiers")
+        if any(
+            not isinstance(chunk_id, str) or _IDENTIFIER_PATTERN.fullmatch(chunk_id) is None
+            for chunk_id in self.relevant_chunk_ids
+        ):
+            raise ValueError("relevant_chunk_ids must contain only bounded identifiers")
 
 
 @dataclass(frozen=True, slots=True)

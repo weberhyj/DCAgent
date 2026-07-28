@@ -785,10 +785,7 @@ class InMemoryChatRepository:
         if missing_ids:
             raise HTTPException(status_code=404, detail="Evaluation case not found")
 
-        runs = [
-            build_evaluation_run(case, self.search_knowledge_chunks(case.question, case.top_k))
-            for case in cases
-        ]
+        runs = [build_evaluation_run(case, self._search_evaluation_case(case)) for case in cases]
         with self._lock:
             for run in runs:
                 run.sequence = self._evaluation_run_sequence
@@ -861,9 +858,8 @@ class InMemoryChatRepository:
 
             for case in cases:
                 try:
-                    hits = self.search_knowledge_chunks(
-                        case.question,
-                        case.top_k,
+                    hits = self._search_evaluation_case(
+                        case,
                         minimum_score=threshold,
                     )
                     run = build_evaluation_run(case, hits, batch_id=batch_id)
@@ -1086,6 +1082,9 @@ class InMemoryChatRepository:
         query: str,
         limit: int,
         routing_key: str,
+        *,
+        evaluation_case_id: str | None = None,
+        relevant_chunk_ids: tuple[str, ...] = (),
     ) -> list[KnowledgeSearchHitModel]:
         if self.retrieval_router is None or self._retrieval_scope_provider is None:
             return self.search_knowledge_chunks(query, limit)
@@ -1108,9 +1107,49 @@ class InMemoryChatRepository:
                 limit=limit,
                 routing_key=routing_key,
                 scope=resolution.scope,
+                evaluation_case_id=evaluation_case_id,
+                relevant_chunk_ids=relevant_chunk_ids,
             )
         )
         return list(outcome.hits)
+
+    def _search_evaluation_case(
+        self,
+        case: EvaluationCaseModel,
+        *,
+        minimum_score: float | None = None,
+    ) -> list[KnowledgeSearchHitModel]:
+        if self.retrieval_router is None or self._retrieval_scope_provider is None:
+            return self.search_knowledge_chunks(
+                case.question,
+                case.top_k,
+                minimum_score=minimum_score,
+            )
+        relevant_chunk_ids = self._evaluation_relevant_chunk_ids(case.expected_source_ids)
+        hits = self._search_routed_knowledge_chunks(
+            case.question,
+            case.top_k,
+            case.id,
+            evaluation_case_id=case.id,
+            relevant_chunk_ids=relevant_chunk_ids,
+        )
+        if minimum_score is None:
+            return hits
+        threshold = resolve_effective_retrieval_min_score(minimum_score)
+        return [hit for hit in hits if hit.score >= threshold]
+
+    def _evaluation_relevant_chunk_ids(
+        self,
+        expected_source_ids: list[str],
+    ) -> tuple[str, ...]:
+        chunk_ids: list[str] = []
+        for source_id in expected_source_ids:
+            for chunk in self._state.knowledge_chunks_by_source.get(source_id, []):
+                if chunk.id not in chunk_ids:
+                    chunk_ids.append(chunk.id)
+                if len(chunk_ids) == 256:
+                    return tuple(chunk_ids)
+        return tuple(chunk_ids)
 
     def _find_conversation(self, conversation_id: str) -> ConversationModel:
         for conversation in self._state.conversations:

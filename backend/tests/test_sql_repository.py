@@ -12,7 +12,7 @@ from app.agent import AgentRunResult
 from app.database import Database
 from app.models import ChatMessageModel, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
-from app.retrieval_models import RetrievalMode, RetrievalScope
+from app.retrieval_models import RetrievalMode, RetrievalRequest, RetrievalScope
 from app.retrieval_router import (
     RetrievalFallbackReason,
     RetrievalRouter,
@@ -39,6 +39,135 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertEqual([message.role for message in messages], ["user", "assistant"])
         self.assertEqual(messages[1].paragraphs[0].citations[0].source_id, "ARC-FIN-Q4")
         self.assertEqual(messages[1].artifacts[0].type, "summary")
+
+    def test_evaluation_run_routes_explicit_case_and_relevant_chunk_labels(self) -> None:
+        self.repository.add_uploaded_knowledge_source(
+            source_id="source-evaluation-labels",
+            name="evaluation-labels.txt",
+            source_type="TXT",
+            classification="internal",
+            records=0,
+            file_path="evaluation-labels.txt",
+            file_size=128,
+            mime_type="text/plain",
+        )
+        self.repository.complete_knowledge_source_indexing(
+            "source-evaluation-labels",
+            [
+                KnowledgeChunkModel(
+                    id="chunk-evaluation-a",
+                    source_id="source-evaluation-labels",
+                    chunk_index=0,
+                    text="evaluation evidence a",
+                    token_count=3,
+                ),
+                KnowledgeChunkModel(
+                    id="chunk-evaluation-b",
+                    source_id="source-evaluation-labels",
+                    chunk_index=1,
+                    text="evaluation evidence b",
+                    token_count=3,
+                ),
+            ],
+        )
+        case = self.repository.create_evaluation_case(
+            question="evaluation evidence",
+            expected_source_ids=["source-evaluation-labels"],
+            expected_terms=[],
+            top_k=8,
+        )
+
+        class RecordingRouter:
+            def __init__(self) -> None:
+                self.requests: list[RetrievalRequest] = []
+
+            def search(self, request: RetrievalRequest) -> RoutedRetrievalOutcome:
+                self.requests.append(request)
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.QWEN3,
+                    hits=(),
+                    stage_ms={},
+                )
+
+        router = RecordingRouter()
+        provider = SimpleNamespace(
+            resolve=lambda: SimpleNamespace(
+                scope=RetrievalScope("default", ("internal",), "v1"),
+                detail="ready",
+            )
+        )
+        self.repository.configure_retrieval(router, provider)
+
+        self.repository.run_evaluation_cases([case.id])
+
+        self.assertEqual(len(router.requests), 1)
+        request = router.requests[0]
+        self.assertEqual(request.evaluation_case_id, case.id)
+        self.assertEqual(
+            request.relevant_chunk_ids,
+            ("chunk-evaluation-a", "chunk-evaluation-b"),
+        )
+
+    def test_memory_evaluation_run_routes_the_same_explicit_labels(self) -> None:
+        repository = InMemoryChatRepository(build_seed_state())
+        repository.add_uploaded_knowledge_source(
+            source_id="source-memory-evaluation",
+            name="memory-evaluation.txt",
+            source_type="TXT",
+            classification="internal",
+            records=0,
+            file_path="memory-evaluation.txt",
+            file_size=128,
+            mime_type="text/plain",
+        )
+        repository.complete_knowledge_source_indexing(
+            "source-memory-evaluation",
+            [
+                KnowledgeChunkModel(
+                    id="chunk-memory-evaluation",
+                    source_id="source-memory-evaluation",
+                    chunk_index=0,
+                    text="memory evaluation evidence",
+                    token_count=3,
+                )
+            ],
+        )
+        case = repository.create_evaluation_case(
+            question="memory evaluation evidence",
+            expected_source_ids=["source-memory-evaluation"],
+            expected_terms=[],
+            top_k=8,
+        )
+
+        class RecordingRouter:
+            def __init__(self) -> None:
+                self.requests: list[RetrievalRequest] = []
+
+            def search(self, request: RetrievalRequest) -> RoutedRetrievalOutcome:
+                self.requests.append(request)
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.QWEN3,
+                    hits=(),
+                    stage_ms={},
+                )
+
+        router = RecordingRouter()
+        provider = SimpleNamespace(
+            resolve=lambda: SimpleNamespace(
+                scope=RetrievalScope("default", ("internal",), "v1"),
+                detail="ready",
+            )
+        )
+        repository.configure_retrieval(router, provider)
+
+        repository.run_evaluation_cases([case.id])
+
+        self.assertEqual(len(router.requests), 1)
+        self.assertEqual(router.requests[0].evaluation_case_id, case.id)
+        self.assertEqual(
+            router.requests[0].relevant_chunk_ids,
+            ("chunk-memory-evaluation",),
+        )
 
     def test_persists_created_conversation_and_first_exchange(self) -> None:
         conversations, active_id, messages = self.repository.create_conversation()

@@ -601,6 +601,38 @@ class EvaluationBatchSummaryTest(unittest.TestCase):
         self.assertEqual(summary.average_source_recall, 0.25)
         self.assertEqual(summary.average_term_recall, 0.75)
 
+    def test_ranking_averages_only_include_runs_with_source_relevance_labels(self) -> None:
+        from app.evaluation_batches import summarize_evaluation_runs
+
+        ranking_labeled = make_evaluation_run(
+            "ranking-labeled",
+            "passed",
+            expected_source_ids=["source"],
+            expected_terms=[],
+            recall_at_k=1.0,
+            mrr=1.0,
+            ndcg_at_k=1.0,
+        )
+        term_only = make_evaluation_run(
+            "term-only",
+            "passed",
+            expected_source_ids=[],
+            expected_terms=["term"],
+            recall_at_k=0.0,
+            mrr=0.0,
+            ndcg_at_k=0.0,
+        )
+
+        mixed = summarize_evaluation_runs([ranking_labeled, term_only], {})
+        unlabeled = summarize_evaluation_runs([term_only], {})
+
+        self.assertEqual(mixed.recall_at_k, 1.0)
+        self.assertEqual(mixed.mrr, 1.0)
+        self.assertEqual(mixed.ndcg_at_k, 1.0)
+        self.assertEqual(unlabeled.recall_at_k, 0.0)
+        self.assertEqual(unlabeled.mrr, 0.0)
+        self.assertEqual(unlabeled.ndcg_at_k, 0.0)
+
 
 class EvaluationBatchComparisonTest(unittest.TestCase):
     def comparison_function(self):

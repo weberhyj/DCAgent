@@ -8,9 +8,9 @@ import math
 import os
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Protocol
@@ -20,8 +20,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = (REPO_ROOT / "backend").resolve()
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
-
-from app.retrieval_models import RetrievalRequest, RetrievalScope  # noqa: E402
 
 
 _FALLBACK_REASONS = frozenset(
@@ -45,6 +43,53 @@ _GATE_NAMES = frozenset({"requests", "p95_seconds", "error_rate", "fallback_rate
 
 class Retriever(Protocol):
     def retrieve(self, request: RetrievalRequest) -> object: ...
+
+
+class RouterProtocol(Protocol):
+    def search(self, request: RetrievalRequest) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalScope:
+    knowledge_base_id: str
+    permission_tags: tuple[str, ...]
+    publication_version: str
+
+    def __post_init__(self) -> None:
+        knowledge_base_id = self.knowledge_base_id.strip()
+        permission_tags = tuple(tag.strip() for tag in self.permission_tags)
+        publication_version = self.publication_version.strip()
+        if (
+            not knowledge_base_id
+            or not permission_tags
+            or any(not tag for tag in permission_tags)
+        ):
+            raise ValueError("benchmark retrieval scope must be complete")
+        if not publication_version:
+            raise ValueError("benchmark retrieval scope must be complete")
+        object.__setattr__(self, "knowledge_base_id", knowledge_base_id)
+        object.__setattr__(self, "permission_tags", permission_tags)
+        object.__setattr__(self, "publication_version", publication_version)
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalRequest:
+    query: str
+    limit: int
+    routing_key: str
+    scope: RetrievalScope
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeDependencies:
+    settings_from_environ: Callable[[Mapping[str, str]], object]
+    database_url_resolver: Callable[[Mapping[str, str]], str]
+    database_factory: Callable[[str], object]
+    repository_factory: Callable[[object], object]
+    resource_factory: Callable[[], object]
+    publication_version: Callable[[str], str]
+    production_scope_factory: Callable[[str, tuple[str, ...], str], object]
+    production_request_factory: Callable[..., object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,19 +133,29 @@ class ProductionRuntime:
     retriever: Retriever
     scope: RetrievalScope
     resources: tuple[object, ...]
+    _closed: bool = field(default=False, init=False)
 
     def close(self) -> None:
-        closed: set[int] = set()
-        for resource in reversed(self.resources):
-            if id(resource) in closed:
-                continue
-            closed.add(id(resource))
-            close = getattr(resource, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
+        if self._closed:
+            return
+        self._closed = True
+        _close_resources(self.resources)
+
+
+@dataclass(frozen=True, slots=True)
+class _RouterRetriever:
+    router: RouterProtocol
+    production_scope: object
+    production_request_factory: Callable[..., object]
+
+    def retrieve(self, request: RetrievalRequest) -> object:
+        production_request = self.production_request_factory(
+            query=request.query,
+            limit=request.limit,
+            routing_key=request.routing_key,
+            scope=self.production_scope,
+        )
+        return self.router.search(production_request)  # type: ignore[arg-type]
 
 
 def summarize_results(
@@ -294,59 +349,118 @@ def write_report(path: Path, report: Mapping[str, object]) -> None:
     destination = path.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(
-            safe_report, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False
+    try:
+        temporary.write_text(
+            json.dumps(
+                safe_report,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, destination)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def build_production_runtime(
     environ: Mapping[str, str] | None = None,
+    *,
+    _dependencies: _RuntimeDependencies | None = None,
 ) -> ProductionRuntime:
-    from app.main import _DefaultRetrievalResourceFactory
-    from app.retrieval_models import RetrievalMode
-    from app.retrieval_publication import collection_publication_version
-    from app.retrieval_settings import RetrievalSettings
-
     environment = dict(os.environ if environ is None else environ)
-    settings = RetrievalSettings.from_environ(environment)
-    if settings.mode is RetrievalMode.LEGACY:
-        raise ValueError("hybrid benchmark requires RETRIEVAL_MODE=shadow or qwen3")
-    factory = _DefaultRetrievalResourceFactory()
-    qdrant = factory.create_qdrant_client(settings)
-    gateway = factory.create_gateway(qdrant, settings)
-    embedding = factory.create_embedding_client(settings)
-    reranker = factory.create_reranker_client(settings)
-    sparse = factory.create_sparse_encoder(environment)
-    retriever = factory.create_hybrid_retriever(
-        settings=settings,
-        embedding=embedding,
-        sparse=sparse,
-        gateway=gateway,
-        reranker=reranker,
+    dependencies = _dependencies or _default_runtime_dependencies()
+    settings = dependencies.settings_from_environ(environment)
+    mode = getattr(
+        getattr(settings, "mode", None), "value", getattr(settings, "mode", None)
     )
+    if mode != "qwen3":
+        raise ValueError("hybrid benchmark requires RETRIEVAL_MODE=qwen3")
+    factory = dependencies.resource_factory()
+    resources: list[object] = []
     try:
+        database = dependencies.database_factory(
+            dependencies.database_url_resolver(environment)
+        )
+        resources.append(database)
+        repository = dependencies.repository_factory(database)
+        resources.append(repository)
+        qdrant = factory.create_qdrant_client(settings)
+        resources.append(qdrant)
+        gateway = factory.create_gateway(qdrant, settings)
+        resources.append(gateway)
+        embedding = factory.create_embedding_client(settings)
+        resources.append(embedding)
+        reranker = factory.create_reranker_client(settings)
+        resources.append(reranker)
+        sparse = factory.create_sparse_encoder(environment)
+        resources.append(sparse)
+        hybrid = factory.create_hybrid_retriever(
+            settings=settings,
+            embedding=embedding,
+            sparse=sparse,
+            gateway=gateway,
+            reranker=reranker,
+        )
+        resources.append(hybrid)
+        audit = factory.create_audit(database)
+        resources.append(audit)
+        router = factory.create_router(
+            settings=settings,
+            legacy_search=repository.search_knowledge_chunks,
+            hybrid=hybrid,
+            audit=audit,
+        )
+        resources.append(router)
         collection_name = gateway.resolve_alias()  # type: ignore[attr-defined]
+        publication_version = dependencies.publication_version(collection_name)
         scope = RetrievalScope(
             settings.knowledge_base_id,
-            settings.permission_tags,
-            collection_publication_version(collection_name),
+            tuple(settings.permission_tags),
+            publication_version,
+        )
+        production_scope = dependencies.production_scope_factory(
+            settings.knowledge_base_id,
+            tuple(settings.permission_tags),
+            publication_version,
         )
     except Exception:
-        ProductionRuntime(
-            retriever=retriever,  # type: ignore[arg-type]
-            scope=RetrievalScope("unavailable", ("unavailable",), "unavailable"),
-            resources=(qdrant, embedding, reranker, retriever),
-        ).close()
+        _close_resources(tuple(resources))
         raise
     return ProductionRuntime(
-        retriever=retriever,  # type: ignore[arg-type]
+        retriever=_RouterRetriever(
+            router,  # type: ignore[arg-type]
+            production_scope,
+            dependencies.production_request_factory,
+        ),
         scope=scope,
-        resources=(qdrant, embedding, reranker, retriever),
+        resources=tuple(resources),
+    )
+
+
+def _default_runtime_dependencies() -> _RuntimeDependencies:
+    from app.database import Database, resolve_database_url
+    from app.main import _DefaultRetrievalResourceFactory
+    from app.retrieval_models import (
+        RetrievalRequest as ProductionRetrievalRequest,
+    )
+    from app.retrieval_models import RetrievalScope as ProductionRetrievalScope
+    from app.retrieval_publication import collection_publication_version
+    from app.retrieval_settings import RetrievalSettings
+    from app.sql_repository import SqlChatRepository
+
+    return _RuntimeDependencies(
+        settings_from_environ=RetrievalSettings.from_environ,
+        database_url_resolver=resolve_database_url,
+        database_factory=Database,
+        repository_factory=SqlChatRepository,
+        resource_factory=_DefaultRetrievalResourceFactory,
+        publication_version=collection_publication_version,
+        production_scope_factory=ProductionRetrievalScope,
+        production_request_factory=ProductionRetrievalRequest,
     )
 
 
@@ -362,7 +476,41 @@ def _outcome_latency_seconds(outcome: object) -> float:
 
 def _outcome_chunk_ids(outcome: object) -> list[str]:
     candidates = getattr(outcome, "candidates", ())
-    return [str(item.chunk_id) for item in candidates if hasattr(item, "chunk_id")]
+    candidate_ids = [
+        str(item.chunk_id) for item in candidates if hasattr(item, "chunk_id")
+    ]
+    if candidate_ids:
+        return candidate_ids
+    hits = getattr(outcome, "hits", ())
+    return [
+        str(item.chunk.id)
+        for item in hits
+        if hasattr(item, "chunk") and hasattr(item.chunk, "id")
+    ]
+
+
+def _close_resources(resources: Sequence[object]) -> None:
+    closed: set[int] = set()
+    for resource in reversed(resources):
+        if id(resource) in closed:
+            continue
+        closed.add(id(resource))
+        closer = next(
+            (
+                method
+                for name in ("close", "shutdown", "dispose")
+                if callable(method := getattr(resource, name, None))
+            ),
+            None,
+        )
+        if closer is None:
+            engine = getattr(resource, "engine", None)
+            closer = getattr(engine, "dispose", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                continue
 
 
 def _outcome_mode(outcome: object) -> str:
