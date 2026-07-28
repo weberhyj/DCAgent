@@ -377,6 +377,17 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
                 self.assertRegex(normalized_design, pattern)
         self.assertNotIn("iter_lines", design)
 
+    def test_active_runbooks_forbid_raw_chunk_answers_on_physoc_failure(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        offline_runbook = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
+            encoding="utf-8"
+        )
+        combined = f"{readme}\n{offline_runbook}"
+
+        self.assertIn("/api/physoc/deepseeks/stream", combined)
+        self.assertIn("no raw-chunk answer on Physoc failure", combined)
+        self.assertIn("HTTP 502", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

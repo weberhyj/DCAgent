@@ -1,6 +1,6 @@
 # Offline single-server topology
 
-This Compose project is the private, single-server deployment contract for DC-Agent. It exposes only the API on `127.0.0.1:8000`; PostgreSQL, ClickHouse, Qdrant, Redis, ClamAV, the embedding service, and optional llama.cpp service remain on the internal Compose network.
+This Compose project is the private, single-server deployment contract for DC-Agent. It exposes only the API on `127.0.0.1:8000`; PostgreSQL, ClickHouse, Qdrant, Redis, ClamAV, the embedding service, the reranker service, and optional llama.cpp service remain on the internal Compose network.
 
 ## Prepare local configuration
 
@@ -8,7 +8,7 @@ Run `tools/prepare_offline_env.ps1` from the repository root. The script copies 
 
 An older `.env` with neither ClickHouse password-file key is upgraded in place with the two fixed relative paths while `STRUCTURED_QUERY_ENABLED` remains unchanged (and therefore remains `false` for legacy deployments). If exactly one key exists, preparation fails closed instead of guessing. Existing valid secret files are never overwritten.
 
-The supported production host contract is **local rootful Linux Compose v2**. The same non-root deployment account must prepare configuration, build the three Python images, and start Compose. `tools/invoke_offline_compose.ps1` is the only supported Compose entry point; do not invoke `docker compose` directly. The wrapper removes every `.env` key and Compose model-selector variable from the child process environment, fixes and inspects the local `default` Docker context, renders every profile with `config --format json`, validates the fixed project name, internal digest-pinned images, approved bind/secret paths, and only then executes the requested Compose arguments. For example, run `& tools/invoke_offline_compose.ps1 up -d`. Configuration/project overrides, one-off `run`, `create`, `start`, `restart`, build-argument overrides, and `up` flags that skip recreation, builds, dependencies, or alter scale are rejected; use `up` to reconcile stopped services with the validated model. On first generation the preparation script records the account's `id -u` and `id -g` as `DCAGENT_UID` and `DCAGENT_GID`; an existing `.env` and any shell overrides must match those exact non-zero numeric values. The locked `PYTHON_BASE_IMAGE` must be a Debian-family image that provides `groupadd` and `useradd`, with the `dcagent` name and selected IDs unused. The Dockerfiles create and verify `dcagent` with those IDs and still finish as `USER dcagent`; rebuild these host-bound images when the deployment UID/GID changes. Host secret files remain mode `0600`; the secret directory and writable `raw`/`parquet` directories remain owned by the deployment account at mode `0700`.
+The supported production host contract is **local rootful Linux Compose v2**. The same non-root deployment account must prepare configuration, build the four Python images, and start Compose. `tools/invoke_offline_compose.ps1` is the only supported Compose entry point; do not invoke `docker compose` directly. The wrapper removes every `.env` key and Compose model-selector variable from the child process environment, fixes and inspects the local `default` Docker context, renders every profile with `config --format json`, validates the fixed project name, internal digest-pinned images, approved bind/secret paths, and only then executes the requested Compose arguments. For example, run `& tools/invoke_offline_compose.ps1 up -d`. Configuration/project overrides, one-off `run`, `create`, `start`, `restart`, build-argument overrides, and `up` flags that skip recreation, builds, dependencies, or alter scale are rejected; use `up` to reconcile stopped services with the validated model. On first generation the preparation script records the account's `id -u` and `id -g` as `DCAGENT_UID` and `DCAGENT_GID`; an existing `.env` and any shell overrides must match those exact non-zero numeric values. The locked `PYTHON_BASE_IMAGE` must be a Debian-family image that provides `groupadd` and `useradd`, with the `dcagent` name and selected IDs unused. The Dockerfiles create and verify `dcagent` with those IDs and still finish as `USER dcagent`; rebuild these host-bound images when the deployment UID/GID changes. Host secret files remain mode `0600`; the secret directory and writable `raw`/`parquet` directories remain owned by the deployment account at mode `0700`.
 
 Every host bind uses `create_host_path: false`, and every Compose interpolation is required with `${VAR:?message}`, so missing or empty values fail configuration instead of falling back to paths such as `/postgres`. Preparation creates only the deployment-account-owned `raw` and `parquet` directories without deleting existing contents. It refuses to continue unless the PostgreSQL, ClickHouse, Qdrant, Redis, and model bind sources already exist, every existing ancestor of the data/model/secret targets is a non-link path, the secret directory is a directory, and an existing secret pair consists of matching regular non-link files. Before startup, inspect the locked vendor images to obtain their actual runtime UID/GID, then pre-create and verify ownership and modes for `${DATA_ROOT}/postgres`, `clickhouse`, `qdrant`, and `redis`; also verify the locked llama image can read `${MODEL_ROOT}`. A mismatch must stop deployment rather than be repaired by broad permissions. The repository-root `.dockerignore` is an allowlist for the wheelhouse, backend runtime/migrations, and Dockerfiles; local secrets, models, uploads, benchmarks, dependency trees, Git metadata, and other artifacts must remain outside the build context.
 
@@ -16,7 +16,7 @@ rootless Docker, Docker `userns` remapping, remote Docker engines/contexts, Wind
 
 `-RotateSecrets` is a **pre-initialization only** operation. `DATA_ROOT` and `MODEL_ROOT` must be unquoted explicit paths or the exact unquoted `${VAR}` form whose dedicated host variable exists; use names such as `${HOST_DATA_ROOT}` rather than a self-reference such as `${DATA_ROOT}`, because `.env` keys are deliberately removed before Compose starts. The script rejects single-quoted and double-quoted path values rather than interpreting them with semantics that differ from Compose. A missing environment variable, unresolved value, unsupported Compose expansion, invalid path, or mismatching shell override is rejected before any secret or data-directory mutation. The script refuses rotation when `${DATA_ROOT}/postgres/PG_VERSION` exists, because changing files alone cannot change the password stored in an initialized PostgreSQL role. Rotation after initialization requires a controlled maintenance procedure: stop dependent services, run a reviewed `ALTER ROLE`, update both secret files together, restart services, and verify connectivity. That coordinated workflow is intentionally outside this phase.
 
-Before deployment, replace every placeholder digest and model checksum in `deploy/offline/.env` with the approved values from the offline artifact lock and internal registry. Do not replace digest references with floating public tags. The digest-pinned PYTHON_BASE_IMAGE must use an approved Debian-family image whose reviewed `uv 0.11.29` binary is preinstalled on PATH. The Dockerfiles do not download uv: they run `uv --version` and then perform the frozen offline sync. On the target host, run `uv --version` from the internal reviewed image before building; all three real image builds remain target-host gates.
+Before deployment, replace every placeholder digest and model checksum in `deploy/offline/.env` with the approved values from the offline artifact lock and internal registry. Do not replace digest references with floating public tags. The digest-pinned PYTHON_BASE_IMAGE must use an approved Debian-family image whose reviewed `uv 0.11.29` binary is preinstalled on PATH. The Dockerfiles do not download uv: they run `uv --version` and then perform the frozen offline sync. On the target host, run `uv --version` from the internal reviewed image before building; all four real image builds remain target-host gates.
 
 ## Migration safety
 
@@ -26,9 +26,201 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 
 ## Profiles
 
-- The default topology starts data services, schema migration, the embedding service, and API.
+- The default topology starts data services, schema migration, the embedding service, the reranker
+  service, and API.
 - `--profile generation` enables the private llama.cpp service after its locked local model is installed.
 - `--profile indexing` enables the structured spreadsheet worker (`app.structured_worker`). Keep it disabled while `STRUCTURED_QUERY_ENABLED=false`.
+
+## Qwen3 hybrid retrieval rollout and rollback
+
+The selected private retrieval models are `Qwen/Qwen3-Embedding-0.6B` and
+`Qwen/Qwen3-Reranker-0.6B`. Ordinary document retrieval is
+`Qdrant Dense + Sparse/BM25 + RRF`, followed by bounded reranking and Top 8 evidence. Exact
+spreadsheet statistics use `ClickHouse complete-data aggregation`; spreadsheet averages are never
+calculated from RAG chunks.
+
+The deployment selector is `RETRIEVAL_MODE=legacy|shadow|qwen3`:
+
+- `legacy` returns only the PostgreSQL Legacy path and is the immediate safety rollback.
+- `shadow` returns Legacy results while a sampled, bounded background job compares Qwen3 rankings.
+- `qwen3` routes a stable conversation canary to Qwen3 and safely falls back to Legacy on a
+  sanitized retrieval failure.
+
+### Artifact and wheel contract
+
+Provision this local-only layout before rendering Compose:
+
+```text
+artifacts/
+  offline-artifacts.json
+  wheels/                         # every Linux/Python 3.12 wheel required by backend/uv.lock
+  models/
+    qwen3-embedding-0.6b/
+      embedding-metadata.json
+      ... approved local tokenizer and model files
+    qwen3-reranker-0.6b/
+      reranker-metadata.json
+      ... approved local tokenizer and model files
+    qdrant-bm25/
+      ... approved FastEmbed BM25 files
+```
+
+`offline-artifacts.json` must validate against `deploy/offline/artifacts.schema.json` and contain
+separate `embedding-model`, `reranker-model`, and `sparse-embedding-model` entries with local paths,
+versions, licenses, and lowercase SHA-256 values. It must not contain a download URL. The two model
+metadata manifests must match the corresponding `.env` model name, version, dimensions/profile,
+and protocol fields.
+
+Generate the service-compatible model tree digests from the repository root on the staging host:
+
+```powershell
+$embedding = (Resolve-Path artifacts/models/qwen3-embedding-0.6b).Path
+$reranker = (Resolve-Path artifacts/models/qwen3-reranker-0.6b).Path
+uv run --directory backend --group offline python -c "from pathlib import Path; from app.embedding_service import compute_model_directory_sha256; print(compute_model_directory_sha256(Path(r'$embedding')))"
+uv run --directory backend --group offline python -c "from pathlib import Path; from app.reranker_service import compute_model_directory_sha256; print(compute_model_directory_sha256(Path(r'$reranker')))"
+```
+
+Copy the resulting values into `EMBEDDING_MODEL_SHA256` and `RERANKER_MODEL_SHA256`. Validate the
+manifest and prove that the locked wheel bundle is complete without public network access:
+
+```powershell
+$env:UV_PYTHON_DOWNLOADS = "never"
+uv run --directory backend --group offline python -c "import json; from pathlib import Path; from app.offline_artifacts import validate_artifact_manifest; validate_artifact_manifest(json.loads(Path('../artifacts/offline-artifacts.json').read_text(encoding='utf-8'))); print('artifact-manifest-ok')"
+uv sync --project backend --frozen --offline --group offline --no-dev --no-index --find-links artifacts/wheels
+uv sync --project backend --frozen --offline --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
+```
+
+The wheel bundle must come from an approved internal staging process and must cover the exact
+`backend/uv.lock`; a missing wheel is a failed deployment gate, not permission to contact PyPI or
+Hugging Face.
+
+### Starting CPU profile
+
+The checked-in starting point is 4 CPU / 6 GiB for Embedding, 4 CPU / 6 GiB for Reranker, 2 GiB for
+Qdrant, and 4 GiB for ClickHouse. Embedding uses a 64-item batch and 256-item queue; Reranker uses a
+24-pair batch and 192-item queue, both with a 10 ms collection window and OpenVINO. These are
+starting limits, not guaranteed capacity. Do not lower or raise them without recording the 15-user
+benchmark, model queue saturation, host CPU steal, RSS, and p95 impact.
+
+### Build, validate, and activate
+
+Keep the API in `shadow` with `RETRIEVAL_SHADOW_PERCENT=0` and
+`RETRIEVAL_CANARY_PERCENT=0` while creating the first index. Prepare, build, and start the validated
+topology:
+
+```powershell
+& tools/prepare_offline_env.ps1
+& tools/invoke_offline_compose.ps1 config
+& tools/invoke_offline_compose.ps1 build schema-migration embedding-service reranker-service api ingestion-worker
+& tools/invoke_offline_compose.ps1 up -d
+```
+
+Run the first full rehearsal without `--activate`. The worker creates an immutable versioned
+collection, validates dimensions, point count, filters, Dense/Sparse search and sample query hits,
+then records the publication as `validated` in PostgreSQL:
+
+```powershell
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v1
+& tools/invoke_offline_compose.ps1 exec -T postgres `
+  psql -U dc_agent -d dc_agent -c "SELECT collection_name, alias_name, status, dimensions, point_count, embedding_model_version, sparse_profile_sha256 FROM retrieval_publications ORDER BY created_at DESC;"
+```
+
+Review the publication row, Qdrant count/dimension, permission-filter samples, model checksums and
+the fixed quality set. Collections are immutable and names are unique, so promotion uses the next
+approved version and performs validation again immediately before the Alias switch:
+
+```powershell
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v2 --activate
+Invoke-RestMethod http://127.0.0.1:8000/api/readyz
+```
+
+`--activate` atomically switches `knowledge_chunks_current` and the PostgreSQL active-publication
+record. If post-switch verification fails, the publisher restores the previous Alias and audit
+state. Never mutate the Qdrant Alias directly because that would bypass the PostgreSQL publication
+fence and make readiness fail closed.
+
+### Shadow and canary promotion
+
+Use the following sequence, with a configuration reconcile and review at every step:
+
+```text
+Shadow 10 -> 50 -> 100
+canary 5 -> 25 -> 50 -> 100
+```
+
+For Shadow, set `RETRIEVAL_MODE=shadow`, keep `RETRIEVAL_CANARY_PERCENT=0`, and set
+`RETRIEVAL_SHADOW_PERCENT` to 10, 50, then 100. For canary, set `RETRIEVAL_MODE=qwen3`, set
+`RETRIEVAL_SHADOW_PERCENT=0`, and set `RETRIEVAL_CANARY_PERCENT` to 5, 25, 50, then 100. After each
+edit run:
+
+```powershell
+& tools/invoke_offline_compose.ps1 config
+& tools/invoke_offline_compose.ps1 up -d
+Invoke-RestMethod http://127.0.0.1:8000/api/readyz
+```
+
+Stop promotion when any gate fails: Recall@50 below 0.90, NDCG@8 regression, target NDCG gain below
+0.05, a critical Top-8 regression, permission leakage, structured aggregate mismatch, retrieval
+P95 above 5 seconds, error rate above 1%, or fallback rate above 1%.
+
+At 100% Qwen3 canary, run the mandatory 15-user acceptance command from the repository root. The
+benchmark deliberately rejects any mode other than `qwen3` and any canary value other than 100:
+
+```powershell
+uv run --project backend --group benchmark python tools/hybrid_retrieval_benchmark.py --concurrency 15 --requests 150 --p95-seconds 5 --max-error-rate 0.01 --max-fallback-rate 0.01 --questions-jsonl artifacts/benchmarks/hybrid-questions.jsonl --output-json artifacts/benchmarks/hybrid-retrieval-report.json
+```
+
+Preserve the JSON report as deployment evidence and never commit sensitive question text or generated
+reports.
+
+### Monitoring
+
+The `retrieval completed` Loguru event contains `request_id`, `mode`, `model_versions`,
+`qdrant_alias`, `candidate_counts`, `stage_timings_ms`, `fallback_code`, and `result_count`. Dashboard
+the overall and per-stage p50/p95, Qwen/Legacy result counts, fallback codes, and
+`fallback_code=circuit_open`. Track Embedding/Reranker HTTP 429 counts as queue saturation, service
+readiness/metadata mismatches, Qdrant Alias resolution, host CPU/RSS, and Shadow queue-full counts.
+Logs and Shadow audit rows must not contain query text, evidence text, model response text, internal
+URLs, or raw exception strings.
+
+### Rollback commands
+
+`RETRIEVAL_MODE=legacy rollback` is the first response to a retrieval incident. Edit exactly that
+key in `deploy/offline/.env`, then reconcile and verify readiness:
+
+```powershell
+$path = (Resolve-Path deploy/offline/.env).Path
+$text = [IO.File]::ReadAllText($path)
+$next = [regex]::Replace($text, '(?m)^RETRIEVAL_MODE=.*$', 'RETRIEVAL_MODE=legacy')
+if ($next -eq $text -and $text -notmatch '(?m)^RETRIEVAL_MODE=legacy$') { throw 'RETRIEVAL_MODE key not found' }
+[IO.File]::WriteAllText($path, $next, [Text.UTF8Encoding]::new($false))
+& tools/invoke_offline_compose.ps1 config
+& tools/invoke_offline_compose.ps1 up -d
+Invoke-RestMethod http://127.0.0.1:8000/api/readyz
+```
+
+For an `Alias rollback`, remain in Legacy, restore the previously approved model directories and
+checksums, then rebuild that known-good model/data combination under a new collection version and
+activate it. Do not reuse an existing immutable collection name:
+
+```powershell
+& tools/invoke_offline_compose.ps1 up -d
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v3 --activate
+```
+
+For a model-service image rollback, check out the last approved release in the deployment release
+directory, restore its `backend/uv.lock`, Dockerfiles and wheel bundle, then run:
+
+```powershell
+& tools/invoke_offline_compose.ps1 build embedding-service reranker-service api ingestion-worker
+& tools/invoke_offline_compose.ps1 up -d
+Invoke-RestMethod http://127.0.0.1:8000/api/readyz
+```
+
+Only resume Shadow after the Alias, database publication record, model metadata and checksums agree.
 
 ## Physoc production gate
 
@@ -179,10 +371,10 @@ uv sync --project backend --frozen --offline --no-default-groups --group benchma
 
 The wheelhouse must contain all wheels and other artifacts required by `backend/uv.lock` for the target Linux platform and Python 3.12, together with approved checksum evidence. Offline hosts must set `UV_PYTHON_DOWNLOADS=never`; neither sync command may fall back to a public package index.
 
-This development machine has neither Docker nor a complete target wheelhouse. Real offline sync, all three image builds, Compose rendering, and Compose smoke therefore remain target-host gates. Validate them on the approved Linux host before deployment.
+This development machine has neither Docker nor a complete target wheelhouse. Real offline sync, all four Python image builds, Compose rendering, and Compose smoke therefore remain target-host gates. Validate them on the approved Linux host before deployment.
 
 ## Offline Compose smoke check
 
-After preparing the offline environment, run `python tools/compose_smoke.py` from the repository root. The smoke runner uses the supported `tools/invoke_offline_compose.ps1` wrapper for `config`, `up`, `exec`, and `down`; it starts only `api` and its declared core dependencies, leaving the indexing worker and generation profile disabled. It validates PostgreSQL/Alembic, ClickHouse, Qdrant, Redis, ClamAV, the embedding service metadata, and the host-published API readiness endpoint, then atomically writes the deterministic audit report to `artifacts/benchmarks/compose-smoke.json`. A failed command, missing executable, malformed response, non-loopback endpoint, or non-200 readiness response is a failed smoke check. The runner always attempts `down --remove-orphans` in cleanup, preserves data volumes by default, and removes them only when `--remove-volumes` is explicitly supplied. Docker is not available on this development machine, so this check is a target-host gate and must not be reported as passed locally.
+After preparing the offline environment, run `python tools/compose_smoke.py` from the repository root. The smoke runner uses the supported `tools/invoke_offline_compose.ps1` wrapper for `config`, `up`, `exec`, and `down`; it starts only `api` and its declared core dependencies, leaving the indexing worker and generation profile disabled. It validates PostgreSQL/Alembic, ClickHouse, Qdrant, Redis, ClamAV, Embedding metadata, Reranker metadata, and the host-published API readiness endpoint, then atomically writes the deterministic audit report to `artifacts/benchmarks/compose-smoke.json`. A failed command, missing executable, malformed response, non-loopback endpoint, or non-200 readiness response is a failed smoke check. The runner always attempts `down --remove-orphans` in cleanup, preserves data volumes by default, and removes them only when `--remove-volumes` is explicitly supplied. Docker is not available on this development machine, so this check is a target-host gate and must not be reported as passed locally.
 
-The locked PostgreSQL image must be PostgreSQL 15 or newer (`POSTGRES_MIN_MAJOR=15`) because exact index validation uses `pg_index.indnullsnotdistinct`. Startup rejects older or unreported server versions before catalog inspection with an explicit `PostgreSQL 15+ required` error; there is no compatibility fallback. The PostgreSQL target host must also run the real baseline/stamp and drift-rejection tests against the approved PostgreSQL version. Local unit tests validate catalog-row normalization and advisory lock orchestration, but they do not prove the live `pg_catalog` queries, session advisory lock concurrency, or rollback behavior on the target server. A Docker build of all three offline images and the Compose configuration check remain target-host gates.
+The locked PostgreSQL image must be PostgreSQL 15 or newer (`POSTGRES_MIN_MAJOR=15`) because exact index validation uses `pg_index.indnullsnotdistinct`. Startup rejects older or unreported server versions before catalog inspection with an explicit `PostgreSQL 15+ required` error; there is no compatibility fallback. The PostgreSQL target host must also run the real baseline/stamp and drift-rejection tests against the approved PostgreSQL version. Local unit tests validate catalog-row normalization and advisory lock orchestration, but they do not prove the live `pg_catalog` queries, session advisory lock concurrency, or rollback behavior on the target server. Docker builds of the backend, worker, Embedding, and Reranker images plus the Compose configuration check remain target-host gates.

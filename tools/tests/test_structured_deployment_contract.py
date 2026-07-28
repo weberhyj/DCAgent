@@ -421,6 +421,45 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, combined)
 
+    def test_docs_define_qwen3_hybrid_retrieval_operations(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        offline_readme = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
+            encoding="utf-8"
+        )
+        rollout = (
+            REPO_ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-07-24-enterprise-knowledge-base-qa-rollout.md"
+        ).read_text(encoding="utf-8")
+        combined = f"{readme}\n{offline_readme}\n{rollout}"
+
+        for phrase in (
+            "Qwen/Qwen3-Embedding-0.6B",
+            "Qwen/Qwen3-Reranker-0.6B",
+            "RETRIEVAL_MODE=legacy|shadow|qwen3",
+            "Qdrant Dense + Sparse/BM25 + RRF",
+            "ClickHouse complete-data aggregation",
+            "Shadow 10 -> 50 -> 100",
+            "canary 5 -> 25 -> 50 -> 100",
+            "Alias rollback",
+            "RETRIEVAL_MODE=legacy rollback",
+            "artifacts/wheels",
+            "--collection knowledge_chunks_qwen3_v1",
+            "--activate",
+            "--concurrency 15 --requests 150",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, combined)
+
+        phase_three = re.search(r"(?ms)^### Phase 3:.*?(?=^### Phase 4:)", rollout)
+        self.assertIsNotNone(phase_three)
+        assert phase_three is not None
+        self.assertNotIn("BGE-M3", phase_three.group(0))
+        self.assertNotIn("BGE Reranker", phase_three.group(0))
+        self.assertNotIn("averages are calculated from RAG chunks", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

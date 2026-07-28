@@ -570,7 +570,7 @@ class BackendUvContractTest(unittest.TestCase):
             "preinstalled on PATH",
             "Dockerfiles do not download uv",
             "uv --version",
-            "all three real image builds remain target-host gates",
+            "all four real image builds remain target-host gates",
         ):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, offline_readme)

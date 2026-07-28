@@ -5,7 +5,7 @@ import json
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
-from threading import Event, Lock
+from threading import Barrier, Lock
 import tempfile
 import unittest
 
@@ -270,8 +270,7 @@ class StructuredAggregationBenchmarkTest(unittest.TestCase):
             execute_workload,
         )
 
-        all_started = Event()
-        release = Event()
+        wave = Barrier(3)
         lock = Lock()
         active = 0
         peak_active = 0
@@ -281,22 +280,12 @@ class StructuredAggregationBenchmarkTest(unittest.TestCase):
             with lock:
                 active += 1
                 peak_active = max(peak_active, active)
-                if peak_active == 3:
-                    all_started.set()
-            self.assertTrue(release.wait(timeout=2))
+            wave.wait(timeout=5)
             with lock:
                 active -= 1
             if index == 4:
                 raise RuntimeError("query failed")
 
-        def release_when_ready() -> None:
-            self.assertTrue(all_started.wait(timeout=2))
-            release.set()
-
-        import threading
-
-        coordinator = threading.Thread(target=release_when_ready)
-        coordinator.start()
         report = execute_workload(
             BenchmarkConfig(rows=1, concurrency=3, requests=6),
             ingestion_batches=([1],),
@@ -305,7 +294,6 @@ class StructuredAggregationBenchmarkTest(unittest.TestCase):
             execute_query=query,
             rss_reader=lambda: 100,
         )
-        coordinator.join(timeout=2)
 
         self.assertEqual(peak_active, 3)
         self.assertEqual(report["successCount"], 5)

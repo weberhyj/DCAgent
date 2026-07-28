@@ -6,7 +6,7 @@
 
 **Architecture:** Keep FastAPI, LangGraph, PostgreSQL, Qdrant, ClickHouse, Redis, and the existing conversation API, then replace the legacy parsing and retrieval path behind explicit phase gates. Each phase produces working software, retains a rollback path, and freezes its public contracts before the next detailed plan is written.
 
-**Tech Stack:** Python 3.12, FastAPI, LangGraph, PostgreSQL, Qdrant, ClickHouse, Redis/Celery, Docling, PaddleOCR, BGE-M3, BGE Reranker v2 M3, SQLGlot, Polars/PyArrow/openpyxl, Physoc DeepSeek SSE, Docker Compose, unittest, Ruff, uv.
+**Tech Stack:** Python 3.12, FastAPI, LangGraph, PostgreSQL, Qdrant, ClickHouse, Redis/Celery, Docling, PaddleOCR, Qwen/Qwen3-Embedding-0.6B, Qwen/Qwen3-Reranker-0.6B, FastEmbed BM25, SQLGlot, Polars/PyArrow/openpyxl, Physoc DeepSeek SSE, Docker Compose, unittest, Ruff, uv.
 
 **Approved Design:** [`../specs/2026-07-24-enterprise-knowledge-base-qa-design.md`](../specs/2026-07-24-enterprise-knowledge-base-qa-design.md)
 
@@ -37,15 +37,18 @@ Exit gate: a real target server produces a passing Physoc probe report and a mod
 
 Exit gate: the fixed parser regression corpus reproduces expected locations and text for every supported format, and failed parsing leaves the previous version active.
 
-### Phase 3: Qdrant hybrid retrieval
+### Phase 3: Qwen3 Qdrant hybrid retrieval
 
-- [ ] Add versioned BGE-M3 Dense and Sparse indexes in Qdrant.
-- [ ] Apply authorization filters before both retrieval branches.
-- [ ] Fuse 50-100 Dense/Sparse candidates, deduplicate, rerank with BGE Reranker v2 M3, and expand adjacent context.
-- [ ] Move production retrieval away from PostgreSQL full-table chunk scans and Python per-row scoring.
-- [ ] Add shadow comparison, migration flag, collection publication, rollback, and Recall@50 evaluation.
+Detailed implementation plan: [`2026-07-27-qwen3-hybrid-retrieval-gray-migration.md`](2026-07-27-qwen3-hybrid-retrieval-gray-migration.md)
 
-Exit gate: permission leakage is zero, Recall@50 is at least 90%, and Qdrant retrieval meets the five-second p95 target on the acceptance dataset.
+- [x] Add versioned Qwen3 Dense and local BM25 Sparse indexes in Qdrant.
+- [x] Apply knowledge-base, permission-tag, and publication filters before both retrieval branches.
+- [x] Fuse Dense/Sparse Top 50 with RRF, rerank Top 24 with Qwen/Qwen3-Reranker-0.6B, and return Top 8 authorized evidence with adjacent context.
+- [x] Move the Qwen3 route away from PostgreSQL full-table chunk scans and Python per-row scoring while preserving Legacy fallback.
+- [x] Add `RETRIEVAL_MODE=legacy|shadow|qwen3`, Shadow comparison, stable canary routing, versioned collection publication, and quality/capacity gates.
+- [ ] Complete the approved target-host Shadow 10 -> 50 -> 100 and canary 5 -> 25 -> 50 -> 100 rollout.
+
+Exit gate: permission leakage is zero, Recall@50 is at least 90%, NDCG@8 does not regress, critical Top-8 regressions are zero, and Qdrant retrieval meets the five-second p95 target in the mandatory 15-user acceptance run. Immediate rollback is `RETRIEVAL_MODE=legacy rollback`; index recovery uses the governed Alias rollback procedure.
 
 ### Phase 4: Query routing and hierarchical synthesis
 
@@ -84,9 +87,10 @@ Exit gate: security, recovery, citation, ingestion, load, and end-to-end busines
 - [ ] Authorization filters are applied before retrieval, statistics, context construction, and model invocation.
 - [ ] Document synthesis requires Physoc; model failure is explicit and cannot reveal raw slices.
 - [ ] Pure structured statistics may return deterministic results without Physoc, but never use slice estimates.
+- [ ] Excel/CSV averages, sums, counts, minima, and maxima use ClickHouse complete-data aggregation; averages are never calculated from RAG chunks.
 - [ ] User-side attachment and manual search-mode controls remain hidden.
 - [ ] Each phase uses TDD, focused commits, full backend regression tests, Ruff checks, and a documented rollback.
 
 ## Planning rule
 
-Only Phase 1 is detailed now because later phases change the same parser, repository, retrieval, and schema boundaries. After each exit gate passes, inspect the resulting code and write the next phase plan with exact post-migration paths and signatures before changing that phase's production code.
+Phase 1 and the Phase 3 Qwen3 implementation now have detailed plans. A phase is not operationally complete merely because its deterministic tests pass: the target-host model checksums, Alias state, permission corpus, Physoc route, live dependencies, and capacity report must also pass. Before changing the remaining parser, synthesis, security, or queue phases, inspect the resulting code and write the next detailed plan with exact post-migration paths and signatures.

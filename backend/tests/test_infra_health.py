@@ -479,7 +479,11 @@ class InfraHealthTest(unittest.TestCase):
         self.addCleanup(server.shutdown)
         service_url = f"http://127.0.0.1:{server.server_port}"
         environ = retrieval_health_environment()
-        environ["DEPENDENCY_TIMEOUT_SECONDS"] = "0.2"
+        # Creating a real httpx.Client can consume about 100 ms on a cold
+        # Windows runner. Leave enough time for the request handler to send
+        # its first byte so this test measures cancellation of a stalled
+        # response instead of scheduler/client-construction latency.
+        environ["DEPENDENCY_TIMEOUT_SECONDS"] = "0.5"
         environ["EMBEDDING_SERVICE_URL"] = service_url
         clients: list[httpx.Client] = []
 
@@ -511,8 +515,8 @@ class InfraHealthTest(unittest.TestCase):
 
         self.assertEqual(first, (False, "unavailable"))
         self.assertTrue(first_chunk_sent.is_set())
-        self.assertLess(elapsed, 0.5)
-        self.assertTrue(client_disconnected.wait(0.2))
+        self.assertLess(elapsed, 0.9)
+        self.assertTrue(client_disconnected.wait(0.5))
         self.assertFalse(
             any(
                 thread.name == "dependency-probe-embedding" and thread.is_alive()

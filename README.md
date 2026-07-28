@@ -129,7 +129,8 @@ rollback, and ClickHouse failure handling.
 
 ## 当前真实架构与能力边界
 
-> 本节描述 `main` 分支当前已经接入的运行链路，不代表路线图中的后续目标架构已经完成。
+> 本节描述当前功能分支已经接入的运行链路。生产切换仍必须完成目标内网服务器上的模型、
+> 数据、权限和 15 用户并发验收。
 
 ```mermaid
 flowchart TD
@@ -137,9 +138,9 @@ flowchart TD
     B --> C["本地原始文件目录"]
     B --> D{"是否启用结构化 Excel/CSV"}
 
-    D -->|"否或普通文档"| E["基础文件解析器"]
-    E --> F["600 字符切片 / 120 字符重叠"]
-    F --> G["PostgreSQL 文档、切片和轻量哈希向量"]
+    D -->|"否或普通文档"| E["解析、切片与发布元数据"]
+    E --> F["PostgreSQL 权威文档与切片"]
+    F --> G["Qdrant 版本化索引"]
 
     D -->|"是"| H["推断并人工确认表结构"]
     H --> I["结构化 indexing worker"]
@@ -151,28 +152,43 @@ flowchart TD
     K --> N["确定性统计答案，不调用大模型"]
     K -.->|"不可用或超时"| X["显式失败，不回退到切片计算"]
 
-    M -->|"普通文档问题"| O["LangGraph 只读检索 Agent"]
-    O --> G
-    G --> P["最多 5 个证据切片"]
+    M -->|"普通文档问题"| O["RetrievalRouter"]
+    O -->|"legacy"| P0["PostgreSQL Legacy 检索"]
+    O -->|"shadow / qwen3"| P1["Qwen3 Embedding + BM25"]
+    P1 --> P2["Qdrant Dense + Sparse"]
+    P2 --> P3["RRF 融合 + Qwen3 Reranker"]
+    P3 --> P["Top 8 授权证据"]
+    P0 --> P
     P -.->|"无可靠证据"| Y["拒绝回答，不调用模型"]
     P --> Q["Physoc DeepSeek POST/SSE"]
     Q --> R["基于证据归纳的最终答案"]
     Q -.->|"超时、非 2xx 或异常 SSE"| Z["HTTP 502"]
 ```
 
-### 普通文档问答链路
+### Qwen3 混合检索链路
 
-当前普通文档问答属于检索增强生成（RAG）：
+普通文档问答采用 `Qdrant Dense + Sparse/BM25 + RRF`：
 
-1. 上传文件保存在 API 主机的受控原始文件目录中。
-2. 解析器提取文本，并按 600 个字符切片、保留 120 个字符重叠。
-3. 切片和 48 维轻量哈希向量保存在 PostgreSQL。
-4. 查询时从 PostgreSQL 读取已索引切片，在 Python 中计算关键词和向量分数。
-5. LangGraph Agent 最多保留 5 个证据切片、深入检查 3 个资料来源，并把证据、调查摘要和最近 6 条消息组成完整 RAG 提示词。
-6. `physoc_deepseek` Provider 将完整提示词通过 `POST /api/physoc/deepseeks/stream` 发送给私有 Physoc 服务，收集 SSE `message` 事件中的 `response`，再返回归纳后的答案。
+1. PostgreSQL 保存权威文档、切片、权限标签和发布状态；Qdrant 保存版本化检索点。
+2. `Qwen/Qwen3-Embedding-0.6B` 生成 1024 维归一化 Dense query vector，本地 BM25
+   生成 Sparse query vector。
+3. 两路检索都先应用 knowledge-base、permission-tag 和 publication filters，各取 Top 50。
+4. RRF（`k=60`）融合候选，`Qwen/Qwen3-Reranker-0.6B` 重排 Top 24，服务拥塞时使用
+   有界降级 Top 12，最终只向 Agent 提供 Top 8 及必要的相邻上下文。
+5. Agent 把授权证据、调查摘要和近期会话组成完整 RAG 提示词，再通过
+   `POST /api/physoc/deepseeks/stream` 交给私有 Physoc DeepSeek 归纳。
+
+`RETRIEVAL_MODE=legacy|shadow|qwen3` 的语义如下：
+
+- `legacy`：只运行 PostgreSQL Legacy 检索，不构造 Qwen3/Qdrant 查询资源。
+- `shadow`：前台仍返回 Legacy 结果；按 `RETRIEVAL_SHADOW_PERCENT` 在后台运行 Qwen3 对比，
+  只存 case/chunk ID、排名指标、耗时和脱敏失败码，不保存原始问题或证据正文。
+- `qwen3`：按稳定会话哈希和 `RETRIEVAL_CANARY_PERCENT` 选择 Qwen3；未命中 canary 或
+  Embedding、Reranker、Qdrant、Alias、超时/熔断异常时安全回退 Legacy。
 
 没有可靠证据时不会调用模型。Physoc 超时、返回非 2xx、SSE 格式异常或答案为空时，API
-返回 HTTP 502；系统不得把检索切片或模板文本伪装成模型答案。
+返回 HTTP 502；`no raw-chunk answer on Physoc failure` 是强制规则，系统不得把检索切片、
+Legacy 结果或模板文本伪装成模型答案。
 
 这条链路是“检索少量相关证据后回答”，不是“读取整个知识库后进行全库总结”。跨章节、
 跨文档和全库 Map-Reduce 汇总仍属于后续阶段。
@@ -185,6 +201,10 @@ flowchart TD
   `--profile indexing` worker 分批写入 Parquet 并发布到 ClickHouse。对于已成功发布且已通过
   行数和内容校验的 ClickHouse publication，`avg`、`sum`、`count`、`min`、`max` 由
   ClickHouse 对该 publication 的数据确定性计算，不调用 Physoc，也不会从文档切片估算结果。
+
+这条路线称为 `ClickHouse complete-data aggregation`。Spreadsheet averages must not be
+calculated from RAG chunks；Qdrant 中只保存表结构、字段和安全摘要，绝不把局部切片平均值当作
+完整数据结果。
 
 这里的“精确统计”只承诺覆盖通过校验的 publication，不等同于无条件覆盖原工作簿中的每个
 单元格。空值、错误值、公式结果、隐藏行、多 Sheet 合并方式和类型转换规则仍需在目标业务
@@ -213,24 +233,27 @@ flowchart TD
 
 ### Compose 服务与实际接入状态
 
-离线 Compose 声明 PostgreSQL、ClickHouse、Qdrant、Redis、ClamAV、Embedding Service、API，
-以及可选的 indexing worker 和 llama.cpp profile。当前实际状态如下：
+离线 Compose 声明 PostgreSQL、ClickHouse、Qdrant、Redis、ClamAV、Embedding Service、
+Reranker Service、API，以及可选的 indexing worker 和 llama.cpp profile。当前实际状态如下：
 
 - PostgreSQL 已用于会话、文档、切片、Agent 审计和结构化元数据。
 - ClickHouse 已用于启用后的 Excel/CSV 精确统计。
 - Physoc 是独立部署的公司内网模型服务，不包含在本 Compose 项目中。
-- Qdrant、Redis 和独立 Embedding Service 当前主要完成了离线部署与健康检查契约，普通文档
-  问答仍未迁移到 Qdrant/BGE 检索。
+- Qdrant、Qwen3 Embedding、BM25、RRF 和 Qwen3 Reranker 已接入普通文档检索，并由
+  `RETRIEVAL_MODE` 控制 Legacy、Shadow 和 Qwen3 路由。
+- Redis 保留给后台任务和后续队列扩展；当前 Shadow 比较使用进程内有界队列。
 - ClamAV 服务当前进入了部署健康检查，但文件上传路由尚未调用病毒扫描。
 
-Compose 会把 Qdrant、Redis、ClamAV 和 Embedding Service 的健康状态作为部署启动门禁；这只
-表示这些容器必须成功启动并通过健康检查。它们尚未成为普通问答业务主链路，因此不能据此
-认为混合向量检索、异步任务队列和上传安全扫描已经启用。
+API readiness 是 mode-aware：`qwen3` 下 Embedding、Reranker、Qdrant、Alias 或模型元数据不匹配
+会使 `/api/readyz` 返回 503；`shadow` 下 API 保持可用但把 Qwen3 依赖报告为 degraded；
+`legacy` 不要求构造这些查询资源。Compose 容器健康只证明进程可用，不能替代索引质量、权限、
+15 用户并发和业务答案验收。
 
 ### 安全与开放范围
 
-当前 FastAPI 路由没有接入身份认证、用户主体、角色或知识库级权限校验，CORS 目前也配置为
-`allow_origins=["*"]`。管理端和用户端之间尚无管理员隔离、部门隔离或文档授权边界。
+当前 FastAPI 路由没有接入身份认证、用户主体或角色映射，CORS 目前也配置为
+`allow_origins=["*"]`。混合检索会对部署配置中的 knowledge-base 和 permission tags 做
+fail-closed 过滤，但这些静态标签还不能替代真实用户身份到部门/文档权限的映射。
 
 因此，当前版本只能部署在网络和人员范围均受控的隔离验收环境，不得直接面向公司全员或其他
 不受信任客户端开放。身份认证、管理员隔离、知识库授权、审计闭环和安全加固属于升级路线的
@@ -244,13 +267,14 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 2. 已审核并预置的内部基础镜像、Python wheelhouse、Embedding/解析模型文件和镜像 digest。
    两个前端还需要预构建静态产物，或可用的 npm 离线缓存/公司内部 npm 源；仓库本身不包含
    所有运行所需 artifact。
-3. PostgreSQL、ClickHouse、Qdrant、Redis、ClamAV 和 Embedding Service 所需的数据目录、权限和 Secret 文件。
+3. PostgreSQL、ClickHouse、Qdrant、Redis、ClamAV、Embedding Service 和 Reranker Service
+   所需的数据目录、权限、模型目录、校验和和 Secret 文件。
 4. API 容器可以访问的私有 Physoc 地址，以及正确的 `LLM_PROVIDER`、`LLM_API_BASE`、
    `LLM_STREAM_PATH` 和 `LLM_MODEL`。
 5. 同机反向代理。离线 Compose 只将 API 发布到 `127.0.0.1:8000`，内网客户端不应直接访问
    容器端口。
-6. 在目标服务器完成 Compose smoke、Physoc probe、真实文档问答、模型故障 HTTP 502、
-   配置恢复和结构化统计验收。
+6. 在目标服务器完成 Compose smoke、Physoc probe、Qwen3 索引发布、Shadow/Canary、真实文档
+   问答、模型故障 HTTP 502、Alias/Legacy 回滚、结构化统计和 15 用户并发验收。
 
 当前开发机没有执行真实目标服务器门禁，因此仓库具备内网部署路线，但不能据此声明任意内网
 服务器均可“复制后立即使用”。
@@ -261,12 +285,12 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 
 ### 当前规模限制与升级路线
 
-普通文档检索目前会从 PostgreSQL 读取已索引切片，并在 Python 中逐条计算分数。该实现适合
-功能验证和中小规模知识库，不适合数百万或数千万普通文档切片。
+Qwen3 混合检索已经移除 Qwen3 路线中的 PostgreSQL 全表逐片评分瓶颈，但“代码已接入”不等于
+“千万级容量已证明”。必须用批准数据集验证 Qdrant 点数、过滤选择率、模型队列、CPU/内存、
+P95、错误率和 fallback rate；强制命令见离线部署手册。
 
-面向大规模企业知识库的后续顺序是：统一 Docling/PaddleOCR 解析、BGE-M3 Dense/Sparse
-Embedding、Qdrant 混合检索、BGE Reranker、相邻上下文扩展、分层 Map-Reduce 汇总，最后补齐
-Redis/Celery 异步任务、ClamAV 上传扫描、权限、引用和千万级验收。详细阶段和退出门禁见
+后续重点是统一 Docling/PaddleOCR 解析、跨文档分层 Map-Reduce 汇总、真实用户权限、
+Redis/Celery 异步任务、ClamAV 上传扫描、细粒度引用和千万级整体验收。详细阶段和退出门禁见
 [`企业知识库升级路线`](docs/superpowers/plans/2026-07-24-enterprise-knowledge-base-qa-rollout.md)。
 
 ## 启动
