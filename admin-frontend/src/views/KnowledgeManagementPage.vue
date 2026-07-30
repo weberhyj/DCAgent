@@ -9,6 +9,7 @@ import BaseInput from '@/components/ui/BaseInput.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
 import { useChatKnowledgeManagement } from '@/composables/useChatKnowledgeManagement'
 import type { KnowledgeSource } from '@/types/chat'
+import { isStructuredKnowledgeSource } from '@/utils/knowledgeSources'
 
 const router = useRouter()
 const {
@@ -115,8 +116,12 @@ function handleUploadDialogOpenUpdate(open: boolean) {
 }
 
 function inspectSource(source: KnowledgeSource) {
-  if (source.records <= 0) return
+  if (!canInspectSource(source)) return
   void router.push({ name: 'knowledge-source-detail', params: { sourceId: source.id } })
+}
+
+function canInspectSource(source: KnowledgeSource) {
+  return source.records > 0 || isStructuredKnowledgeSource(source)
 }
 
 function requestRemoveSource(source: KnowledgeSource) {
@@ -284,7 +289,7 @@ function formatFileSize(bytes?: number | null) {
               <BaseButton
                 variant="ghost"
                 size="icon"
-                :disabled="source.records <= 0"
+                :disabled="!canInspectSource(source)"
                 :data-testid="`inspect-knowledge-source-${source.id}`"
                 :aria-label="`查看解析片段 ${source.name}`"
                 title="查看解析详情"

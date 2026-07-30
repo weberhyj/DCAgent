@@ -142,6 +142,29 @@ describe('KnowledgeManagementPage', () => {
     })
   })
 
+  it('opens a structured source awaiting schema confirmation even when it has no indexed records', async () => {
+    knowledgeState.sources = [{
+      ...indexedSource,
+      id: 'kb-sales',
+      name: 'sales.xlsx',
+      sourceType: 'XLSX',
+      records: 0,
+      status: '\u5f85\u786e\u8ba4\u8868\u7ed3\u6784',
+    }]
+
+    const wrapper = mountPage()
+    const inspectButton = wrapper.get('[data-testid="inspect-knowledge-source-kb-sales"]')
+
+    expect((inspectButton.element as HTMLButtonElement).disabled).toBe(false)
+
+    await inspectButton.trigger('click')
+
+    expect(routerPushMock).toHaveBeenCalledWith({
+      name: 'knowledge-source-detail',
+      params: { sourceId: 'kb-sales' },
+    })
+  })
+
   it('renders a table-like source list with administrator columns', () => {
     const wrapper = mountPage()
 
