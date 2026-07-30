@@ -105,7 +105,7 @@ def create_reranker_app(
 ) -> FastAPI:
     if not isinstance(metadata, RerankerModelMetadata):
         raise ValueError("metadata must be RerankerModelMetadata")
-    _validate_batch_capacity(max_items)
+    _validate_batch_capacity(max_items, max_queue_items)
     return _create_batched_app(
         backend,
         metadata,
@@ -228,7 +228,7 @@ def create_production_app(
             metadata = _load_environment_metadata(target)
             max_items = _positive_int(target, "RERANKER_BATCH_MAX_ITEMS", MAX_RERANK_PASSAGES)
             max_queue_items = _positive_int(target, "RERANKER_QUEUE_MAX_ITEMS", 192)
-            _validate_batch_capacity(max_items)
+            _validate_batch_capacity(max_items, max_queue_items)
             wait_ms = _nonnegative_float(target, "RERANKER_BATCH_WAIT_MS", 10.0)
             loader = _load_ollama_reranker_backend if backend_loader is None else backend_loader
             backend = await run_in_threadpool(loader, target, metadata)
@@ -554,11 +554,16 @@ def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
-def _validate_batch_capacity(max_items: int) -> None:
+def _validate_batch_capacity(max_items: int, max_queue_items: int) -> None:
     if max_items < MAX_RERANK_PASSAGES:
         raise ValueError(
             f"RERANKER_BATCH_MAX_ITEMS must be at least {MAX_RERANK_PASSAGES} "
             "to preserve the reranker wire contract"
+        )
+    if max_queue_items < MAX_RERANK_PASSAGES:
+        raise ValueError(
+            f"RERANKER_QUEUE_MAX_ITEMS must be at least {MAX_RERANK_PASSAGES} "
+            "to accept one maximum-size reranker request"
         )
 
 

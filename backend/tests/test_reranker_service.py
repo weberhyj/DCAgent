@@ -467,6 +467,19 @@ class RerankerServiceTest(unittest.TestCase):
                         pass
                 self.assertEqual(loader_calls, [])
 
+    def test_production_rejects_queue_capacity_below_wire_contract_before_loader(self) -> None:
+        loader_calls: list[object] = []
+        app = create_production_app(
+            environ=production_environment(RERANKER_QUEUE_MAX_ITEMS="31"),
+            backend_loader=lambda values, metadata: loader_calls.append(values),
+        )
+
+        with self.assertRaisesRegex(ValueError, "RERANKER_QUEUE_MAX_ITEMS must be at least 32"):
+            with TestClient(app):
+                pass
+
+        self.assertEqual(loader_calls, [])
+
     def test_production_reranks_nine_passages_in_two_ollama_subbatches(self) -> None:
         generated_client = GeneratedSubbatchClient()
         backend = OllamaGenerativeRerankerBackend(
@@ -495,6 +508,37 @@ class RerankerServiceTest(unittest.TestCase):
         self.assertEqual(generated_client.query_calls, 2)
         prompts = [payload["prompt"] for _, payload in generated_client.calls]  # type: ignore[index]
         self.assertEqual([prompt.count("\nDocument ") for prompt in prompts], [8, 1])
+
+    def test_production_reranks_thirty_two_passages_in_four_ollama_subbatches(self) -> None:
+        generated_client = GeneratedSubbatchClient()
+        backend = OllamaGenerativeRerankerBackend(
+            generated_client,
+            model="qwen-test",
+            path="/api/generate",
+            keep_alive="5m",
+            num_predict=512,
+            batch_max_items=8,
+        )
+        app = create_production_app(
+            environ=production_environment(RERANKER_QUEUE_MAX_ITEMS="32"),
+            backend_loader=lambda values, metadata: backend,
+        )
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            generated_client.calls.clear()
+            generated_client.query_calls = 0
+            response = client.post(
+                "/v1/rerank",
+                json={"query": "q", "passages": [f"passage-{index}" for index in range(32)]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["scores"], [index / 100 for index in range(32)])
+        self.assertEqual(generated_client.query_calls, 4)
+        self.assertEqual(
+            [payload["prompt"].count("\nDocument ") for _, payload in generated_client.calls],  # type: ignore[index]
+            [8, 8, 8, 8],
+        )
 
     def test_later_malformed_ollama_subbatch_returns_sanitized_503_without_partial_scores(
         self,
@@ -703,6 +747,12 @@ class RerankerServiceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "at least 32"):
             create_reranker_app(Backend(), metadata, max_items=31)
+
+    def test_nonproduction_factory_rejects_queue_capacity_below_wire_contract(self) -> None:
+        metadata = RerankerModelMetadata("qwen", "1", "a" * 64, "b" * 64, "1")
+
+        with self.assertRaisesRegex(ValueError, "RERANKER_QUEUE_MAX_ITEMS must be at least 32"):
+            create_reranker_app(Backend(), metadata, max_queue_items=31)
 
     def test_backend_failures_are_sanitized_and_malformed_scores_are_500(self) -> None:
         metadata = RerankerModelMetadata("qwen", "1", "a" * 64, "b" * 64, "1")
