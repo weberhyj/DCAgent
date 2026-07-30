@@ -327,7 +327,6 @@ class RerankerServiceTest(unittest.TestCase):
             ("OLLAMA_RERANK_NUM_PREDICT", "1.5", "positive integer"),
             ("OLLAMA_RERANK_NUM_PREDICT", "true", "positive integer"),
             ("OLLAMA_RERANK_NUM_PREDICT", "511", "at least 512"),
-            ("OLLAMA_RERANK_BATCH_MAX_ITEMS", None, "integer from 1 through 32"),
             ("OLLAMA_RERANK_BATCH_MAX_ITEMS", "   ", "integer from 1 through 32"),
             ("OLLAMA_RERANK_BATCH_MAX_ITEMS", "0", "integer from 1 through 32"),
             ("OLLAMA_RERANK_BATCH_MAX_ITEMS", "33", "integer from 1 through 32"),
@@ -381,6 +380,23 @@ class RerankerServiceTest(unittest.TestCase):
             batch_max_items=8,
         )
         self.assertEqual(backend.close_calls, 1)
+
+    def test_default_ollama_factory_defaults_missing_subbatch_limit_to_eight(self) -> None:
+        backend = CloseTrackingBackend()
+        environ = production_environment()
+        del environ["OLLAMA_RERANK_BATCH_MAX_ITEMS"]
+        with (
+            patch("app.reranker_service.SyncOllamaClient", return_value=DigestClient()),
+            patch(
+                "app.reranker_service.OllamaGenerativeRerankerBackend",
+                return_value=backend,
+            ) as backend_type,
+        ):
+            app = create_production_app(environ=environ)
+            with TestClient(app):
+                pass
+
+        self.assertEqual(backend_type.call_args.kwargs["batch_max_items"], 8)
 
     def test_default_ollama_factory_fails_closed_on_unbound_model_digest(self) -> None:
         cases = (

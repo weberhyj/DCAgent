@@ -21,6 +21,7 @@ from .inference_batching import DynamicBatcher, InferenceQueueFull
 from .offline_artifacts import is_local_filesystem_path
 from .ollama_client import SyncOllamaClient
 from .ollama_reranker_backend import (
+    DEFAULT_OLLAMA_RERANK_BATCH_MAX_ITEMS,
     MAX_OLLAMA_RERANK_BATCH_MAX_ITEMS,
     RERANK_PROMPT_PROFILE_SHA256,
     OllamaGenerativeRerankerBackend,
@@ -306,9 +307,10 @@ def _load_ollama_reranker_backend(
     keep_alive = _required(environ, "OLLAMA_KEEP_ALIVE")
     timeout_seconds = _required_positive_float(environ, "OLLAMA_REQUEST_TIMEOUT_SECONDS")
     format_json = _required_boolean(environ, "OLLAMA_RERANK_FORMAT_JSON")
-    batch_max_items = _required_int_in_range(
+    batch_max_items = _int_in_range(
         environ,
         "OLLAMA_RERANK_BATCH_MAX_ITEMS",
+        default=DEFAULT_OLLAMA_RERANK_BATCH_MAX_ITEMS,
         minimum=1,
         maximum=MAX_OLLAMA_RERANK_BATCH_MAX_ITEMS,
     )
@@ -499,14 +501,15 @@ def _required_positive_int(environ: Mapping[str, str], name: str) -> int:
     return value
 
 
-def _required_int_in_range(
+def _int_in_range(
     environ: Mapping[str, str],
     name: str,
     *,
+    default: int,
     minimum: int,
     maximum: int,
 ) -> int:
-    raw_value = environ.get(name)
+    raw_value = environ.get(name, str(default))
     message = f"{name} must be an integer from {minimum} through {maximum}"
     if isinstance(raw_value, bool) or not isinstance(raw_value, str):
         raise ValueError(message)
