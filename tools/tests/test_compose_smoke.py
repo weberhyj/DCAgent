@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 
@@ -119,9 +120,14 @@ def _reranker_metadata(*, model: str = QWEN25_RERANKER_MODEL) -> dict[str, objec
 
 
 class _HelperResponse:
-    def __init__(self, payload: dict[str, object], status: int = 200) -> None:
+    def __init__(self, payload: dict[str, object] | bytes, status: int = 200) -> None:
         self.status = status
-        self._body = json.dumps(payload).encode("utf-8")
+        self._body = (
+            payload
+            if isinstance(payload, bytes)
+            else json.dumps(payload).encode("utf-8")
+        )
+        self.read_limits: list[int] = []
 
     def __enter__(self):
         return self
@@ -129,19 +135,25 @@ class _HelperResponse:
     def __exit__(self, *_args: object) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, limit: int = -1) -> bytes:
+        self.read_limits.append(limit)
+        return self._body if limit < 0 else self._body[:limit]
 
 
 def _run_helper(
     script: str,
     *,
     environ: dict[str, str],
-    responses: dict[str, dict[str, object]],
+    responses: dict[str, dict[str, object] | bytes | BaseException | _HelperResponse],
 ) -> dict[str, object]:
     def urlopen(request, *, timeout):
         del timeout
-        return _HelperResponse(responses[request.full_url])
+        response = responses[request.full_url]
+        if isinstance(response, BaseException):
+            raise response
+        if isinstance(response, _HelperResponse):
+            return response
+        return _HelperResponse(response)
 
     output = io.StringIO()
     with (
@@ -220,17 +232,30 @@ class FakeRunner:
         self.outputs = outputs or {}
         self.raises = raises or {}
         self.calls: list[tuple[list[str], bool]] = []
+        self.timeouts: list[int] = []
 
-    def __call__(self, command, *, shell):
+    def __call__(self, command, *, shell, timeout_seconds=3600):
         compose_smoke = _module()
         argv = list(command)
         self.calls.append((argv, shell))
+        self.timeouts.append(timeout_seconds)
         key = self._key(argv)
+        group = key.split(".", 1)[0]
         if key in self.raises:
             raise self.raises[key]
+        if group in self.raises:
+            raise self.raises[group]
+        output = self.outputs.get(key)
+        if output is None and group in self.outputs:
+            output = self.outputs[group]
+            try:
+                operation = key.split(".", 1)[1]
+                output = json.dumps({operation: json.loads(output)[operation]})
+            except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+                pass
         return compose_smoke.CommandResult(
-            self.exit_codes.get(key, 0),
-            self.outputs.get(key, self._default_output(key)),
+            self.exit_codes.get(key, self.exit_codes.get(group, 0)),
+            output if output is not None else self._default_output(key),
         )
 
     @staticmethod
@@ -261,8 +286,14 @@ class FakeRunner:
         if service == "clamav":
             return "clamav_ping" if "--ping" in arguments else "clamav_version"
         if service == "embedding-service":
+            for operation in ("ready", "metadata", "embeddings"):
+                if f'PROBE = "{operation}"' in helper:
+                    return f"embedding.{operation}"
             return "embedding"
         if service == "reranker-service":
+            for operation in ("ready", "metadata", "rerank"):
+                if f'PROBE = "{operation}"' in helper:
+                    return f"reranker.{operation}"
             return "reranker"
         if service == "api":
             return "api"
@@ -270,6 +301,12 @@ class FakeRunner:
 
     @staticmethod
     def _default_output(key: str) -> str:
+        if key.startswith("embedding."):
+            operation = key.split(".", 1)[1]
+            return json.dumps({operation: json.loads(_embedding_payload())[operation]})
+        if key.startswith("reranker."):
+            operation = key.split(".", 1)[1]
+            return json.dumps({operation: json.loads(_reranker_payload())[operation]})
         outputs = {
             "config": "",
             "up": "",
@@ -308,6 +345,222 @@ class FakeRunner:
 
 
 class ComposeSmokeTest(unittest.TestCase):
+    def test_adapter_helpers_bound_response_reads_and_fail_closed_when_oversized(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        cases = (
+            (
+                "embedding",
+                compose_smoke.HTTP_HELPER_SCRIPT,
+                _embedding_environment(),
+                (
+                    "http://127.0.0.1:8081/readyz",
+                    "http://127.0.0.1:8081/v1/metadata",
+                    "http://127.0.0.1:8081/v1/embeddings",
+                ),
+                ("ready", "metadata", "embeddings"),
+            ),
+            (
+                "reranker",
+                compose_smoke.RERANKER_HTTP_HELPER_SCRIPT,
+                _reranker_environment(),
+                (
+                    "http://127.0.0.1:8082/readyz",
+                    "http://127.0.0.1:8082/v1/metadata",
+                    "http://127.0.0.1:8082/v1/rerank",
+                ),
+                ("ready", "metadata", "rerank"),
+            ),
+        )
+        for component, script, environ, urls, operations in cases:
+            with self.subTest(component=component):
+                oversized = _HelperResponse(
+                    b'{"canary":"'
+                    + b"x" * compose_smoke.ADAPTER_MAX_RESPONSE_BYTES
+                    + b'"}'
+                )
+                result = _run_helper(
+                    script,
+                    environ=environ,
+                    responses={url: oversized for url in urls},
+                )
+
+                self.assertEqual(
+                    [result[name]["errorCode"] for name in operations],
+                    ["response_too_large"] * 3,
+                )
+                self.assertEqual(
+                    oversized.read_limits,
+                    [compose_smoke.ADAPTER_MAX_RESPONSE_BYTES + 1] * 3,
+                )
+                self.assertNotIn("canary", json.dumps(result))
+
+    def test_adapter_helper_error_and_validation_paths_are_sanitized(self) -> None:
+        compose_smoke = _module()
+        embedding_metadata = _embedding_metadata()
+        reranker_metadata = _reranker_metadata()
+        http_error = urllib.error.HTTPError(
+            "http://127.0.0.1:8081/readyz",
+            503,
+            "PROMPT-CANARY",
+            {},
+            io.BytesIO(b'{"prompt":"PROMPT-CANARY"}'),
+        )
+        embedding_cases = {
+            "http_error": (
+                "ready",
+                http_error,
+                "http_503",
+            ),
+            "url_error": (
+                "ready",
+                urllib.error.URLError("DOCUMENT-CANARY"),
+                "transport_error",
+            ),
+            "invalid_json": ("metadata", b"VECTOR-CANARY", "invalid_json"),
+            "wrong_cardinality": (
+                "embeddings",
+                {
+                    **embedding_metadata,
+                    "purpose": "query",
+                    "vectors": [[0.25] * MEASURED_EMBEDDING_DIMENSIONS] * 2,
+                },
+                "embedding_mismatch",
+            ),
+            "wrong_dimensions": (
+                "embeddings",
+                {
+                    **embedding_metadata,
+                    "purpose": "query",
+                    "vectors": [[0.25] * (MEASURED_EMBEDDING_DIMENSIONS - 1)],
+                },
+                "embedding_mismatch",
+            ),
+            "nan": (
+                "embeddings",
+                {
+                    **embedding_metadata,
+                    "purpose": "query",
+                    "vectors": [[float("nan")] * MEASURED_EMBEDDING_DIMENSIONS],
+                },
+                "embedding_mismatch",
+            ),
+            "infinity": (
+                "embeddings",
+                {
+                    **embedding_metadata,
+                    "purpose": "query",
+                    "vectors": [[float("inf")] * MEASURED_EMBEDDING_DIMENSIONS],
+                },
+                "embedding_mismatch",
+            ),
+        }
+        for label, (probe, response, expected_error) in embedding_cases.items():
+            with self.subTest(component="embedding", case=label):
+                result = _run_helper(
+                    compose_smoke._embedding_probe_script(probe),
+                    environ=_embedding_environment(),
+                    responses={
+                        {
+                            "ready": "http://127.0.0.1:8081/readyz",
+                            "metadata": "http://127.0.0.1:8081/v1/metadata",
+                            "embeddings": "http://127.0.0.1:8081/v1/embeddings",
+                        }[probe]: response
+                    },
+                )
+                self.assertEqual(result[probe]["errorCode"], expected_error)
+                self.assertNotRegex(
+                    json.dumps(result),
+                    "PROMPT-CANARY|DOCUMENT-CANARY|VECTOR-CANARY",
+                )
+
+        reranker_cases = {
+            "nan": [float("nan"), 0.25],
+            "infinity": [float("inf"), 0.25],
+            "negative": [-0.1, 0.25],
+            "above_one": [1.1, 0.25],
+        }
+        for label, scores in reranker_cases.items():
+            with self.subTest(component="reranker", case=label):
+                result = _run_helper(
+                    compose_smoke._reranker_probe_script("rerank"),
+                    environ=_reranker_environment(),
+                    responses={
+                        "http://127.0.0.1:8082/v1/rerank": {
+                            **reranker_metadata,
+                            "passageCount": 2,
+                            "scores": scores,
+                            "response": "GENERATED-CANARY",
+                        }
+                    },
+                )
+                self.assertEqual(result["rerank"]["errorCode"], "rerank_mismatch")
+                self.assertNotIn("GENERATED-CANARY", json.dumps(result))
+
+    def test_adapter_probes_use_separate_short_runner_deadlines(self) -> None:
+        compose_smoke = _module()
+        runner = FakeRunner()
+
+        with tempfile.TemporaryDirectory() as directory:
+            compose_smoke.run_compose_smoke(
+                report_path=Path(directory) / "report.json",
+                runner=runner,
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+
+        adapter_calls = [
+            (key, timeout_seconds)
+            for (command, _), timeout_seconds in zip(
+                runner.calls, runner.timeouts, strict=True
+            )
+            if (key := runner._key(command)).startswith(("embedding.", "reranker."))
+        ]
+        self.assertEqual(
+            adapter_calls,
+            [
+                ("embedding.ready", compose_smoke.ADAPTER_PROBE_TIMEOUT_SECONDS),
+                ("embedding.metadata", compose_smoke.ADAPTER_PROBE_TIMEOUT_SECONDS),
+                ("embedding.embeddings", compose_smoke.ADAPTER_PROBE_TIMEOUT_SECONDS),
+                ("reranker.ready", compose_smoke.ADAPTER_PROBE_TIMEOUT_SECONDS),
+                ("reranker.metadata", compose_smoke.ADAPTER_PROBE_TIMEOUT_SECONDS),
+                ("reranker.rerank", compose_smoke.ADAPTER_PROBE_TIMEOUT_SECONDS),
+            ],
+        )
+        self.assertLess(compose_smoke.ADAPTER_PROBE_TIMEOUT_SECONDS, 60)
+
+    def test_adapter_timeout_report_is_sanitized_without_running_a_real_sleep(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        canary = (
+            "PROMPT-DOCUMENT-VECTOR-GENERATED-CANARY "
+            "http://adapter-secret.invalid/path?query=private"
+        )
+        runner = FakeRunner(
+            exit_codes={"embedding.embeddings": 124},
+            outputs={"embedding.embeddings": canary},
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "report.json"
+            report = compose_smoke.run_compose_smoke(
+                report_path=report_path,
+                runner=runner,
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+            persisted = report_path.read_text(encoding="utf-8")
+
+        self.assertFalse(report["passed"])
+        self.assertIn("command:embedding.embeddings", report["failures"])
+        self.assertEqual(
+            report["readyResults"]["embedding"]["embeddings"]["errorCode"],
+            "probe_timeout",
+        )
+        self.assertNotIn(canary, persisted)
+
     def test_adapter_helpers_pin_qwen25_models_and_inject_measured_dimensions(
         self,
     ) -> None:
@@ -879,6 +1132,16 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertEqual(timeout.exit_code, 124)
         self.assertEqual(timeout.stdout, "partial timeout output")
 
+        with mock.patch.object(
+            compose_smoke.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(["pwsh"], 0, stdout="ok"),
+        ) as run:
+            compose_smoke._default_runner(
+                ["pwsh", "--version"], shell=False, timeout_seconds=7
+            )
+        self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
     def test_success_cli_prints_sorted_component_versions_before_pass(self) -> None:
         compose_smoke = _module()
         output = io.StringIO()
@@ -1068,6 +1331,52 @@ class ComposeSmokeTest(unittest.TestCase):
         for forbidden in (prompt, document, coordinates, scores, generated):
             self.assertNotIn(forbidden, persisted)
 
+    def test_adapter_failure_report_discards_nested_raw_body_canaries(self) -> None:
+        compose_smoke = _module()
+        canaries = (
+            "FAILURE-PROMPT-CANARY",
+            "FAILURE-DOCUMENT-CANARY",
+            "FAILURE-VECTOR-CANARY",
+            "FAILURE-GENERATED-CANARY",
+        )
+        embedding_failure = {
+            "embeddings": {
+                **_operation(errorCode="embedding_mismatch"),
+                "vectorCount": 0,
+                "raw": {
+                    "prompt": canaries[0],
+                    "document": canaries[1],
+                    "vectors": [canaries[2]],
+                },
+            }
+        }
+        reranker_failure = {
+            "rerank": {
+                **_operation(errorCode="rerank_mismatch"),
+                "scoreCount": 0,
+                "raw": {"response": canaries[3]},
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "compose-smoke.json"
+            report = compose_smoke.run_compose_smoke(
+                report_path=report_path,
+                runner=FakeRunner(
+                    outputs={
+                        "embedding.embeddings": json.dumps(embedding_failure),
+                        "reranker.rerank": json.dumps(reranker_failure),
+                    }
+                ),
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+            persisted = report_path.read_text(encoding="utf-8")
+
+        self.assertFalse(report["passed"])
+        for canary in canaries:
+            self.assertNotIn(canary, persisted)
+
     def test_exception_removes_stale_report_instead_of_leaving_false_pass(self) -> None:
         compose_smoke = _module()
         with tempfile.TemporaryDirectory() as directory:
@@ -1118,6 +1427,27 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertIn("artifacts/benchmarks/compose-smoke.json", text)
         self.assertIn("--remove-volumes", text)
         self.assertIn("preserves data volumes by default", text)
+
+    def test_readmes_separate_linux_curl_and_windows_powershell_ollama_probes(
+        self,
+    ) -> None:
+        for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                linux_match = re.search(
+                    r"(?ms)^#### Linux \(Bash\)\s*$\n(?P<body>.*?)^#### Windows \(PowerShell\)\s*$",
+                    text,
+                )
+                self.assertIsNotNone(linux_match)
+                assert linux_match is not None
+                linux = linux_match.group("body")
+                windows = text[linux_match.end() :]
+                self.assertIn("curl --fail-with-body", linux)
+                self.assertNotIn("curl.exe", linux)
+                self.assertTrue("Invoke-RestMethod" in windows or "curl.exe" in windows)
+                for endpoint in ("/api/embed", "/api/generate", "/api/tags"):
+                    self.assertIn(endpoint, linux)
+                    self.assertIn(endpoint, windows)
 
 
 if __name__ == "__main__":

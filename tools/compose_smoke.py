@@ -27,6 +27,9 @@ DEFAULT_REPORT_PATH = REPO_ROOT / "artifacts" / "benchmarks" / "compose-smoke.js
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 APPROVED_EMBEDDING_MODEL = "qwen2.5:0.5b"
 APPROVED_RERANKER_MODEL = "qwen2.5:3b"
+COMMAND_TIMEOUT_SECONDS = 3600
+ADAPTER_PROBE_TIMEOUT_SECONDS = 20
+ADAPTER_MAX_RESPONSE_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -53,9 +56,20 @@ def _validated_argv(command: Sequence[str]) -> list[str]:
     return result
 
 
-def _default_runner(command: Sequence[str], *, shell: bool) -> CommandResult:
+def _default_runner(
+    command: Sequence[str],
+    *,
+    shell: bool,
+    timeout_seconds: int = COMMAND_TIMEOUT_SECONDS,
+) -> CommandResult:
     if shell is not False:
         raise ValueError("offline Compose commands must use shell=False")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= COMMAND_TIMEOUT_SECONDS
+    ):
+        raise ValueError("command timeout must be a positive bounded integer")
     argv = _validated_argv(command)
     try:
         completed = subprocess.run(
@@ -67,7 +81,7 @@ def _default_runner(command: Sequence[str], *, shell: bool) -> CommandResult:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=3600,
+            timeout=timeout_seconds,
             check=True,
         )
     except FileNotFoundError:
@@ -177,9 +191,11 @@ exec 3<>/dev/tcp/127.0.0.1/6333
 printf 'GET / HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3
 cat <&3
 """
-HTTP_HELPER_SCRIPT = r"""
+_EMBEDDING_HTTP_HELPER_TEMPLATE = r"""
 import json, math, os, time, urllib.error, urllib.request
 APPROVED_MODEL = __APPROVED_EMBEDDING_MODEL__
+PROBE = __PROBE__
+MAX_RESPONSE_BYTES = __MAX_RESPONSE_BYTES__
 def call(url, payload=None):
     started = time.perf_counter()
     request = urllib.request.Request(
@@ -191,7 +207,7 @@ def call(url, payload=None):
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             status = response.status
-            raw = response.read().decode("utf-8")
+            raw_bytes = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
         return {"status": error.code, "latencyMs": round((time.perf_counter()-started)*1000, 3),
                 "errorCode": "http_" + str(error.code)}, None
@@ -203,6 +219,13 @@ def call(url, payload=None):
                 "errorCode": "unexpected_error"}, None
     result = {"status": status, "latencyMs": round((time.perf_counter()-started)*1000, 3),
               "errorCode": None}
+    if len(raw_bytes) > MAX_RESPONSE_BYTES:
+        result["errorCode"] = "response_too_large"
+        return result, None
+    try: raw = raw_bytes.decode("utf-8")
+    except Exception:
+        result["errorCode"] = "invalid_json"
+        return result, None
     try: body = json.loads(raw)
     except Exception:
         result["errorCode"] = "invalid_json"
@@ -227,46 +250,51 @@ def metadata_matches(body, expected):
     return body is not None and all(body.get(key) == value for key, value in expected.items())
 expected = expected_metadata()
 configured_model_matches = os.environ.get("EMBEDDING_MODEL_NAME", "") == APPROVED_MODEL
-ready_result, ready = call("http://127.0.0.1:8081/readyz")
-if ready_result["errorCode"] is None and (
-    not configured_model_matches or ready is None or ready.get("status") != "ready" or
-    not metadata_matches(ready, expected)
-):
-    ready_result["errorCode"] = "metadata_mismatch"
-metadata_result, metadata = call("http://127.0.0.1:8081/v1/metadata")
-metadata_result["dimensions"] = metadata.get("dimensions") if metadata is not None else None
-if metadata_result["errorCode"] is None and (
-    not configured_model_matches or not metadata_matches(metadata, expected)
-):
-    metadata_result["errorCode"] = "metadata_mismatch"
-embedding_result, embedding = call(
-    "http://127.0.0.1:8081/v1/embeddings",
-    {"texts": ["compose-smoke"], "purpose": "query"},
-)
-vectors = embedding.get("vectors") if embedding is not None else None
-embedding_result["vectorCount"] = len(vectors) if isinstance(vectors, list) else 0
-embedding_result["dimensions"] = (
-    len(vectors[0]) if isinstance(vectors, list) and vectors and isinstance(vectors[0], list) else None
-)
-valid_vectors = (
-    isinstance(vectors, list) and len(vectors) == 1 and
-    all(isinstance(vector, list) and len(vector) == expected["dimensions"] for vector in vectors) and
-    all(type(value) in (int, float) and math.isfinite(float(value)) for vector in vectors for value in vector)
-)
-if embedding_result["errorCode"] is None and (
-    not configured_model_matches or not metadata_matches(embedding, expected) or
-    embedding.get("purpose") != "query" or not valid_vectors
-):
-    embedding_result["errorCode"] = "embedding_mismatch"
-print(json.dumps({"ready": ready_result, "metadata": metadata_result,
-                  "embeddings": embedding_result}, sort_keys=True))
-""".replace(
-    "__APPROVED_EMBEDDING_MODEL__",
-    json.dumps(APPROVED_EMBEDDING_MODEL),
-).strip()
-RERANKER_HTTP_HELPER_SCRIPT = r"""
+results = {}
+if PROBE in (None, "ready"):
+    ready_result, ready = call("http://127.0.0.1:8081/readyz")
+    if ready_result["errorCode"] is None and (
+        not configured_model_matches or ready is None or ready.get("status") != "ready" or
+        not metadata_matches(ready, expected)
+    ):
+        ready_result["errorCode"] = "metadata_mismatch"
+    results["ready"] = ready_result
+if PROBE in (None, "metadata"):
+    metadata_result, metadata = call("http://127.0.0.1:8081/v1/metadata")
+    metadata_result["dimensions"] = metadata.get("dimensions") if metadata is not None else None
+    if metadata_result["errorCode"] is None and (
+        not configured_model_matches or not metadata_matches(metadata, expected)
+    ):
+        metadata_result["errorCode"] = "metadata_mismatch"
+    results["metadata"] = metadata_result
+if PROBE in (None, "embeddings"):
+    embedding_result, embedding = call(
+        "http://127.0.0.1:8081/v1/embeddings",
+        {"texts": ["compose-smoke"], "purpose": "query"},
+    )
+    vectors = embedding.get("vectors") if embedding is not None else None
+    embedding_result["vectorCount"] = len(vectors) if isinstance(vectors, list) else 0
+    embedding_result["dimensions"] = (
+        len(vectors[0]) if isinstance(vectors, list) and vectors and isinstance(vectors[0], list) else None
+    )
+    valid_vectors = (
+        isinstance(vectors, list) and len(vectors) == 1 and
+        all(isinstance(vector, list) and len(vector) == expected["dimensions"] for vector in vectors) and
+        all(type(value) in (int, float) and math.isfinite(float(value)) for vector in vectors for value in vector)
+    )
+    if embedding_result["errorCode"] is None and (
+        not configured_model_matches or not metadata_matches(embedding, expected) or
+        embedding.get("purpose") != "query" or not valid_vectors
+    ):
+        embedding_result["errorCode"] = "embedding_mismatch"
+    results["embeddings"] = embedding_result
+print(json.dumps(results, sort_keys=True))
+"""
+_RERANKER_HTTP_HELPER_TEMPLATE = r"""
 import json, math, os, time, urllib.error, urllib.request
 APPROVED_MODEL = __APPROVED_RERANKER_MODEL__
+PROBE = __PROBE__
+MAX_RESPONSE_BYTES = __MAX_RESPONSE_BYTES__
 def call(url, payload=None):
     started = time.perf_counter()
     request = urllib.request.Request(
@@ -278,7 +306,7 @@ def call(url, payload=None):
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             status = response.status
-            raw = response.read().decode("utf-8")
+            raw_bytes = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
         return {"status": error.code, "latencyMs": round((time.perf_counter()-started)*1000, 3),
                 "errorCode": "http_" + str(error.code)}, None
@@ -290,6 +318,13 @@ def call(url, payload=None):
                 "errorCode": "unexpected_error"}, None
     result = {"status": status, "latencyMs": round((time.perf_counter()-started)*1000, 3),
               "errorCode": None}
+    if len(raw_bytes) > MAX_RESPONSE_BYTES:
+        result["errorCode"] = "response_too_large"
+        return result, None
+    try: raw = raw_bytes.decode("utf-8")
+    except Exception:
+        result["errorCode"] = "invalid_json"
+        return result, None
     try: body = json.loads(raw)
     except Exception:
         result["errorCode"] = "invalid_json"
@@ -308,39 +343,86 @@ expected = {
 def metadata_matches(body):
     return body is not None and all(body.get(key) == value for key, value in expected.items())
 configured_model_matches = os.environ.get("RERANKER_MODEL_NAME", "") == APPROVED_MODEL
-ready_result, ready = call("http://127.0.0.1:8082/readyz")
-if ready_result["errorCode"] is None and (
-    not configured_model_matches or ready is None or ready.get("status") != "ready" or
-    not metadata_matches(ready)
-):
-    ready_result["errorCode"] = "metadata_mismatch"
-metadata_result, metadata = call("http://127.0.0.1:8082/v1/metadata")
-if metadata_result["errorCode"] is None and (
-    not configured_model_matches or not metadata_matches(metadata)
-):
-    metadata_result["errorCode"] = "metadata_mismatch"
-rerank_result, rerank = call(
-    "http://127.0.0.1:8082/v1/rerank",
-    {"query": "compose-smoke", "passages": ["candidate-a", "candidate-b"]},
-)
-scores = rerank.get("scores") if rerank is not None else None
-rerank_result["scoreCount"] = len(scores) if isinstance(scores, list) else 0
-valid_scores = (
-    isinstance(scores, list) and len(scores) == 2 and
-    all(type(score) in (int, float) and math.isfinite(float(score)) and 0 <= score <= 1
-        for score in scores)
-)
-if rerank_result["errorCode"] is None and (
-    not configured_model_matches or not metadata_matches(rerank) or
-    rerank.get("passageCount") != 2 or not valid_scores
-):
-    rerank_result["errorCode"] = "rerank_mismatch"
-print(json.dumps({"ready": ready_result, "metadata": metadata_result,
-                  "rerank": rerank_result}, sort_keys=True))
-""".replace(
-    "__APPROVED_RERANKER_MODEL__",
-    json.dumps(APPROVED_RERANKER_MODEL),
-).strip()
+results = {}
+if PROBE in (None, "ready"):
+    ready_result, ready = call("http://127.0.0.1:8082/readyz")
+    if ready_result["errorCode"] is None and (
+        not configured_model_matches or ready is None or ready.get("status") != "ready" or
+        not metadata_matches(ready)
+    ):
+        ready_result["errorCode"] = "metadata_mismatch"
+    results["ready"] = ready_result
+if PROBE in (None, "metadata"):
+    metadata_result, metadata = call("http://127.0.0.1:8082/v1/metadata")
+    if metadata_result["errorCode"] is None and (
+        not configured_model_matches or not metadata_matches(metadata)
+    ):
+        metadata_result["errorCode"] = "metadata_mismatch"
+    results["metadata"] = metadata_result
+if PROBE in (None, "rerank"):
+    rerank_result, rerank = call(
+        "http://127.0.0.1:8082/v1/rerank",
+        {"query": "compose-smoke", "passages": ["candidate-a", "candidate-b"]},
+    )
+    scores = rerank.get("scores") if rerank is not None else None
+    rerank_result["scoreCount"] = len(scores) if isinstance(scores, list) else 0
+    valid_scores = (
+        isinstance(scores, list) and len(scores) == 2 and
+        all(type(score) in (int, float) and math.isfinite(float(score)) and 0 <= score <= 1
+            for score in scores)
+    )
+    if rerank_result["errorCode"] is None and (
+        not configured_model_matches or not metadata_matches(rerank) or
+        rerank.get("passageCount") != 2 or not valid_scores
+    ):
+        rerank_result["errorCode"] = "rerank_mismatch"
+    results["rerank"] = rerank_result
+print(json.dumps(results, sort_keys=True))
+"""
+
+
+def _probe_literal(probe: str | None, allowed: frozenset[str]) -> str:
+    if probe is not None and probe not in allowed:
+        raise ValueError("unsupported adapter probe")
+    return "None" if probe is None else json.dumps(probe)
+
+
+def _embedding_probe_script(probe: str | None) -> str:
+    return (
+        _EMBEDDING_HTTP_HELPER_TEMPLATE.replace(
+            "__APPROVED_EMBEDDING_MODEL__", json.dumps(APPROVED_EMBEDDING_MODEL)
+        )
+        .replace(
+            "__MAX_RESPONSE_BYTES__",
+            str(ADAPTER_MAX_RESPONSE_BYTES),
+        )
+        .replace(
+            "__PROBE__",
+            _probe_literal(probe, frozenset({"ready", "metadata", "embeddings"})),
+        )
+        .strip()
+    )
+
+
+def _reranker_probe_script(probe: str | None) -> str:
+    return (
+        _RERANKER_HTTP_HELPER_TEMPLATE.replace(
+            "__APPROVED_RERANKER_MODEL__", json.dumps(APPROVED_RERANKER_MODEL)
+        )
+        .replace(
+            "__MAX_RESPONSE_BYTES__",
+            str(ADAPTER_MAX_RESPONSE_BYTES),
+        )
+        .replace(
+            "__PROBE__",
+            _probe_literal(probe, frozenset({"ready", "metadata", "rerank"})),
+        )
+        .strip()
+    )
+
+
+HTTP_HELPER_SCRIPT = _embedding_probe_script(None)
+RERANKER_HTTP_HELPER_SCRIPT = _reranker_probe_script(None)
 API_HELPER_SCRIPT = r"""
 import json, urllib.error, urllib.request
 url = "http://127.0.0.1:8000/api/readyz"
@@ -361,6 +443,9 @@ class _Check:
     name: str
     component: str
     command: tuple[str, ...]
+    timeout_seconds: int = COMMAND_TIMEOUT_SECONDS
+    report_name: str | None = None
+    operation: str | None = None
 
 
 def _checks(wrapper_path: Path) -> tuple[_Check, ...]:
@@ -500,33 +585,45 @@ def _checks(wrapper_path: Path) -> tuple[_Check, ...]:
                 )
             ),
         ),
-        _Check(
-            "embedding",
-            "embedding",
-            tuple(
-                build_compose_command(
-                    "exec",
-                    "embedding-service",
-                    "python",
-                    "-c",
-                    HTTP_HELPER_SCRIPT,
-                    wrapper_path=wrapper_path,
-                )
-            ),
+        *(
+            _Check(
+                f"embedding.{operation}",
+                "embedding",
+                tuple(
+                    build_compose_command(
+                        "exec",
+                        "embedding-service",
+                        "python",
+                        "-c",
+                        _embedding_probe_script(operation),
+                        wrapper_path=wrapper_path,
+                    )
+                ),
+                ADAPTER_PROBE_TIMEOUT_SECONDS,
+                "embedding",
+                operation,
+            )
+            for operation in ("ready", "metadata", "embeddings")
         ),
-        _Check(
-            "reranker",
-            "reranker",
-            tuple(
-                build_compose_command(
-                    "exec",
-                    "reranker-service",
-                    "python",
-                    "-c",
-                    RERANKER_HTTP_HELPER_SCRIPT,
-                    wrapper_path=wrapper_path,
-                )
-            ),
+        *(
+            _Check(
+                f"reranker.{operation}",
+                "reranker",
+                tuple(
+                    build_compose_command(
+                        "exec",
+                        "reranker-service",
+                        "python",
+                        "-c",
+                        _reranker_probe_script(operation),
+                        wrapper_path=wrapper_path,
+                    )
+                ),
+                ADAPTER_PROBE_TIMEOUT_SECONDS,
+                "reranker",
+                operation,
+            )
+            for operation in ("ready", "metadata", "rerank")
         ),
         # The API is published on the host loopback interface.  Probe that
         # binding directly so a container-internal loopback cannot mask a bad
@@ -841,25 +938,37 @@ def run_compose_smoke(
         "up": None,
         "version": None,
     }
+    adapter_payloads: dict[str, dict[str, object]] = {
+        "embedding": {},
+        "reranker": {},
+    }
     for check in _checks(wrapper):
         command_exit_codes[check.name] = None
     command_exit_codes["down"] = None
     active_exception: BaseException | None = None
     try:
         config = runner(
-            build_compose_command("config", wrapper_path=wrapper), shell=False
+            build_compose_command("config", wrapper_path=wrapper),
+            shell=False,
+            timeout_seconds=COMMAND_TIMEOUT_SECONDS,
         )
         command_exit_codes["config"] = config.exit_code
         if config.exit_code != 0:
             failures.append("command:config")
         else:
-            up = runner(build_compose_command("up", wrapper_path=wrapper), shell=False)
+            up = runner(
+                build_compose_command("up", wrapper_path=wrapper),
+                shell=False,
+                timeout_seconds=COMMAND_TIMEOUT_SECONDS,
+            )
             command_exit_codes["up"] = up.exit_code
             if up.exit_code != 0:
                 failures.append("command:up")
             else:
                 version = runner(
-                    build_compose_command("version", wrapper_path=wrapper), shell=False
+                    build_compose_command("version", wrapper_path=wrapper),
+                    shell=False,
+                    timeout_seconds=COMMAND_TIMEOUT_SECONDS,
                 )
                 command_exit_codes["version"] = version.exit_code
                 if version.exit_code != 0:
@@ -872,10 +981,40 @@ def run_compose_smoke(
                     except ValueError:
                         failures.append("version:compose")
                 for check in _checks(wrapper):
-                    result = runner(check.command, shell=False)
+                    result = runner(
+                        check.command,
+                        shell=False,
+                        timeout_seconds=check.timeout_seconds,
+                    )
                     command_exit_codes[check.name] = result.exit_code
                     if result.exit_code != 0:
                         failures.append(f"command:{check.name}")
+                        if check.report_name and check.operation:
+                            adapter_payloads[check.report_name][check.operation] = {
+                                "status": 0,
+                                "latencyMs": 0.0,
+                                "errorCode": (
+                                    "probe_timeout"
+                                    if result.exit_code == 124
+                                    else "probe_failed"
+                                ),
+                            }
+                        continue
+                    if check.report_name and check.operation:
+                        try:
+                            probe_output = _json_object(result.stdout, check.name)
+                            operation = probe_output.get(check.operation)
+                            if not isinstance(operation, Mapping):
+                                raise ValueError("adapter probe output is invalid")
+                            adapter_payloads[check.report_name][check.operation] = dict(
+                                operation
+                            )
+                        except ValueError:
+                            adapter_payloads[check.report_name][check.operation] = {
+                                "status": 0,
+                                "latencyMs": 0.0,
+                                "errorCode": "invalid_output",
+                            }
                         continue
                     try:
                         ok, version_value, details = _validate_check(
@@ -888,6 +1027,19 @@ def run_compose_smoke(
                         component_versions[check.component] = version_value
                     if not ok:
                         failures.append(f"check:{check.name}")
+                for adapter_name in ("embedding", "reranker"):
+                    adapter_check = _Check(adapter_name, adapter_name, ())
+                    try:
+                        ok, _, details = _validate_check(
+                            adapter_check,
+                            json.dumps(adapter_payloads[adapter_name]),
+                            migration_head=migration_head,
+                        )
+                    except ValueError:
+                        ok, details = False, {"invalid": True}
+                    ready_results[adapter_name] = {"passed": ok, **details}
+                    if not ok:
+                        failures.append(f"check:{adapter_name}")
     finally:
         active_exception = sys.exc_info()[1]
         try:
@@ -896,6 +1048,7 @@ def run_compose_smoke(
                     "down", wrapper_path=wrapper, remove_volumes=remove_volumes
                 ),
                 shell=False,
+                timeout_seconds=COMMAND_TIMEOUT_SECONDS,
             )
         except BaseException as cleanup_error:
             if active_exception is None:

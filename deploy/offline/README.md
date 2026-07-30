@@ -54,6 +54,41 @@ The deployment selector is `RETRIEVAL_MODE=legacy|shadow|qwen3`:
 Run these commands on the approved Ollama host. Pulling is an internal staging action and must not
 cause the production DC-Agent host to contact a public model service:
 
+#### Linux (Bash)
+
+```bash
+set -euo pipefail
+ollama pull qwen2.5:0.5b
+ollama pull qwen2.5:3b
+ollama_url='http://127.0.0.1:11434'
+
+embed_json="$(curl --fail-with-body --silent --show-error \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"model":"qwen2.5:0.5b","input":["dimension-probe"],"truncate":true,"keep_alive":"30m"}' \
+  "$ollama_url/api/embed")"
+dimensions="$(python3 -c 'import json,sys; body=json.load(sys.stdin); value=len(body["embeddings"][0]); assert value > 0; print(value)' <<<"$embed_json")"
+printf 'EMBEDDING_MODEL_DIMENSIONS=%s\n' "$dimensions"
+
+generate_body="$(python3 - <<'PY'
+import json
+prompt = 'Return only JSON: {"scores":[{"index":0,"score":0.0},{"index":1,"score":0.0}]}. Score passage relevance to the query from 0 to 1. Query: leave policy. Passage 0: annual leave policy. Passage 1: cafeteria menu.'
+print(json.dumps({"model": "qwen2.5:3b", "prompt": prompt, "stream": False, "format": "json", "options": {"temperature": 0, "num_predict": 128}}))
+PY
+)"
+generate_json="$(curl --fail-with-body --silent --show-error \
+  -H 'Content-Type: application/json' --data-binary "$generate_body" \
+  "$ollama_url/api/generate")"
+python3 -c 'import json,sys; envelope=json.load(sys.stdin); scores=json.loads(envelope["response"])["scores"]; assert len(scores) == 2; print(json.dumps(scores))' <<<"$generate_json"
+
+tags_json="$(curl --fail-with-body --silent --show-error "$ollama_url/api/tags")"
+for model in qwen2.5:0.5b qwen2.5:3b; do
+  digest="$(python3 -c 'import json,re,sys; model=sys.argv[1]; body=json.load(sys.stdin); entry=next((item for item in body["models"] if item.get("name") == model or item.get("model") == model), None); assert entry is not None, f"model not found: {model}"; digest=str(entry["digest"]).removeprefix("sha256:"); assert re.fullmatch(r"[0-9a-f]{64}", digest), f"invalid digest: {model}"; print(digest)' "$model" <<<"$tags_json")"
+  printf '%s %s\n' "$model" "$digest"
+done
+```
+
+#### Windows (PowerShell)
+
 ```powershell
 ollama pull qwen2.5:0.5b
 ollama pull qwen2.5:3b
