@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from collections.abc import Callable, Mapping
 
@@ -280,8 +281,8 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
 
                 self.assert_response_error(lambda: backend.embed(["text"], purpose="document"))
 
-    def test_rejects_zero_and_non_finite_vector_norms(self) -> None:
-        for vector in ([0, 0], [1e308, 1e308]):
+    def test_rejects_zero_vector_norms(self) -> None:
+        for vector in ([0, 0], [-0.0, 0.0]):
             with self.subTest(vector=vector):
                 client = RecordingOllamaClient([{"embeddings": [vector]}])
                 backend = OllamaEmbeddingBackend(
@@ -293,6 +294,43 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                 )
 
                 self.assert_response_error(lambda: backend.embed(["text"], purpose="document"))
+
+    def test_normalizes_large_and_tiny_finite_vectors_stably(self) -> None:
+        cases = (
+            ([1e308, 1e308], [1.0 / math.sqrt(2.0), 1.0 / math.sqrt(2.0)]),
+            ([1e-308, 0.0], [1.0, 0.0]),
+        )
+        for vector, expected in cases:
+            with self.subTest(vector=vector):
+                client = RecordingOllamaClient([{"embeddings": [vector]}])
+                backend = OllamaEmbeddingBackend(
+                    client,
+                    model="qwen2.5",
+                    path="/api/embed",
+                    dimensions=2,
+                    keep_alive="10m",
+                )
+
+                try:
+                    actual = backend.embed(["text"], purpose="document")[0]
+                except OllamaResponseError as error:
+                    self.fail(f"finite nonzero vector was rejected: {error}")
+
+                for coordinate, expected_coordinate in zip(actual, expected, strict=True):
+                    self.assertAlmostEqual(coordinate, expected_coordinate, places=15)
+
+    def test_translates_huge_integer_conversion_overflow_to_response_error(self) -> None:
+        huge_integer = 10**400
+        client = RecordingOllamaClient([{"embeddings": [[huge_integer, 1]]}])
+        backend = OllamaEmbeddingBackend(
+            client,
+            model="qwen2.5",
+            path="/api/embed",
+            dimensions=2,
+            keep_alive="10m",
+        )
+
+        self.assert_response_error(lambda: backend.embed(["text"], purpose="document"))
 
     def test_legacy_endpoint_sends_one_request_per_text(self) -> None:
         client = RecordingOllamaClient(

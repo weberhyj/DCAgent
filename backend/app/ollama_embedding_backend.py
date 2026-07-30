@@ -91,14 +91,23 @@ def _normalize(vector: object, dimensions: int) -> list[float]:
     for index, value in enumerate(vector):
         if type(value) not in {int, float}:
             raise OllamaResponseError(f"Ollama embedding coordinate {index} must be numeric")
-        coordinate = float(value)
+        try:
+            coordinate = float(value)
+        except OverflowError:
+            raise OllamaResponseError(
+                f"Ollama embedding coordinate {index} must be finite"
+            ) from None
         if not math.isfinite(coordinate):
             raise OllamaResponseError(f"Ollama embedding coordinate {index} must be finite")
         values.append(coordinate)
-    norm = math.sqrt(sum(value * value for value in values))
-    if norm <= 0.0 or not math.isfinite(norm):
+    scale = max(abs(value) for value in values)
+    if scale <= 0.0:
         raise OllamaResponseError("Ollama embedding norm must be positive and finite")
-    return [value / norm for value in values]
+    scaled = [value / scale for value in values]
+    scaled_norm = math.sqrt(sum(value * value for value in scaled))
+    if scaled_norm <= 0.0 or not math.isfinite(scaled_norm):
+        raise OllamaResponseError("Ollama embedding norm must be positive and finite")
+    return [value / scaled_norm for value in scaled]
 
 
 __all__ = ["OllamaEmbeddingBackend"]
