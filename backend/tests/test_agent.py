@@ -113,6 +113,18 @@ class AgentTest(unittest.TestCase):
             with self.subTest(greeting=greeting):
                 self.assertTrue(is_greeting_message(greeting))
 
+    def test_common_unicode_greeting_punctuation_is_ignored(self) -> None:
+        for greeting in (
+            "您好…",
+            "您好～～",
+            "您好；",
+            "您好：",
+            "“您好”",
+            "您好......",
+        ):
+            with self.subTest(greeting=greeting):
+                self.assertTrue(is_greeting_message(greeting))
+
     def test_greeting_with_substantive_question_falls_through(self) -> None:
         agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
@@ -124,7 +136,7 @@ class AgentTest(unittest.TestCase):
 
         result = agent.try_answer_greeting(
             conversation_id="conv-greeting",
-            content="你好，请问报销制度是什么",
+            content="“你好”，请问报销制度是什么",
             mode="quick",
         )
 

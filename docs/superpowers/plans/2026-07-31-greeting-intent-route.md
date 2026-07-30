@@ -74,6 +74,18 @@ def test_supported_greeting_phrases_are_recognized(self) -> None:
         with self.subTest(content=content):
             self.assertTrue(is_greeting_message(content))
 
+def test_common_unicode_greeting_punctuation_is_ignored(self) -> None:
+    for content in (
+        "您好…",
+        "您好～～",
+        "您好；",
+        "您好：",
+        "“您好”",
+        "您好......",
+    ):
+        with self.subTest(content=content):
+            self.assertTrue(is_greeting_message(content))
+
 def test_greeting_with_substantive_question_falls_through(self) -> None:
     agent = ReadOnlyKnowledgeAgent(
         tools=KnowledgeAgentTools(
@@ -85,7 +97,7 @@ def test_greeting_with_substantive_question_falls_through(self) -> None:
 
     result = agent.try_answer_greeting(
         conversation_id="conv-greeting",
-        content="你好，请问报销制度是什么",
+        content="“你好”，请问报销制度是什么",
         mode="quick",
     )
 
@@ -107,7 +119,7 @@ Expected: FAIL because `GREETING_REPLY`, `is_greeting_message`, and `try_answer_
 
 - [ ] **Step 3: Implement the minimal Agent greeting classifier and result**
 
-In `backend/app/agent.py`, import `re` and `ResponseParagraphModel`, then add:
+In `backend/app/agent.py`, import `unicodedata` and `ResponseParagraphModel`, then add:
 
 ```python
 GREETING_REPLY = (
@@ -126,13 +138,20 @@ _GREETING_MESSAGES = frozenset(
         "介绍一下你自己",
     }
 )
-_GREETING_IGNORED_CHARACTERS = re.compile(r"[\s，。！？!?、,.]+")
-
-
 def is_greeting_message(content: str) -> bool:
-    normalized = _GREETING_IGNORED_CHARACTERS.sub("", content).casefold()
+    normalized = "".join(
+        character
+        for character in content
+        if not character.isspace()
+        and not unicodedata.category(character).startswith("P")
+        and character not in {"~", "～"}
+    ).casefold()
     return normalized in {item.casefold() for item in _GREETING_MESSAGES}
 ```
+
+This normalization ignores whitespace, all Unicode punctuation, and the common chat
+symbols `~` / `～`. Other symbols and emoji remain significant, so matching still requires
+the entire normalized input to equal a greeting phrase.
 
 Add this public method to `ReadOnlyKnowledgeAgent` before `run()`:
 

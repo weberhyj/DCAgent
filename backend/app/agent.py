@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
@@ -35,7 +35,6 @@ GREETING_REPLY = (
 GREETING_PHRASES = frozenset(
     {"你好", "您好", "嗨", "哈喽", "在吗", "你在吗", "你是谁", "介绍一下你自己"}
 )
-GREETING_IGNORED_CHARACTERS = re.compile(r"[\s，。！？!?、,.]+")
 
 
 @dataclass(slots=True)
@@ -123,7 +122,13 @@ def now_label() -> str:
 
 
 def is_greeting_message(content: str) -> bool:
-    normalized = GREETING_IGNORED_CHARACTERS.sub("", content).casefold()
+    normalized = "".join(
+        character
+        for character in content
+        if not character.isspace()
+        and not unicodedata.category(character).startswith("P")
+        and character not in {"~", "～"}
+    ).casefold()
     return normalized in GREETING_PHRASES
 
 
