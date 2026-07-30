@@ -125,7 +125,12 @@ class SyncOllamaClient:
 
 
 def _validate_base_url(base_url: str) -> str:
-    if not isinstance(base_url, str) or not base_url or base_url != base_url.strip():
+    if (
+        not isinstance(base_url, str)
+        or not base_url
+        or base_url != base_url.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in base_url)
+    ):
         raise ValueError("Ollama base URL must be a non-empty HTTP(S) URL")
     if "?" in base_url or "#" in base_url:
         raise ValueError("Ollama base URL must not contain a query or fragment")
@@ -186,6 +191,8 @@ def _validate_private_host(host: str) -> None:
 def _validate_api_path(path: str) -> str:
     if not isinstance(path, str) or not path.startswith("/api/"):
         raise ValueError("Ollama request path must be an absolute /api/ path")
+    if "%" in path:
+        raise ValueError("Ollama request path must not contain percent encoding")
     parsed = urlsplit(path)
     if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or parsed.path != path:
         raise ValueError("Ollama request path must not contain a query or fragment")

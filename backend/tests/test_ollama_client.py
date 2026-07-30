@@ -120,6 +120,15 @@ class OllamaClientTest(unittest.TestCase):
             with self.subTest(base_url=base_url), self.assertRaises(ValueError):
                 SyncOllamaClient(base_url, transport=RecordingTransport())
 
+    def test_rejects_ascii_control_characters_in_base_url(self) -> None:
+        for base_url in (
+            "http://local\thost:11434",
+            "http://local\nhost:11434",
+            "http://local\rhost:11434",
+        ):
+            with self.subTest(base_url=repr(base_url)), self.assertRaises(ValueError):
+                SyncOllamaClient(base_url, transport=RecordingTransport())
+
     def test_rejects_paths_outside_absolute_api_namespace(self) -> None:
         transport = RecordingTransport()
         client = SyncOllamaClient("http://localhost:11434", transport=transport)
@@ -133,6 +142,16 @@ class OllamaClientTest(unittest.TestCase):
             "/api/generate?secret=1",
             "/api/generate#fragment",
         ):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                client.post_json(path, {})
+
+        self.assertEqual(transport.calls, [])
+
+    def test_rejects_percent_encoded_path_ambiguity_without_calls(self) -> None:
+        transport = RecordingTransport()
+        client = SyncOllamaClient("http://localhost:11434", transport=transport)
+
+        for path in ("/api/%2e%2e/admin", "/api/foo%2fbar", "/api/foo%5cbar"):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 client.post_json(path, {})
 
