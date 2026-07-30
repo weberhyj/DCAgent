@@ -1,4 +1,4 @@
-"""Private offline Embedding service with a single checksum-pinned model."""
+"""Private Embedding service with a single checksum-pinned model."""
 
 from __future__ import annotations
 
@@ -31,7 +31,8 @@ from .embedding_contracts import (
 )
 from .inference_batching import DynamicBatcher, InferenceQueueFull
 from .offline_artifacts import is_local_filesystem_path
-from .qwen3_embedding_runtime import load_qwen3_embedding_backend
+from .ollama_client import SyncOllamaClient
+from .ollama_embedding_backend import OllamaEmbeddingBackend
 
 EMBEDDING_METADATA_FILENAME = "embedding-metadata.json"
 OFFLINE_EMBEDDING_ENVIRONMENT: Mapping[str, str] = MappingProxyType(
@@ -63,7 +64,7 @@ class EmbeddingBackend(Protocol):
 
 
 EmbeddingBackendLoader = Callable[
-    [Path, EmbeddingModelMetadata],
+    [Mapping[str, str], EmbeddingModelMetadata],
     EmbeddingBackend,
 ]
 
@@ -323,47 +324,55 @@ def create_production_app(
     environ: MutableMapping[str, str] | None = None,
     backend_loader: EmbeddingBackendLoader | None = None,
 ) -> FastAPI:
-    """Create an app whose one local model is loaded only during startup."""
+    """Create an app whose one Ollama model is loaded only during startup."""
 
     target = os.environ if environ is None else environ
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        model_root, metadata = _load_pinned_model_configuration(target)
-        target.update(OFFLINE_EMBEDDING_ENVIRONMENT)
-        runtime = _embedding_runtime(target.get("EMBEDDING_RUNTIME", "openvino"))
-        max_items = _positive_int(target, "EMBEDDING_BATCH_MAX_ITEMS", MAX_EMBEDDING_TEXTS)
-        max_queue_items = _positive_int(target, "EMBEDDING_QUEUE_MAX_ITEMS", 256)
-        wait_ms = _nonnegative_float(target, "EMBEDDING_BATCH_WAIT_MS", 10.0)
-
-        def default_loader(root: Path, pinned: EmbeddingModelMetadata) -> EmbeddingBackend:
-            return load_qwen3_embedding_backend(root, pinned, runtime=runtime)
-
-        loader = default_loader if backend_loader is None else backend_loader
-        backend = await run_in_threadpool(loader, model_root, metadata)
-        await run_in_threadpool(
-            _validate_embedding_backend_startup,
-            backend,
-            metadata,
-        )
-        batchers = _create_embedding_batchers(
-            backend,
-            max_items=max_items,
-            max_queue_items=max_queue_items,
-            wait_ms=wait_ms,
-        )
-        await _start_embedding_batchers(batchers)
-        app.state.embedding_backend = backend
-        app.state.embedding_metadata = metadata
-        app.state.embedding_batchers = batchers
-        app.state.embedding_ready = True
+        backend: EmbeddingBackend | None = None
+        batchers: dict[EmbeddingPurpose, DynamicBatcher[str, list[float]]] | None = None
         try:
+            metadata = _load_environment_metadata(target)
+            max_items = _positive_int(target, "EMBEDDING_BATCH_MAX_ITEMS", MAX_EMBEDDING_TEXTS)
+            max_queue_items = _positive_int(target, "EMBEDDING_QUEUE_MAX_ITEMS", 256)
+            wait_ms = _nonnegative_float(target, "EMBEDDING_BATCH_WAIT_MS", 10.0)
+            loader = _load_ollama_embedding_backend if backend_loader is None else backend_loader
+            backend = await run_in_threadpool(loader, target, metadata)
+            await run_in_threadpool(
+                _validate_embedding_backend_startup,
+                backend,
+                metadata,
+            )
+            batchers = _create_embedding_batchers(
+                backend,
+                max_items=max_items,
+                max_queue_items=max_queue_items,
+                wait_ms=wait_ms,
+            )
+            await _start_embedding_batchers(batchers)
+            app.state.embedding_backend = backend
+            app.state.embedding_metadata = metadata
+            app.state.embedding_batchers = batchers
+            app.state.embedding_ready = True
             yield
         finally:
             app.state.embedding_ready = False
-            await _close_embedding_batchers(batchers)
             app.state.embedding_batchers = None
             app.state.embedding_backend = None
+            app.state.embedding_metadata = None
+            if batchers is not None:
+                try:
+                    await _close_embedding_batchers(batchers)
+                except Exception:
+                    pass
+            if backend is not None:
+                close = getattr(backend, "close", None)
+                if callable(close):
+                    try:
+                        await run_in_threadpool(close)
+                    except Exception:
+                        pass
 
     return _build_embedding_app(lifespan=lifespan)
 
@@ -396,8 +405,15 @@ async def _start_embedding_batchers(
 async def _close_embedding_batchers(
     batchers: Mapping[EmbeddingPurpose, DynamicBatcher[str, list[float]]],
 ) -> None:
+    first_error: Exception | None = None
     for batcher in batchers.values():
-        await batcher.close()
+        try:
+            await batcher.close()
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
@@ -417,6 +433,88 @@ def _nonnegative_float(environ: Mapping[str, str], name: str, default: float) ->
         raise ValueError(f"{name} must be non-negative") from error
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be non-negative")
+    return value
+
+
+def _load_environment_metadata(environ: Mapping[str, str]) -> EmbeddingModelMetadata:
+    name = _required_environment_value(environ, "EMBEDDING_MODEL_NAME")
+    version = _required_environment_value(environ, "EMBEDDING_MODEL_VERSION")
+    sha256 = _required_environment_value(environ, "EMBEDDING_MODEL_SHA256")
+    if SHA256_PATTERN.fullmatch(sha256) is None:
+        raise ValueError(
+            "EMBEDDING_MODEL_SHA256 must be exactly 64 lowercase hexadecimal characters"
+        )
+    dimensions = _required_positive_int(environ, "EMBEDDING_MODEL_DIMENSIONS")
+    normalized_value = _required_environment_value(environ, "EMBEDDING_MODEL_NORMALIZED")
+    if normalized_value != "true":
+        raise ValueError("EMBEDDING_MODEL_NORMALIZED must be true")
+    encoding_profile_sha256 = _required_environment_value(
+        environ, "EMBEDDING_ENCODING_PROFILE_SHA256"
+    )
+    if SHA256_PATTERN.fullmatch(encoding_profile_sha256) is None:
+        raise ValueError(
+            "EMBEDDING_ENCODING_PROFILE_SHA256 must be exactly 64 lowercase hexadecimal characters"
+        )
+    protocol_version = _required_environment_value(environ, "EMBEDDING_PROTOCOL_VERSION")
+    return EmbeddingModelMetadata(
+        name,
+        version,
+        sha256,
+        dimensions,
+        True,
+        encoding_profile_sha256,
+        protocol_version,
+    )
+
+
+def _load_ollama_embedding_backend(
+    environ: Mapping[str, str],
+    metadata: EmbeddingModelMetadata,
+) -> EmbeddingBackend:
+    base_url = _required_environment_value(environ, "OLLAMA_BASE_URL")
+    model = _required_environment_value(environ, "OLLAMA_EMBEDDING_MODEL")
+    if model != metadata.name:
+        raise ValueError("OLLAMA_EMBEDDING_MODEL must equal EMBEDDING_MODEL_NAME")
+    path = _required_environment_value(environ, "OLLAMA_EMBEDDING_PATH")
+    keep_alive = _required_environment_value(environ, "OLLAMA_KEEP_ALIVE")
+    timeout_seconds = _required_positive_float(environ, "OLLAMA_REQUEST_TIMEOUT_SECONDS")
+    client = SyncOllamaClient(base_url, timeout_seconds=timeout_seconds)
+    try:
+        return OllamaEmbeddingBackend(
+            client,
+            model=model,
+            path=path,
+            dimensions=metadata.dimensions,
+            keep_alive=keep_alive,
+        )
+    except Exception:
+        client.close()
+        raise
+
+
+def _required_positive_int(environ: Mapping[str, str], name: str) -> int:
+    raw_value = environ.get(name)
+    if isinstance(raw_value, bool) or not isinstance(raw_value, str):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _required_positive_float(environ: Mapping[str, str], name: str) -> float:
+    raw_value = environ.get(name)
+    if isinstance(raw_value, bool) or not isinstance(raw_value, str):
+        raise ValueError(f"{name} must be a positive finite number")
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive finite number") from error
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
     return value
 
 

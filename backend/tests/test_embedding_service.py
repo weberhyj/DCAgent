@@ -42,6 +42,36 @@ class FakeEmbeddingBackend:
         ]
 
 
+class CloseTrackingEmbeddingBackend(FakeEmbeddingBackend):
+    def __init__(self, dimensions: int = 4) -> None:
+        super().__init__(dimensions)
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class CloseFailingEmbeddingBackend(CloseTrackingEmbeddingBackend):
+    def close(self) -> None:
+        super().close()
+        raise RuntimeError("secret embedding prompt must not leak")
+
+
+class CloseTrackingBatcher:
+    def __init__(self, *, close_fails: bool = False) -> None:
+        self.close_fails = close_fails
+        self.start_calls = 0
+        self.close_calls = 0
+
+    async def start(self) -> None:
+        self.start_calls += 1
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_fails:
+            raise RuntimeError("secret embedding text must not leak")
+
+
 class WrongVectorCountBackend(FakeEmbeddingBackend):
     def embed(self, texts: list[str], *, purpose: str) -> list[list[float]]:
         vectors = super().embed(texts, purpose=purpose)
@@ -86,6 +116,24 @@ def write_metadata_manifest(root: Path, *, dimensions: int = 4) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def production_environment(**overrides: str) -> dict[str, str]:
+    return {
+        "EMBEDDING_MODEL_NAME": "bge-test",
+        "EMBEDDING_MODEL_VERSION": "1",
+        "EMBEDDING_MODEL_SHA256": "a" * 64,
+        "EMBEDDING_MODEL_DIMENSIONS": "4",
+        "EMBEDDING_MODEL_NORMALIZED": "true",
+        "EMBEDDING_ENCODING_PROFILE_SHA256": "e" * 64,
+        "EMBEDDING_PROTOCOL_VERSION": "1",
+        "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
+        "OLLAMA_EMBEDDING_MODEL": "bge-test",
+        "OLLAMA_EMBEDDING_PATH": "/api/embed",
+        "OLLAMA_KEEP_ALIVE": "5m",
+        "OLLAMA_REQUEST_TIMEOUT_SECONDS": "15",
+        **overrides,
+    }
 
 
 class EmbeddingContractsTest(unittest.TestCase):
@@ -238,128 +286,222 @@ class EmbeddingServiceTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 500)
                 self.assertIn("vector", response.json()["detail"].lower())
 
-    def test_production_app_loads_one_checksum_pinned_local_backend_on_startup(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "model"
-            root.mkdir()
-            (root / "weights.bin").write_bytes(b"offline model weights")
-            write_metadata_manifest(root)
-            checksum = compute_model_directory_sha256(root)
-            environ = {
-                "EMBEDDING_MODEL_ROOT": str(root),
-                "EMBEDDING_MODEL_SHA256": checksum,
-            }
-            loader_calls: list[tuple[Path, EmbeddingModelMetadata]] = []
-            backend = FakeEmbeddingBackend()
+    def test_production_app_uses_environment_metadata_and_closes_backend(self) -> None:
+        environ = production_environment()
+        loader_calls: list[tuple[object, EmbeddingModelMetadata]] = []
+        backend = CloseTrackingEmbeddingBackend()
 
-            def load_backend(
-                model_root: Path, model_metadata: EmbeddingModelMetadata
-            ) -> FakeEmbeddingBackend:
-                loader_calls.append((model_root, model_metadata))
-                return backend
+        def load_backend(
+            received_environ: object,
+            model_metadata: EmbeddingModelMetadata,
+        ) -> CloseTrackingEmbeddingBackend:
+            loader_calls.append((received_environ, model_metadata))
+            return backend
 
-            app = create_production_app(environ=environ, backend_loader=load_backend)
-            self.assertEqual(loader_calls, [])
+        app = create_production_app(environ=environ, backend_loader=load_backend)
+        self.assertEqual(loader_calls, [])
+        self.assertFalse(app.state.embedding_ready)
 
-            with TestClient(app) as client:
-                self.assertEqual(len(loader_calls), 1)
-                self.assertEqual(loader_calls[0][0], root)
-                self.assertEqual(loader_calls[0][1].sha256, checksum)
-                self.assertEqual(
-                    [purpose for _, purpose in backend.calls],
-                    ["query", "document"],
-                )
-                self.assertTrue(all(len(texts) == 1 for texts, _ in backend.calls))
-                for text in ("first", "second"):
-                    response = client.post(
-                        "/v1/embeddings",
-                        json={"texts": [text], "purpose": "query"},
-                    )
-                    self.assertEqual(response.status_code, 200)
-
-            self.assertEqual(len(loader_calls), 1)
+        with TestClient(app) as client:
+            self.assertEqual(loader_calls, [(environ, metadata())])
             self.assertEqual(
-                [purpose for _, purpose in backend.calls],
-                ["query", "document", "query", "query"],
+                backend.calls,
+                [
+                    (["dc-agent-embedding-startup-probe"], "query"),
+                    (["dc-agent-embedding-startup-probe"], "document"),
+                ],
             )
-            self.assertEqual(environ["HF_HUB_OFFLINE"], "1")
-            self.assertEqual(environ["TRANSFORMERS_OFFLINE"], "1")
-            self.assertEqual(environ["HF_HUB_DISABLE_TELEMETRY"], "1")
-            self.assertEqual(environ["TOKENIZERS_PARALLELISM"], "false")
+            ready = client.get("/readyz")
+            model_metadata = client.get("/v1/metadata")
+            response = client.post(
+                "/v1/embeddings",
+                json={"texts": ["first"], "purpose": "query"},
+            )
+            self.assertEqual(ready.status_code, 200)
+            self.assertEqual(ready.json()["modelChecksum"], "a" * 64)
+            self.assertEqual(model_metadata.status_code, 200)
+            self.assertEqual(model_metadata.json()["modelName"], "bge-test")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["purpose"], "query")
+            self.assertEqual(response.json()["dimensions"], 4)
+
+        self.assertEqual(len(loader_calls), 1)
+        self.assertEqual(backend.close_calls, 1)
+        self.assertFalse(app.state.embedding_ready)
+        self.assertIsNone(app.state.embedding_backend)
+        self.assertIsNone(app.state.embedding_metadata)
+        self.assertIsNone(app.state.embedding_batchers)
+        for name in (
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "HF_HUB_DISABLE_TELEMETRY",
+            "TOKENIZERS_PARALLELISM",
+        ):
+            self.assertNotIn(name, environ)
 
     def test_production_startup_aborts_when_backend_dimensions_do_not_match(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "model"
-            root.mkdir()
-            write_metadata_manifest(root, dimensions=4)
-            checksum = compute_model_directory_sha256(root)
-            backend = FakeEmbeddingBackend(dimensions=3)
-            app = create_production_app(
-                environ={
-                    "EMBEDDING_MODEL_ROOT": str(root),
-                    "EMBEDDING_MODEL_SHA256": checksum,
-                },
-                backend_loader=lambda model_root, model_metadata: backend,
-            )
-
-            with self.assertRaisesRegex(RuntimeError, "embedding backend startup self-test failed"):
-                with TestClient(app):
-                    pass
-
-            self.assertFalse(app.state.embedding_ready)
-            self.assertEqual(len(backend.calls), 1)
-            self.assertEqual(backend.calls[0][1], "query")
-
-    def test_production_startup_fails_before_loading_on_checksum_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "model"
-            root.mkdir()
-            write_metadata_manifest(root)
-            loader_calls: list[Path] = []
-
-            def load_backend(
-                model_root: Path, model_metadata: EmbeddingModelMetadata
-            ) -> FakeEmbeddingBackend:
-                loader_calls.append(model_root)
-                return FakeEmbeddingBackend()
-
-            app = create_production_app(
-                environ={
-                    "EMBEDDING_MODEL_ROOT": str(root),
-                    "EMBEDDING_MODEL_SHA256": "b" * 64,
-                },
-                backend_loader=load_backend,
-            )
-
-            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
-                with TestClient(app):
-                    pass
-            self.assertEqual(loader_calls, [])
-
-    def test_production_startup_requires_root_checksum_and_local_manifest(self) -> None:
-        cases = (
-            ({}, "EMBEDDING_MODEL_ROOT"),
-            ({"EMBEDDING_MODEL_ROOT": "https://models.example/test"}, "local"),
+        backend = CloseTrackingEmbeddingBackend(dimensions=3)
+        app = create_production_app(
+            environ=production_environment(),
+            backend_loader=lambda environ, model_metadata: backend,
         )
-        for environ, message in cases:
-            with self.subTest(environ=environ):
+
+        with self.assertRaisesRegex(RuntimeError, "embedding backend startup self-test failed"):
+            with TestClient(app):
+                pass
+
+        self.assertFalse(app.state.embedding_ready)
+        self.assertEqual(backend.calls, [(["dc-agent-embedding-startup-probe"], "query")])
+        self.assertEqual(backend.close_calls, 1)
+        self.assertIsNone(app.state.embedding_backend)
+        self.assertIsNone(app.state.embedding_metadata)
+        self.assertIsNone(app.state.embedding_batchers)
+
+    def test_production_startup_requires_all_environment_metadata_fields(self) -> None:
+        fields = (
+            "EMBEDDING_MODEL_NAME",
+            "EMBEDDING_MODEL_VERSION",
+            "EMBEDDING_MODEL_SHA256",
+            "EMBEDDING_MODEL_DIMENSIONS",
+            "EMBEDDING_MODEL_NORMALIZED",
+            "EMBEDDING_ENCODING_PROFILE_SHA256",
+            "EMBEDDING_PROTOCOL_VERSION",
+        )
+        for field in fields:
+            with self.subTest(field=field):
+                environ = production_environment()
+                del environ[field]
+                loader_calls: list[object] = []
+                app = create_production_app(
+                    environ=environ,
+                    backend_loader=lambda values, pinned: loader_calls.append(values),
+                )
+                with self.assertRaisesRegex(ValueError, field):
+                    with TestClient(app):
+                        pass
+                self.assertEqual(loader_calls, [])
+                self.assertFalse(app.state.embedding_ready)
+
+    def test_production_startup_rejects_invalid_environment_metadata(self) -> None:
+        cases = (
+            ("EMBEDDING_MODEL_SHA256", "A" * 64),
+            ("EMBEDDING_MODEL_SHA256", "a" * 63),
+            ("EMBEDDING_ENCODING_PROFILE_SHA256", "g" * 64),
+            ("EMBEDDING_ENCODING_PROFILE_SHA256", "e" * 63),
+            ("EMBEDDING_MODEL_DIMENSIONS", "0"),
+            ("EMBEDDING_MODEL_DIMENSIONS", "4.5"),
+            ("EMBEDDING_MODEL_NORMALIZED", "false"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                loader_calls: list[object] = []
+                app = create_production_app(
+                    environ=production_environment(**{field: value}),
+                    backend_loader=lambda values, pinned: loader_calls.append(values),
+                )
+                with self.assertRaisesRegex(ValueError, field):
+                    with TestClient(app):
+                        pass
+                self.assertEqual(loader_calls, [])
+                self.assertFalse(app.state.embedding_ready)
+
+    def test_default_ollama_factory_rejects_invalid_environment(self) -> None:
+        cases = (
+            ("OLLAMA_BASE_URL", None, "OLLAMA_BASE_URL"),
+            ("OLLAMA_BASE_URL", "https://example.com", "private"),
+            ("OLLAMA_EMBEDDING_MODEL", None, "OLLAMA_EMBEDDING_MODEL"),
+            ("OLLAMA_EMBEDDING_MODEL", "different-model", "must equal"),
+            ("OLLAMA_EMBEDDING_PATH", None, "OLLAMA_EMBEDDING_PATH"),
+            ("OLLAMA_EMBEDDING_PATH", "/api/generate", "embedding path"),
+            ("OLLAMA_KEEP_ALIVE", "   ", "OLLAMA_KEEP_ALIVE"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "invalid", "positive finite"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "nan", "positive finite"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "inf", "positive finite"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "0", "positive finite"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                environ = production_environment()
+                if value is None:
+                    del environ[field]
+                else:
+                    environ[field] = value
                 app = create_production_app(environ=environ)
                 with self.assertRaisesRegex(ValueError, message):
                     with TestClient(app):
                         pass
+                self.assertFalse(app.state.embedding_ready)
 
+    def test_default_ollama_factory_constructs_client_and_backend(self) -> None:
+        backend = CloseTrackingEmbeddingBackend()
+        client = object()
+        with (
+            patch("app.embedding_service.SyncOllamaClient", return_value=client) as client_type,
+            patch(
+                "app.embedding_service.OllamaEmbeddingBackend", return_value=backend
+            ) as backend_type,
+        ):
+            app = create_production_app(environ=production_environment())
+            with TestClient(app) as test_client:
+                self.assertEqual(test_client.get("/readyz").status_code, 200)
+
+        client_type.assert_called_once_with("http://127.0.0.1:11434", timeout_seconds=15.0)
+        backend_type.assert_called_once_with(
+            client,
+            model="bge-test",
+            path="/api/embed",
+            dimensions=4,
+            keep_alive="5m",
+        )
+        self.assertEqual(backend.close_calls, 1)
+
+    def test_production_shutdown_swallows_backend_close_errors_and_resets_state(self) -> None:
+        backend = CloseFailingEmbeddingBackend()
+        app = create_production_app(
+            environ=production_environment(),
+            backend_loader=lambda environ, model_metadata: backend,
+        )
+
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/readyz").status_code, 200)
+
+        self.assertEqual(backend.close_calls, 1)
+        self.assertFalse(app.state.embedding_ready)
+        self.assertIsNone(app.state.embedding_backend)
+        self.assertIsNone(app.state.embedding_metadata)
+        self.assertIsNone(app.state.embedding_batchers)
+
+    def test_production_shutdown_attempts_every_batcher_close_after_an_error(self) -> None:
+        backend = CloseTrackingEmbeddingBackend()
+        query_batcher = CloseTrackingBatcher(close_fails=True)
+        document_batcher = CloseTrackingBatcher()
+        batchers = {"query": query_batcher, "document": document_batcher}
+        with patch("app.embedding_service._create_embedding_batchers", return_value=batchers):
+            app = create_production_app(
+                environ=production_environment(),
+                backend_loader=lambda environ, model_metadata: backend,
+            )
+            with TestClient(app) as client:
+                self.assertEqual(client.get("/readyz").status_code, 200)
+
+        self.assertEqual(query_batcher.start_calls, 1)
+        self.assertEqual(document_batcher.start_calls, 1)
+        self.assertEqual(query_batcher.close_calls, 1)
+        self.assertEqual(document_batcher.close_calls, 1)
+        self.assertEqual(backend.close_calls, 1)
+        self.assertFalse(app.state.embedding_ready)
+        self.assertIsNone(app.state.embedding_backend)
+        self.assertIsNone(app.state.embedding_metadata)
+        self.assertIsNone(app.state.embedding_batchers)
+
+    def test_model_checksum_streams_bounded_reads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            checksum = compute_model_directory_sha256(root)
-            app = create_production_app(
-                environ={
-                    "EMBEDDING_MODEL_ROOT": str(root),
-                    "EMBEDDING_MODEL_SHA256": checksum,
-                }
-            )
-            with self.assertRaisesRegex(ValueError, EMBEDDING_METADATA_FILENAME):
-                with TestClient(app):
-                    pass
+            (root / "weights.bin").write_bytes(b"offline model weights")
+            write_metadata_manifest(root)
+            expected = compute_model_directory_sha256(root)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("full read")):
+                self.assertEqual(compute_model_directory_sha256(root), expected)
 
     def test_flag_loader_sets_offline_environment_before_local_model_import(self) -> None:
         model_root = Path("C:/offline/models/bge-test")
