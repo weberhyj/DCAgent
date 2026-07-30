@@ -28,10 +28,27 @@ REQUIRED_ENV_KEYS = (
     "RETRIEVAL_CANARY_PERCENT",
     "RETRIEVAL_PERMISSION_TAGS",
     "QDRANT_COLLECTION_ALIAS",
+    "OLLAMA_BASE_URL",
+    "OLLAMA_EMBEDDING_MODEL",
+    "OLLAMA_EMBEDDING_PATH",
+    "OLLAMA_RERANKER_MODEL",
+    "OLLAMA_GENERATE_PATH",
+    "OLLAMA_KEEP_ALIVE",
+    "OLLAMA_REQUEST_TIMEOUT_SECONDS",
+    "OLLAMA_RERANK_FORMAT_JSON",
+    "OLLAMA_RERANK_NUM_PREDICT",
+)
+
+REMOVED_LOCAL_ADAPTER_KEYS = (
     "EMBEDDING_MODEL_DIR",
-    "RERANKER_MODEL_DIR",
+    "EMBEDDING_MODEL_ROOT",
     "EMBEDDING_RUNTIME",
+    "EMBEDDING_THREADS",
+    "RERANKER_MODEL_DIR",
+    "RERANKER_MODEL_ROOT",
     "RERANKER_RUNTIME",
+    "RERANKER_MAX_LENGTH",
+    "RERANKER_THREADS",
 )
 
 
@@ -72,10 +89,46 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(
                     values["QDRANT_COLLECTION_ALIAS"], "knowledge_chunks_current"
                 )
-                self.assertEqual(values["EMBEDDING_MODEL_DIR"], "qwen3-embedding-0.6b")
-                self.assertEqual(values["RERANKER_MODEL_DIR"], "qwen3-reranker-0.6b")
-                self.assertEqual(values["EMBEDDING_RUNTIME"], "openvino")
-                self.assertEqual(values["RERANKER_RUNTIME"], "openvino")
+                self.assertEqual(values["RETRIEVAL_RERANK_TOP_K"], "8")
+                self.assertEqual(values["RETRIEVAL_DEGRADED_RERANK_TOP_K"], "4")
+                self.assertEqual(values["RETRIEVAL_FINAL_TOP_K"], "4")
+                self.assertEqual(values["RETRIEVAL_TOTAL_TIMEOUT_SECONDS"], "20")
+                self.assertEqual(values["EMBEDDING_MODEL_NAME"], "qwen2.5:0.5b")
+                self.assertEqual(
+                    values["EMBEDDING_MODEL_VERSION"], "ollama-qwen25-05b-v1"
+                )
+                self.assertEqual(values["EMBEDDING_MODEL_DIMENSIONS"], "896")
+                self.assertEqual(values["EMBEDDING_MODEL_NORMALIZED"], "true")
+                self.assertEqual(
+                    values["EMBEDDING_ENCODING_PROFILE_SHA256"],
+                    "44f2b1c9565fdfebaa0d1df064367cfab9cd884106fdd6150f19ca8eb4ade30b",
+                )
+                self.assertEqual(values["RERANKER_MODEL_NAME"], "qwen2.5:3b")
+                self.assertEqual(
+                    values["RERANKER_MODEL_VERSION"], "ollama-qwen25-3b-v1"
+                )
+                self.assertEqual(
+                    values["RERANKER_PROMPT_PROFILE_SHA256"],
+                    "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd",
+                )
+                self.assertEqual(values["OLLAMA_BASE_URL"], "http://172.16.0.10:11434")
+                self.assertEqual(values["OLLAMA_EMBEDDING_MODEL"], "qwen2.5:0.5b")
+                self.assertEqual(values["OLLAMA_EMBEDDING_PATH"], "/api/embed")
+                self.assertEqual(values["OLLAMA_RERANKER_MODEL"], "qwen2.5:3b")
+                self.assertEqual(values["OLLAMA_GENERATE_PATH"], "/api/generate")
+                self.assertEqual(values["OLLAMA_KEEP_ALIVE"], "30m")
+                self.assertEqual(values["OLLAMA_REQUEST_TIMEOUT_SECONDS"], "15")
+                self.assertEqual(values["OLLAMA_RERANK_FORMAT_JSON"], "true")
+                self.assertEqual(values["OLLAMA_RERANK_NUM_PREDICT"], "256")
+                for key in REMOVED_LOCAL_ADAPTER_KEYS:
+                    self.assertNotIn(key, values)
+
+        offline_values = active_assignments(
+            (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(offline_values["RERANKER_BATCH_MAX_ITEMS"], "8")
 
     def test_api_receives_retrieval_rollout_and_pinned_metadata(self) -> None:
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
@@ -105,6 +158,19 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         ):
             with self.subTest(key=key):
                 self.assertRegex(api, rf"(?m)^\s+{key}:")
+
+        worker = service_block(compose, "ingestion-worker")
+        for consumer in (api, worker):
+            self.assertNotIn("OLLAMA_", consumer)
+
+    def test_artifact_manifest_excludes_ollama_owned_model_weights(self) -> None:
+        schema = (REPO_ROOT / "deploy" / "offline" / "artifacts.schema.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Ollama owns embedding and reranker model weights", schema)
+        self.assertIn("mounted into DC-Agent containers", schema)
+        self.assertNotIn("Local embedding-model", schema)
+        self.assertNotIn("reranker-model", schema)
 
     def test_model_readiness_is_mode_aware_in_application_not_compose_dependencies(
         self,

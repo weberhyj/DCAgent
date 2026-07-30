@@ -326,7 +326,17 @@ class BackendUvContractTest(unittest.TestCase):
                 self.assertRegex(sync_args, r"(?<!\S)--offline(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--no-install-project(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--no-dev(?!\S)")
-                self.assertRegex(sync_args, r"(?<!\S)--group\s+offline(?!\S)")
+                if filename in ("embedding.Dockerfile", "reranker.Dockerfile"):
+                    self.assertNotRegex(sync_args, r"(?<!\S)--group\s+offline(?!\S)")
+                    for adapter_only_env in (
+                        "HF_HUB_OFFLINE",
+                        "TRANSFORMERS_OFFLINE",
+                        "HF_HUB_DISABLE_TELEMETRY",
+                        "TOKENIZERS_PARALLELISM",
+                    ):
+                        self.assertNotIn(adapter_only_env, active_text)
+                else:
+                    self.assertRegex(sync_args, r"(?<!\S)--group\s+offline(?!\S)")
                 self.assertRegex(sync_args, r"(?<!\S)--find-links=/wheels(?!\S)")
                 self.assertNotRegex(
                     active_normalized,

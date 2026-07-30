@@ -16,7 +16,7 @@ RUN case "$(uv --version)" in \
         "uv 0.11.29"|"uv 0.11.29 "*) ;; \
         *) exit 1 ;; \
     esac \
-    && uv sync --frozen --offline --no-install-project --no-dev --group offline --find-links=/wheels \
+    && uv sync --frozen --offline --no-install-project --no-dev --find-links=/wheels \
     && rm -rf /root/.cache/uv
 ENV PATH="/app/.venv/bin:$PATH"
 
@@ -32,11 +32,7 @@ RUN case "$DCAGENT_UID" in ''|*[!0-9]*) exit 1 ;; esac \
     && useradd --uid "$DCAGENT_UID" --gid "$DCAGENT_GID" --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin dcagent \
     && test "$(id -u dcagent)" = "$DCAGENT_UID" \
     && test "$(id -g dcagent)" = "$DCAGENT_GID"
-ENV HOME=/nonexistent \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
-    HF_HUB_DISABLE_TELEMETRY=1 \
-    TOKENIZERS_PARALLELISM=false
+ENV HOME=/nonexistent
 USER dcagent
 
 CMD ["python", "-m", "uvicorn", "app.reranker_service:create_production_app", "--factory", "--host", "0.0.0.0", "--port", "8082"]

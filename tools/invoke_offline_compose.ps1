@@ -275,6 +275,13 @@ function Assert-RenderedOfflineCompose {
     if ((Get-JsonPropertyValue -Object $physocEgressNetwork -Name "internal") -eq $true) {
         throw "Rendered Compose physoc-egress network must not be internal"
     }
+    $ollamaEgressNetwork = Get-JsonPropertyValue -Object $networks -Name "ollama-egress"
+    if ($null -eq $ollamaEgressNetwork) {
+        throw "Rendered Compose configuration is missing the ollama-egress network"
+    }
+    if ((Get-JsonPropertyValue -Object $ollamaEgressNetwork -Name "internal") -eq $true) {
+        throw "Rendered Compose ollama-egress network must not be internal"
+    }
     foreach ($requiredService in @(
         "postgres",
         "clickhouse",
@@ -307,6 +314,9 @@ function Assert-RenderedOfflineCompose {
         $expectedNetworks = @("offline")
         if ($serviceName -ceq "api") {
             $expectedNetworks = @("offline", "physoc-egress")
+        }
+        elseif ($serviceName -in @("embedding-service", "reranker-service")) {
+            $expectedNetworks = @("offline", "ollama-egress")
         }
         if (
             $actualNetworks.Count -ne $expectedNetworks.Count -or
@@ -379,12 +389,6 @@ function Assert-RenderedOfflineCompose {
         "redis" = [ordered]@{
             "/data" = Join-Path $dataRoot "redis"
         }
-        "embedding-service" = [ordered]@{
-            "/models" = $modelRoot
-        }
-        "reranker-service" = [ordered]@{
-            "/models" = $modelRoot
-        }
         "api" = [ordered]@{
             "/data/raw" = Join-Path $dataRoot "raw"
             "/data/parquet" = Join-Path $dataRoot "parquet"
@@ -426,13 +430,6 @@ function Assert-RenderedOfflineCompose {
             $createHostPath = Get-JsonPropertyValue -Object $bind -Name "create_host_path"
             if ($createHostPath -ne $false) {
                 throw "$serviceName bind mount for $target must disable create_host_path"
-            }
-            if (
-                $serviceName -ceq "reranker-service" -and
-                $target -ceq "/models" -and
-                (Get-JsonPropertyValue -Object $volume -Name "read_only") -ne $true
-            ) {
-                throw "reranker-service bind mount for /models must be read-only"
             }
             $seenTargets[$target] = $true
         }

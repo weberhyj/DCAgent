@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dc-agent.local/schemas/offline-artifacts.schema.json",
   "title": "DC-Agent offline artifact manifest",
-  "description": "A closed manifest of checksummed artifacts provisioned on the offline host.",
+  "description": "A closed manifest of checksummed artifacts mounted into DC-Agent containers. Ollama owns embedding and reranker model weights.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -19,7 +19,7 @@
   },
   "$defs": {
     "artifact": {
-      "description": "Local embedding-model, reranker-model, and sparse-embedding-model directories, Docling artifacts, PaddleOCR detection models, PaddleOCR recognition models, PaddleOCR classification models, PaddlePaddle CPU wheels, LibreOffice binaries, and Poppler/native libraries, each with identity, license, local path, and SHA-256 checksum metadata.",
+      "description": "Mounted sparse-embedding-model directories, Docling artifacts, PaddleOCR detection models, PaddleOCR recognition models, PaddleOCR classification models, PaddlePaddle CPU wheels, LibreOffice binaries, and Poppler/native libraries, each with identity, license, local path, and SHA-256 checksum metadata.",
       "type": "object",
       "additionalProperties": false,
       "required": [

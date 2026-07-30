@@ -60,17 +60,25 @@ class ComposeContractTest(unittest.TestCase):
         )
         service_requirements = {
             "embedding-service": (
-                "EMBEDDING_MODEL_ROOT",
                 "EMBEDDING_MODEL_SHA256",
-                "EMBEDDING_RUNTIME",
+                "OLLAMA_BASE_URL",
+                "OLLAMA_EMBEDDING_MODEL",
+                "OLLAMA_EMBEDDING_PATH",
+                "OLLAMA_KEEP_ALIVE",
+                "OLLAMA_REQUEST_TIMEOUT_SECONDS",
                 "EMBEDDING_BATCH_MAX_ITEMS",
                 "EMBEDDING_QUEUE_MAX_ITEMS",
                 "EMBEDDING_BATCH_WAIT_MS",
             ),
             "reranker-service": (
-                "RERANKER_MODEL_ROOT",
                 "RERANKER_MODEL_SHA256",
-                "RERANKER_RUNTIME",
+                "OLLAMA_BASE_URL",
+                "OLLAMA_RERANKER_MODEL",
+                "OLLAMA_GENERATE_PATH",
+                "OLLAMA_KEEP_ALIVE",
+                "OLLAMA_REQUEST_TIMEOUT_SECONDS",
+                "OLLAMA_RERANK_FORMAT_JSON",
+                "OLLAMA_RERANK_NUM_PREDICT",
                 "RERANKER_BATCH_MAX_ITEMS",
                 "RERANKER_QUEUE_MAX_ITEMS",
                 "RERANKER_BATCH_WAIT_MS",
@@ -79,20 +87,23 @@ class ComposeContractTest(unittest.TestCase):
         for service, variables in service_requirements.items():
             block = service_block(compose, service)
             with self.subTest(service=service):
-                self.assertIn('HF_HUB_OFFLINE: "1"', block)
-                self.assertIn('TRANSFORMERS_OFFLINE: "1"', block)
-                self.assertIn("networks:\n      - offline", block)
+                self.assertRegex(
+                    block,
+                    r"(?ms)^    networks:\n      - offline\n      - ollama-egress(?:\n|$)",
+                )
                 self.assertNotRegex(block, r"(?m)^\s+ports:")
                 self.assertRegex(block, r"(?m)^\s+cpus:")
                 self.assertRegex(block, r"(?m)^\s+mem_limit:")
-                self.assertRegex(block, r"(?m)^\s+OMP_NUM_THREADS:")
-                self.assertRegex(block, r"(?m)^\s+OPENVINO_NUM_THREADS:")
-                self.assertIn("target: /models", block)
-                self.assertIn("read_only: true", block)
+                self.assertNotRegex(block, r"(?m)^\s+volumes:")
+                self.assertNotIn("MODEL_ROOT", block)
+                self.assertNotIn("MODEL_DIR", block)
+                self.assertNotIn("_RUNTIME", block)
+                self.assertNotIn("OMP_NUM_THREADS", block)
+                self.assertNotIn("OPENVINO_NUM_THREADS", block)
                 for variable in variables:
                     self.assertRegex(block, rf"(?m)^\s+{variable}:")
 
-    def test_compose_limits_physoc_egress_to_api(self) -> None:
+    def test_compose_limits_egress_networks_to_approved_services(self) -> None:
         compose_text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
             encoding="utf-8"
         )
@@ -102,6 +113,10 @@ class ComposeContractTest(unittest.TestCase):
         self.assertRegex(
             networks,
             r"(?ms)^  physoc-egress:\n\s+internal: false(?:\n|$)",
+        )
+        self.assertRegex(
+            networks,
+            r"(?ms)^  ollama-egress:\n\s+internal: false(?:\n|$)",
         )
 
         def service_block(service_name: str) -> str:
@@ -116,6 +131,11 @@ class ComposeContractTest(unittest.TestCase):
             service_block("api"),
             r"(?ms)^    networks:\n      - offline\n      - physoc-egress(?:\n|$)",
         )
+        for service_name in ("embedding-service", "reranker-service"):
+            self.assertRegex(
+                service_block(service_name),
+                r"(?ms)^    networks:\n      - offline\n      - ollama-egress(?:\n|$)",
+            )
         for service_name in (
             "postgres",
             "clickhouse",
@@ -123,8 +143,6 @@ class ComposeContractTest(unittest.TestCase):
             "redis",
             "clamav",
             "schema-migration",
-            "embedding-service",
-            "reranker-service",
             "ingestion-worker",
             "llama",
         ):
@@ -132,6 +150,9 @@ class ComposeContractTest(unittest.TestCase):
                 block = service_block(service_name)
                 self.assertIn("      - offline", block)
                 self.assertNotIn("physoc-egress", block)
+                self.assertNotIn("ollama-egress", block)
+                self.assertNotIn("OLLAMA_BASE_URL", block)
+        self.assertNotIn("OLLAMA_BASE_URL", service_block("api"))
 
     def test_compose_supports_keyless_physoc_stream_configuration(self) -> None:
         text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
@@ -322,13 +343,11 @@ class ComposeContractTest(unittest.TestCase):
                     },
                     "embedding-service": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
-                        "networks": service_networks("offline"),
-                        "volumes": [bind(model_root, "/models", read_only=True)],
+                        "networks": service_networks("offline", "ollama-egress"),
                     },
                     "reranker-service": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
-                        "networks": service_networks("offline"),
-                        "volumes": [bind(model_root, "/models", read_only=True)],
+                        "networks": service_networks("offline", "ollama-egress"),
                     },
                     "api": {
                         "build": {"args": {"PYTHON_BASE_IMAGE": safe_image}},
@@ -365,6 +384,7 @@ class ComposeContractTest(unittest.TestCase):
                 "networks": {
                     "offline": {"internal": True},
                     "physoc-egress": {"internal": False},
+                    "ollama-egress": {"internal": False},
                 },
                 "secrets": {
                     "postgres_password": {"file": str(password_path)},
@@ -478,6 +498,20 @@ class ComposeContractTest(unittest.TestCase):
                 ).lower(),
             )
 
+            missing_adapter_egress = json.loads(json.dumps(rendered))
+            del missing_adapter_egress["services"]["embedding-service"]["networks"][
+                "ollama-egress"
+            ]
+            rejected_missing_adapter_egress = run(missing_adapter_egress)
+            self.assertNotEqual(0, rejected_missing_adapter_egress.returncode)
+            self.assertIn(
+                "network",
+                (
+                    rejected_missing_adapter_egress.stdout
+                    + rejected_missing_adapter_egress.stderr
+                ).lower(),
+            )
+
             non_api_egress = json.loads(json.dumps(rendered))
             non_api_egress["services"]["postgres"]["networks"]["physoc-egress"] = None
             rejected_non_api_egress = run(non_api_egress)
@@ -506,6 +540,17 @@ class ComposeContractTest(unittest.TestCase):
                 "network",
                 (
                     rejected_internal_egress.stdout + rejected_internal_egress.stderr
+                ).lower(),
+            )
+
+            internal_ollama_egress = json.loads(json.dumps(rendered))
+            internal_ollama_egress["networks"]["ollama-egress"]["internal"] = True
+            rejected_internal_ollama = run(internal_ollama_egress)
+            self.assertNotEqual(0, rejected_internal_ollama.returncode)
+            self.assertIn(
+                "network",
+                (
+                    rejected_internal_ollama.stdout + rejected_internal_ollama.stderr
                 ).lower(),
             )
 
@@ -666,23 +711,10 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_bind.returncode)
             self.assertIn("bind", (rejected_bind.stdout + rejected_bind.stderr).lower())
 
-            wrong_reranker_source = json.loads(json.dumps(rendered))
-            wrong_reranker_source["services"]["reranker-service"]["volumes"][0][
-                "source"
-            ] = str(root / "external-models")
-            rejected_reranker_source = run(wrong_reranker_source)
-            self.assertNotEqual(0, rejected_reranker_source.returncode)
-            self.assertIn(
-                "bind",
-                (
-                    rejected_reranker_source.stdout + rejected_reranker_source.stderr
-                ).lower(),
-            )
-
             extra_reranker_bind = json.loads(json.dumps(rendered))
-            extra_reranker_bind["services"]["reranker-service"]["volumes"].append(
+            extra_reranker_bind["services"]["reranker-service"]["volumes"] = [
                 bind(model_root, "/unexpected", read_only=True)
-            )
+            ]
             rejected_extra_reranker_bind = run(extra_reranker_bind)
             self.assertNotEqual(0, rejected_extra_reranker_bind.returncode)
             self.assertIn(
@@ -690,34 +722,6 @@ class ComposeContractTest(unittest.TestCase):
                 (
                     rejected_extra_reranker_bind.stdout
                     + rejected_extra_reranker_bind.stderr
-                ).lower(),
-            )
-
-            writable_reranker_bind = json.loads(json.dumps(rendered))
-            writable_reranker_bind["services"]["reranker-service"]["volumes"][0][
-                "read_only"
-            ] = False
-            rejected_writable_reranker_bind = run(writable_reranker_bind)
-            self.assertNotEqual(0, rejected_writable_reranker_bind.returncode)
-            self.assertIn(
-                "read-only",
-                (
-                    rejected_writable_reranker_bind.stdout
-                    + rejected_writable_reranker_bind.stderr
-                ).lower(),
-            )
-
-            creating_reranker_bind = json.loads(json.dumps(rendered))
-            creating_reranker_bind["services"]["reranker-service"]["volumes"][0][
-                "bind"
-            ]["create_host_path"] = True
-            rejected_creating_reranker_bind = run(creating_reranker_bind)
-            self.assertNotEqual(0, rejected_creating_reranker_bind.returncode)
-            self.assertIn(
-                "create_host_path",
-                (
-                    rejected_creating_reranker_bind.stdout
-                    + rejected_creating_reranker_bind.stderr
                 ).lower(),
             )
 
@@ -1907,10 +1911,24 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotRegex(text, r"\bchown\s+-R\b[^\n]*\s/app(?:\s|$)")
             version_gate = 'case "$(uv --version)" in'
             version_pattern = '"uv 0.11.29"|"uv 0.11.29 "*)'
-            sync_command = (
-                "uv sync --frozen --offline --no-install-project --no-dev "
-                "--group offline --find-links=/wheels"
-            )
+            if dockerfile_name in ("embedding.Dockerfile", "reranker.Dockerfile"):
+                sync_command = (
+                    "uv sync --frozen --offline --no-install-project --no-dev "
+                    "--find-links=/wheels"
+                )
+                self.assertNotIn("--group offline", text)
+                for adapter_only_env in (
+                    "HF_HUB_OFFLINE",
+                    "TRANSFORMERS_OFFLINE",
+                    "HF_HUB_DISABLE_TELEMETRY",
+                    "TOKENIZERS_PARALLELISM",
+                ):
+                    self.assertNotIn(adapter_only_env, text)
+            else:
+                sync_command = (
+                    "uv sync --frozen --offline --no-install-project --no-dev "
+                    "--group offline --find-links=/wheels"
+                )
             self.assertIn("UV_NO_INDEX=1", text)
             self.assertIn("UV_PYTHON_DOWNLOADS=never", text)
             self.assertIn("UV_LINK_MODE=copy", text)
@@ -1962,8 +1980,8 @@ class ComposeContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertNotRegex(compose_text, r"(?m)^\s*-\s+\$\{[^}]+\}[^\n]*:")
-        self.assertEqual(14, compose_text.count("type: bind"))
-        self.assertEqual(14, compose_text.count("create_host_path: false"))
+        self.assertEqual(12, compose_text.count("type: bind"))
+        self.assertEqual(12, compose_text.count("create_host_path: false"))
 
     def test_linux_identity_and_path_hardening_contract(self) -> None:
         script_text = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(
