@@ -4,7 +4,7 @@ import hashlib
 import json
 import unittest
 
-from app.ollama_client import OllamaBusy, OllamaServiceError
+from app.ollama_client import OllamaBusy, OllamaResponseError, OllamaServiceError
 from app.ollama_reranker_backend import (
     RERANK_PROMPT_PROFILE,
     RERANK_PROMPT_PROFILE_SHA256,
@@ -219,6 +219,21 @@ class OllamaGenerativeRerankerBackendTest(unittest.TestCase):
                     "query", ["passage"]
                 )
 
+    def test_response_rejects_duplicate_object_keys_at_every_level_without_leaking(self) -> None:
+        secret = "RAW_DUPLICATE_SECRET_123"
+        invalid = (
+            f'{{"scores":"{secret}","scores":[{{"index":0,"score":0.5}}]}}',
+            f'{{"scores":[{{"index":"{secret}","index":0,"score":0.5}}]}}',
+            f'{{"scores":[{{"index":0,"score":"{secret}","score":0.5}}]}}',
+        )
+        for model_response in invalid:
+            with self.subTest(model_response=model_response):
+                with self.assertRaises(ValueError) as caught:
+                    make_backend(RecordingClient({"response": model_response})).rerank(
+                        "query", ["passage"]
+                    )
+                self.assertNotIn(secret, str(caught.exception))
+
     def test_response_accepts_leading_and_trailing_json_whitespace(self) -> None:
         client = RecordingClient({"response": ' \n\t{"scores":[{"index":0,"score":0.5}]}\r\n '})
         self.assertEqual(make_backend(client).rerank("query", ["passage"]), [0.5])
@@ -294,6 +309,20 @@ class OllamaGenerativeRerankerBackendTest(unittest.TestCase):
                     "query", ["passage"]
                 )
 
+    def test_response_rejects_huge_integer_score_with_sanitized_value_error(self) -> None:
+        huge_integer = 10**400
+        raw_response = f'{{"scores":[{{"index":0,"score":{huge_integer}}}]}}'
+
+        with self.assertRaises(ValueError) as caught:
+            make_backend(RecordingClient({"response": raw_response})).rerank(
+                "query-secret", ["passage-secret"]
+            )
+
+        message = str(caught.exception)
+        self.assertNotIn(str(huge_integer), message)
+        self.assertNotIn("query-secret", message)
+        self.assertNotIn("passage-secret", message)
+
     def test_adapter_errors_do_not_include_query_passage_or_raw_response(self) -> None:
         secrets = ("QUERY_SECRET_123", "PASSAGE_SECRET_456", "RAW_SECRET_789")
         client = RecordingClient({"response": f"not-json-{secrets[2]}"})
@@ -305,10 +334,11 @@ class OllamaGenerativeRerankerBackendTest(unittest.TestCase):
         for secret in secrets:
             self.assertNotIn(secret, message)
 
-    def test_client_service_and_busy_errors_propagate_unchanged(self) -> None:
+    def test_client_errors_propagate_unchanged(self) -> None:
         for error in (
             OllamaServiceError("sanitized service error"),
             OllamaBusy("sanitized busy error"),
+            OllamaResponseError("sanitized response error"),
         ):
             with self.subTest(error=type(error).__name__):
                 client = RecordingClient(error=error)

@@ -122,6 +122,15 @@ def _build_prompt(query: str, passages: Sequence[str]) -> str:
     return RERANK_PROMPT_PROFILE.format(query=query, documents=documents)
 
 
+def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(_INVALID_RESPONSE_MESSAGE)
+        result[key] = value
+    return result
+
+
 def _parse_scores(response: object, passage_count: int) -> list[float]:
     if not isinstance(response, Mapping):
         raise ValueError(_INVALID_RESPONSE_MESSAGE)
@@ -129,8 +138,8 @@ def _parse_scores(response: object, passage_count: int) -> list[float]:
     if not isinstance(raw_response, str):
         raise ValueError(_INVALID_RESPONSE_MESSAGE)
     try:
-        decoded = json.loads(raw_response)
-    except (json.JSONDecodeError, UnicodeError):
+        decoded = json.loads(raw_response, object_pairs_hook=_object_without_duplicate_keys)
+    except (ValueError, UnicodeError):
         raise ValueError(_INVALID_RESPONSE_MESSAGE) from None
 
     if not isinstance(decoded, Mapping) or set(decoded) != {"scores"}:
@@ -155,8 +164,8 @@ def _parse_scores(response: object, passage_count: int) -> list[float]:
         if (
             isinstance(score, bool)
             or not isinstance(score, (int, float))
-            or not math.isfinite(score)
             or not 0 <= score <= 1
+            or not math.isfinite(score)
         ):
             raise ValueError(_INVALID_RESPONSE_MESSAGE)
         scores_by_index[index] = float(score)
