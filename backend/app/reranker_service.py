@@ -305,6 +305,9 @@ def _load_ollama_reranker_backend(
     num_predict = _required_positive_int(environ, "OLLAMA_RERANK_NUM_PREDICT")
     client = SyncOllamaClient(base_url, timeout_seconds=timeout_seconds)
     try:
+        actual_digest = client.model_digest(model)
+        if not hmac.compare_digest(actual_digest, metadata.sha256):
+            raise ValueError("Ollama model digest does not match configured model checksum")
         return OllamaGenerativeRerankerBackend(
             client,
             model=model,

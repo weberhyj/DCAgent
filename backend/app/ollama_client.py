@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import re
 from collections.abc import Mapping
 from typing import Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -12,6 +13,7 @@ _PRIVATE_IPV4_NETWORKS = tuple(
     ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 )
 _PRIVATE_IPV6_NETWORK = ipaddress.IPv6Network("fc00::/7")
+_MODEL_DIGEST_PATTERN = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 
 
 class OllamaError(RuntimeError):
@@ -31,6 +33,13 @@ class OllamaResponseError(OllamaError):
 
 
 class OllamaTransport(Protocol):
+    def get_json(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> object: ...
+
     def post_json(
         self,
         url: str,
@@ -64,6 +73,22 @@ class _HttpxOllamaTransport:
             response = self._client.post(
                 url,
                 json=payload,
+                timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 2.0)),
+            )
+        response.raise_for_status()
+        return response.json()
+
+    def get_json(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> object:
+        if timeout_seconds is None:
+            response = self._client.get(url)
+        else:
+            response = self._client.get(
+                url,
                 timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 2.0)),
             )
         response.raise_for_status()
@@ -116,6 +141,73 @@ class SyncOllamaClient:
         if not isinstance(response, Mapping):
             raise OllamaResponseError("Ollama service returned a non-object response")
         return response
+
+    def get_json(
+        self,
+        path: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Mapping[str, object]:
+        if self._closed:
+            raise OllamaServiceError("Ollama client is closed")
+        normalized_path = _validate_api_path(path)
+        request_timeout = None if timeout_seconds is None else _validate_timeout(timeout_seconds)
+        try:
+            response = self._transport.get_json(
+                f"{self._base_url}{normalized_path}",
+                timeout_seconds=request_timeout,
+            )
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code == 429:
+                raise OllamaBusy("Ollama service is busy") from None
+            raise OllamaServiceError("Ollama service request failed") from None
+        except httpx.HTTPError:
+            raise OllamaServiceError("Ollama service request failed") from None
+        except (UnicodeError, ValueError):
+            raise OllamaResponseError("Ollama service returned invalid JSON") from None
+
+        if not isinstance(response, Mapping):
+            raise OllamaResponseError("Ollama service returned a non-object response")
+        return response
+
+    def model_digest(self, model: str) -> str:
+        if (
+            not isinstance(model, str)
+            or not model
+            or model != model.strip()
+            or _contains_ascii_control(model)
+        ):
+            raise ValueError("Ollama model name must be a non-empty string")
+
+        inventory = self.get_json("/api/tags")
+        models = inventory.get("models")
+        if not isinstance(models, list):
+            raise OllamaResponseError("Ollama model inventory response is invalid")
+
+        matches: list[str] = []
+        for entry in models:
+            if not isinstance(entry, Mapping):
+                raise OllamaResponseError("Ollama model inventory response is invalid")
+            name = _inventory_identifier(entry, "name")
+            model_name = _inventory_identifier(entry, "model")
+            if name is None and model_name is None:
+                raise OllamaResponseError("Ollama model inventory response is invalid")
+            if name is not None and model_name is not None and name != model_name:
+                raise OllamaResponseError("Ollama model inventory response is invalid")
+            digest = entry.get("digest")
+            if not isinstance(digest, str):
+                raise OllamaResponseError("Ollama model inventory response is invalid")
+            digest_match = _MODEL_DIGEST_PATTERN.fullmatch(digest)
+            if digest_match is None:
+                raise OllamaResponseError("Ollama model inventory response is invalid")
+            if model == name or model == model_name:
+                matches.append(digest_match.group(1))
+
+        if not matches:
+            raise OllamaResponseError("Configured Ollama model is unavailable")
+        if len(matches) != 1:
+            raise OllamaResponseError("Ollama model inventory is ambiguous")
+        return matches[0]
 
     def close(self) -> None:
         if self._closed:
@@ -216,3 +308,17 @@ def _validate_timeout(timeout_seconds: float) -> float:
 
 def _contains_ascii_control(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _inventory_identifier(entry: Mapping[str, object], field: str) -> str | None:
+    value = entry.get(field)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or _contains_ascii_control(value)
+    ):
+        raise OllamaResponseError("Ollama model inventory response is invalid")
+    return value

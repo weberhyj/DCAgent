@@ -98,6 +98,15 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(
                     values["EMBEDDING_MODEL_VERSION"], "ollama-qwen25-05b-v1"
                 )
+                self.assertRegex(values["EMBEDDING_MODEL_SHA256"], r"^[0-9a-f]{64}$")
+                self.assertRegex(
+                    text,
+                    r"(?m)^# Operator action: replace with the target Ollama "
+                    r"/api/tags digest for qwen2\.5:0\.5b\.\n"
+                    r"# Store the normalized 64 lowercase hex characters without "
+                    r"the optional sha256: prefix\.\n"
+                    r"EMBEDDING_MODEL_SHA256=[0-9a-f]{64}$",
+                )
                 dimensions = values["EMBEDDING_MODEL_DIMENSIONS"]
                 self.assertRegex(dimensions, r"^[1-9][0-9]*$")
                 self.assertGreater(int(dimensions), 0)
@@ -117,6 +126,15 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(values["RERANKER_MODEL_NAME"], "qwen2.5:3b")
                 self.assertEqual(
                     values["RERANKER_MODEL_VERSION"], "ollama-qwen25-3b-v1"
+                )
+                self.assertRegex(values["RERANKER_MODEL_SHA256"], r"^[0-9a-f]{64}$")
+                self.assertRegex(
+                    text,
+                    r"(?m)^# Operator action: replace with the target Ollama "
+                    r"/api/tags digest for qwen2\.5:3b\.\n"
+                    r"# Store the normalized 64 lowercase hex characters without "
+                    r"the optional sha256: prefix\.\n"
+                    r"RERANKER_MODEL_SHA256=[0-9a-f]{64}$",
                 )
                 self.assertEqual(
                     values["RERANKER_PROMPT_PROFILE_SHA256"],

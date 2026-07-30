@@ -173,11 +173,12 @@ class OfflineArtifactManifestTest(unittest.TestCase):
             with self.subTest(schema_remote_path=remote_path):
                 self.assertIsNone(re.fullmatch(local_path_pattern, remote_path))
 
+        schema_description = schema["description"].lower()
+        self.assertIn("ollama owns embedding and reranker model weights", schema_description)
+
         description = artifact_schema["description"].lower()
         for artifact_family in (
             "docling",
-            "embedding-model",
-            "reranker-model",
             "sparse-embedding-model",
             "paddleocr detection",
             "paddleocr recognition",
@@ -188,6 +189,9 @@ class OfflineArtifactManifestTest(unittest.TestCase):
         ):
             with self.subTest(artifact_family=artifact_family):
                 self.assertIn(artifact_family, description)
+
+        self.assertNotRegex(description, r"(?<!sparse-)embedding-model")
+        self.assertNotIn("reranker-model", description)
 
         self.assertNotRegex(json.dumps(schema).lower(), r"download(?:url|uri)")
 

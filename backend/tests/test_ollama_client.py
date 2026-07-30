@@ -27,6 +27,7 @@ class RecordingTransport:
         self.response = {} if response is _DEFAULT_RESPONSE else response
         self.error = error
         self.calls: list[tuple[str, object, float | None]] = []
+        self.get_calls: list[tuple[str, float | None]] = []
         self.close_calls = 0
 
     def post_json(
@@ -37,6 +38,17 @@ class RecordingTransport:
         timeout_seconds: float | None = None,
     ) -> object:
         self.calls.append((url, payload, timeout_seconds))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+    def get_json(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> object:
+        self.get_calls.append((url, timeout_seconds))
         if self.error is not None:
             raise self.error
         return self.response
@@ -69,6 +81,98 @@ class RecordingHttpxClient:
 
 
 class OllamaClientTest(unittest.TestCase):
+    def test_resolves_unique_model_digest_and_normalizes_optional_prefix(self) -> None:
+        digest = "a" * 64
+        for returned_digest in (digest, f"sha256:{digest}"):
+            with self.subTest(returned_digest=returned_digest):
+                transport = RecordingTransport(
+                    response={
+                        "models": [
+                            {
+                                "name": "unrelated:latest",
+                                "model": "unrelated:latest",
+                                "digest": "b" * 64,
+                            },
+                            {
+                                "name": "qwen2.5:0.5b",
+                                "model": "qwen2.5:0.5b",
+                                "digest": returned_digest,
+                            },
+                        ]
+                    }
+                )
+                client = SyncOllamaClient("http://ollama:11434", transport=transport)
+                resolver = getattr(client, "model_digest", None)
+                self.assertTrue(callable(resolver))
+
+                self.assertEqual(resolver("qwen2.5:0.5b"), digest)
+                self.assertEqual(
+                    transport.get_calls,
+                    [("http://ollama:11434/api/tags", None)],
+                )
+                self.assertEqual(transport.calls, [])
+
+    def test_model_digest_rejects_missing_duplicate_and_malformed_inventory(self) -> None:
+        digest = "a" * 64
+        cases = (
+            ({"models": []}, "unavailable"),
+            (
+                {
+                    "models": [
+                        {"name": "qwen2.5:0.5b", "digest": digest},
+                        {"model": "qwen2.5:0.5b", "digest": digest},
+                    ]
+                },
+                "ambiguous",
+            ),
+            ({}, "invalid"),
+            ({"models": "not-a-list"}, "invalid"),
+            ({"models": ["not-an-object"]}, "invalid"),
+            (
+                {"models": [{"name": "qwen2.5:0.5b", "digest": "sha256:bad"}]},
+                "invalid",
+            ),
+            (
+                {
+                    "models": [
+                        {
+                            "name": "qwen2.5:0.5b",
+                            "model": "different:latest",
+                            "digest": digest,
+                        }
+                    ]
+                },
+                "invalid",
+            ),
+        )
+        for response, message in cases:
+            with self.subTest(response=response):
+                client = SyncOllamaClient(
+                    "http://ollama:11434",
+                    transport=RecordingTransport(response=response),
+                )
+                resolver = getattr(client, "model_digest", None)
+                self.assertTrue(callable(resolver))
+                with self.assertRaisesRegex(OllamaResponseError, message):
+                    resolver("qwen2.5:0.5b")
+
+    def test_model_digest_maps_transport_failure_without_leaking_details(self) -> None:
+        request = httpx.Request("GET", "http://ollama:11434/api/tags")
+        client = SyncOllamaClient(
+            "http://ollama:11434",
+            transport=RecordingTransport(
+                error=httpx.ConnectError("private inventory host details", request=request)
+            ),
+        )
+        resolver = getattr(client, "model_digest", None)
+        self.assertTrue(callable(resolver))
+
+        with self.assertRaises(OllamaServiceError) as caught:
+            resolver("qwen2.5:0.5b")
+
+        self.assertNotIn("private", str(caught.exception))
+        self.assertNotIn("qwen2.5", str(caught.exception))
+
     def test_accepts_only_local_or_private_base_urls_and_normalizes_slash(self) -> None:
         cases = (
             ("http://localhost:11434/", "http://localhost:11434/api/generate"),

@@ -360,7 +360,7 @@ class BackendUvContractTest(unittest.TestCase):
             "The Docker build context must not allowlist any requirements file",
         )
 
-    def test_model_service_images_use_single_offline_qwen3_factories(self) -> None:
+    def test_model_service_images_use_ollama_qwen25_adapter_factories(self) -> None:
         expected_commands = {
             "embedding.Dockerfile": (
                 "app.embedding_service:create_production_app",

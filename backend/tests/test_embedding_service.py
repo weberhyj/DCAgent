@@ -12,7 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app import embedding_service
+from app import embedding_service, ollama_embedding_backend
 from app.embedding_contracts import (
     EmbeddingMetadataExpectation,
     EmbeddingMetadataResponse,
@@ -27,6 +27,11 @@ from app.embedding_service import (
     create_embedding_app,
     create_production_app,
     load_flag_embedding_backend,
+)
+from app.ollama_client import OllamaResponseError
+
+EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256 = (
+    "44f2b1c9565fdfebaa0d1df064367cfab9cd884106fdd6150f19ca8eb4ade30b"
 )
 
 
@@ -73,6 +78,28 @@ class CloseTrackingBatcher:
             raise RuntimeError("secret embedding text must not leak")
 
 
+class DigestClient:
+    def __init__(
+        self,
+        digest: str = "a" * 64,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.digest = digest
+        self.error = error
+        self.model_calls: list[str] = []
+        self.close_calls = 0
+
+    def model_digest(self, model: str) -> str:
+        self.model_calls.append(model)
+        if self.error is not None:
+            raise self.error
+        return self.digest
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 class WrongVectorCountBackend(FakeEmbeddingBackend):
     def embed(self, texts: list[str], *, purpose: str) -> list[list[float]]:
         vectors = super().embed(texts, purpose=purpose)
@@ -98,7 +125,7 @@ def metadata(
         checksum,
         dimensions,
         normalized,
-        "e" * 64,
+        EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256,
         "1",
     )
 
@@ -126,7 +153,7 @@ def production_environment(**overrides: str) -> dict[str, str]:
         "EMBEDDING_MODEL_SHA256": "a" * 64,
         "EMBEDDING_MODEL_DIMENSIONS": "4",
         "EMBEDDING_MODEL_NORMALIZED": "true",
-        "EMBEDDING_ENCODING_PROFILE_SHA256": "e" * 64,
+        "EMBEDDING_ENCODING_PROFILE_SHA256": (EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256),
         "EMBEDDING_PROTOCOL_VERSION": "1",
         "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
         "OLLAMA_EMBEDDING_MODEL": "bge-test",
@@ -430,6 +457,28 @@ class EmbeddingServiceTest(unittest.TestCase):
                 self.assertEqual(loader_calls, [])
                 self.assertFalse(app.state.embedding_ready)
 
+    def test_production_startup_rejects_mismatched_embedding_profile(self) -> None:
+        self.assertEqual(
+            getattr(
+                ollama_embedding_backend,
+                "OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256",
+                None,
+            ),
+            EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256,
+        )
+        loader_calls: list[object] = []
+        app = create_production_app(
+            environ=production_environment(EMBEDDING_ENCODING_PROFILE_SHA256="b" * 64),
+            backend_loader=lambda values, pinned: loader_calls.append(values),
+        )
+
+        with self.assertRaisesRegex(ValueError, "embedding encoding profile"):
+            with TestClient(app):
+                pass
+
+        self.assertEqual(loader_calls, [])
+        self.assertFalse(app.state.embedding_ready)
+
     def test_default_ollama_factory_rejects_invalid_environment(self) -> None:
         cases = (
             ("OLLAMA_BASE_URL", None, "OLLAMA_BASE_URL"),
@@ -490,7 +539,7 @@ class EmbeddingServiceTest(unittest.TestCase):
 
     def test_default_ollama_factory_constructs_client_and_backend(self) -> None:
         backend = CloseTrackingEmbeddingBackend()
-        client = object()
+        client = DigestClient()
         with (
             patch("app.embedding_service.SyncOllamaClient", return_value=client) as client_type,
             patch(
@@ -502,6 +551,7 @@ class EmbeddingServiceTest(unittest.TestCase):
                 self.assertEqual(test_client.get("/readyz").status_code, 200)
 
         client_type.assert_called_once_with("http://127.0.0.1:11434", timeout_seconds=15.0)
+        self.assertEqual(client.model_calls, ["bge-test"])
         backend_type.assert_called_once_with(
             client,
             model="bge-test",
@@ -510,6 +560,40 @@ class EmbeddingServiceTest(unittest.TestCase):
             keep_alive="5m",
         )
         self.assertEqual(backend.close_calls, 1)
+
+    def test_default_ollama_factory_fails_closed_on_unbound_model_digest(self) -> None:
+        cases = (
+            (DigestClient(digest="b" * 64), "digest does not match"),
+            (
+                DigestClient(error=OllamaResponseError("Configured Ollama model is unavailable")),
+                "unavailable",
+            ),
+            (
+                DigestClient(
+                    error=OllamaResponseError("Ollama model inventory response is invalid")
+                ),
+                "invalid",
+            ),
+        )
+        for client, message in cases:
+            backend = CloseTrackingEmbeddingBackend()
+            with (
+                self.subTest(message=message),
+                patch("app.embedding_service.SyncOllamaClient", return_value=client),
+                patch(
+                    "app.embedding_service.OllamaEmbeddingBackend",
+                    return_value=backend,
+                ) as backend_type,
+            ):
+                app = create_production_app(environ=production_environment())
+                with self.assertRaisesRegex((ValueError, OllamaResponseError), message):
+                    with TestClient(app):
+                        pass
+
+            backend_type.assert_not_called()
+            self.assertEqual(client.model_calls, ["bge-test"])
+            self.assertEqual(client.close_calls, 1)
+            self.assertFalse(app.state.embedding_ready)
 
     def test_production_shutdown_swallows_backend_close_errors_and_resets_state(self) -> None:
         backend = CloseFailingEmbeddingBackend()

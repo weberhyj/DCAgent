@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app import reranker_service
-from app.ollama_client import OllamaServiceError
+from app.ollama_client import OllamaResponseError, OllamaServiceError
 from app.ollama_reranker_backend import RERANK_PROMPT_PROFILE_SHA256
 from app.qwen3_reranker_runtime import Qwen3RerankerMalformedOutput
 from app.reranker_contracts import RerankerModelMetadata
@@ -41,6 +41,28 @@ class CloseTrackingBackend(Backend):
         self.close_calls += 1
         if self.close_fails:
             raise RuntimeError("secret query passage and response must not leak")
+
+
+class DigestClient:
+    def __init__(
+        self,
+        digest: str = "a" * 64,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.digest = digest
+        self.error = error
+        self.model_calls: list[str] = []
+        self.close_calls = 0
+
+    def model_digest(self, model: str) -> str:
+        self.model_calls.append(model)
+        if self.error is not None:
+            raise self.error
+        return self.digest
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class FailingBackend(Backend):
@@ -292,7 +314,7 @@ class RerankerServiceTest(unittest.TestCase):
 
     def test_default_ollama_factory_constructs_client_and_backend(self) -> None:
         backend = CloseTrackingBackend()
-        client = object()
+        client = DigestClient()
         with (
             patch("app.reranker_service.SyncOllamaClient", return_value=client) as client_type,
             patch(
@@ -305,6 +327,7 @@ class RerankerServiceTest(unittest.TestCase):
                 self.assertEqual(test_client.get("/readyz").status_code, 200)
 
         client_type.assert_called_once_with("http://127.0.0.1:11434", timeout_seconds=15.0)
+        self.assertEqual(client.model_calls, ["qwen-test"])
         backend_type.assert_called_once_with(
             client,
             model="qwen-test",
@@ -315,10 +338,44 @@ class RerankerServiceTest(unittest.TestCase):
         )
         self.assertEqual(backend.close_calls, 1)
 
+    def test_default_ollama_factory_fails_closed_on_unbound_model_digest(self) -> None:
+        cases = (
+            (DigestClient(digest="b" * 64), "digest does not match"),
+            (
+                DigestClient(error=OllamaResponseError("Configured Ollama model is unavailable")),
+                "unavailable",
+            ),
+            (
+                DigestClient(
+                    error=OllamaResponseError("Ollama model inventory response is invalid")
+                ),
+                "invalid",
+            ),
+        )
+        for client, message in cases:
+            backend = CloseTrackingBackend()
+            with (
+                self.subTest(message=message),
+                patch("app.reranker_service.SyncOllamaClient", return_value=client),
+                patch(
+                    "app.reranker_service.OllamaGenerativeRerankerBackend",
+                    return_value=backend,
+                ) as backend_type,
+            ):
+                app = create_production_app(environ=production_environment())
+                with self.assertRaisesRegex((ValueError, OllamaResponseError), message):
+                    with TestClient(app):
+                        pass
+
+            backend_type.assert_not_called()
+            self.assertEqual(client.model_calls, ["qwen-test"])
+            self.assertEqual(client.close_calls, 1)
+            self.assertFalse(app.state.reranker_ready)
+
     def test_default_ollama_factory_accepts_exact_false_json_boolean(self) -> None:
         backend = CloseTrackingBackend()
         with (
-            patch("app.reranker_service.SyncOllamaClient", return_value=object()),
+            patch("app.reranker_service.SyncOllamaClient", return_value=DigestClient()),
             patch(
                 "app.reranker_service.OllamaGenerativeRerankerBackend",
                 return_value=backend,
@@ -336,6 +393,9 @@ class RerankerServiceTest(unittest.TestCase):
         class Client:
             def __init__(self) -> None:
                 self.close_calls = 0
+
+            def model_digest(self, model: str) -> str:
+                return "a" * 64
 
             def close(self) -> None:
                 self.close_calls += 1

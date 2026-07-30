@@ -6,6 +6,10 @@ from collections.abc import Sequence
 from .embedding_contracts import EmbeddingPurpose
 from .ollama_client import OllamaResponseError, SyncOllamaClient
 
+OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256 = (
+    "44f2b1c9565fdfebaa0d1df064367cfab9cd884106fdd6150f19ca8eb4ade30b"
+)
+
 
 class OllamaEmbeddingBackend:
     def __init__(
@@ -110,4 +114,7 @@ def _normalize(vector: object, dimensions: int) -> list[float]:
     return [value / scaled_norm for value in scaled]
 
 
-__all__ = ["OllamaEmbeddingBackend"]
+__all__ = [
+    "OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256",
+    "OllamaEmbeddingBackend",
+]
