@@ -78,6 +78,7 @@ def test_common_unicode_greeting_punctuation_is_ignored(self) -> None:
     for content in (
         "您好…",
         "您好～～",
+        "您好~",
         "您好；",
         "您好：",
         "“您好”",
@@ -85,6 +86,11 @@ def test_common_unicode_greeting_punctuation_is_ignored(self) -> None:
     ):
         with self.subTest(content=content):
             self.assertTrue(is_greeting_message(content))
+
+def test_non_punctuation_symbols_remain_significant(self) -> None:
+    for content in ("您好😀", "您好＋", "您好$", "您好©"):
+        with self.subTest(content=content):
+            self.assertFalse(is_greeting_message(content))
 
 def test_greeting_with_substantive_question_falls_through(self) -> None:
     agent = ReadOnlyKnowledgeAgent(
@@ -112,10 +118,17 @@ Run from the repository root:
 uv run --directory backend python -m unittest `
   tests.test_agent.AgentTest.test_pure_greeting_builds_welcome_run_without_external_dependencies `
   tests.test_agent.AgentTest.test_supported_greeting_phrases_are_recognized `
+  tests.test_agent.AgentTest.test_common_unicode_greeting_punctuation_is_ignored `
+  tests.test_agent.AgentTest.test_non_punctuation_symbols_remain_significant `
   tests.test_agent.AgentTest.test_greeting_with_substantive_question_falls_through -v
 ```
 
-Expected: FAIL because `GREETING_REPLY`, `is_greeting_message`, and `try_answer_greeting` do not exist.
+Expected: During the initial API implementation cycle, test collection fails because
+`GREETING_REPLY`, `is_greeting_message`, and `try_answer_greeting` do not exist. During the
+punctuation-normalization cycle, after those APIs exist but before Unicode normalization is
+implemented, `test_common_unicode_greeting_punctuation_is_ignored` fails for Unicode
+punctuation and wave-mark cases that the old finite regex does not handle. The symbol-boundary
+test remains green because emoji and symbols other than `~` / `～` must stay significant.
 
 - [ ] **Step 3: Implement the minimal Agent greeting classifier and result**
 

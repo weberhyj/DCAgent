@@ -117,6 +117,7 @@ class AgentTest(unittest.TestCase):
         for greeting in (
             "您好…",
             "您好～～",
+            "您好~",
             "您好；",
             "您好：",
             "“您好”",
@@ -124,6 +125,11 @@ class AgentTest(unittest.TestCase):
         ):
             with self.subTest(greeting=greeting):
                 self.assertTrue(is_greeting_message(greeting))
+
+    def test_non_punctuation_symbols_remain_significant(self) -> None:
+        for greeting in ("您好😀", "您好＋", "您好$", "您好©"):
+            with self.subTest(greeting=greeting):
+                self.assertFalse(is_greeting_message(greeting))
 
     def test_greeting_with_substantive_question_falls_through(self) -> None:
         agent = ReadOnlyKnowledgeAgent(
