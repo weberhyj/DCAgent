@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -30,12 +31,16 @@ APPROVED_RERANKER_MODEL = "qwen2.5:3b"
 COMMAND_TIMEOUT_SECONDS = 3600
 ADAPTER_PROBE_TIMEOUT_SECONDS = 20
 ADAPTER_MAX_RESPONSE_BYTES = 64 * 1024
+PROCESS_TERMINATION_GRACE_SECONDS = 0.5
+PROCESS_DRAIN_TIMEOUT_SECONDS = 1.0
+TASKKILL_TIMEOUT_SECONDS = 5
 
 
 @dataclass(frozen=True)
 class CommandResult:
     exit_code: int
     stdout: str = ""
+    timed_out: bool = False
 
 
 Runner = Callable[..., CommandResult]
@@ -56,6 +61,70 @@ def _validated_argv(command: Sequence[str]) -> list[str]:
     return result
 
 
+def _windows_startupinfo():
+    if os.name != "nt":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return startupinfo
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=TASKKILL_TIMEOUT_SECONDS,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                startupinfo=_windows_startupinfo(),
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+        if process.poll() is None:
+            process.kill()
+        return
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _drain_terminated_process(
+    process: subprocess.Popen[str], partial_output: object
+) -> str:
+    output = ""
+    try:
+        output, _ = process.communicate(timeout=PROCESS_DRAIN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        if process.poll() is None:
+            process.kill()
+        if process.stdout is not None:
+            process.stdout.close()
+        try:
+            process.wait(timeout=PROCESS_DRAIN_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        if process.stdout is not None and not process.stdout.closed:
+            process.stdout.close()
+    return _output_text(output) or _output_text(partial_output)
+
+
 def _default_runner(
     command: Sequence[str],
     *,
@@ -71,8 +140,17 @@ def _default_runner(
     ):
         raise ValueError("command timeout must be a positive bounded integer")
     argv = _validated_argv(command)
+    popen_options: dict[str, object] = {}
+    if os.name == "nt":
+        popen_options.update(
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW,
+            startupinfo=_windows_startupinfo(),
+        )
+    else:
+        popen_options["start_new_session"] = True
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv,
             shell=False,
             stdin=subprocess.DEVNULL,
@@ -81,16 +159,18 @@ def _default_runner(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout_seconds,
-            check=True,
+            **popen_options,
         )
     except FileNotFoundError:
         return CommandResult(127, "")
-    except subprocess.CalledProcessError as error:
-        return CommandResult(int(error.returncode), _output_text(error.stdout))
+
+    try:
+        stdout, _ = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
-        return CommandResult(124, _output_text(error.stdout))
-    return CommandResult(int(completed.returncode), completed.stdout or "")
+        _terminate_process_tree(process)
+        stdout = _drain_terminated_process(process, error.output)
+        return CommandResult(124, stdout, timed_out=True)
+    return CommandResult(int(process.returncode), stdout or "")
 
 
 def _wrapper_prefix(wrapper_path: Path) -> list[str]:
@@ -995,7 +1075,7 @@ def run_compose_smoke(
                                 "latencyMs": 0.0,
                                 "errorCode": (
                                     "probe_timeout"
-                                    if result.exit_code == 124
+                                    if result.timed_out
                                     else "probe_failed"
                                 ),
                             }

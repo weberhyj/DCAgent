@@ -5,11 +5,13 @@ from functools import cache
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from unittest import mock
@@ -227,10 +229,12 @@ class FakeRunner:
         exit_codes: dict[str, int] | None = None,
         outputs: dict[str, str] | None = None,
         raises: dict[str, BaseException] | None = None,
+        timed_out: set[str] | None = None,
     ) -> None:
         self.exit_codes = exit_codes or {}
         self.outputs = outputs or {}
         self.raises = raises or {}
+        self.timed_out = timed_out or set()
         self.calls: list[tuple[list[str], bool]] = []
         self.timeouts: list[int] = []
 
@@ -256,6 +260,7 @@ class FakeRunner:
         return compose_smoke.CommandResult(
             self.exit_codes.get(key, self.exit_codes.get(group, 0)),
             output if output is not None else self._default_output(key),
+            timed_out=key in self.timed_out or group in self.timed_out,
         )
 
     @staticmethod
@@ -541,6 +546,7 @@ class ComposeSmokeTest(unittest.TestCase):
         runner = FakeRunner(
             exit_codes={"embedding.embeddings": 124},
             outputs={"embedding.embeddings": canary},
+            timed_out={"embedding.embeddings"},
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -560,6 +566,40 @@ class ComposeSmokeTest(unittest.TestCase):
             "probe_timeout",
         )
         self.assertNotIn(canary, persisted)
+
+    def test_adapter_exit_124_without_runner_timeout_is_probe_failed(self) -> None:
+        compose_smoke = _module()
+        natural_exit = compose_smoke._default_runner(
+            [sys.executable, "-c", "raise SystemExit(124)"],
+            shell=False,
+            timeout_seconds=5,
+        )
+        self.assertEqual(natural_exit.exit_code, 124)
+        self.assertFalse(natural_exit.timed_out)
+
+        class Exit124Runner(FakeRunner):
+            def __call__(self, command, *, shell, timeout_seconds=3600):
+                result = super().__call__(
+                    command,
+                    shell=shell,
+                    timeout_seconds=timeout_seconds,
+                )
+                if self._key(list(command)) == "embedding.embeddings":
+                    return natural_exit
+                return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = compose_smoke.run_compose_smoke(
+                report_path=Path(directory) / "report.json",
+                runner=Exit124Runner(),
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+
+        self.assertEqual(
+            report["readyResults"]["embedding"]["embeddings"]["errorCode"],
+            "probe_failed",
+        )
 
     def test_adapter_helpers_pin_qwen25_models_and_inject_measured_dimensions(
         self,
@@ -1108,39 +1148,90 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("check:clamav_ping", report["failures"])
 
-    def test_default_runner_uses_check_true_and_converts_process_errors(self) -> None:
+    def test_default_runner_uses_isolated_popen_and_preserves_process_results(
+        self,
+    ) -> None:
         compose_smoke = _module()
+        process = mock.Mock()
+        process.communicate.return_value = ("wrapper failed", None)
+        process.returncode = 9
         with mock.patch.object(
             compose_smoke.subprocess,
-            "run",
-            side_effect=subprocess.CalledProcessError(
-                9, ["pwsh"], output="wrapper failed"
-            ),
-        ) as run:
+            "Popen",
+            return_value=process,
+        ) as popen:
             result = compose_smoke._default_runner(["pwsh", "--version"], shell=False)
         self.assertEqual(result.exit_code, 9)
         self.assertEqual(result.stdout, "wrapper failed")
-        self.assertTrue(run.call_args.kwargs["check"])
-        with mock.patch.object(
-            compose_smoke.subprocess,
-            "run",
-            side_effect=subprocess.TimeoutExpired(
-                ["pwsh"], 1, output=b"partial timeout output"
-            ),
-        ):
-            timeout = compose_smoke._default_runner(["pwsh", "--version"], shell=False)
-        self.assertEqual(timeout.exit_code, 124)
-        self.assertEqual(timeout.stdout, "partial timeout output")
+        self.assertFalse(result.timed_out)
+        process.communicate.assert_called_once_with(
+            timeout=compose_smoke.COMMAND_TIMEOUT_SECONDS
+        )
+        options = popen.call_args.kwargs
+        self.assertIs(options["stdout"], subprocess.PIPE)
+        self.assertIs(options["stderr"], subprocess.STDOUT)
+        if os.name == "nt":
+            self.assertTrue(
+                options["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+            self.assertTrue(options["creationflags"] & subprocess.CREATE_NO_WINDOW)
+        else:
+            self.assertTrue(options["start_new_session"])
 
         with mock.patch.object(
             compose_smoke.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess(["pwsh"], 0, stdout="ok"),
-        ) as run:
+            "Popen",
+            side_effect=FileNotFoundError,
+        ):
+            missing = compose_smoke._default_runner(["missing-command"], shell=False)
+        self.assertEqual(missing, compose_smoke.CommandResult(127, ""))
+
+        short_process = mock.Mock()
+        short_process.communicate.return_value = ("ok", None)
+        short_process.returncode = 0
+        with mock.patch.object(
+            compose_smoke.subprocess,
+            "Popen",
+            return_value=short_process,
+        ):
             compose_smoke._default_runner(
                 ["pwsh", "--version"], shell=False, timeout_seconds=7
             )
-        self.assertEqual(run.call_args.kwargs["timeout"], 7)
+        short_process.communicate.assert_called_once_with(timeout=7)
+
+    def test_default_runner_timeout_kills_descendant_process_tree_promptly(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        child_script = "import time; time.sleep(5)"
+        parent_script = (
+            "import subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c',sys.argv[1]], "
+            "stdout=sys.stdout, stderr=sys.stderr); "
+            "print(child.pid, flush=True); time.sleep(30)"
+        )
+
+        started = time.perf_counter()
+        result = compose_smoke._default_runner(
+            [sys.executable, "-c", parent_script, child_script],
+            shell=False,
+            timeout_seconds=1,
+        )
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(result.exit_code, 124)
+        self.assertLess(elapsed, 3.0)
+        self.assertTrue(result.timed_out)
+        child_pid = int(result.stdout.strip().splitlines()[0])
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except (OSError, ProcessLookupError):
+                break
+            time.sleep(0.02)
+        else:
+            self.fail(f"descendant process still exists after timeout: {child_pid}")
 
     def test_success_cli_prints_sorted_component_versions_before_pass(self) -> None:
         compose_smoke = _module()
