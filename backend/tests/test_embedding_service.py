@@ -30,8 +30,11 @@ from app.embedding_service import (
 )
 from app.ollama_client import OllamaResponseError
 
-EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256 = (
-    "deebb4d03b8c3b08d2865df27c96a1e1c2dacee0df2e7792c4980f73ceb127a4"
+EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE_SHA256 = (
+    ollama_embedding_backend.ollama_embedding_encoding_profile_sha256("/api/embed")
+)
+EXPECTED_OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE_SHA256 = (
+    ollama_embedding_backend.ollama_embedding_encoding_profile_sha256("/api/embeddings")
 )
 
 
@@ -125,7 +128,7 @@ def metadata(
         checksum,
         dimensions,
         normalized,
-        EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256,
+        EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE_SHA256,
         "1",
     )
 
@@ -153,7 +156,9 @@ def production_environment(**overrides: str) -> dict[str, str]:
         "EMBEDDING_MODEL_SHA256": "a" * 64,
         "EMBEDDING_MODEL_DIMENSIONS": "4",
         "EMBEDDING_MODEL_NORMALIZED": "true",
-        "EMBEDDING_ENCODING_PROFILE_SHA256": (EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256),
+        "EMBEDDING_ENCODING_PROFILE_SHA256": (
+            EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE_SHA256
+        ),
         "EMBEDDING_PROTOCOL_VERSION": "1",
         "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
         "OLLAMA_EMBEDDING_MODEL": "bge-test",
@@ -458,14 +463,6 @@ class EmbeddingServiceTest(unittest.TestCase):
                 self.assertFalse(app.state.embedding_ready)
 
     def test_production_startup_rejects_mismatched_embedding_profile(self) -> None:
-        self.assertEqual(
-            getattr(
-                ollama_embedding_backend,
-                "OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256",
-                None,
-            ),
-            EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256,
-        )
         loader_calls: list[object] = []
         app = create_production_app(
             environ=production_environment(EMBEDDING_ENCODING_PROFILE_SHA256="b" * 64),
@@ -478,6 +475,53 @@ class EmbeddingServiceTest(unittest.TestCase):
 
         self.assertEqual(loader_calls, [])
         self.assertFalse(app.state.embedding_ready)
+
+    def test_production_startup_selects_profile_hash_from_actual_ollama_path(self) -> None:
+        loader_calls: list[object] = []
+        backend = CloseTrackingEmbeddingBackend()
+
+        def load_backend(values, pinned):
+            loader_calls.append((values, pinned))
+            return backend
+
+        app = create_production_app(
+            environ=production_environment(
+                OLLAMA_EMBEDDING_PATH="/api/embeddings",
+                EMBEDDING_ENCODING_PROFILE_SHA256=(
+                    EXPECTED_OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE_SHA256
+                ),
+            ),
+            backend_loader=load_backend,
+        )
+
+        with TestClient(app) as client:
+            response = client.get("/v1/metadata")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(loader_calls), 1)
+        self.assertEqual(
+            loader_calls[0][1].encoding_profile_sha256,
+            EXPECTED_OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE_SHA256,
+        )
+        self.assertEqual(backend.close_calls, 1)
+
+    def test_production_startup_rejects_profile_hash_for_other_ollama_path(self) -> None:
+        loader_calls: list[object] = []
+        app = create_production_app(
+            environ=production_environment(
+                OLLAMA_EMBEDDING_PATH="/api/embeddings",
+                EMBEDDING_ENCODING_PROFILE_SHA256=(
+                    EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE_SHA256
+                ),
+            ),
+            backend_loader=lambda values, pinned: loader_calls.append((values, pinned)),
+        )
+
+        with self.assertRaisesRegex(ValueError, "embedding encoding profile"):
+            with TestClient(app):
+                pass
+
+        self.assertEqual(loader_calls, [])
 
     def test_default_ollama_factory_rejects_invalid_environment(self) -> None:
         cases = (

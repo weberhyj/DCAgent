@@ -712,12 +712,16 @@ def _configure_retrieval_runtime(
         )
     )
     audit = factory.create_audit(database)  # type: ignore[attr-defined]
+    embedding_fingerprint = settings.embedding_fingerprint
+    if embedding_fingerprint is None:
+        raise ValueError("Embedding fingerprint is required for Qwen retrieval")
     scope_provider = DynamicRetrievalScopeProvider(
         audit=audit,
         gateway=gateway,
         alias_name=settings.qdrant_collection_alias,
         knowledge_base_id=settings.knowledge_base_id,
         permission_tags=settings.permission_tags,
+        embedding_fingerprint=embedding_fingerprint,
     )
     router = own(
         factory.create_router(  # type: ignore[attr-defined]

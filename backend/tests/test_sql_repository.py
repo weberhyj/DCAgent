@@ -10,6 +10,7 @@ from loguru import logger as loguru_logger
 
 from app.agent import AgentRunResult
 from app.database import Database
+from app.embedding_fingerprint import EmbeddingFingerprint
 from app.models import ChatMessageModel, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
 from app.retrieval_models import RetrievalMode, RetrievalRequest, RetrievalScope
@@ -21,6 +22,16 @@ from app.retrieval_router import (
 from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.seed import build_seed_state
 from app.sql_repository import SqlChatRepository
+
+TEST_EMBEDDING_FINGERPRINT = EmbeddingFingerprint(
+    model_name="qwen2.5:0.5b",
+    model_version="test-v1",
+    model_sha256="a" * 64,
+    dimensions=896,
+    normalized=True,
+    encoding_profile_sha256="b" * 64,
+    protocol_version="v1",
+)
 
 
 class SqlRepositoryTest(unittest.TestCase):
@@ -700,6 +711,7 @@ class SqlRepositoryTest(unittest.TestCase):
             alias_name="knowledge_chunks_current",
             knowledge_base_id="default",
             permission_tags=("internal",),
+            embedding_fingerprint=TEST_EMBEDDING_FINGERPRINT,
         )
         hybrid = SimpleNamespace(calls=0)
 
@@ -741,6 +753,7 @@ class SqlRepositoryTest(unittest.TestCase):
             alias_name="knowledge_chunks_current",
             knowledge_base_id="default",
             permission_tags=("internal",),
+            embedding_fingerprint=TEST_EMBEDDING_FINGERPRINT,
         )
         hybrid = SimpleNamespace(calls=0)
 

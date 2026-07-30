@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from app.embedding_fingerprint import EmbeddingFingerprint
 from app.retrieval_models import RetrievalCandidate, RetrievalMode, RetrievalOutcome, RetrievalScope
 from app.retrieval_settings import RetrievalSettings
 
@@ -30,6 +31,14 @@ def private_hybrid_environment() -> dict[str, str]:
 
 
 class RetrievalSettingsTest(unittest.TestCase):
+    def test_exposes_immutable_embedding_fingerprint_for_configured_embedding(self) -> None:
+        settings = RetrievalSettings.from_environ(private_hybrid_environment())
+
+        self.assertEqual(
+            settings.embedding_fingerprint,
+            EmbeddingFingerprint.from_metadata(settings.embedding),
+        )
+
     def test_hybrid_route_defaults_accept_qwen25_models(self) -> None:
         settings = RetrievalSettings.from_environ(private_hybrid_environment())
 

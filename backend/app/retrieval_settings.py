@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .embedding_contracts import EmbeddingModelMetadata
+from .embedding_fingerprint import EmbeddingFingerprint
 from .offline_settings import parse_bool, require_private_url
 from .retrieval_models import RetrievalMode
 
@@ -157,6 +158,12 @@ class RetrievalSettings:
     reranker_service_url: str | None
     embedding: EmbeddingModelMetadata | None
     reranker: RerankerModelSettings | None
+
+    @property
+    def embedding_fingerprint(self) -> EmbeddingFingerprint | None:
+        if self.embedding is None:
+            return None
+        return EmbeddingFingerprint.from_metadata(self.embedding)
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> RetrievalSettings:

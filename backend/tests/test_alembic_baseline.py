@@ -14,6 +14,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 REVISION = "20260715_00"
 QWEN3_RETRIEVAL_REVISION = "20260727_04"
 SHADOW_EVALUATION_LABELS_REVISION = "20260728_05"
+EMBEDDING_FINGERPRINT_REVISION = "20260730_06"
 
 EXPECTED_COLUMNS: dict[str, tuple[tuple[str, str, bool, bool], ...]] = {
     "agent_runs": (
@@ -241,6 +242,11 @@ class AlembicBaselineTest(unittest.TestCase):
                         "error_message",
                         "created_at",
                         "completed_at",
+                        "embedding_model_name",
+                        "embedding_model_sha256",
+                        "embedding_normalized",
+                        "embedding_encoding_profile_sha256",
+                        "embedding_protocol_version",
                     ),
                     "retrieval_source_indexes": (
                         "source_id",
@@ -373,9 +379,78 @@ class AlembicBaselineTest(unittest.TestCase):
                 self.assertIn(("request_id",), shadow_unique_constraints)
                 with engine.connect() as connection:
                     self.assertEqual(
-                        SHADOW_EVALUATION_LABELS_REVISION,
+                        EMBEDDING_FINGERPRINT_REVISION,
                         connection.scalar(text("SELECT version_num FROM alembic_version")),
                     )
+            finally:
+                engine.dispose()
+
+    def test_embedding_fingerprint_migration_preserves_legacy_rows_and_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite+pysqlite:///{(Path(temp_dir) / 'fingerprint.db').as_posix()}"
+            config = make_config(database_url)
+            command.upgrade(config, SHADOW_EVALUATION_LABELS_REVISION)
+            engine = create_engine(database_url)
+            try:
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "INSERT INTO retrieval_publications "
+                            "(id, collection_name, alias_name, status, embedding_model_version, "
+                            "sparse_profile_sha256, dimensions, point_count, created_at) "
+                            "VALUES ('legacy', 'knowledge_chunks_qwen3_v1', "
+                            "'knowledge_chunks_current', 'active', 'old-qwen3-v1', :sparse, 896, "
+                            "10, '2026-07-30T00:00:00+00:00')"
+                        ),
+                        {"sparse": "c" * 64},
+                    )
+            finally:
+                engine.dispose()
+
+            command.upgrade(config, EMBEDDING_FINGERPRINT_REVISION)
+            engine = create_engine(database_url)
+            try:
+                columns = {
+                    column["name"]: column
+                    for column in inspect(engine).get_columns("retrieval_publications")
+                }
+                for name in (
+                    "embedding_model_name",
+                    "embedding_model_sha256",
+                    "embedding_normalized",
+                    "embedding_encoding_profile_sha256",
+                    "embedding_protocol_version",
+                ):
+                    self.assertTrue(columns[name]["nullable"])
+                with engine.connect() as connection:
+                    row = connection.execute(
+                        text(
+                            "SELECT embedding_model_name, embedding_model_sha256, "
+                            "embedding_normalized, embedding_encoding_profile_sha256, "
+                            "embedding_protocol_version FROM retrieval_publications "
+                            "WHERE id = 'legacy'"
+                        )
+                    ).one()
+                self.assertEqual(tuple(row), (None, None, None, None, None))
+            finally:
+                engine.dispose()
+
+            command.downgrade(config, SHADOW_EVALUATION_LABELS_REVISION)
+            engine = create_engine(database_url)
+            try:
+                column_names = {
+                    column["name"]
+                    for column in inspect(engine).get_columns("retrieval_publications")
+                }
+                self.assertNotIn("embedding_model_name", column_names)
+                with engine.connect() as connection:
+                    legacy_version = connection.scalar(
+                        text(
+                            "SELECT embedding_model_version FROM retrieval_publications "
+                            "WHERE id = 'legacy'"
+                        )
+                    )
+                self.assertEqual(legacy_version, "old-qwen3-v1")
             finally:
                 engine.dispose()
 

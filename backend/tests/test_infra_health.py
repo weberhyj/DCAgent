@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
 from types import SimpleNamespace
@@ -121,8 +122,14 @@ class RetrievalHealthGateway:
 
 
 class RetrievalHealthAudit:
-    def __init__(self, collection_name: str | None = "knowledge_chunks_qwen3_v1") -> None:
+    def __init__(
+        self,
+        collection_name: str | None = "knowledge_chunks_qwen3_v1",
+        *,
+        embedding_fingerprint: object | None = None,
+    ) -> None:
         self.collection_name = collection_name
+        self.embedding_fingerprint = embedding_fingerprint
 
     def active_publication(self, alias_name: str) -> object | None:
         del alias_name
@@ -131,6 +138,7 @@ class RetrievalHealthAudit:
         return SimpleNamespace(
             id="publication-id-not-used-as-scope",
             collection_name=self.collection_name,
+            embedding_fingerprint=self.embedding_fingerprint,
         )
 
 
@@ -138,13 +146,21 @@ def retrieval_scope_provider(
     gateway: RetrievalHealthGateway,
     *,
     active_collection: str | None = "knowledge_chunks_qwen3_v1",
+    publication_fingerprint: object | None = None,
 ) -> DynamicRetrievalScopeProvider:
+    configured = RetrievalSettings.from_environ(retrieval_health_environment())
+    if publication_fingerprint is None:
+        publication_fingerprint = configured.embedding_fingerprint
     return DynamicRetrievalScopeProvider(
-        audit=RetrievalHealthAudit(active_collection),
+        audit=RetrievalHealthAudit(
+            active_collection,
+            embedding_fingerprint=publication_fingerprint,
+        ),
         gateway=gateway,
         alias_name="knowledge_chunks_current",
         knowledge_base_id="default",
         permission_tags=("internal",),
+        embedding_fingerprint=configured.embedding_fingerprint,
     )
 
 
@@ -350,6 +366,31 @@ class InfraHealthTest(unittest.TestCase):
         qdrant = next(check for check in checks if check.name == "qdrant")
 
         self.assertEqual(qdrant.check(), (False, "scope unavailable"))
+
+    def test_retrieval_health_reports_embedding_fingerprint_mismatch(self) -> None:
+        environ = retrieval_health_environment()
+        retrieval = RetrievalSettings.from_environ(environ)
+        gateway = RetrievalHealthGateway()
+        mismatched = replace(
+            retrieval.embedding_fingerprint,
+            model_version="old-qwen3-v1",
+        )
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=RetrievalHealthHttpClient(retrieval_health_responses()),
+            retrieval_settings=retrieval,
+            retrieval_gateway=gateway,
+            retrieval_scope_provider=retrieval_scope_provider(
+                gateway,
+                publication_fingerprint=mismatched,
+            ),
+        )
+        qdrant = next(check for check in checks if check.name == "qdrant")
+
+        self.assertEqual(qdrant.check(), (False, "embedding_fingerprint_mismatch"))
+        self.assertEqual(gateway.validations, [])
 
     def test_metadata_stream_rejects_chunked_body_over_cap_and_closes_response(self) -> None:
         environ = retrieval_health_environment()

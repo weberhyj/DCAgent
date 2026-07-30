@@ -7,17 +7,15 @@ from collections.abc import Sequence
 from .embedding_contracts import EmbeddingPurpose
 from .ollama_client import OllamaResponseError, SyncOllamaClient
 
-OLLAMA_EMBEDDING_ENCODING_PROFILE = "\n".join(
+OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE = "\n".join(
     (
         "profile=dc-agent.ollama.embedding",
         "protocol=dc-agent.ollama.embedding.v1",
         "purpose.query=raw_text",
         "purpose.document=raw_text",
-        "modern.path=/api/embed",
-        "modern.input=raw_text_batch",
-        "modern.truncate=true",
-        "legacy.path=/api/embeddings",
-        "legacy.prompt=single_raw_text",
+        "path=/api/embed",
+        "input=raw_text_batch",
+        "truncate=true",
         "output.count=one_per_input",
         "output.dimensions=configured_exact",
         "output.coordinates=finite_numeric",
@@ -26,9 +24,41 @@ OLLAMA_EMBEDDING_ENCODING_PROFILE = "\n".join(
         "normalization.output=unit_l2",
     )
 )
-OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256 = hashlib.sha256(
-    OLLAMA_EMBEDDING_ENCODING_PROFILE.encode("utf-8")
-).hexdigest()
+OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE = "\n".join(
+    (
+        "profile=dc-agent.ollama.embedding",
+        "protocol=dc-agent.ollama.embedding.v1",
+        "purpose.query=raw_text",
+        "purpose.document=raw_text",
+        "path=/api/embeddings",
+        "prompt=single_raw_text",
+        "output.count=one_per_input",
+        "output.dimensions=configured_exact",
+        "output.coordinates=finite_numeric",
+        "output.vector=nonzero",
+        "normalization.algorithm=max_abs_scaled_l2",
+        "normalization.output=unit_l2",
+    )
+)
+_OLLAMA_EMBEDDING_ENCODING_PROFILES = {
+    "/api/embed": OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE,
+    "/api/embeddings": OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE,
+}
+
+
+def ollama_embedding_encoding_profile(path: str) -> str:
+    try:
+        return _OLLAMA_EMBEDDING_ENCODING_PROFILES[path]
+    except (KeyError, TypeError):
+        raise ValueError("Ollama embedding path must be /api/embed or /api/embeddings") from None
+
+
+def ollama_embedding_encoding_profile_sha256(path: str) -> str:
+    return hashlib.sha256(ollama_embedding_encoding_profile(path).encode("utf-8")).hexdigest()
+
+
+OLLAMA_EMBEDDING_ENCODING_PROFILE = OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE
+OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256 = ollama_embedding_encoding_profile_sha256("/api/embed")
 
 
 class OllamaEmbeddingBackend:
@@ -137,5 +167,9 @@ def _normalize(vector: object, dimensions: int) -> list[float]:
 __all__ = [
     "OLLAMA_EMBEDDING_ENCODING_PROFILE",
     "OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256",
+    "OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE",
+    "OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE",
     "OllamaEmbeddingBackend",
+    "ollama_embedding_encoding_profile",
+    "ollama_embedding_encoding_profile_sha256",
 ]

@@ -109,8 +109,10 @@ $dimensions
 ```
 
 Set `EMBEDDING_MODEL_DIMENSIONS` to exactly that `$dimensions` value. Older Ollama releases that do
-not expose `/api/embed` must use `OLLAMA_EMBEDDING_PATH=/api/embeddings`; the adapter then sends one
-legacy `prompt` request per text. Do not silently switch paths after an arbitrary error.
+not expose `/api/embed` must use `OLLAMA_EMBEDDING_PATH=/api/embeddings` and set
+`EMBEDDING_ENCODING_PROFILE_SHA256=23e5b954b6099dcc4427a33745ad03b9ce7dc6fbf2d8fd4728f1d7e1ce7db34c`;
+the adapter then sends one legacy `prompt` request per text. Do not silently switch paths after an
+arbitrary error.
 
 Probe JSON score generation separately. This only proves the native Ollama model can return the
 required shape; the adapter still applies its fixed prompt, index/count checks, finite `[0,1]`
@@ -153,11 +155,15 @@ The locked adapter profiles are:
 EMBEDDING_MODEL_NAME=qwen2.5:0.5b
 EMBEDDING_MODEL_DIMENSIONS=<len(embeddings[0]) from the target /api/embed probe>
 EMBEDDING_MODEL_SHA256=<normalized qwen2.5:0.5b digest from /api/tags>
-EMBEDDING_ENCODING_PROFILE_SHA256=deebb4d03b8c3b08d2865df27c96a1e1c2dacee0df2e7792c4980f73ceb127a4
+EMBEDDING_ENCODING_PROFILE_SHA256=fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10
 RERANKER_MODEL_NAME=qwen2.5:3b
 RERANKER_MODEL_SHA256=<normalized qwen2.5:3b digest from /api/tags>
 RERANKER_PROMPT_PROFILE_SHA256=e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd
 ```
+
+After upgrading, legacy retrieval publications without a complete embedding fingerprint remain
+unavailable. Rebuild and activate the collection with the current model digest, dimensions,
+protocol, and the profile hash for the selected endpoint.
 
 Startup checks `/api/tags` and fails closed when either configured digest differs from the target
 Ollama model. The embedding profile hash is derived from the canonical raw-text/normalization

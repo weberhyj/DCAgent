@@ -25,6 +25,7 @@ from app.infra.health import (
 from app.main import _database_url_with_connect_timeout, create_app
 from app.offline_settings import OfflineSettings
 from app.qdrant_retrieval import QdrantRetrievalGateway
+from app.retrieval_settings import RetrievalSettings
 
 
 class ClosableFake:
@@ -89,6 +90,9 @@ class RecordingRetrievalResourceFactory:
         self.active_publication: object | None = SimpleNamespace(
             id="publication-uuid-must-not-be-scope",
             collection_name="knowledge_chunks_qwen3_v17",
+            embedding_fingerprint=RetrievalSettings.from_environ(
+                private_qwen_environment()
+            ).embedding_fingerprint,
         )
         self.audit = SimpleNamespace(active_publication=lambda alias: self.active_publication)
         self.index_lifecycle = SimpleNamespace(name="index-lifecycle")
@@ -538,6 +542,9 @@ class LazyStartupTest(unittest.TestCase):
                     resources.active_publication = SimpleNamespace(
                         id="later-publication-id",
                         collection_name="knowledge_chunks_qwen3_v18",
+                        embedding_fingerprint=RetrievalSettings.from_environ(
+                            private_qwen_environment(mode)
+                        ).embedding_fingerprint,
                     )
                     resources.alias_collection = "knowledge_chunks_qwen3_v18"
                     available = repository.retrieval_scope_provider.resolve()
@@ -672,7 +679,7 @@ class LazyStartupTest(unittest.TestCase):
                 "CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)"
             )
             connection.exec_driver_sql(
-                "INSERT INTO alembic_version (version_num) VALUES ('20260728_05')"
+                "INSERT INTO alembic_version (version_num) VALUES ('20260730_06')"
             )
 
         class FakeResponse:

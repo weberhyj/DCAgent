@@ -33,8 +33,8 @@ from .inference_batching import DynamicBatcher, InferenceQueueFull
 from .offline_artifacts import is_local_filesystem_path
 from .ollama_client import SyncOllamaClient
 from .ollama_embedding_backend import (
-    OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256,
     OllamaEmbeddingBackend,
+    ollama_embedding_encoding_profile_sha256,
 )
 
 EMBEDDING_METADATA_FILENAME = "embedding-metadata.json"
@@ -458,10 +458,9 @@ def _load_environment_metadata(environ: Mapping[str, str]) -> EmbeddingModelMeta
         raise ValueError(
             "EMBEDDING_ENCODING_PROFILE_SHA256 must be exactly 64 lowercase hexadecimal characters"
         )
-    if not hmac.compare_digest(
-        encoding_profile_sha256,
-        OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256,
-    ):
+    path = _required_environment_value(environ, "OLLAMA_EMBEDDING_PATH")
+    expected_profile_sha256 = ollama_embedding_encoding_profile_sha256(path)
+    if not hmac.compare_digest(encoding_profile_sha256, expected_profile_sha256):
         raise ValueError(
             "EMBEDDING_ENCODING_PROFILE_SHA256 must match the Ollama embedding encoding profile"
         )

@@ -16,6 +16,7 @@ from .embedding_contracts import (
     MAX_EMBEDDING_TEXTS,
     EmbeddingMetadataExpectation,
 )
+from .embedding_fingerprint import EmbeddingFingerprint
 from .models import KnowledgeChunkModel, KnowledgeSourceModel
 from .qdrant_retrieval import IndexMaintenanceScope
 from .retrieval_audit import (
@@ -130,6 +131,7 @@ class PublicationAudit(Protocol):
         publication_id: str,
         *,
         point_count: int,
+        expected_embedding_fingerprint: EmbeddingFingerprint,
         fence: AliasPublicationFence | None = None,
     ) -> RetrievalPublication: ...
 
@@ -397,6 +399,7 @@ class RetrievalIndexPublisher:
         self.embedding = embedding
         self.sparse = sparse
         self._embedding_metadata = embedding_metadata
+        self._embedding_fingerprint = EmbeddingFingerprint.from_metadata(embedding_metadata)
         self._sparse_profile_sha256 = _sha256(sparse_profile_sha256)
         self._alias_name = _required_text(alias_name, "alias_name")
         self._knowledge_base_id = _required_text(knowledge_base_id, "knowledge_base_id")
@@ -436,9 +439,8 @@ class RetrievalIndexPublisher:
         publication = self.audit.create_publication(
             collection_name=collection_name,
             alias_name=self._alias_name,
-            embedding_model_version=self._embedding_metadata.version,
+            embedding_fingerprint=self._embedding_fingerprint,
             sparse_profile_sha256=self._sparse_profile_sha256,
-            dimensions=self._embedding_metadata.dimensions,
         )
         alias_fence_acquired = False
         body_completed = False
@@ -565,6 +567,7 @@ class RetrievalIndexPublisher:
                 publication.id,
                 point_count=validated_count,
             )
+            self._require_publication_fingerprint(publication)
             if not activate:
                 return publication
             alias_switch_attempted = True
@@ -572,6 +575,7 @@ class RetrievalIndexPublisher:
             publication = self.audit.mark_publication_active(
                 publication.id,
                 point_count=validated_count,
+                expected_embedding_fingerprint=self._embedding_fingerprint,
                 fence=alias_fence,
             )
             self._verify_activation(publication, collection_name)
@@ -1073,12 +1077,14 @@ class RetrievalIndexPublisher:
     ) -> None:
         if publication.status != "active" or publication.collection_name != expected_collection:
             raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+        self._require_publication_fingerprint(publication)
         self._require_live_alias(expected_collection)
 
     def _audited_live_publication(self) -> RetrievalPublication:
         publication = self.audit.active_publication(self._alias_name)
         if publication is None:
             raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+        self._require_publication_fingerprint(publication)
         self._require_live_alias(publication.collection_name)
         invalid_version_error: RetrievalReconciliationRequiredError | None = None
         try:
@@ -1106,6 +1112,7 @@ class RetrievalIndexPublisher:
             return None
         if publication is None or live_collection != publication.collection_name:
             raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+        self._require_publication_fingerprint(publication)
         invalid_version_error: RetrievalReconciliationRequiredError | None = None
         try:
             collection_publication_version(publication.collection_name)
@@ -1128,6 +1135,10 @@ class RetrievalIndexPublisher:
         if reconciliation_error is not None:
             raise reconciliation_error
         if live_collection != expected_collection:
+            raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
+
+    def _require_publication_fingerprint(self, publication: RetrievalPublication) -> None:
+        if publication.embedding_fingerprint != self._embedding_fingerprint:
             raise RetrievalReconciliationRequiredError("retrieval index reconciliation required")
 
     def _source(self, source_id: str) -> KnowledgeSourceModel:

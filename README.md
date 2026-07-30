@@ -350,7 +350,9 @@ if ($dimensions -le 0) { throw 'Ollama returned no embedding dimensions' }
 ```
 
 把 `$dimensions` 填入 `EMBEDDING_MODEL_DIMENSIONS`。老 Ollama 只提供 legacy endpoint 时，显式
-设置 `OLLAMA_EMBEDDING_PATH=/api/embeddings`；不得在任意错误后自动切换路径。用原生生成接口
+设置 `OLLAMA_EMBEDDING_PATH=/api/embeddings`，并把
+`EMBEDDING_ENCODING_PROFILE_SHA256` 改为 legacy profile hash
+`23e5b954b6099dcc4427a33745ad03b9ce7dc6fbf2d8fd4728f1d7e1ce7db34c`；不得在任意错误后自动切换路径。用原生生成接口
 确认 3B 模型能返回 JSON score shape：
 
 ```powershell
@@ -383,11 +385,14 @@ $rerankerDigest = Get-OllamaDigest 'qwen2.5:3b'
 EMBEDDING_MODEL_NAME=qwen2.5:0.5b
 EMBEDDING_MODEL_DIMENSIONS=<len(embeddings[0])>
 EMBEDDING_MODEL_SHA256=<真实 embedding digest，无 sha256: 前缀>
-EMBEDDING_ENCODING_PROFILE_SHA256=deebb4d03b8c3b08d2865df27c96a1e1c2dacee0df2e7792c4980f73ceb127a4
+EMBEDDING_ENCODING_PROFILE_SHA256=fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10
 RERANKER_MODEL_NAME=qwen2.5:3b
 RERANKER_MODEL_SHA256=<真实 reranker digest，无 sha256: 前缀>
 RERANKER_PROMPT_PROFILE_SHA256=e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd
 ```
+
+升级后，缺少完整 embedding fingerprint 的旧 retrieval publication 会保持不可用；请用当前
+model digest、dimensions、protocol 和所选 endpoint profile 重新构建并激活 collection。
 
 目标防火墙只允许 DC-Agent 主机访问批准的 Ollama IP/端口；Ollama 侧代理/ACL 只开放
 `/api/tags`、`/api/embed`（或 `/api/embeddings`）和 `/api/generate`。Compose 中只有

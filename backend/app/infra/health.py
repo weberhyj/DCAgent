@@ -768,6 +768,11 @@ def _qdrant_retrieval_check(
             resolution = scope_provider.resolve()
             collection_name = resolution.collection_name
             if resolution.scope is None or not isinstance(collection_name, str):
+                if resolution.detail in {
+                    "embedding_fingerprint_mismatch",
+                    "embedding_fingerprint_unavailable",
+                }:
+                    return False, resolution.detail
                 return False, "scope unavailable"
             gateway.validate_collection(
                 collection_name,

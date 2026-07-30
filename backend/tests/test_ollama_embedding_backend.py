@@ -9,17 +9,31 @@ from app import ollama_embedding_backend
 from app.ollama_client import OllamaResponseError, OllamaServiceError
 from app.ollama_embedding_backend import OllamaEmbeddingBackend
 
-EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE = "\n".join(
+EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE = "\n".join(
     (
         "profile=dc-agent.ollama.embedding",
         "protocol=dc-agent.ollama.embedding.v1",
         "purpose.query=raw_text",
         "purpose.document=raw_text",
-        "modern.path=/api/embed",
-        "modern.input=raw_text_batch",
-        "modern.truncate=true",
-        "legacy.path=/api/embeddings",
-        "legacy.prompt=single_raw_text",
+        "path=/api/embed",
+        "input=raw_text_batch",
+        "truncate=true",
+        "output.count=one_per_input",
+        "output.dimensions=configured_exact",
+        "output.coordinates=finite_numeric",
+        "output.vector=nonzero",
+        "normalization.algorithm=max_abs_scaled_l2",
+        "normalization.output=unit_l2",
+    )
+)
+EXPECTED_OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE = "\n".join(
+    (
+        "profile=dc-agent.ollama.embedding",
+        "protocol=dc-agent.ollama.embedding.v1",
+        "purpose.query=raw_text",
+        "purpose.document=raw_text",
+        "path=/api/embeddings",
+        "prompt=single_raw_text",
         "output.count=one_per_input",
         "output.dimensions=configured_exact",
         "output.coordinates=finite_numeric",
@@ -57,23 +71,34 @@ class RecordingOllamaClient:
 
 
 class OllamaEmbeddingBackendTest(unittest.TestCase):
-    def test_encoding_profile_is_canonical_and_hash_derived(self) -> None:
-        profile = getattr(ollama_embedding_backend, "OLLAMA_EMBEDDING_ENCODING_PROFILE", None)
-        self.assertEqual(
-            profile,
-            EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE,
-        )
-        self.assertIsInstance(profile, str)
-        self.assertTrue(profile.isascii())
-        self.assertNotIn("\r", profile)
-        self.assertFalse(profile.endswith("\n"))
-        self.assertTrue(
-            all(line.count("=") == 1 and line.split("=", 1)[0] for line in profile.split("\n"))
-        )
-        self.assertEqual(
-            ollama_embedding_backend.OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256,
-            hashlib.sha256(EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE.encode("utf-8")).hexdigest(),
-        )
+    def test_endpoint_profiles_are_canonical_distinct_and_hash_derived(self) -> None:
+        profiles = {
+            "/api/embed": EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE,
+            "/api/embeddings": EXPECTED_OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE,
+        }
+        hashes = set()
+        for path, expected_profile in profiles.items():
+            with self.subTest(path=path):
+                profile = ollama_embedding_backend.ollama_embedding_encoding_profile(path)
+                profile_hash = ollama_embedding_backend.ollama_embedding_encoding_profile_sha256(
+                    path
+                )
+                self.assertEqual(profile, expected_profile)
+                self.assertTrue(profile.isascii())
+                self.assertNotIn("\r", profile)
+                self.assertFalse(profile.endswith("\n"))
+                self.assertTrue(
+                    all(
+                        line.count("=") == 1 and line.split("=", 1)[0]
+                        for line in profile.split("\n")
+                    )
+                )
+                self.assertEqual(
+                    profile_hash,
+                    hashlib.sha256(expected_profile.encode("utf-8")).hexdigest(),
+                )
+                hashes.add(profile_hash)
+        self.assertEqual(len(hashes), 2)
 
     def assert_response_error(self, operation: Callable[[], object]) -> None:
         try:

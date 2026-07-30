@@ -22,6 +22,7 @@ from app.database import (
     StructuredPublicationRecord,
 )
 from app.embedding_contracts import EmbeddingModelMetadata
+from app.embedding_fingerprint import EmbeddingFingerprint
 from app.models import KnowledgeChunkModel, KnowledgeSourceModel
 from app.qdrant_retrieval import IndexMaintenanceScope
 from app.retrieval_audit import RetrievalAuditRepository, RetrievalPublication
@@ -45,6 +46,7 @@ EMBEDDING = EmbeddingModelMetadata(
     encoding_profile_sha256="b" * 64,
     protocol_version="v1",
 )
+FINGERPRINT = EmbeddingFingerprint.from_metadata(EMBEDDING)
 
 
 def sample_chunks(count: int) -> list[KnowledgeChunkModel]:
@@ -342,6 +344,7 @@ class RecordingAudit:
         self.fence_exit_error_message = "PRIVATE-COMMIT-FAILURE"
         self.recovery_state_error_message: str | None = None
         self.recover_activation_error_message: str | None = None
+        self.validated_embedding_fingerprint = None
 
     @contextmanager
     def source_maintenance_lock(self, source_id):
@@ -391,13 +394,14 @@ class RecordingAudit:
             collection_name=values["collection_name"],
             alias_name=values["alias_name"],
             status="building",
-            embedding_model_version=values["embedding_model_version"],
+            embedding_model_version=values["embedding_fingerprint"].model_version,
             sparse_profile_sha256=values["sparse_profile_sha256"],
-            dimensions=values["dimensions"],
+            dimensions=values["embedding_fingerprint"].dimensions,
             point_count=0,
             error_message=None,
             created_at="2026-07-27T00:00:00+00:00",
             completed_at=None,
+            embedding_fingerprint=values["embedding_fingerprint"],
         )
         self.publications[publication.id] = publication
         self.publication = publication
@@ -409,15 +413,33 @@ class RecordingAudit:
             publication,
             status="validated",
             point_count=point_count,
+            embedding_fingerprint=(
+                publication.embedding_fingerprint
+                if self.validated_embedding_fingerprint is None
+                else self.validated_embedding_fingerprint
+            ),
         )
         self.publications[publication_id] = publication
         self.publication = publication
         return publication
 
-    def mark_publication_active(self, publication_id, *, point_count, fence=None):
+    def mark_publication_active(
+        self,
+        publication_id,
+        *,
+        point_count,
+        expected_embedding_fingerprint,
+        fence=None,
+    ):
         self.timeline.append("audit-active")
         if self.fail_activation:
             raise RuntimeError("postgres unavailable")
+        if (
+            expected_embedding_fingerprint is not None
+            and self.publications[publication_id].embedding_fingerprint
+            != expected_embedding_fingerprint
+        ):
+            raise RuntimeError("embedding fingerprint mismatch")
         for candidate_id, candidate in tuple(self.publications.items()):
             if (
                 candidate.status == "active"
@@ -748,6 +770,35 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(publisher.gateway.created_dense_dimensions, [EMBEDDING.dimensions])
         self.assertEqual(publisher.gateway.validated_dense_dimensions, [EMBEDDING.dimensions])
         self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_embedding_fingerprint_mismatch_fails_before_alias_activation(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publisher.audit.validated_embedding_fingerprint = replace(
+            FINGERPRINT,
+            model_version="old-qwen3-v1",
+        )
+
+        with self.assertRaises(RetrievalPublicationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        self.assertNotIn("activate_alias", publisher.gateway.events)
+
+    def test_incremental_upsert_refuses_active_publication_fingerprint_mismatch(self) -> None:
+        publisher = build_publisher(chunks=sample_chunks(1))
+        publication = publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+        publisher.audit.publications[publication.id] = replace(
+            publication,
+            embedding_fingerprint=replace(
+                FINGERPRINT,
+                model_sha256="d" * 64,
+            ),
+        )
+        publisher.gateway.events.clear()
+
+        with self.assertRaisesRegex(RetrievalPublicationError, "reconciliation required"):
+            publisher.upsert_source("source-1")
+
+        self.assertNotIn("delete_source:source-1", publisher.gateway.events)
 
     def test_failed_build_never_moves_alias_and_deletes_only_unaliased_collection(self) -> None:
         publisher = build_publisher(chunks=sample_chunks(3), fail_validation=True)

@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from .embedding_fingerprint import EmbeddingFingerprint
 from .retrieval_models import RetrievalScope
 from .retrieval_publication import collection_publication_version
 
@@ -42,12 +43,14 @@ class DynamicRetrievalScopeProvider:
         alias_name: str,
         knowledge_base_id: str,
         permission_tags: Sequence[str],
+        embedding_fingerprint: EmbeddingFingerprint,
     ) -> None:
         self._audit = audit
         self._gateway = gateway
         self._alias_name = alias_name
         self._knowledge_base_id = knowledge_base_id
         self._permission_tags = tuple(permission_tags)
+        self._embedding_fingerprint = embedding_fingerprint
 
     def resolve(self) -> RetrievalScopeResolution:
         try:
@@ -61,6 +64,15 @@ class DynamicRetrievalScopeProvider:
                 or alias_collection.strip() != active_collection.strip()
             ):
                 return _unavailable_resolution()
+            publication_fingerprint = getattr(
+                active_publication,
+                "embedding_fingerprint",
+                None,
+            )
+            if publication_fingerprint is None:
+                return _unavailable_resolution("embedding_fingerprint_unavailable")
+            if publication_fingerprint != self._embedding_fingerprint:
+                return _unavailable_resolution("embedding_fingerprint_mismatch")
             collection_name = active_collection.strip()
             scope = RetrievalScope(
                 self._knowledge_base_id,
@@ -76,9 +88,9 @@ class DynamicRetrievalScopeProvider:
         )
 
 
-def _unavailable_resolution() -> RetrievalScopeResolution:
+def _unavailable_resolution(detail: str = "unavailable") -> RetrievalScopeResolution:
     return RetrievalScopeResolution(
         scope=None,
         collection_name=None,
-        detail="unavailable",
+        detail=detail,
     )

@@ -20,6 +20,7 @@ from .database import (
     RetrievalPublicationRecord,
     RetrievalShadowComparisonRecord,
 )
+from .embedding_fingerprint import EmbeddingFingerprint
 
 _HASH_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -72,6 +73,7 @@ class RetrievalPublication:
     error_message: str | None
     created_at: str
     completed_at: str | None
+    embedding_fingerprint: EmbeddingFingerprint | None = None
 
 
 @dataclass(slots=True)
@@ -116,26 +118,29 @@ class RetrievalAuditRepository:
         *,
         collection_name: str,
         alias_name: str,
-        embedding_model_version: str,
+        embedding_fingerprint: EmbeddingFingerprint,
         sparse_profile_sha256: str,
-        dimensions: int,
     ) -> RetrievalPublication:
         collection_name = _bounded_text("collection_name", collection_name, 240)
         alias_name = _bounded_text("alias_name", alias_name, 240)
-        embedding_model_version = _bounded_text(
-            "embedding_model_version", embedding_model_version, 120
-        )
+        if not isinstance(embedding_fingerprint, EmbeddingFingerprint):
+            raise RetrievalAuditValidationError(
+                "embedding_fingerprint must be an EmbeddingFingerprint"
+            )
         sparse_profile_sha256 = _hash("sparse_profile_sha256", sparse_profile_sha256)
-        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
-            raise RetrievalAuditValidationError("dimensions must be a positive integer")
         record = RetrievalPublicationRecord(
             id=uuid4().hex,
             collection_name=collection_name,
             alias_name=alias_name,
             status="building",
-            embedding_model_version=embedding_model_version,
+            embedding_model_name=embedding_fingerprint.model_name,
+            embedding_model_version=embedding_fingerprint.model_version,
+            embedding_model_sha256=embedding_fingerprint.model_sha256,
             sparse_profile_sha256=sparse_profile_sha256,
-            dimensions=dimensions,
+            dimensions=embedding_fingerprint.dimensions,
+            embedding_normalized=embedding_fingerprint.normalized,
+            embedding_encoding_profile_sha256=(embedding_fingerprint.encoding_profile_sha256),
+            embedding_protocol_version=embedding_fingerprint.protocol_version,
             point_count=0,
             created_at=_timestamp(),
         )
@@ -198,6 +203,7 @@ class RetrievalAuditRepository:
         publication_id: str,
         *,
         point_count: int,
+        expected_embedding_fingerprint: EmbeddingFingerprint,
         fence: AliasPublicationFence | None = None,
     ) -> RetrievalPublication:
         point_count = _count("point_count", point_count)
@@ -210,6 +216,7 @@ class RetrievalAuditRepository:
                 target = _locked_publication(fence.session, publication_id)
                 if target.alias_name != fence.alias_name:
                     raise RetrievalAuditValidationError("Alias publication fence mismatch")
+                _require_embedding_fingerprint(target, expected_embedding_fingerprint)
                 return _activate_publication(fence.session, target, point_count)
             except IntegrityError:
                 _rollback_pending_activation(fence)
@@ -229,6 +236,7 @@ class RetrievalAuditRepository:
                     raise RetrievalAuditNotFoundError("Retrieval publication not found")
                 _acquire_alias_transaction_lock(session, alias_name)
                 target = _locked_publication(session, publication_id)
+                _require_embedding_fingerprint(target, expected_embedding_fingerprint)
                 return _activate_publication(session, target, point_count)
         except IntegrityError:
             conflict_error = RetrievalAuditError("Retrieval publication activation conflict")
@@ -537,7 +545,42 @@ def _publication_from_record(record: RetrievalPublicationRecord) -> RetrievalPub
         error_message=record.error_message,
         created_at=record.created_at,
         completed_at=record.completed_at,
+        embedding_fingerprint=_embedding_fingerprint_from_record(record),
     )
+
+
+def _embedding_fingerprint_from_record(
+    record: RetrievalPublicationRecord,
+) -> EmbeddingFingerprint | None:
+    values = (
+        record.embedding_model_name,
+        record.embedding_model_sha256,
+        record.embedding_normalized,
+        record.embedding_encoding_profile_sha256,
+        record.embedding_protocol_version,
+    )
+    if any(value is None for value in values):
+        return None
+    try:
+        return EmbeddingFingerprint(
+            model_name=record.embedding_model_name,
+            model_version=record.embedding_model_version,
+            model_sha256=record.embedding_model_sha256,
+            dimensions=record.dimensions,
+            normalized=record.embedding_normalized,
+            encoding_profile_sha256=record.embedding_encoding_profile_sha256,
+            protocol_version=record.embedding_protocol_version,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_embedding_fingerprint(
+    record: RetrievalPublicationRecord,
+    expected: EmbeddingFingerprint,
+) -> None:
+    if _embedding_fingerprint_from_record(record) != expected:
+        raise RetrievalAuditValidationError("Retrieval publication embedding fingerprint mismatch")
 
 
 def _shadow_from_record(record: RetrievalShadowComparisonRecord) -> RetrievalShadowComparison:

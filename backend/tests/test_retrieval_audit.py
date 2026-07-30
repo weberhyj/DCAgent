@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import traceback
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from sqlalchemy.exc import IntegrityError
@@ -9,10 +10,21 @@ from sqlalchemy.orm import Session
 
 import app.retrieval_audit as retrieval_audit
 from app.database import Database, RetrievalPublicationRecord
+from app.embedding_fingerprint import EmbeddingFingerprint
 from app.retrieval_audit import (
     RetrievalAuditError,
     RetrievalAuditRepository,
     RetrievalAuditValidationError,
+)
+
+FINGERPRINT = EmbeddingFingerprint(
+    model_name="qwen2.5:0.5b",
+    model_version="qwen25-embedding-v1",
+    model_sha256="a" * 64,
+    dimensions=896,
+    normalized=True,
+    encoding_profile_sha256="b" * 64,
+    protocol_version="v1",
 )
 
 
@@ -22,16 +34,83 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         self.database.create_schema()
         self.repository = RetrievalAuditRepository(self.database)
 
+    def test_publication_round_trips_complete_embedding_fingerprint(self) -> None:
+        publication = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v90",
+            alias_name="knowledge_chunks_current",
+            embedding_fingerprint=FINGERPRINT,
+            sparse_profile_sha256="c" * 64,
+        )
+
+        stored = self.repository.get_publication(publication.id)
+
+        self.assertEqual(stored.embedding_fingerprint, FINGERPRINT)
+        self.assertEqual(stored.embedding_model_version, FINGERPRINT.model_version)
+        self.assertEqual(stored.dimensions, FINGERPRINT.dimensions)
+
+    def test_legacy_publication_missing_fingerprint_fields_reads_as_unavailable(self) -> None:
+        legacy = RetrievalPublicationRecord(
+            id="legacy-publication",
+            collection_name="knowledge_chunks_qwen3_v91",
+            alias_name="knowledge_chunks_current",
+            status="active",
+            embedding_model_name=None,
+            embedding_model_version="old-qwen3-v1",
+            embedding_model_sha256=None,
+            sparse_profile_sha256="c" * 64,
+            dimensions=896,
+            embedding_normalized=None,
+            embedding_encoding_profile_sha256=None,
+            embedding_protocol_version=None,
+            point_count=10,
+            created_at="2026-07-30T00:00:00+00:00",
+        )
+        with self.database.session() as session:
+            session.add(legacy)
+
+        stored = self.repository.get_publication(legacy.id)
+
+        self.assertIsNone(stored.embedding_fingerprint)
+        self.assertEqual(stored.embedding_model_version, "old-qwen3-v1")
+        self.assertEqual(stored.dimensions, 896)
+
+    def test_activation_fence_rejects_embedding_fingerprint_mismatch(self) -> None:
+        publication = self.repository.create_publication(
+            collection_name="knowledge_chunks_qwen3_v92",
+            alias_name="knowledge_chunks_current",
+            embedding_fingerprint=FINGERPRINT,
+            sparse_profile_sha256="c" * 64,
+        )
+        self.repository.mark_publication_validated(publication.id, point_count=10)
+
+        with self.assertRaisesRegex(
+            RetrievalAuditValidationError,
+            "embedding fingerprint mismatch",
+        ):
+            self.repository.mark_publication_active(
+                publication.id,
+                point_count=10,
+                expected_embedding_fingerprint=replace(
+                    FINGERPRINT,
+                    model_version="old-qwen3-v1",
+                ),
+            )
+
+        self.assertEqual(self.repository.get_publication(publication.id).status, "validated")
+
     def test_records_publication_and_redacted_shadow_comparison(self) -> None:
         publication = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(publication.id, point_count=12)
-        self.repository.mark_publication_active(publication.id, point_count=12)
+        self.repository.mark_publication_active(
+            publication.id,
+            point_count=12,
+            expected_embedding_fingerprint=publication.embedding_fingerprint,
+        )
         self.repository.record_shadow(
             request_id="request-1",
             routing_key_hash="b" * 64,
@@ -54,19 +133,26 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         publication = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
 
         with self.assertRaises(RetrievalAuditValidationError):
-            self.repository.mark_publication_active(publication.id, point_count=1)
+            self.repository.mark_publication_active(
+                publication.id,
+                point_count=1,
+                expected_embedding_fingerprint=publication.embedding_fingerprint,
+            )
 
         self.repository.mark_publication_validated(publication.id, point_count=1)
         with self.assertRaises(RetrievalAuditValidationError):
             self.repository.mark_publication_retired(publication.id)
 
-        self.repository.mark_publication_active(publication.id, point_count=1)
+        self.repository.mark_publication_active(
+            publication.id,
+            point_count=1,
+            expected_embedding_fingerprint=publication.embedding_fingerprint,
+        )
         with self.assertRaises(RetrievalAuditValidationError):
             self.repository.mark_publication_failed(publication.id, "late failure")
 
@@ -74,28 +160,38 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         first = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(first.id, point_count=12)
-        self.repository.mark_publication_active(first.id, point_count=12)
+        self.repository.mark_publication_active(
+            first.id,
+            point_count=12,
+            expected_embedding_fingerprint=first.embedding_fingerprint,
+        )
         second = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v2",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-2",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-2"),
             sparse_profile_sha256="b" * 64,
-            dimensions=1024,
         )
 
         with self.assertRaises(RetrievalAuditValidationError):
-            self.repository.mark_publication_active(second.id, point_count=13)
+            self.repository.mark_publication_active(
+                second.id,
+                point_count=13,
+                expected_embedding_fingerprint=second.embedding_fingerprint,
+            )
 
         self.assertEqual(self.repository.get_publication(first.id).status, "active")
         self.assertEqual(self.repository.get_publication(second.id).status, "building")
 
         self.repository.mark_publication_validated(second.id, point_count=13)
-        self.repository.mark_publication_active(second.id, point_count=13)
+        self.repository.mark_publication_active(
+            second.id,
+            point_count=13,
+            expected_embedding_fingerprint=second.embedding_fingerprint,
+        )
         self.assertEqual(self.repository.get_publication(first.id).status, "retired")
         self.assertEqual(self.repository.get_publication(second.id).status, "active")
         self.assertEqual(
@@ -106,16 +202,14 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         first = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
         second = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v2",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-2",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-2"),
             sparse_profile_sha256="b" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(first.id, point_count=12)
         self.repository.mark_publication_validated(second.id, point_count=13)
@@ -133,16 +227,19 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         publication = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(publication.id, point_count=12)
 
         with patch(
             "app.retrieval_audit._acquire_alias_transaction_lock",
         ) as alias_lock:
-            self.repository.mark_publication_active(publication.id, point_count=12)
+            self.repository.mark_publication_active(
+                publication.id,
+                point_count=12,
+                expected_embedding_fingerprint=publication.embedding_fingerprint,
+            )
 
         alias_lock.assert_called_once()
         self.assertEqual(alias_lock.call_args.args[1], "knowledge_chunks_current")
@@ -179,9 +276,8 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         publication = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
 
         with self.repository.alias_publication_lock("knowledge_chunks_current") as fence:
@@ -198,18 +294,20 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         first = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(first.id, point_count=12)
-        self.repository.mark_publication_active(first.id, point_count=12)
+        self.repository.mark_publication_active(
+            first.id,
+            point_count=12,
+            expected_embedding_fingerprint=first.embedding_fingerprint,
+        )
         second = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v2",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-2",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-2"),
             sparse_profile_sha256="b" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(second.id, point_count=13)
 
@@ -217,6 +315,7 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
             self.repository.mark_publication_active(
                 second.id,
                 point_count=13,
+                expected_embedding_fingerprint=second.embedding_fingerprint,
                 fence=fence,
             )
             failed = self.repository.mark_publication_failed(
@@ -235,21 +334,27 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         first = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(first.id, point_count=12)
-        self.repository.mark_publication_active(first.id, point_count=12)
+        self.repository.mark_publication_active(
+            first.id,
+            point_count=12,
+            expected_embedding_fingerprint=first.embedding_fingerprint,
+        )
         second = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v2",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-2",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-2"),
             sparse_profile_sha256="b" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(second.id, point_count=13)
-        self.repository.mark_publication_active(second.id, point_count=13)
+        self.repository.mark_publication_active(
+            second.id,
+            point_count=13,
+            expected_embedding_fingerprint=second.embedding_fingerprint,
+        )
 
         with self.repository.alias_publication_lock("knowledge_chunks_current") as fence:
             snapshot = self.repository.publication_recovery_state(second.id, fence=fence)
@@ -281,18 +386,20 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         first = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v1",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-1",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-1"),
             sparse_profile_sha256="a" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(first.id, point_count=12)
-        self.repository.mark_publication_active(first.id, point_count=12)
+        self.repository.mark_publication_active(
+            first.id,
+            point_count=12,
+            expected_embedding_fingerprint=first.embedding_fingerprint,
+        )
         second = self.repository.create_publication(
             collection_name="knowledge_chunks_qwen3_v2",
             alias_name="knowledge_chunks_current",
-            embedding_model_version="qwen3-0.6b-2",
+            embedding_fingerprint=replace(FINGERPRINT, model_version="qwen3-0.6b-2"),
             sparse_profile_sha256="b" * 64,
-            dimensions=1024,
         )
         self.repository.mark_publication_validated(second.id, point_count=13)
         secret_marker = "UNIQUE-ACTIVATION-SECRET-7f04"
@@ -321,7 +428,11 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
             side_effect=fail_target_activation,
         ):
             try:
-                self.repository.mark_publication_active(second.id, point_count=13)
+                self.repository.mark_publication_active(
+                    second.id,
+                    point_count=13,
+                    expected_embedding_fingerprint=second.embedding_fingerprint,
+                )
             except RetrievalAuditError as error:
                 raised = error
 
