@@ -337,7 +337,7 @@ python3 -c 'import json,sys; envelope=json.load(sys.stdin); scores=json.loads(en
 
 tags_json="$(curl --fail-with-body --silent --show-error "$ollama_url/api/tags")"
 for model in qwen2.5:0.5b qwen2.5:3b; do
-  digest="$(python3 -c 'import json,re,sys; model=sys.argv[1]; body=json.load(sys.stdin); entry=next((item for item in body["models"] if item.get("name") == model or item.get("model") == model), None); assert entry is not None, f"model not found: {model}"; digest=str(entry["digest"]).removeprefix("sha256:"); assert re.fullmatch(r"[0-9a-f]{64}", digest), f"invalid digest: {model}"; print(digest)' "$model" <<<"$tags_json")"
+  digest="$(python3 -c 'import json,re,sys; model=sys.argv[1]; body=json.load(sys.stdin); matches=[item for item in body["models"] if item.get("name") == model or item.get("model") == model]; len(matches) == 1 or sys.exit(f"expected exactly one model match: {model}"); digest=str(matches[0]["digest"]).removeprefix("sha256:"); re.fullmatch(r"[0-9a-f]{64}", digest) or sys.exit(f"invalid digest: {model}"); print(digest)' "$model" <<<"$tags_json")"
   printf '%s %s\n' "$model" "$digest"
 done
 ```
@@ -375,9 +375,9 @@ if ($scoreProbe.scores.Count -ne 2) { throw 'Ollama JSON score probe returned th
 ```powershell
 $tags = (curl.exe --fail-with-body --silent --show-error "$ollama/api/tags") | ConvertFrom-Json
 function Get-OllamaDigest([string]$model) {
-  $entry = $tags.models | Where-Object { $_.name -eq $model -or $_.model -eq $model } | Select-Object -First 1
-  if ($null -eq $entry) { throw "Ollama model not found: $model" }
-  $digest = ([string]$entry.digest) -replace '^sha256:', ''
+  $modelMatches = @($tags.models | Where-Object { $_.name -ceq $model -or $_.model -ceq $model })
+  if ($modelMatches.Count -ne 1) { throw "Expected exactly one Ollama model match: $model" }
+  $digest = ([string]$modelMatches[0].digest) -replace '^sha256:', ''
   if ($digest -cnotmatch '^[0-9a-f]{64}$') { throw "Invalid Ollama digest for $model" }
   $digest
 }

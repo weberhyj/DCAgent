@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import gzip
+import json
 import unittest
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any
 from unittest.mock import patch
 
 import httpx
 
+from app.embedding_contracts import MAX_EMBEDDING_TEXTS
 from app.ollama_client import (
+    DEFAULT_OLLAMA_MAX_RESPONSE_BYTES,
+    MAX_OLLAMA_MAX_RESPONSE_BYTES,
     OllamaBusy,
     OllamaResponseError,
     OllamaServiceError,
@@ -65,14 +71,22 @@ class FalseyRecordingTransport(RecordingTransport):
 class RecordingHttpxClient:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
-        self.calls: list[tuple[str, object, object]] = []
+        self.calls: list[tuple[str, str, object, object]] = []
         self.close_calls = 0
 
-    def post(self, url: str, *, json: object, timeout: object = None) -> httpx.Response:
-        self.calls.append((url, json, timeout))
-        return httpx.Response(
+    @contextmanager
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: object = None,
+        timeout: object = None,
+    ):
+        self.calls.append((method, url, json, timeout))
+        yield httpx.Response(
             200,
-            request=httpx.Request("POST", url),
+            request=httpx.Request(method, url),
             json={"model": "qwen2.5"},
         )
 
@@ -80,7 +94,234 @@ class RecordingHttpxClient:
         self.close_calls += 1
 
 
+class TrackingByteStream(httpx.SyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.iterated_chunks = 0
+        self.close_calls = 0
+
+    def __iter__(self):
+        for chunk in self.chunks:
+            self.iterated_chunks += 1
+            yield chunk
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 class OllamaClientTest(unittest.TestCase):
+    def _default_client_with_handler(
+        self,
+        handler: Any,
+        *,
+        max_response_bytes: int,
+        timeout_seconds: float = 15.0,
+    ) -> tuple[SyncOllamaClient, Any]:
+        real_client_type = httpx.Client
+
+        def client_factory(**kwargs: Any) -> httpx.Client:
+            return real_client_type(transport=httpx.MockTransport(handler), **kwargs)
+
+        factory_patch = patch("app.ollama_client.httpx.Client", side_effect=client_factory)
+        factory = factory_patch.start()
+        try:
+            client = SyncOllamaClient(
+                "http://10.20.30.40:11434",
+                timeout_seconds=timeout_seconds,
+                max_response_bytes=max_response_bytes,
+            )
+        finally:
+            factory_patch.stop()
+        self.addCleanup(client.close)
+        return client, factory
+
+    def test_default_response_limit_has_headroom_for_max_embedding_batch(self) -> None:
+        configured_dimensions = 896
+        conservative_json_bytes_per_float = 32
+        conservative_response_bytes = (
+            MAX_EMBEDDING_TEXTS * configured_dimensions * conservative_json_bytes_per_float
+            + MAX_EMBEDDING_TEXTS * 2
+            + len('{"embeddings":[]}')
+        )
+
+        self.assertLess(conservative_response_bytes, DEFAULT_OLLAMA_MAX_RESPONSE_BYTES // 4)
+
+    def test_rejects_invalid_response_limits(self) -> None:
+        invalid_limits = (0, -1, True, 1.5, "1024", MAX_OLLAMA_MAX_RESPONSE_BYTES + 1)
+        for max_response_bytes in invalid_limits:
+            with self.subTest(max_response_bytes=max_response_bytes), self.assertRaises(ValueError):
+                SyncOllamaClient(
+                    "http://ollama:11434",
+                    transport=RecordingTransport(),
+                    max_response_bytes=max_response_bytes,  # type: ignore[arg-type]
+                )
+
+    def test_content_length_over_limit_is_rejected_before_body_read_and_response_closes(
+        self,
+    ) -> None:
+        stream = TrackingByteStream([b"KEEP-THIS-CANARY-PRIVATE"])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Length": "13"},
+                stream=stream,
+                request=request,
+            )
+
+        client, _ = self._default_client_with_handler(handler, max_response_bytes=12)
+
+        with self.assertRaises(OllamaResponseError) as caught:
+            client.post_json("/api/generate", {})
+
+        self.assertEqual(stream.iterated_chunks, 0)
+        self.assertEqual(stream.close_calls, 1)
+        self.assertNotIn("KEEP-THIS-CANARY-PRIVATE", str(caught.exception))
+        self.assertNotIn("10.20.30.40", str(caught.exception))
+
+    def test_content_length_equal_to_limit_succeeds(self) -> None:
+        body = b'{"ok":true}'
+        stream = TrackingByteStream([body])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Length": str(len(body))},
+                stream=stream,
+                request=request,
+            )
+
+        client, _ = self._default_client_with_handler(handler, max_response_bytes=len(body))
+
+        self.assertEqual(client.post_json("/api/generate", {}), {"ok": True})
+        self.assertEqual(stream.close_calls, 1)
+
+    def test_chunked_response_without_content_length_is_bounded(self) -> None:
+        cases = (
+            ([b'{"ok":', b"true}"], len(b'{"ok":true}'), {"ok": True}),
+            ([b'{"secret":"', b"CANARY", b'"}'], 15, OllamaResponseError),
+        )
+        for chunks, limit, expected in cases:
+            with self.subTest(expected=expected):
+                stream = TrackingByteStream(chunks)
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(200, stream=stream, request=request)
+
+                client, _ = self._default_client_with_handler(
+                    handler,
+                    max_response_bytes=limit,
+                )
+                if isinstance(expected, dict):
+                    self.assertEqual(client.get_json("/api/tags"), expected)
+                else:
+                    with self.assertRaises(expected) as caught:
+                        client.get_json("/api/tags")
+                    self.assertEqual(stream.iterated_chunks, 2)
+                    self.assertNotIn("CANARY", str(caught.exception))
+                    self.assertNotIn("10.20.30.40", str(caught.exception))
+                self.assertEqual(stream.close_calls, 1)
+
+    def test_gzip_decoded_response_over_limit_is_rejected(self) -> None:
+        decoded = json.dumps({"payload": "x" * 256}).encode("utf-8")
+        compressed = gzip.compress(decoded)
+        self.assertLess(len(compressed), 64)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Encoding": "gzip",
+                    "Content-Length": str(len(compressed)),
+                },
+                content=compressed,
+                request=request,
+            )
+
+        client, _ = self._default_client_with_handler(handler, max_response_bytes=64)
+
+        with self.assertRaises(OllamaResponseError):
+            client.post_json("/api/embed", {})
+
+    def test_invalid_content_length_json_utf8_and_non_object_are_sanitized(self) -> None:
+        cases = (
+            ({"Content-Length": "-1"}, [b"{}"]),
+            ({"Content-Length": "not-a-number"}, [b"{}"]),
+            ({}, [b""]),
+            ({}, [b'{"unterminated"']),
+            ({}, [b"\xff"]),
+            ({}, [b"[]"]),
+        )
+        for headers, chunks in cases:
+            with self.subTest(headers=headers, chunks=chunks):
+                stream = TrackingByteStream(chunks)
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(200, headers=headers, stream=stream, request=request)
+
+                client, _ = self._default_client_with_handler(handler, max_response_bytes=64)
+                with self.assertRaises(OllamaResponseError) as caught:
+                    client.post_json("/api/generate", {"prompt": "PRIVATE-PROMPT"})
+                message = str(caught.exception)
+                self.assertNotIn("PRIVATE-PROMPT", message)
+                self.assertNotIn("10.20.30.40", message)
+                self.assertNotIn("unterminated", message)
+
+    def test_http_status_fails_before_oversized_content_length_validation(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                503,
+                headers={"Content-Length": "999999"},
+                content=b"PRIVATE-STATUS-BODY",
+                request=request,
+            )
+
+        client, _ = self._default_client_with_handler(handler, max_response_bytes=8)
+
+        with self.assertRaises(OllamaServiceError) as caught:
+            client.get_json("/api/tags")
+
+        self.assertNotIsInstance(caught.exception, OllamaResponseError)
+        self.assertNotIn("PRIVATE-STATUS-BODY", str(caught.exception))
+
+    def test_real_httpx_client_receives_get_post_urls_and_timeout_overrides(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        client, factory = self._default_client_with_handler(
+            handler,
+            max_response_bytes=64,
+            timeout_seconds=4.0,
+        )
+
+        self.assertEqual(client.get_json("/api/tags"), {"ok": True})
+        self.assertEqual(
+            client.post_json("/api/generate", {"prompt": "hi"}, timeout_seconds=5.0),
+            {"ok": True},
+        )
+
+        self.assertEqual(
+            [(request.method, str(request.url)) for request in requests],
+            [
+                ("GET", "http://10.20.30.40:11434/api/tags"),
+                ("POST", "http://10.20.30.40:11434/api/generate"),
+            ],
+        )
+        self.assertEqual(requests[0].extensions["timeout"]["read"], 4.0)
+        self.assertEqual(requests[1].extensions["timeout"]["read"], 5.0)
+        self.assertEqual(factory.call_count, 1)
+
+    def test_context_manager_closes_default_transport_once(self) -> None:
+        http_client = RecordingHttpxClient()
+        with patch("app.ollama_client.httpx.Client", return_value=http_client):
+            with SyncOllamaClient("http://localhost:11434") as client:
+                self.assertEqual(client.get_json("/api/tags"), {"model": "qwen2.5"})
+
+        self.assertEqual(http_client.close_calls, 1)
+
     def test_resolves_unique_model_digest_and_normalizes_optional_prefix(self) -> None:
         digest = "a" * 64
         for returned_digest in (digest, f"sha256:{digest}"):
@@ -397,15 +638,22 @@ class OllamaClientTest(unittest.TestCase):
         http_client = RecordingHttpxClient()
         with patch("app.ollama_client.httpx.Client", return_value=http_client) as factory:
             client = SyncOllamaClient("http://localhost:11434", timeout_seconds=4.0)
+            client.get_json("/api/tags")
             client.post_json("/api/generate", {"prompt": "one"})
             client.post_json("/api/chat", {"prompt": "two"}, timeout_seconds=5.0)
             client.close()
             client.close()
 
         self.assertEqual(factory.call_count, 1)
-        self.assertEqual(len(http_client.calls), 2)
-        self.assertIsNone(http_client.calls[0][2])
-        override = http_client.calls[1][2]
+        self.assertEqual(len(http_client.calls), 3)
+        self.assertEqual(http_client.calls[0][:3], ("GET", "http://localhost:11434/api/tags", None))
+        self.assertEqual(
+            http_client.calls[1][:3],
+            ("POST", "http://localhost:11434/api/generate", {"prompt": "one"}),
+        )
+        self.assertIsNone(http_client.calls[0][3])
+        self.assertIsNone(http_client.calls[1][3])
+        override = http_client.calls[2][3]
         self.assertIsInstance(override, httpx.Timeout)
         self.assertEqual(override.connect, 2.0)
         self.assertEqual(override.read, 5.0)

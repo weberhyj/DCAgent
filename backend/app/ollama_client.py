@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import math
 import re
 from collections.abc import Mapping
@@ -14,6 +15,9 @@ _PRIVATE_IPV4_NETWORKS = tuple(
 )
 _PRIVATE_IPV6_NETWORK = ipaddress.IPv6Network("fc00::/7")
 _MODEL_DIGEST_PATTERN = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
+DEFAULT_OLLAMA_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_OLLAMA_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+_RESPONSE_CHUNK_BYTES = 64 * 1024
 
 
 class OllamaError(RuntimeError):
@@ -52,7 +56,8 @@ class OllamaTransport(Protocol):
 
 
 class _HttpxOllamaTransport:
-    def __init__(self, timeout_seconds: float) -> None:
+    def __init__(self, timeout_seconds: float, max_response_bytes: int) -> None:
+        self._max_response_bytes = max_response_bytes
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 2.0)),
             limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
@@ -68,15 +73,17 @@ class _HttpxOllamaTransport:
         timeout_seconds: float | None = None,
     ) -> object:
         if timeout_seconds is None:
-            response = self._client.post(url, json=payload)
+            request = self._client.stream("POST", url, json=payload)
         else:
-            response = self._client.post(
+            request = self._client.stream(
+                "POST",
                 url,
                 json=payload,
                 timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 2.0)),
             )
-        response.raise_for_status()
-        return response.json()
+        with request as response:
+            response.raise_for_status()
+            return _read_bounded_json(response, self._max_response_bytes)
 
     def get_json(
         self,
@@ -85,14 +92,16 @@ class _HttpxOllamaTransport:
         timeout_seconds: float | None = None,
     ) -> object:
         if timeout_seconds is None:
-            response = self._client.get(url)
+            request = self._client.stream("GET", url)
         else:
-            response = self._client.get(
+            request = self._client.stream(
+                "GET",
                 url,
                 timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 2.0)),
             )
-        response.raise_for_status()
-        return response.json()
+        with request as response:
+            response.raise_for_status()
+            return _read_bounded_json(response, self._max_response_bytes)
 
     def close(self) -> None:
         self._client.close()
@@ -104,13 +113,25 @@ class SyncOllamaClient:
         base_url: str,
         transport: OllamaTransport | None = None,
         timeout_seconds: float = 15.0,
+        max_response_bytes: int = DEFAULT_OLLAMA_MAX_RESPONSE_BYTES,
     ) -> None:
         self._base_url = _validate_base_url(base_url)
         self._timeout_seconds = _validate_timeout(timeout_seconds)
+        self._max_response_bytes = _validate_max_response_bytes(max_response_bytes)
         self._transport = (
-            _HttpxOllamaTransport(self._timeout_seconds) if transport is None else transport
+            _HttpxOllamaTransport(self._timeout_seconds, self._max_response_bytes)
+            if transport is None
+            else transport
         )
         self._closed = False
+
+    def __enter__(self) -> SyncOllamaClient:
+        if self._closed:
+            raise OllamaServiceError("Ollama client is closed")
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
 
     def post_json(
         self,
@@ -304,6 +325,36 @@ def _validate_timeout(timeout_seconds: float) -> float:
     ):
         raise ValueError("Ollama timeout must be a positive finite number")
     return float(timeout_seconds)
+
+
+def _validate_max_response_bytes(max_response_bytes: int) -> int:
+    if (
+        type(max_response_bytes) is not int
+        or max_response_bytes <= 0
+        or max_response_bytes > MAX_OLLAMA_MAX_RESPONSE_BYTES
+    ):
+        raise ValueError(
+            "Ollama maximum response bytes must be a positive integer no greater than "
+            f"{MAX_OLLAMA_MAX_RESPONSE_BYTES}"
+        )
+    return max_response_bytes
+
+
+def _read_bounded_json(response: httpx.Response, max_response_bytes: int) -> object:
+    declared_length = response.headers.get("Content-Length")
+    if declared_length is not None:
+        if re.fullmatch(r"[0-9]+", declared_length) is None:
+            raise OllamaResponseError("Ollama service returned an invalid response")
+        if int(declared_length) > max_response_bytes:
+            raise OllamaResponseError("Ollama service response exceeded size limit")
+
+    body = bytearray()
+    chunk_size = min(_RESPONSE_CHUNK_BYTES, max_response_bytes + 1)
+    for chunk in response.iter_bytes(chunk_size=chunk_size):
+        if len(body) + len(chunk) > max_response_bytes:
+            raise OllamaResponseError("Ollama service response exceeded size limit")
+        body.extend(chunk)
+    return json.loads(body.decode("utf-8"))
 
 
 def _contains_ascii_control(value: str) -> bool:

@@ -1541,6 +1541,60 @@ class ComposeSmokeTest(unittest.TestCase):
                     self.assertIn(endpoint, linux)
                     self.assertIn(endpoint, windows)
 
+    def test_readme_digest_probes_require_one_exact_model_match(self) -> None:
+        for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                linux_match = re.search(
+                    r"(?ms)^#### Linux \(Bash\)\s*$\n(?P<body>.*?)^#### Windows \(PowerShell\)\s*$",
+                    text,
+                )
+                self.assertIsNotNone(linux_match)
+                assert linux_match is not None
+                linux = linux_match.group("body")
+                windows = text[linux_match.end() :]
+
+                self.assertIn('matches=[item for item in body["models"]', linux)
+                self.assertIn("len(matches) == 1 or sys.exit", linux)
+                self.assertNotIn("entry=next(", linux)
+                self.assertIn("$modelMatches = @($tags.models | Where-Object", windows)
+                self.assertIn("$modelMatches.Count -ne 1", windows)
+                self.assertIn("-ceq $model", windows)
+                self.assertNotIn("Select-Object -First 1", windows)
+
+                command_match = re.search(
+                    r"python3 -c '(?P<code>[^']+)' \"\$model\"", linux
+                )
+                self.assertIsNotNone(command_match)
+                assert command_match is not None
+                command = command_match.group("code")
+                digest = "a" * 64
+                inventories = (
+                    ({"models": []}, 1),
+                    ({"models": [{"name": "qwen2.5:0.5b", "digest": digest}]}, 0),
+                    (
+                        {
+                            "models": [
+                                {"name": "qwen2.5:0.5b", "digest": digest},
+                                {"model": "qwen2.5:0.5b", "digest": digest},
+                            ]
+                        },
+                        1,
+                    ),
+                )
+                for inventory, expected_return_code in inventories:
+                    completed = subprocess.run(
+                        [sys.executable, "-c", command, "qwen2.5:0.5b"],
+                        input=json.dumps(inventory),
+                        capture_output=True,
+                        text=True,
+                        shell=False,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        completed.returncode, expected_return_code, completed.stderr
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
