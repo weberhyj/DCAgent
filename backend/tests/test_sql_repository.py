@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from loguru import logger as loguru_logger
 
-from app.agent import AgentRunResult
+from app.agent import GREETING_REPLY, AgentRunResult
 from app.database import Database
 from app.embedding_fingerprint import EmbeddingFingerprint
 from app.models import ChatMessageModel, KnowledgeChunkModel
@@ -579,6 +579,56 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertEqual(structured.calls, 1)
         self.assertEqual(router.calls, 0)
         self.assertEqual(messages[-1].content, "42")
+
+    def test_repositories_route_greeting_before_structured_retrieval_and_llm(self) -> None:
+        class NeverStructuredService:
+            def try_answer(self, **kwargs):
+                raise AssertionError(f"structured service must not receive greeting {kwargs}")
+
+        class NeverRouter:
+            def search(self, request):
+                raise AssertionError(f"router must not receive greeting {request}")
+
+        class NeverProvider:
+            def generate_reply(self, request):
+                raise AssertionError(f"LLM must not receive greeting {request}")
+
+        scope = RetrievalScope("default", ("internal",), "v1")
+        repositories = (
+            (
+                "sql",
+                SqlChatRepository(
+                    self.database,
+                    llm_provider=NeverProvider(),
+                    structured_service=NeverStructuredService(),
+                    retrieval_router=NeverRouter(),
+                    retrieval_scope=scope,
+                ),
+            ),
+            (
+                "memory",
+                InMemoryChatRepository(
+                    build_seed_state(),
+                    llm_provider=NeverProvider(),
+                    structured_service=NeverStructuredService(),
+                    retrieval_router=NeverRouter(),
+                    retrieval_scope=scope,
+                ),
+            ),
+        )
+
+        for name, repository in repositories:
+            with self.subTest(repository=name):
+                _, conversation_id, _ = repository.create_conversation()
+
+                _, _, messages = repository.send_message(conversation_id, "你好", "quick")
+
+                self.assertEqual(messages[-1].paragraphs[-1].text, GREETING_REPLY)
+                run = repository.list_agent_runs(limit=1)[0]
+                self.assertEqual(run.evidence_count, 0)
+                self.assertEqual(run.source_count, 0)
+                self.assertEqual(len(run.steps), 1)
+                self.assertEqual(run.steps[0].tool_name, "respond_greeting")
 
     def test_repositories_reject_partial_retrieval_router_configuration(self) -> None:
         scope = RetrievalScope("default", ("internal",), "v1")
