@@ -19,9 +19,13 @@ from pydantic import ValidationError
 
 from .inference_batching import DynamicBatcher, InferenceQueueFull
 from .offline_artifacts import is_local_filesystem_path
+from .ollama_client import SyncOllamaClient
+from .ollama_reranker_backend import (
+    RERANK_PROMPT_PROFILE_SHA256,
+    OllamaGenerativeRerankerBackend,
+)
 from .qwen3_reranker_runtime import (
     Qwen3RerankerMalformedOutput,
-    load_qwen3_reranker_backend,
 )
 from .reranker_contracts import (
     MAX_RERANK_PASSAGES,
@@ -57,7 +61,7 @@ class RerankerBackend(Protocol):
     def rerank(self, query: str, passages: Sequence[str]) -> Sequence[float]: ...
 
 
-RerankerBackendLoader = Callable[[Path, RerankerModelMetadata], RerankerBackend]
+RerankerBackendLoader = Callable[[Mapping[str, str], RerankerModelMetadata], RerankerBackend]
 
 
 class _RerankerBackendFailure(RuntimeError):
@@ -214,39 +218,107 @@ def create_production_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        model_root, metadata = _load_pinned_model_configuration(target)
-        target.update(OFFLINE_RERANKER_ENVIRONMENT)
-        runtime = _runtime(target.get("RERANKER_RUNTIME", "openvino"))
-        max_length = _positive_int(target, "RERANKER_MAX_LENGTH", 8192)
-        max_items = _positive_int(target, "RERANKER_BATCH_MAX_ITEMS", MAX_RERANK_PASSAGES)
-        max_queue_items = _positive_int(target, "RERANKER_QUEUE_MAX_ITEMS", 192)
-        wait_ms = _nonnegative_float(target, "RERANKER_BATCH_WAIT_MS", 10.0)
-
-        def default_loader(root: Path, pinned: RerankerModelMetadata) -> RerankerBackend:
-            return load_qwen3_reranker_backend(root, pinned, runtime=runtime, max_length=max_length)
-
-        backend = await run_in_threadpool(
-            default_loader if backend_loader is None else backend_loader, model_root, metadata
-        )
-        await run_in_threadpool(_validate_reranker_backend_startup, backend)
-        batcher: DynamicBatcher[tuple[str, str], float] = DynamicBatcher(
-            lambda pairs: _invoke_backend_pairs(backend, pairs),
-            max_items=max_items,
-            max_queue_items=max_queue_items,
-            wait_ms=wait_ms,
-        )
-        await batcher.start()
-        app.state.reranker_metadata = metadata
-        app.state.reranker_batcher = batcher
-        app.state.reranker_ready = True
+        backend: RerankerBackend | None = None
+        batcher: DynamicBatcher[tuple[str, str], float] | None = None
         try:
+            metadata = _load_environment_metadata(target)
+            max_items = _positive_int(target, "RERANKER_BATCH_MAX_ITEMS", MAX_RERANK_PASSAGES)
+            max_queue_items = _positive_int(target, "RERANKER_QUEUE_MAX_ITEMS", 192)
+            wait_ms = _nonnegative_float(target, "RERANKER_BATCH_WAIT_MS", 10.0)
+            loader = _load_ollama_reranker_backend if backend_loader is None else backend_loader
+            backend = await run_in_threadpool(loader, target, metadata)
+            await run_in_threadpool(_validate_reranker_backend_startup, backend)
+            batcher = DynamicBatcher(
+                lambda pairs: _invoke_backend_pairs(backend, pairs),
+                max_items=max_items,
+                max_queue_items=max_queue_items,
+                wait_ms=wait_ms,
+            )
+            await batcher.start()
+            app.state.reranker_backend = backend
+            app.state.reranker_metadata = metadata
+            app.state.reranker_batcher = batcher
+            app.state.reranker_ready = True
             yield
         finally:
             app.state.reranker_ready = False
-            await batcher.close()
             app.state.reranker_batcher = None
+            app.state.reranker_backend = None
+            app.state.reranker_metadata = None
+            if batcher is not None:
+                try:
+                    await batcher.close()
+                except Exception:
+                    pass
+            if backend is not None:
+                close = getattr(backend, "close", None)
+                if callable(close):
+                    try:
+                        await run_in_threadpool(close)
+                    except Exception:
+                        pass
 
     return _build_reranker_app(lifespan=lifespan)
+
+
+def _load_environment_metadata(environ: Mapping[str, str]) -> RerankerModelMetadata:
+    name = _required(environ, "RERANKER_MODEL_NAME")
+    version = _required(environ, "RERANKER_MODEL_VERSION")
+    sha256 = _required(environ, "RERANKER_MODEL_SHA256")
+    if SHA256_PATTERN.fullmatch(sha256) is None:
+        raise ValueError(
+            "RERANKER_MODEL_SHA256 must be exactly 64 lowercase hexadecimal characters"
+        )
+    prompt_profile_sha256 = _required(environ, "RERANKER_PROMPT_PROFILE_SHA256")
+    if SHA256_PATTERN.fullmatch(prompt_profile_sha256) is None:
+        raise ValueError(
+            "RERANKER_PROMPT_PROFILE_SHA256 must be exactly 64 lowercase hexadecimal characters"
+        )
+    if not hmac.compare_digest(prompt_profile_sha256, RERANK_PROMPT_PROFILE_SHA256):
+        raise ValueError("RERANKER_PROMPT_PROFILE_SHA256 must match the reranker prompt profile")
+    protocol_version = _required(environ, "RERANKER_PROTOCOL_VERSION")
+    return RerankerModelMetadata(
+        name,
+        version,
+        sha256,
+        prompt_profile_sha256,
+        protocol_version,
+    )
+
+
+def _load_ollama_reranker_backend(
+    environ: Mapping[str, str],
+    metadata: RerankerModelMetadata,
+) -> RerankerBackend:
+    base_url = _required(environ, "OLLAMA_BASE_URL")
+    model = _required(environ, "OLLAMA_RERANKER_MODEL")
+    if model != metadata.name:
+        raise ValueError("OLLAMA_RERANKER_MODEL must equal RERANKER_MODEL_NAME")
+    path = environ.get("OLLAMA_GENERATE_PATH")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("OLLAMA_GENERATE_PATH is required")
+    if path != "/api/generate":
+        raise ValueError("Ollama generate path must be /api/generate")
+    keep_alive = _required(environ, "OLLAMA_KEEP_ALIVE")
+    timeout_seconds = _required_positive_float(environ, "OLLAMA_REQUEST_TIMEOUT_SECONDS")
+    format_json = _required_boolean(environ, "OLLAMA_RERANK_FORMAT_JSON")
+    num_predict = _required_positive_int(environ, "OLLAMA_RERANK_NUM_PREDICT")
+    client = SyncOllamaClient(base_url, timeout_seconds=timeout_seconds)
+    try:
+        return OllamaGenerativeRerankerBackend(
+            client,
+            model=model,
+            path=path,
+            keep_alive=keep_alive,
+            format_json=format_json,
+            num_predict=num_predict,
+        )
+    except Exception:
+        try:
+            client.close()
+        except Exception:
+            pass
+        raise
 
 
 def _invoke_backend_pairs(
@@ -392,6 +464,41 @@ def _required(environ: Mapping[str, str], name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} is required")
     return value.strip()
+
+
+def _required_positive_int(environ: Mapping[str, str], name: str) -> int:
+    raw_value = environ.get(name)
+    if isinstance(raw_value, bool) or not isinstance(raw_value, str):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _required_positive_float(environ: Mapping[str, str], name: str) -> float:
+    raw_value = environ.get(name)
+    if isinstance(raw_value, bool) or not isinstance(raw_value, str):
+        raise ValueError(f"{name} must be a positive finite number")
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive finite number") from error
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return value
+
+
+def _required_boolean(environ: Mapping[str, str], name: str) -> bool:
+    value = environ.get(name)
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"{name} must be a boolean encoded as true or false")
 
 
 def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
