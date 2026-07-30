@@ -1,4 +1,4 @@
-"""Fail-closed configuration for Qwen3 hybrid retrieval."""
+"""Fail-closed configuration for hybrid retrieval."""
 
 from __future__ import annotations
 
@@ -16,9 +16,6 @@ class RetrievalSettingsError(ValueError):
     pass
 
 
-_EMBEDDING_NAME = "Qwen/Qwen3-Embedding-0.6B"
-_RERANKER_NAME = "Qwen/Qwen3-Reranker-0.6B"
-_QWEN3_DIMENSIONS = 1024
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -101,16 +98,10 @@ def _embedding_metadata(
     environ: Mapping[str, str],
     *,
     prefix: str,
-    expected_name: str,
 ) -> EmbeddingModelMetadata:
     name = _required(environ, f"{prefix}_MODEL_NAME")
-    if name != expected_name:
-        raise RetrievalSettingsError(f"{prefix}_MODEL_NAME must be {expected_name}")
-
     dimensions_key = f"{prefix}_MODEL_DIMENSIONS"
     dimensions = _integer(environ, dimensions_key, 0)
-    if dimensions != _QWEN3_DIMENSIONS:
-        raise RetrievalSettingsError(f"{dimensions_key} must be {_QWEN3_DIMENSIONS}")
 
     normalized_key = f"{prefix}_MODEL_NORMALIZED"
     try:
@@ -134,8 +125,6 @@ def _embedding_metadata(
 
 def _reranker_metadata(environ: Mapping[str, str]) -> RerankerModelSettings:
     name = _required(environ, "RERANKER_MODEL_NAME")
-    if name != _RERANKER_NAME:
-        raise RetrievalSettingsError(f"RERANKER_MODEL_NAME must be {_RERANKER_NAME}")
     try:
         return RerankerModelSettings(
             name=name,
@@ -266,7 +255,6 @@ class RetrievalSettings:
             embedding=_embedding_metadata(
                 environ,
                 prefix="EMBEDDING",
-                expected_name=_EMBEDDING_NAME,
             ),
             reranker=_reranker_metadata(environ),
         )

@@ -37,8 +37,8 @@ from app.structured_models import StructuredColumnType, StructuredPublicationRes
 from app.structured_repository import StructuredRepository
 
 EMBEDDING = EmbeddingModelMetadata(
-    name="Qwen/Qwen3-Embedding-0.6B",
-    version="qwen3-embedding-v1",
+    name="qwen2.5:0.5b",
+    version="qwen25-embedding-v1",
     sha256="a" * 64,
     dimensions=3,
     normalized=True,
@@ -124,6 +124,7 @@ class RecordingGateway:
         alias_after_activation_failure: str | None = None,
         unrelated_authorized_hits: bool = False,
         wrong_point_identity_hits: bool = False,
+        collection_schema_dimensions: int | None = None,
     ) -> None:
         self.events: list[str] = []
         self.points: list[models.PointStruct] = []
@@ -142,6 +143,7 @@ class RecordingGateway:
         self.alias_after_activation_failure = alias_after_activation_failure
         self.unrelated_authorized_hits = unrelated_authorized_hits
         self.wrong_point_identity_hits = wrong_point_identity_hits
+        self.collection_schema_dimensions = collection_schema_dimensions
         self.activation_error_message = "ambiguous alias update failure"
         self.restore_error_message = "restore unavailable"
         self.existing_collections: set[str] = set()
@@ -157,9 +159,16 @@ class RecordingGateway:
         self.create_entered = Event()
         self.create_release = Event()
         self.timeline: list[str] = []
+        self.created_dense_dimensions: list[int] = []
+        self.validated_dense_dimensions: list[int] = []
+        self.collection_dimensions: dict[str, int] = {}
 
     def create_collection(self, collection_name, *, dense_dimensions):
         self.events.append("create")
+        self.created_dense_dimensions.append(dense_dimensions)
+        self.collection_dimensions[collection_name] = (
+            self.collection_schema_dimensions or dense_dimensions
+        )
         self.existing_collections.add(collection_name)
         if self.block_first_create:
             self.block_first_create = False
@@ -182,6 +191,9 @@ class RecordingGateway:
 
     def validate_collection(self, collection_name, *, dense_dimensions, expected_point_count):
         self.events.append(f"validate:{expected_point_count}")
+        self.validated_dense_dimensions.append(dense_dimensions)
+        if self.collection_dimensions[collection_name] != dense_dimensions:
+            raise ValueError("dense dimension mismatch")
         if self.fail_validation:
             raise ValueError("permission probe failed")
         return expected_point_count
@@ -507,6 +519,7 @@ def build_publisher(
     alias_after_activation_failure=None,
     unrelated_authorized_hits=False,
     wrong_point_identity_hits=False,
+    collection_schema_dimensions=None,
     repository=None,
     audit=None,
     structured_catalog_provider=None,
@@ -523,6 +536,7 @@ def build_publisher(
         alias_after_activation_failure=alias_after_activation_failure,
         unrelated_authorized_hits=unrelated_authorized_hits,
         wrong_point_identity_hits=wrong_point_identity_hits,
+        collection_schema_dimensions=collection_schema_dimensions,
     )
     audit = audit or RecordingAudit(
         fail_activation=fail_activation,
@@ -701,6 +715,8 @@ class RetrievalPublicationTest(unittest.TestCase):
         result = publisher.build_and_activate("knowledge_chunks_qwen3_v1")
 
         self.assertEqual(result.point_count, 3)
+        self.assertEqual(publisher.gateway.created_dense_dimensions, [EMBEDDING.dimensions])
+        self.assertEqual(publisher.gateway.validated_dense_dimensions, [EMBEDDING.dimensions])
         self.assertEqual(
             publisher.gateway.events,
             [
@@ -719,6 +735,19 @@ class RetrievalPublicationTest(unittest.TestCase):
                 "activate_alias",
             ],
         )
+
+    def test_gateway_schema_dimension_mismatch_fails_before_alias_activation(self) -> None:
+        publisher = build_publisher(
+            chunks=sample_chunks(3),
+            collection_schema_dimensions=EMBEDDING.dimensions + 1,
+        )
+
+        with self.assertRaises(IndexValidationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        self.assertEqual(publisher.gateway.created_dense_dimensions, [EMBEDDING.dimensions])
+        self.assertEqual(publisher.gateway.validated_dense_dimensions, [EMBEDDING.dimensions])
+        self.assertNotIn("activate_alias", publisher.gateway.events)
 
     def test_failed_build_never_moves_alias_and_deletes_only_unaliased_collection(self) -> None:
         publisher = build_publisher(chunks=sample_chunks(3), fail_validation=True)
