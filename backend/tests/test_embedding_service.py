@@ -12,6 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from app import embedding_service
 from app.embedding_contracts import (
     EmbeddingMetadataExpectation,
     EmbeddingMetadataResponse,
@@ -382,6 +383,29 @@ class EmbeddingServiceTest(unittest.TestCase):
                 self.assertEqual(loader_calls, [])
                 self.assertFalse(app.state.embedding_ready)
 
+    def test_production_startup_rejects_whitespace_environment_metadata(self) -> None:
+        fields = (
+            "EMBEDDING_MODEL_NAME",
+            "EMBEDDING_MODEL_VERSION",
+            "EMBEDDING_MODEL_SHA256",
+            "EMBEDDING_MODEL_DIMENSIONS",
+            "EMBEDDING_MODEL_NORMALIZED",
+            "EMBEDDING_ENCODING_PROFILE_SHA256",
+            "EMBEDDING_PROTOCOL_VERSION",
+        )
+        for field in fields:
+            with self.subTest(field=field):
+                loader_calls: list[object] = []
+                app = create_production_app(
+                    environ=production_environment(**{field: " \t "}),
+                    backend_loader=lambda values, pinned: loader_calls.append(values),
+                )
+                with self.assertRaisesRegex(ValueError, field):
+                    with TestClient(app):
+                        pass
+                self.assertEqual(loader_calls, [])
+                self.assertFalse(app.state.embedding_ready)
+
     def test_production_startup_rejects_invalid_environment_metadata(self) -> None:
         cases = (
             ("EMBEDDING_MODEL_SHA256", "A" * 64),
@@ -389,6 +413,7 @@ class EmbeddingServiceTest(unittest.TestCase):
             ("EMBEDDING_ENCODING_PROFILE_SHA256", "g" * 64),
             ("EMBEDDING_ENCODING_PROFILE_SHA256", "e" * 63),
             ("EMBEDDING_MODEL_DIMENSIONS", "0"),
+            ("EMBEDDING_MODEL_DIMENSIONS", "-1"),
             ("EMBEDDING_MODEL_DIMENSIONS", "4.5"),
             ("EMBEDDING_MODEL_NORMALIZED", "false"),
         )
@@ -413,11 +438,15 @@ class EmbeddingServiceTest(unittest.TestCase):
             ("OLLAMA_EMBEDDING_MODEL", "different-model", "must equal"),
             ("OLLAMA_EMBEDDING_PATH", None, "OLLAMA_EMBEDDING_PATH"),
             ("OLLAMA_EMBEDDING_PATH", "/api/generate", "embedding path"),
+            ("OLLAMA_KEEP_ALIVE", None, "OLLAMA_KEEP_ALIVE"),
             ("OLLAMA_KEEP_ALIVE", "   ", "OLLAMA_KEEP_ALIVE"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", None, "positive finite"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "   ", "positive finite"),
             ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "invalid", "positive finite"),
             ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "nan", "positive finite"),
             ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "inf", "positive finite"),
             ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "0", "positive finite"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "-1", "positive finite"),
         )
         for field, value, message in cases:
             with self.subTest(field=field, value=value):
@@ -430,6 +459,33 @@ class EmbeddingServiceTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     with TestClient(app):
                         pass
+                self.assertFalse(app.state.embedding_ready)
+
+    def test_invalid_keep_alive_and_timeout_fail_before_client_construction(self) -> None:
+        cases = (
+            ("OLLAMA_KEEP_ALIVE", None),
+            ("OLLAMA_KEEP_ALIVE", "   "),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", None),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "   "),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "invalid"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "nan"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "inf"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "0"),
+            ("OLLAMA_REQUEST_TIMEOUT_SECONDS", "-1"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                environ = production_environment()
+                if value is None:
+                    del environ[field]
+                else:
+                    environ[field] = value
+                with patch("app.embedding_service.SyncOllamaClient") as client_type:
+                    app = create_production_app(environ=environ)
+                    with self.assertRaises(ValueError):
+                        with TestClient(app):
+                            pass
+                client_type.assert_not_called()
                 self.assertFalse(app.state.embedding_ready)
 
     def test_default_ollama_factory_constructs_client_and_backend(self) -> None:
@@ -502,6 +558,56 @@ class EmbeddingServiceTest(unittest.TestCase):
             expected = compute_model_directory_sha256(root)
             with patch.object(Path, "read_bytes", side_effect=AssertionError("full read")):
                 self.assertEqual(compute_model_directory_sha256(root), expected)
+
+    def test_local_configuration_rejects_checksum_mismatch_before_manifest_loading(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "weights.bin").write_bytes(b"offline model weights")
+            with patch.object(
+                embedding_service,
+                "_read_model_metadata_manifest",
+                side_effect=AssertionError("manifest loader must not run"),
+            ):
+                with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                    embedding_service._load_pinned_model_configuration(
+                        {
+                            "EMBEDDING_MODEL_ROOT": str(root),
+                            "EMBEDDING_MODEL_SHA256": "b" * 64,
+                        }
+                    )
+
+    def test_local_metadata_manifest_rejects_missing_invalid_and_wrong_fields(self) -> None:
+        valid_payload = {
+            "modelName": "bge-test",
+            "modelVersion": "1",
+            "dimensions": 4,
+            "normalized": True,
+            "encodingProfileSha256": "e" * 64,
+            "protocolVersion": "1",
+        }
+        cases = (
+            (None, "regular file"),
+            ("{", "invalid"),
+            (
+                json.dumps(
+                    {key: value for key, value in valid_payload.items() if key != "modelName"}
+                ),
+                "missing fields: modelName",
+            ),
+            (json.dumps({**valid_payload, "unexpected": "field"}), "unexpected fields: unexpected"),
+        )
+        for manifest, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                if manifest is not None:
+                    (root / EMBEDDING_METADATA_FILENAME).write_text(
+                        manifest,
+                        encoding="utf-8",
+                    )
+                with self.assertRaisesRegex(ValueError, message):
+                    embedding_service._read_model_metadata_manifest(root, "a" * 64)
 
     def test_flag_loader_sets_offline_environment_before_local_model_import(self) -> None:
         model_root = Path("C:/offline/models/bge-test")
