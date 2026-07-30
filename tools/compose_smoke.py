@@ -25,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WRAPPER_PATH = REPO_ROOT / "tools" / "invoke_offline_compose.ps1"
 DEFAULT_REPORT_PATH = REPO_ROOT / "artifacts" / "benchmarks" / "compose-smoke.json"
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+APPROVED_EMBEDDING_MODEL = "qwen2.5:0.5b"
+APPROVED_RERANKER_MODEL = "qwen2.5:3b"
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,7 @@ cat <&3
 """
 HTTP_HELPER_SCRIPT = r"""
 import json, math, os, time, urllib.error, urllib.request
+APPROVED_MODEL = __APPROVED_EMBEDDING_MODEL__
 def call(url, payload=None):
     started = time.perf_counter()
     request = urllib.request.Request(
@@ -212,7 +215,7 @@ def expected_metadata():
     try: dimensions = int(os.environ.get("EMBEDDING_MODEL_DIMENSIONS", "0"))
     except Exception: dimensions = 0
     return {
-        "modelName": os.environ.get("EMBEDDING_MODEL_NAME", ""),
+        "modelName": APPROVED_MODEL,
         "modelVersion": os.environ.get("EMBEDDING_MODEL_VERSION", ""),
         "modelChecksum": os.environ.get("EMBEDDING_MODEL_SHA256", ""),
         "dimensions": dimensions,
@@ -223,14 +226,18 @@ def expected_metadata():
 def metadata_matches(body, expected):
     return body is not None and all(body.get(key) == value for key, value in expected.items())
 expected = expected_metadata()
+configured_model_matches = os.environ.get("EMBEDDING_MODEL_NAME", "") == APPROVED_MODEL
 ready_result, ready = call("http://127.0.0.1:8081/readyz")
 if ready_result["errorCode"] is None and (
-    ready is None or ready.get("status") != "ready" or not metadata_matches(ready, expected)
+    not configured_model_matches or ready is None or ready.get("status") != "ready" or
+    not metadata_matches(ready, expected)
 ):
     ready_result["errorCode"] = "metadata_mismatch"
 metadata_result, metadata = call("http://127.0.0.1:8081/v1/metadata")
 metadata_result["dimensions"] = metadata.get("dimensions") if metadata is not None else None
-if metadata_result["errorCode"] is None and not metadata_matches(metadata, expected):
+if metadata_result["errorCode"] is None and (
+    not configured_model_matches or not metadata_matches(metadata, expected)
+):
     metadata_result["errorCode"] = "metadata_mismatch"
 embedding_result, embedding = call(
     "http://127.0.0.1:8081/v1/embeddings",
@@ -247,14 +254,19 @@ valid_vectors = (
     all(type(value) in (int, float) and math.isfinite(float(value)) for vector in vectors for value in vector)
 )
 if embedding_result["errorCode"] is None and (
-    not metadata_matches(embedding, expected) or embedding.get("purpose") != "query" or not valid_vectors
+    not configured_model_matches or not metadata_matches(embedding, expected) or
+    embedding.get("purpose") != "query" or not valid_vectors
 ):
     embedding_result["errorCode"] = "embedding_mismatch"
 print(json.dumps({"ready": ready_result, "metadata": metadata_result,
                   "embeddings": embedding_result}, sort_keys=True))
-""".strip()
+""".replace(
+    "__APPROVED_EMBEDDING_MODEL__",
+    json.dumps(APPROVED_EMBEDDING_MODEL),
+).strip()
 RERANKER_HTTP_HELPER_SCRIPT = r"""
 import json, math, os, time, urllib.error, urllib.request
+APPROVED_MODEL = __APPROVED_RERANKER_MODEL__
 def call(url, payload=None):
     started = time.perf_counter()
     request = urllib.request.Request(
@@ -287,7 +299,7 @@ def call(url, payload=None):
         return result, None
     return result, body
 expected = {
-    "modelName": os.environ.get("RERANKER_MODEL_NAME", ""),
+    "modelName": APPROVED_MODEL,
     "modelVersion": os.environ.get("RERANKER_MODEL_VERSION", ""),
     "modelChecksum": os.environ.get("RERANKER_MODEL_SHA256", ""),
     "promptProfileSha256": os.environ.get("RERANKER_PROMPT_PROFILE_SHA256", ""),
@@ -295,13 +307,17 @@ expected = {
 }
 def metadata_matches(body):
     return body is not None and all(body.get(key) == value for key, value in expected.items())
+configured_model_matches = os.environ.get("RERANKER_MODEL_NAME", "") == APPROVED_MODEL
 ready_result, ready = call("http://127.0.0.1:8082/readyz")
 if ready_result["errorCode"] is None and (
-    ready is None or ready.get("status") != "ready" or not metadata_matches(ready)
+    not configured_model_matches or ready is None or ready.get("status") != "ready" or
+    not metadata_matches(ready)
 ):
     ready_result["errorCode"] = "metadata_mismatch"
 metadata_result, metadata = call("http://127.0.0.1:8082/v1/metadata")
-if metadata_result["errorCode"] is None and not metadata_matches(metadata):
+if metadata_result["errorCode"] is None and (
+    not configured_model_matches or not metadata_matches(metadata)
+):
     metadata_result["errorCode"] = "metadata_mismatch"
 rerank_result, rerank = call(
     "http://127.0.0.1:8082/v1/rerank",
@@ -315,12 +331,16 @@ valid_scores = (
         for score in scores)
 )
 if rerank_result["errorCode"] is None and (
-    not metadata_matches(rerank) or rerank.get("passageCount") != 2 or not valid_scores
+    not configured_model_matches or not metadata_matches(rerank) or
+    rerank.get("passageCount") != 2 or not valid_scores
 ):
     rerank_result["errorCode"] = "rerank_mismatch"
 print(json.dumps({"ready": ready_result, "metadata": metadata_result,
                   "rerank": rerank_result}, sort_keys=True))
-""".strip()
+""".replace(
+    "__APPROVED_RERANKER_MODEL__",
+    json.dumps(APPROVED_RERANKER_MODEL),
+).strip()
 API_HELPER_SCRIPT = r"""
 import json, urllib.error, urllib.request
 url = "http://127.0.0.1:8000/api/readyz"

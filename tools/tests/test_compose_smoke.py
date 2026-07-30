@@ -16,7 +16,17 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "tools" / "compose_smoke.py"
-EMBEDDING_DIMENSIONS = 896
+QWEN25_EMBEDDING_MODEL = "qwen2.5:0.5b"
+QWEN25_RERANKER_MODEL = "qwen2.5:3b"
+MEASURED_EMBEDDING_DIMENSIONS = 37
+MODEL_SHA256 = "a" * 64
+RERANKER_SHA256 = "c" * 64
+ENCODING_PROFILE_SHA256 = (
+    "deebb4d03b8c3b08d2865df27c96a1e1c2dacee0df2e7792c4980f73ceb127a4"
+)
+PROMPT_PROFILE_SHA256 = (
+    "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd"
+)
 
 
 def _operation(**overrides: object) -> dict[str, object]:
@@ -46,14 +56,146 @@ def _migration_head() -> str:
 def _embedding_payload(**overrides: object) -> str:
     payload: dict[str, object] = {
         "ready": _operation(),
-        "metadata": _operation(dimensions=EMBEDDING_DIMENSIONS),
+        "metadata": _operation(dimensions=MEASURED_EMBEDDING_DIMENSIONS),
         "embeddings": _operation(
             vectorCount=1,
-            dimensions=EMBEDDING_DIMENSIONS,
+            dimensions=MEASURED_EMBEDDING_DIMENSIONS,
         ),
     }
     payload.update(overrides)
     return json.dumps(payload)
+
+
+def _embedding_environment(
+    *,
+    model: str = QWEN25_EMBEDDING_MODEL,
+    dimensions: int = MEASURED_EMBEDDING_DIMENSIONS,
+) -> dict[str, str]:
+    return {
+        "EMBEDDING_MODEL_NAME": model,
+        "EMBEDDING_MODEL_VERSION": "ollama-qwen25-05b-v1",
+        "EMBEDDING_MODEL_SHA256": MODEL_SHA256,
+        "EMBEDDING_MODEL_DIMENSIONS": str(dimensions),
+        "EMBEDDING_MODEL_NORMALIZED": "true",
+        "EMBEDDING_ENCODING_PROFILE_SHA256": ENCODING_PROFILE_SHA256,
+        "EMBEDDING_PROTOCOL_VERSION": "v1",
+    }
+
+
+def _embedding_metadata(
+    *,
+    model: str = QWEN25_EMBEDDING_MODEL,
+    dimensions: int = MEASURED_EMBEDDING_DIMENSIONS,
+) -> dict[str, object]:
+    return {
+        "modelName": model,
+        "modelVersion": "ollama-qwen25-05b-v1",
+        "modelChecksum": MODEL_SHA256,
+        "dimensions": dimensions,
+        "normalized": True,
+        "encodingProfileSha256": ENCODING_PROFILE_SHA256,
+        "protocolVersion": "v1",
+    }
+
+
+def _reranker_environment(*, model: str = QWEN25_RERANKER_MODEL) -> dict[str, str]:
+    return {
+        "RERANKER_MODEL_NAME": model,
+        "RERANKER_MODEL_VERSION": "ollama-qwen25-3b-v1",
+        "RERANKER_MODEL_SHA256": RERANKER_SHA256,
+        "RERANKER_PROMPT_PROFILE_SHA256": PROMPT_PROFILE_SHA256,
+        "RERANKER_PROTOCOL_VERSION": "v1",
+    }
+
+
+def _reranker_metadata(*, model: str = QWEN25_RERANKER_MODEL) -> dict[str, object]:
+    return {
+        "modelName": model,
+        "modelVersion": "ollama-qwen25-3b-v1",
+        "modelChecksum": RERANKER_SHA256,
+        "promptProfileSha256": PROMPT_PROFILE_SHA256,
+        "protocolVersion": "v1",
+    }
+
+
+class _HelperResponse:
+    def __init__(self, payload: dict[str, object], status: int = 200) -> None:
+        self.status = status
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _run_helper(
+    script: str,
+    *,
+    environ: dict[str, str],
+    responses: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    def urlopen(request, *, timeout):
+        del timeout
+        return _HelperResponse(responses[request.full_url])
+
+    output = io.StringIO()
+    with (
+        mock.patch.dict("os.environ", environ, clear=True),
+        mock.patch("urllib.request.urlopen", side_effect=urlopen),
+        contextlib.redirect_stdout(output),
+    ):
+        exec(compile(script, "compose-smoke-helper", "exec"), {})
+    return json.loads(output.getvalue())
+
+
+def _run_embedding_helper(
+    script: str,
+    *,
+    environment_model: str = QWEN25_EMBEDDING_MODEL,
+    metadata_model: str = QWEN25_EMBEDDING_MODEL,
+    dimensions: int = MEASURED_EMBEDDING_DIMENSIONS,
+) -> dict[str, object]:
+    metadata = _embedding_metadata(model=metadata_model, dimensions=dimensions)
+    return _run_helper(
+        script,
+        environ=_embedding_environment(model=environment_model, dimensions=dimensions),
+        responses={
+            "http://127.0.0.1:8081/readyz": {"status": "ready", **metadata},
+            "http://127.0.0.1:8081/v1/metadata": metadata,
+            "http://127.0.0.1:8081/v1/embeddings": {
+                **metadata,
+                "purpose": "query",
+                "vectors": [[0.25] * dimensions],
+            },
+        },
+    )
+
+
+def _run_reranker_helper(
+    script: str,
+    *,
+    environment_model: str = QWEN25_RERANKER_MODEL,
+    metadata_model: str = QWEN25_RERANKER_MODEL,
+) -> dict[str, object]:
+    metadata = _reranker_metadata(model=metadata_model)
+    return _run_helper(
+        script,
+        environ=_reranker_environment(model=environment_model),
+        responses={
+            "http://127.0.0.1:8082/readyz": {"status": "ready", **metadata},
+            "http://127.0.0.1:8082/v1/metadata": metadata,
+            "http://127.0.0.1:8082/v1/rerank": {
+                **metadata,
+                "passageCount": 2,
+                "scores": [0.75, 0.25],
+            },
+        },
+    )
 
 
 def _reranker_payload(**overrides: object) -> str:
@@ -166,6 +308,138 @@ class FakeRunner:
 
 
 class ComposeSmokeTest(unittest.TestCase):
+    def test_adapter_helpers_pin_qwen25_models_and_inject_measured_dimensions(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        self.assertEqual(
+            compose_smoke.APPROVED_EMBEDDING_MODEL,
+            QWEN25_EMBEDDING_MODEL,
+        )
+        self.assertEqual(
+            compose_smoke.APPROVED_RERANKER_MODEL,
+            QWEN25_RERANKER_MODEL,
+        )
+
+        embedding = _run_embedding_helper(compose_smoke.HTTP_HELPER_SCRIPT)
+        self.assertTrue(
+            all(
+                embedding[name]["errorCode"] is None
+                for name in ("ready", "metadata", "embeddings")
+            )
+        )
+        self.assertEqual(
+            embedding["metadata"]["dimensions"],
+            MEASURED_EMBEDDING_DIMENSIONS,
+        )
+        self.assertEqual(
+            embedding["embeddings"]["dimensions"],
+            MEASURED_EMBEDDING_DIMENSIONS,
+        )
+
+        reranker = _run_reranker_helper(compose_smoke.RERANKER_HTTP_HELPER_SCRIPT)
+        self.assertTrue(
+            all(
+                reranker[name]["errorCode"] is None
+                for name in ("ready", "metadata", "rerank")
+            )
+        )
+
+    def test_adapter_helpers_reject_wrong_models_even_when_service_env_agrees(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        wrong_embedding_models = (
+            "Qwen/Qwen3-Embedding-0.6B",
+            "wrong-embedding-model",
+        )
+        for wrong_model in wrong_embedding_models:
+            with self.subTest(component="embedding", model=wrong_model):
+                result = _run_embedding_helper(
+                    compose_smoke.HTTP_HELPER_SCRIPT,
+                    environment_model=wrong_model,
+                    metadata_model=wrong_model,
+                )
+                self.assertEqual(result["ready"]["errorCode"], "metadata_mismatch")
+                self.assertEqual(
+                    result["metadata"]["errorCode"],
+                    "metadata_mismatch",
+                )
+                self.assertEqual(
+                    result["embeddings"]["errorCode"],
+                    "embedding_mismatch",
+                )
+
+        wrong_reranker_models = (
+            "Qwen/Qwen3-Reranker-0.6B",
+            "wrong-reranker-model",
+        )
+        for wrong_model in wrong_reranker_models:
+            with self.subTest(component="reranker", model=wrong_model):
+                result = _run_reranker_helper(
+                    compose_smoke.RERANKER_HTTP_HELPER_SCRIPT,
+                    environment_model=wrong_model,
+                    metadata_model=wrong_model,
+                )
+                self.assertEqual(result["ready"]["errorCode"], "metadata_mismatch")
+                self.assertEqual(
+                    result["metadata"]["errorCode"],
+                    "metadata_mismatch",
+                )
+                self.assertEqual(result["rerank"]["errorCode"], "rerank_mismatch")
+
+        embedding_result = _run_embedding_helper(
+            compose_smoke.HTTP_HELPER_SCRIPT,
+            metadata_model="arbitrary-embedding-model",
+        )
+        self.assertEqual(
+            embedding_result["metadata"]["errorCode"],
+            "metadata_mismatch",
+        )
+
+        reranker_result = _run_reranker_helper(
+            compose_smoke.RERANKER_HTTP_HELPER_SCRIPT,
+            metadata_model="arbitrary-reranker-model",
+        )
+        self.assertEqual(
+            reranker_result["metadata"]["errorCode"],
+            "metadata_mismatch",
+        )
+
+        wrong_embedding_env_result = _run_embedding_helper(
+            compose_smoke.HTTP_HELPER_SCRIPT,
+            environment_model="wrong-env-embedding",
+        )
+        self.assertEqual(
+            wrong_embedding_env_result["metadata"]["errorCode"],
+            "metadata_mismatch",
+        )
+
+        wrong_reranker_env_result = _run_reranker_helper(
+            compose_smoke.RERANKER_HTTP_HELPER_SCRIPT,
+            environment_model="wrong-env-reranker",
+        )
+        self.assertEqual(
+            wrong_reranker_env_result["metadata"]["errorCode"],
+            "metadata_mismatch",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = compose_smoke.run_compose_smoke(
+                report_path=Path(directory) / "report.json",
+                runner=FakeRunner(
+                    outputs={
+                        "embedding": json.dumps(wrong_embedding_env_result),
+                        "reranker": json.dumps(wrong_reranker_env_result),
+                    }
+                ),
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+        self.assertFalse(report["passed"])
+        self.assertIn("check:embedding", report["failures"])
+        self.assertIn("check:reranker", report["failures"])
+
     def test_default_postgres_fixture_uses_discovered_migration_head(self) -> None:
         compose_smoke = _module()
         postgres = json.loads(FakeRunner._default_output("postgres"))
@@ -473,7 +747,7 @@ class ComposeSmokeTest(unittest.TestCase):
             "metadata": _embedding_payload(
                 metadata=_operation(
                     status=200,
-                    dimensions=EMBEDDING_DIMENSIONS,
+                    dimensions=MEASURED_EMBEDDING_DIMENSIONS,
                     errorCode="metadata_mismatch",
                 )
             ),
@@ -483,7 +757,7 @@ class ComposeSmokeTest(unittest.TestCase):
             "count": _embedding_payload(
                 embeddings=_operation(
                     vectorCount=0,
-                    dimensions=EMBEDDING_DIMENSIONS,
+                    dimensions=MEASURED_EMBEDDING_DIMENSIONS,
                 )
             ),
         }
@@ -732,10 +1006,10 @@ class ComposeSmokeTest(unittest.TestCase):
                 {
                     "passed": True,
                     "ready": _operation(),
-                    "metadata": _operation(dimensions=EMBEDDING_DIMENSIONS),
+                    "metadata": _operation(dimensions=MEASURED_EMBEDDING_DIMENSIONS),
                     "embeddings": _operation(
                         vectorCount=1,
-                        dimensions=EMBEDDING_DIMENSIONS,
+                        dimensions=MEASURED_EMBEDDING_DIMENSIONS,
                     ),
                 },
             )
