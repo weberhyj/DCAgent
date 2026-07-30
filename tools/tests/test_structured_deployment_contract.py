@@ -75,7 +75,8 @@ def service_block(compose: str, service: str) -> str:
 class StructuredDeploymentContractTests(unittest.TestCase):
     def test_env_examples_define_structured_rollout_contract(self) -> None:
         for path in ENV_EXAMPLES:
-            values = active_assignments(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            values = active_assignments(text)
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 for key in REQUIRED_ENV_KEYS:
                     self.assertIn(key, values)
@@ -97,7 +98,17 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(
                     values["EMBEDDING_MODEL_VERSION"], "ollama-qwen25-05b-v1"
                 )
-                self.assertEqual(values["EMBEDDING_MODEL_DIMENSIONS"], "896")
+                dimensions = values["EMBEDDING_MODEL_DIMENSIONS"]
+                self.assertRegex(dimensions, r"^[1-9][0-9]*$")
+                self.assertGreater(int(dimensions), 0)
+                self.assertRegex(
+                    text,
+                    r"(?m)^# Operator action: before deployment, call the target "
+                    r"Ollama /api/embed endpoint\.\n"
+                    r"# Measure len\(embeddings\[0\]\) in the response and replace "
+                    r"the example value below\.\n"
+                    r"EMBEDDING_MODEL_DIMENSIONS=[1-9][0-9]*$",
+                )
                 self.assertEqual(values["EMBEDDING_MODEL_NORMALIZED"], "true")
                 self.assertEqual(
                     values["EMBEDDING_ENCODING_PROFILE_SHA256"],
