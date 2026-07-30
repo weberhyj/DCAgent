@@ -121,7 +121,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(values["EMBEDDING_MODEL_NORMALIZED"], "true")
                 self.assertEqual(
                     values["EMBEDDING_ENCODING_PROFILE_SHA256"],
-                    "44f2b1c9565fdfebaa0d1df064367cfab9cd884106fdd6150f19ca8eb4ade30b",
+                    "deebb4d03b8c3b08d2865df27c96a1e1c2dacee0df2e7792c4980f73ceb127a4",
                 )
                 self.assertEqual(values["RERANKER_MODEL_NAME"], "qwen2.5:3b")
                 self.assertEqual(

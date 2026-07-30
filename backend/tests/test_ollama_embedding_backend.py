@@ -1,11 +1,33 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import unittest
 from collections.abc import Callable, Mapping
 
+from app import ollama_embedding_backend
 from app.ollama_client import OllamaResponseError, OllamaServiceError
 from app.ollama_embedding_backend import OllamaEmbeddingBackend
+
+EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE = "\n".join(
+    (
+        "profile=dc-agent.ollama.embedding",
+        "protocol=dc-agent.ollama.embedding.v1",
+        "purpose.query=raw_text",
+        "purpose.document=raw_text",
+        "modern.path=/api/embed",
+        "modern.input=raw_text_batch",
+        "modern.truncate=true",
+        "legacy.path=/api/embeddings",
+        "legacy.prompt=single_raw_text",
+        "output.count=one_per_input",
+        "output.dimensions=configured_exact",
+        "output.coordinates=finite_numeric",
+        "output.vector=nonzero",
+        "normalization.algorithm=max_abs_scaled_l2",
+        "normalization.output=unit_l2",
+    )
+)
 
 
 class RecordingOllamaClient:
@@ -35,6 +57,24 @@ class RecordingOllamaClient:
 
 
 class OllamaEmbeddingBackendTest(unittest.TestCase):
+    def test_encoding_profile_is_canonical_and_hash_derived(self) -> None:
+        profile = getattr(ollama_embedding_backend, "OLLAMA_EMBEDDING_ENCODING_PROFILE", None)
+        self.assertEqual(
+            profile,
+            EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE,
+        )
+        self.assertIsInstance(profile, str)
+        self.assertTrue(profile.isascii())
+        self.assertNotIn("\r", profile)
+        self.assertFalse(profile.endswith("\n"))
+        self.assertTrue(
+            all(line.count("=") == 1 and line.split("=", 1)[0] for line in profile.split("\n"))
+        )
+        self.assertEqual(
+            ollama_embedding_backend.OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256,
+            hashlib.sha256(EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE.encode("utf-8")).hexdigest(),
+        )
+
     def assert_response_error(self, operation: Callable[[], object]) -> None:
         try:
             operation()
@@ -364,21 +404,26 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
             ],
         )
 
-    def test_query_and_document_use_the_same_raw_text(self) -> None:
-        for purpose in ("query", "document"):
-            with self.subTest(purpose=purpose):
-                client = RecordingOllamaClient([{"embeddings": [[1, 0]]}])
-                backend = OllamaEmbeddingBackend(
-                    client,
-                    model="qwen2.5",
-                    path="/api/embed",
-                    dimensions=2,
-                    keep_alive="10m",
-                )
+    def test_query_and_document_use_the_same_raw_text_for_both_endpoints(self) -> None:
+        for path, response, payload_field in (
+            ("/api/embed", {"embeddings": [[1, 0]]}, "input"),
+            ("/api/embeddings", {"embedding": [1, 0]}, "prompt"),
+        ):
+            for purpose in ("query", "document"):
+                with self.subTest(path=path, purpose=purpose):
+                    client = RecordingOllamaClient([response])
+                    backend = OllamaEmbeddingBackend(
+                        client,
+                        model="qwen2.5",
+                        path=path,
+                        dimensions=2,
+                        keep_alive="10m",
+                    )
 
-                backend.embed(["raw text"], purpose=purpose)
+                    backend.embed(["raw text"], purpose=purpose)
 
-                self.assertEqual(client.calls[0][1]["input"], ["raw text"])  # type: ignore[index]
+                    expected_text: object = ["raw text"] if path == "/api/embed" else "raw text"
+                    self.assertEqual(client.calls[0][1][payload_field], expected_text)  # type: ignore[index]
 
 
 if __name__ == "__main__":

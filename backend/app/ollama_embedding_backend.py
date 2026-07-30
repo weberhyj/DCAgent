@@ -1,14 +1,34 @@
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Sequence
 
 from .embedding_contracts import EmbeddingPurpose
 from .ollama_client import OllamaResponseError, SyncOllamaClient
 
-OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256 = (
-    "44f2b1c9565fdfebaa0d1df064367cfab9cd884106fdd6150f19ca8eb4ade30b"
+OLLAMA_EMBEDDING_ENCODING_PROFILE = "\n".join(
+    (
+        "profile=dc-agent.ollama.embedding",
+        "protocol=dc-agent.ollama.embedding.v1",
+        "purpose.query=raw_text",
+        "purpose.document=raw_text",
+        "modern.path=/api/embed",
+        "modern.input=raw_text_batch",
+        "modern.truncate=true",
+        "legacy.path=/api/embeddings",
+        "legacy.prompt=single_raw_text",
+        "output.count=one_per_input",
+        "output.dimensions=configured_exact",
+        "output.coordinates=finite_numeric",
+        "output.vector=nonzero",
+        "normalization.algorithm=max_abs_scaled_l2",
+        "normalization.output=unit_l2",
+    )
 )
+OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256 = hashlib.sha256(
+    OLLAMA_EMBEDDING_ENCODING_PROFILE.encode("utf-8")
+).hexdigest()
 
 
 class OllamaEmbeddingBackend:
@@ -115,6 +135,7 @@ def _normalize(vector: object, dimensions: int) -> list[float]:
 
 
 __all__ = [
+    "OLLAMA_EMBEDDING_ENCODING_PROFILE",
     "OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256",
     "OllamaEmbeddingBackend",
 ]

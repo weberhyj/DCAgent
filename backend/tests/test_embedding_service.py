@@ -31,7 +31,7 @@ from app.embedding_service import (
 from app.ollama_client import OllamaResponseError
 
 EXPECTED_OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256 = (
-    "44f2b1c9565fdfebaa0d1df064367cfab9cd884106fdd6150f19ca8eb4ade30b"
+    "deebb4d03b8c3b08d2865df27c96a1e1c2dacee0df2e7792c4980f73ceb127a4"
 )
 
 
