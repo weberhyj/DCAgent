@@ -157,6 +157,17 @@ class OllamaClientTest(unittest.TestCase):
 
         self.assertEqual(transport.calls, [])
 
+    def test_rejects_ascii_control_characters_in_path_without_calls(self) -> None:
+        transport = RecordingTransport()
+        client = SyncOllamaClient("http://localhost:11434", transport=transport)
+
+        for code_point in (*range(32), 127):
+            path = f"/api/foo{chr(code_point)}bar"
+            with self.subTest(code_point=code_point), self.assertRaises(ValueError):
+                client.post_json(path, {})
+
+        self.assertEqual(transport.calls, [])
+
     def test_requires_mapping_response(self) -> None:
         for response in (None, [], "json", 42):
             with self.subTest(response=response):
@@ -180,6 +191,46 @@ class OllamaClientTest(unittest.TestCase):
 
         self.assertIs(result, response)
         self.assertEqual(transport.calls[0][2], 0.25)
+
+    def test_maps_malformed_json_and_unicode_errors_to_response_error(self) -> None:
+        errors = (
+            ValueError("private malformed JSON details"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "private decoding details"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                client = SyncOllamaClient(
+                    "http://ollama:11434",
+                    transport=RecordingTransport(error=error),
+                )
+                with self.assertRaises(OllamaResponseError) as caught:
+                    client.post_json("/api/generate", {})
+                self.assertNotIn("private", str(caught.exception))
+
+    def test_rejects_invalid_timeout_overrides_without_calls(self) -> None:
+        transport = RecordingTransport()
+        client = SyncOllamaClient("http://ollama:11434", transport=transport)
+
+        invalid_timeouts = (
+            0,
+            -1,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+            True,
+            False,
+            "1",
+            object(),
+        )
+        for timeout_seconds in invalid_timeouts:
+            with self.subTest(timeout_seconds=timeout_seconds), self.assertRaises(ValueError):
+                client.post_json(
+                    "/api/generate",
+                    {},
+                    timeout_seconds=timeout_seconds,  # type: ignore[arg-type]
+                )
+
+        self.assertEqual(transport.calls, [])
 
     def test_uses_an_explicitly_injected_falsey_transport(self) -> None:
         transport = FalseyRecordingTransport(response={"ok": True})

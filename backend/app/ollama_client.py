@@ -129,7 +129,7 @@ def _validate_base_url(base_url: str) -> str:
         not isinstance(base_url, str)
         or not base_url
         or base_url != base_url.strip()
-        or any(ord(character) < 32 or ord(character) == 127 for character in base_url)
+        or _contains_ascii_control(base_url)
     ):
         raise ValueError("Ollama base URL must be a non-empty HTTP(S) URL")
     if "?" in base_url or "#" in base_url:
@@ -191,6 +191,8 @@ def _validate_private_host(host: str) -> None:
 def _validate_api_path(path: str) -> str:
     if not isinstance(path, str) or not path.startswith("/api/"):
         raise ValueError("Ollama request path must be an absolute /api/ path")
+    if _contains_ascii_control(path):
+        raise ValueError("Ollama request path must not contain ASCII control characters")
     if "%" in path:
         raise ValueError("Ollama request path must not contain percent encoding")
     parsed = urlsplit(path)
@@ -210,3 +212,7 @@ def _validate_timeout(timeout_seconds: float) -> float:
     ):
         raise ValueError("Ollama timeout must be a positive finite number")
     return float(timeout_seconds)
+
+
+def _contains_ascii_control(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
