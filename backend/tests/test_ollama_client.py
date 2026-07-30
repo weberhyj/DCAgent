@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import gzip
-import json
 import unittest
+import zlib
 from collections.abc import Mapping
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import httpx
 
+from app import ollama_client as ollama_client_module
 from app.embedding_contracts import MAX_EMBEDDING_TEXTS
 from app.ollama_client import (
     DEFAULT_OLLAMA_MAX_RESPONSE_BYTES,
@@ -87,7 +89,7 @@ class RecordingHttpxClient:
         yield httpx.Response(
             200,
             request=httpx.Request(method, url),
-            json={"model": "qwen2.5"},
+            stream=httpx.ByteStream(b'{"model":"qwen2.5"}'),
         )
 
     def close(self) -> None:
@@ -109,7 +111,56 @@ class TrackingByteStream(httpx.SyncByteStream):
         self.close_calls += 1
 
 
+class RecordingZlibDecoder:
+    def __init__(self, decoder: Any) -> None:
+        self.decoder = decoder
+        self.decompress_calls: list[tuple[int, int, int]] = []
+        self.flush_calls: list[tuple[int, int]] = []
+
+    @property
+    def eof(self) -> bool:
+        return self.decoder.eof
+
+    @property
+    def unconsumed_tail(self) -> bytes:
+        return self.decoder.unconsumed_tail
+
+    @property
+    def unused_data(self) -> bytes:
+        return self.decoder.unused_data
+
+    def decompress(self, data: bytes, max_length: int) -> bytes:
+        output = self.decoder.decompress(data, max_length)
+        self.decompress_calls.append((len(data), max_length, len(output)))
+        return output
+
+    def flush(self, length: int) -> bytes:
+        output = self.decoder.flush(length)
+        self.flush_calls.append((length, len(output)))
+        return output
+
+
 class OllamaClientTest(unittest.TestCase):
+    def _controlled_zlib(
+        self,
+    ) -> tuple[SimpleNamespace, list[RecordingZlibDecoder]]:
+        real_decompressobj = zlib.decompressobj
+        decoders: list[RecordingZlibDecoder] = []
+
+        def decompressobj(wbits: int) -> RecordingZlibDecoder:
+            decoder = RecordingZlibDecoder(real_decompressobj(wbits))
+            decoders.append(decoder)
+            return decoder
+
+        return (
+            SimpleNamespace(
+                MAX_WBITS=zlib.MAX_WBITS,
+                error=zlib.error,
+                decompressobj=decompressobj,
+            ),
+            decoders,
+        )
+
     def _default_client_with_handler(
         self,
         handler: Any,
@@ -222,26 +273,171 @@ class OllamaClientTest(unittest.TestCase):
                     self.assertNotIn("10.20.30.40", str(caught.exception))
                 self.assertEqual(stream.close_calls, 1)
 
-    def test_gzip_decoded_response_over_limit_is_rejected(self) -> None:
-        decoded = json.dumps({"payload": "x" * 256}).encode("utf-8")
-        compressed = gzip.compress(decoded)
-        self.assertLess(len(compressed), 64)
+    def test_small_and_exact_limit_gzip_json_succeed(self) -> None:
+        exact_limit = 64
+        bodies = (
+            (b'{"ok":true}', exact_limit),
+            (b'{"ok":true}', len(b'{"ok":true}')),
+            (b'{"ok":true}' + b" " * (exact_limit - len(b'{"ok":true}')), exact_limit),
+        )
+        for body, limit in bodies:
+            with self.subTest(body_length=len(body), limit=limit):
+                compressed = gzip.compress(body)
+                stream = TrackingByteStream([compressed])
+                controlled_zlib, decoders = self._controlled_zlib()
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        200,
+                        headers={
+                            "Content-Encoding": "gzip",
+                            "Content-Length": str(len(compressed)),
+                        },
+                        stream=stream,
+                        request=request,
+                    )
+
+                client, _ = self._default_client_with_handler(
+                    handler,
+                    max_response_bytes=limit,
+                )
+
+                with patch.object(ollama_client_module, "zlib", controlled_zlib):
+                    self.assertEqual(client.get_json("/api/tags"), {"ok": True})
+                self.assertEqual(len(decoders), 1)
+                decoder = decoders[0]
+                self.assertEqual(decoder.flush_calls, [])
+                generated_sizes = [generated for _, _, generated in decoder.decompress_calls]
+                requested_sizes = [requested for _, requested, _ in decoder.decompress_calls]
+                self.assertTrue(generated_sizes)
+                self.assertLessEqual(max(generated_sizes), limit + 1)
+                self.assertLessEqual(sum(generated_sizes), limit)
+                for generated, requested in zip(generated_sizes, requested_sizes, strict=True):
+                    self.assertLessEqual(generated, requested)
+                self.assertEqual(stream.close_calls, 1)
+
+    def test_chunked_gzip_bomb_limits_every_decoder_allocation_and_closes(self) -> None:
+        limit = 64
+        decoded = b'{"payload":"' + b"x" * (16 * 1024 * 1024) + b'"}'
+        compressed = gzip.compress(decoded, compresslevel=9)
+        self.assertLess(len(compressed), 20 * 1024)
+        stream = TrackingByteStream(
+            [compressed[index : index + 257] for index in range(0, len(compressed), 257)]
+        )
+        controlled_zlib, decoders = self._controlled_zlib()
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
-                headers={
-                    "Content-Encoding": "gzip",
-                    "Content-Length": str(len(compressed)),
-                },
-                content=compressed,
+                headers={"Content-Encoding": "gzip"},
+                stream=stream,
+                request=request,
+            )
+
+        client, _ = self._default_client_with_handler(
+            handler,
+            max_response_bytes=limit,
+        )
+
+        with (
+            patch.object(ollama_client_module, "zlib", controlled_zlib),
+            self.assertRaises(OllamaResponseError) as caught,
+        ):
+            client.post_json("/api/embed", {"prompt": "PRIVATE-PROMPT"})
+
+        self.assertEqual(len(decoders), 1)
+        decoder = decoders[0]
+        self.assertTrue(decoder.decompress_calls)
+        for _, requested_bytes, generated_bytes in decoder.decompress_calls:
+            self.assertLessEqual(requested_bytes, limit + 1)
+            self.assertLessEqual(generated_bytes, requested_bytes)
+        self.assertLessEqual(
+            sum(generated_bytes for _, _, generated_bytes in decoder.decompress_calls),
+            limit + 1,
+        )
+        self.assertEqual(stream.close_calls, 1)
+        self.assertNotIn("PRIVATE-PROMPT", str(caught.exception))
+        self.assertNotIn("10.20.30.40", str(caught.exception))
+
+    def test_chunked_gzip_raw_bytes_are_bounded_independently(self) -> None:
+        body = b'{"ok":true}'
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        deflated = compressor.compress(body) + compressor.flush()
+        oversized_header = (
+            b"\x1f\x8b\x08\x08\x00\x00\x00\x00\x00\xff" + b"a" * (64 * 1024) + b"\x00"
+        )
+        trailer = (zlib.crc32(body) & 0xFFFFFFFF).to_bytes(4, "little") + len(body).to_bytes(
+            4, "little"
+        )
+        compressed = oversized_header + deflated + trailer
+        stream = TrackingByteStream([compressed])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Encoding": "gzip"},
+                stream=stream,
                 request=request,
             )
 
         client, _ = self._default_client_with_handler(handler, max_response_bytes=64)
 
         with self.assertRaises(OllamaResponseError):
-            client.post_json("/api/embed", {})
+            client.get_json("/api/tags")
+
+        self.assertEqual(stream.close_calls, 1)
+
+    def test_invalid_truncated_and_trailing_gzip_fail_closed(self) -> None:
+        valid = gzip.compress(b'{"ok":true}')
+        cases = (
+            b"PRIVATE-NOT-GZIP",
+            valid[:-4],
+            valid + b"PRIVATE-TRAILING-DATA",
+        )
+        for compressed in cases:
+            with self.subTest(compressed_length=len(compressed)):
+                stream = TrackingByteStream([compressed])
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        200,
+                        headers={"Content-Encoding": "gzip"},
+                        stream=stream,
+                        request=request,
+                    )
+
+                client, _ = self._default_client_with_handler(
+                    handler,
+                    max_response_bytes=64,
+                )
+                with self.assertRaises(OllamaResponseError) as caught:
+                    client.get_json("/api/tags")
+                self.assertEqual(stream.close_calls, 1)
+                self.assertNotIn("PRIVATE", str(caught.exception))
+                self.assertNotIn("10.20.30.40", str(caught.exception))
+
+    def test_unsupported_or_multiple_content_encoding_fails_before_body_read(self) -> None:
+        for content_encoding in ("br", "gzip, identity", "gzip, br"):
+            with self.subTest(content_encoding=content_encoding):
+                stream = TrackingByteStream([b"PRIVATE-ENCODED-BODY"])
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        200,
+                        headers={"Content-Encoding": content_encoding},
+                        stream=stream,
+                        request=request,
+                    )
+
+                client, _ = self._default_client_with_handler(
+                    handler,
+                    max_response_bytes=64,
+                )
+                with self.assertRaises(OllamaResponseError) as caught:
+                    client.get_json("/api/tags")
+                self.assertEqual(stream.iterated_chunks, 0)
+                self.assertEqual(stream.close_calls, 1)
+                self.assertNotIn("PRIVATE", str(caught.exception))
 
     def test_invalid_content_length_json_utf8_and_non_object_are_sanitized(self) -> None:
         cases = (
@@ -289,7 +485,11 @@ class OllamaClientTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
-            return httpx.Response(200, json={"ok": True}, request=request)
+            return httpx.Response(
+                200,
+                stream=httpx.ByteStream(b'{"ok":true}'),
+                request=request,
+            )
 
         client, factory = self._default_client_with_handler(
             handler,
@@ -661,6 +861,7 @@ class OllamaClientTest(unittest.TestCase):
         kwargs = factory.call_args.kwargs
         self.assertFalse(kwargs["follow_redirects"])
         self.assertFalse(kwargs["trust_env"])
+        self.assertEqual(kwargs["headers"], {"Accept-Encoding": "identity"})
         self.assertEqual(kwargs["limits"].max_connections, 16)
         self.assertEqual(kwargs["limits"].max_keepalive_connections, 8)
         self.assertEqual(kwargs["timeout"].connect, 2.0)

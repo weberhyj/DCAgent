@@ -4,6 +4,7 @@ import ipaddress
 import json
 import math
 import re
+import zlib
 from collections.abc import Mapping
 from typing import Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -18,6 +19,7 @@ _MODEL_DIGEST_PATTERN = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 DEFAULT_OLLAMA_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_OLLAMA_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _RESPONSE_CHUNK_BYTES = 64 * 1024
+_GZIP_WINDOW_BITS = zlib.MAX_WBITS | 16
 
 
 class OllamaError(RuntimeError):
@@ -61,6 +63,7 @@ class _HttpxOllamaTransport:
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 2.0)),
             limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+            headers={"Accept-Encoding": "identity"},
             follow_redirects=False,
             trust_env=False,
         )
@@ -341,20 +344,100 @@ def _validate_max_response_bytes(max_response_bytes: int) -> int:
 
 
 def _read_bounded_json(response: httpx.Response, max_response_bytes: int) -> object:
+    content_encoding = response.headers.get("Content-Encoding")
+    normalized_encoding = "identity" if content_encoding is None else content_encoding.lower()
+    if normalized_encoding == "identity":
+        raw_limit = max_response_bytes
+    elif normalized_encoding == "gzip":
+        raw_limit = min(
+            MAX_OLLAMA_MAX_RESPONSE_BYTES,
+            max(max_response_bytes, _RESPONSE_CHUNK_BYTES),
+        )
+    else:
+        raise OllamaResponseError("Ollama service returned an invalid response")
+
     declared_length = response.headers.get("Content-Length")
     if declared_length is not None:
         if re.fullmatch(r"[0-9]+", declared_length) is None:
             raise OllamaResponseError("Ollama service returned an invalid response")
-        if int(declared_length) > max_response_bytes:
+        if int(declared_length) > raw_limit:
             raise OllamaResponseError("Ollama service response exceeded size limit")
 
+    if normalized_encoding == "gzip":
+        body = _read_bounded_gzip(response, max_response_bytes, raw_limit)
+    else:
+        body = _read_bounded_identity(response, max_response_bytes)
+    return json.loads(body.decode("utf-8"))
+
+
+def _read_bounded_identity(response: httpx.Response, max_response_bytes: int) -> bytearray:
     body = bytearray()
     chunk_size = min(_RESPONSE_CHUNK_BYTES, max_response_bytes + 1)
-    for chunk in response.iter_bytes(chunk_size=chunk_size):
+    for chunk in response.iter_raw(chunk_size=chunk_size):
         if len(body) + len(chunk) > max_response_bytes:
             raise OllamaResponseError("Ollama service response exceeded size limit")
         body.extend(chunk)
-    return json.loads(body.decode("utf-8"))
+    return body
+
+
+def _read_bounded_gzip(
+    response: httpx.Response,
+    max_response_bytes: int,
+    raw_limit: int,
+) -> bytearray:
+    decoder = zlib.decompressobj(_GZIP_WINDOW_BITS)
+    body = bytearray()
+    raw_size = 0
+    finished = False
+    raw_chunk_size = min(_RESPONSE_CHUNK_BYTES, raw_limit + 1)
+    try:
+        for raw_chunk in response.iter_raw(chunk_size=raw_chunk_size):
+            raw_size += len(raw_chunk)
+            if raw_size > raw_limit:
+                raise OllamaResponseError("Ollama service response exceeded size limit")
+            if finished:
+                if raw_chunk:
+                    raise OllamaResponseError("Ollama service returned an invalid response")
+                continue
+
+            pending = raw_chunk
+            while pending:
+                previous_pending_size = len(pending)
+                remaining = max_response_bytes - len(body)
+                decoded = decoder.decompress(pending, remaining + 1)
+                _append_bounded_decoded(body, decoded, max_response_bytes)
+                if decoder.unused_data:
+                    raise OllamaResponseError("Ollama service returned an invalid response")
+
+                pending = decoder.unconsumed_tail
+                if decoder.eof:
+                    if pending:
+                        raise OllamaResponseError("Ollama service returned an invalid response")
+                    finished = True
+                    break
+                if pending and len(pending) >= previous_pending_size and not decoded:
+                    raise OllamaResponseError("Ollama service returned an invalid response")
+
+        if not finished or not decoder.eof:
+            raise OllamaResponseError("Ollama service returned an invalid response")
+        remaining = max_response_bytes - len(body)
+        # ``Decompress.flush(length)`` treats length as an initial allocation, not a hard cap.
+        # A bounded empty-input decompress safely drains any final decoder output after EOF.
+        final_decoded = decoder.decompress(b"", remaining + 1)
+        _append_bounded_decoded(body, final_decoded, max_response_bytes)
+    except zlib.error:
+        raise OllamaResponseError("Ollama service returned an invalid response") from None
+    return body
+
+
+def _append_bounded_decoded(
+    body: bytearray,
+    decoded: bytes,
+    max_response_bytes: int,
+) -> None:
+    if len(decoded) > max_response_bytes - len(body):
+        raise OllamaResponseError("Ollama service response exceeded size limit")
+    body.extend(decoded)
 
 
 def _contains_ascii_control(value: str) -> bool:
