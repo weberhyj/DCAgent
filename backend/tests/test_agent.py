@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from app.agent import KnowledgeAgentTools, ReadOnlyKnowledgeAgent
+from app.agent import (
+    GREETING_REPLY,
+    KnowledgeAgentTools,
+    ReadOnlyKnowledgeAgent,
+    is_greeting_message,
+)
 from app.llm import LLMRequest
 from app.models import (
     ChatMessageModel,
@@ -64,6 +69,67 @@ class RecordingProvider:
 
 
 class AgentTest(unittest.TestCase):
+    def test_pure_greeting_builds_welcome_run_without_external_dependencies(self) -> None:
+        def unexpected_call(*args: object, **kwargs: object) -> None:
+            raise AssertionError("greeting must not call external dependencies")
+
+        class UnexpectedProvider:
+            def generate_reply(self, request: LLMRequest) -> ChatMessageModel:
+                raise AssertionError("greeting must not call external dependencies")
+
+        agent = ReadOnlyKnowledgeAgent(
+            tools=KnowledgeAgentTools(
+                search_knowledge=unexpected_call,
+                inspect_document=unexpected_call,
+            ),
+            llm_provider=UnexpectedProvider(),
+        )
+
+        result = agent.try_answer_greeting(
+            conversation_id="conv-greeting",
+            content="  您好！ ",
+            mode="quick",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.reply.paragraphs[0].text, GREETING_REPLY)
+        self.assertEqual(result.evidence_count, 0)
+        self.assertEqual(result.source_count, 0)
+        self.assertEqual([step.tool_name for step in result.steps], ["respond_greeting"])
+        self.assertTrue(result.steps[0].read_only)
+
+    def test_supported_greeting_phrases_are_recognized(self) -> None:
+        for greeting in (
+            "你好",
+            "您好",
+            "嗨",
+            "哈喽",
+            "在吗",
+            "你在吗",
+            "你是谁",
+            "介绍一下你自己",
+        ):
+            with self.subTest(greeting=greeting):
+                self.assertTrue(is_greeting_message(greeting))
+
+    def test_greeting_with_substantive_question_falls_through(self) -> None:
+        agent = ReadOnlyKnowledgeAgent(
+            tools=KnowledgeAgentTools(
+                search_knowledge=lambda query, limit, routing_key: [],
+                inspect_document=lambda source_id: [],
+            ),
+            llm_provider=RecordingProvider(),
+        )
+
+        result = agent.try_answer_greeting(
+            conversation_id="conv-greeting",
+            content="你好，请问报销制度是什么",
+            mode="quick",
+        )
+
+        self.assertIsNone(result)
+
     def test_deep_mode_retries_with_expanded_query_when_first_search_is_weak(self) -> None:
         policy = source("kb-policy", "差旅制度.txt")
         finance = source("kb-finance", "财务规则.txt")

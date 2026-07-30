@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
@@ -19,12 +20,22 @@ from .models import (
     ComposerMode,
     KnowledgeChunkModel,
     KnowledgeSearchHitModel,
+    ResponseParagraphModel,
 )
 from .retrieval import is_reliable_knowledge_score
 from .time_utils import display_datetime_label
 
 AgentRunStatus = Literal["completed", "failed"]
 AgentStepStatus = Literal["completed", "failed"]
+
+GREETING_REPLY = (
+    "您好，我是 DCAgent 企业知识库智能助手。您可以向我询问 Word、Excel、PDF 等知识库资料中的内容，"
+    "我会检索相关依据并为您汇总回答。"
+)
+GREETING_PHRASES = frozenset(
+    {"你好", "您好", "嗨", "哈喽", "在吗", "你在吗", "你是谁", "介绍一下你自己"}
+)
+GREETING_IGNORED_CHARACTERS = re.compile(r"[\s，。！？!?、,.]+")
 
 
 @dataclass(slots=True)
@@ -109,6 +120,11 @@ class AgentState(TypedDict):
 
 def now_label() -> str:
     return display_datetime_label()
+
+
+def is_greeting_message(content: str) -> bool:
+    normalized = GREETING_IGNORED_CHARACTERS.sub("", content).casefold()
+    return normalized in GREETING_PHRASES
 
 
 def build_agent_search_queries(content: str, mode: ComposerMode) -> list[str]:
@@ -209,6 +225,48 @@ class ReadOnlyKnowledgeAgent:
         self.max_hits = max_hits
         self.max_sources_to_inspect = max_sources_to_inspect
         self.graph = self._build_graph()
+
+    def try_answer_greeting(
+        self,
+        conversation_id: str,
+        content: str,
+        mode: ComposerMode,
+    ) -> AgentRunResult | None:
+        if not is_greeting_message(content):
+            return None
+
+        timestamp = now_label()
+        query = content.strip()
+        step = AgentStep(
+            id=f"step-{uuid4().hex[:12]}",
+            step_index=0,
+            tool_name="respond_greeting",
+            status="completed",
+            input_summary=query,
+            output_summary="已返回固定欢迎词",
+            started_at=timestamp,
+            completed_at=timestamp,
+            read_only=True,
+        )
+        reply = ChatMessageModel(
+            id=f"msg-agent-{uuid4().hex[:12]}",
+            role="assistant",
+            time=timestamp,
+            paragraphs=[ResponseParagraphModel(text=GREETING_REPLY)],
+        )
+        return AgentRunResult(
+            id=f"agent-{uuid4().hex[:12]}",
+            conversation_id=conversation_id,
+            query=query,
+            mode=mode,
+            status="completed",
+            started_at=timestamp,
+            completed_at=timestamp,
+            reply=reply,
+            steps=[step],
+            evidence_count=0,
+            source_count=0,
+        )
 
     def run(
         self,
