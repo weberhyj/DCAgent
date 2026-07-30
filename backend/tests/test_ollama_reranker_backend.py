@@ -93,6 +93,12 @@ class OllamaGenerativeRerankerBackendTest(unittest.TestCase):
             {"num_predict": True},
             {"num_predict": 2.5},
             {"num_predict": "256"},
+            {"batch_max_items": 0},
+            {"batch_max_items": 33},
+            {"batch_max_items": True},
+            {"batch_max_items": 2.5},
+            {"batch_max_items": "8"},
+            {"batch_max_items": 8, "num_predict": 511},
         )
         for overrides in cases:
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
@@ -131,7 +137,7 @@ class OllamaGenerativeRerankerBackendTest(unittest.TestCase):
                 ]
             )
         )
-        backend = make_backend(client, num_predict=321)
+        backend = make_backend(client, num_predict=321, batch_max_items=5)
 
         result = backend.rerank("secret query", ["first secret passage", "second passage"])
 
@@ -164,6 +170,56 @@ class OllamaGenerativeRerankerBackendTest(unittest.TestCase):
         self.assertIn('Document 0:\n"first secret passage"', prompt)
         self.assertIn('Document 1:\n"second passage"', prompt)
         self.assertLess(prompt.index("Document 0:"), prompt.index("Document 1:"))
+
+    def test_rerank_splits_nine_passages_into_eight_and_one_and_restores_order(self) -> None:
+        client = RecordingClient(
+            responses=[
+                response_for(
+                    [{"index": index, "score": index / 10} for index in reversed(range(8))]
+                ),
+                response_for([{"index": 0, "score": 0.8}]),
+            ]
+        )
+
+        result = make_backend(client, batch_max_items=8, num_predict=512).rerank(
+            "query", [f"passage-{index}" for index in range(9)]
+        )
+
+        self.assertEqual(result, [index / 10 for index in range(9)])
+        self.assertEqual(len(client.calls), 2)
+        prompts = [payload["prompt"] for _, payload in client.calls]  # type: ignore[index]
+        self.assertEqual([prompt.count("\nDocument ") for prompt in prompts], [8, 1])
+        self.assertIn('Document 0:\n"passage-8"', prompts[1])
+        self.assertNotIn("Document 1:", prompts[1])
+
+    def test_rerank_splits_thirty_two_passages_into_four_ordered_calls(self) -> None:
+        responses = []
+        expected: list[float] = []
+        for chunk_index in range(4):
+            chunk_scores = [(chunk_index * 8 + index) / 32 for index in range(8)]
+            expected.extend(chunk_scores)
+            responses.append(
+                response_for(
+                    [
+                        {"index": index, "score": score}
+                        for index, score in reversed(list(enumerate(chunk_scores)))
+                    ]
+                )
+            )
+        client = RecordingClient(responses=responses)
+
+        result = make_backend(client, batch_max_items=8, num_predict=512).rerank(
+            "query", [f"passage-{index}" for index in range(32)]
+        )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(len(client.calls), 4)
+        for chunk_index, (_, payload) in enumerate(client.calls):
+            prompt = payload["prompt"]  # type: ignore[index]
+            self.assertEqual(prompt.count("\nDocument "), 8)
+            self.assertIn(f'Document 0:\n"passage-{chunk_index * 8}"', prompt)
+            self.assertIn(f'Document 7:\n"passage-{chunk_index * 8 + 7}"', prompt)
+            self.assertNotIn("Document 8:", prompt)
 
     def test_rerank_json_encodes_adversarial_query_and_passage_boundaries(self) -> None:
         query = (
@@ -471,6 +527,42 @@ class OllamaGenerativeRerankerBackendTest(unittest.TestCase):
         self.assertLess(first_prompt.index("a-first"), first_prompt.index("a-second"))
         self.assertIn('Query:\n"query-b"', second_prompt)
         self.assertLess(second_prompt.index("b-first"), second_prompt.index("b-second"))
+
+    def test_score_pairs_subbatches_each_query_and_restores_interleaved_positions(self) -> None:
+        client = RecordingClient(
+            responses=[
+                response_for([{"index": index, "score": 0.1 + index / 100} for index in range(8)]),
+                response_for([{"index": index, "score": 0.18 + index / 100} for index in range(2)]),
+                response_for([{"index": index, "score": 0.5 + index / 100} for index in range(8)]),
+                response_for([{"index": 0, "score": 0.58}]),
+            ]
+        )
+        backend = make_backend(client, batch_max_items=8, num_predict=512)
+        pairs = [
+            pair
+            for index in range(10)
+            for pair in (
+                (("query-a", f"a-{index}"),)
+                if index == 9
+                else (("query-a", f"a-{index}"), ("query-b", f"b-{index}"))
+            )
+        ]
+
+        result = backend.score_pairs(pairs)
+
+        expected_a = [0.1 + index / 100 for index in range(8)] + [0.18, 0.19]
+        expected_b = [0.5 + index / 100 for index in range(8)] + [0.58]
+        expected: list[float] = []
+        for index in range(10):
+            expected.append(expected_a[index])
+            if index < 9:
+                expected.append(expected_b[index])
+        self.assertEqual(result, expected)
+        self.assertEqual(len(client.calls), 4)
+        prompts = [payload["prompt"] for _, payload in client.calls]  # type: ignore[index]
+        self.assertEqual([prompt.count("\nDocument ") for prompt in prompts], [8, 2, 8, 1])
+        self.assertTrue(all('Query:\n"query-a"' in prompt for prompt in prompts[:2]))
+        self.assertTrue(all('Query:\n"query-b"' in prompt for prompt in prompts[2:]))
 
     def test_close_delegates_to_client(self) -> None:
         client = RecordingClient()

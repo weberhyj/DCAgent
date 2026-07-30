@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,10 @@ from fastapi.testclient import TestClient
 
 from app import reranker_service
 from app.ollama_client import OllamaResponseError, OllamaServiceError
-from app.ollama_reranker_backend import RERANK_PROMPT_PROFILE_SHA256
+from app.ollama_reranker_backend import (
+    RERANK_PROMPT_PROFILE_SHA256,
+    OllamaGenerativeRerankerBackend,
+)
 from app.qwen3_reranker_runtime import Qwen3RerankerMalformedOutput
 from app.reranker_contracts import RerankerModelMetadata
 from app.reranker_service import (
@@ -63,6 +67,37 @@ class DigestClient:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+class GeneratedSubbatchClient:
+    def __init__(self, *, malformed_on_query_call: int | None = None) -> None:
+        self.malformed_on_query_call = malformed_on_query_call
+        self.query_calls = 0
+        self.calls: list[tuple[str, object]] = []
+
+    def post_json(self, path: str, payload: object) -> object:
+        self.calls.append((path, payload))
+        assert isinstance(payload, dict)
+        prompt = payload["prompt"]
+        assert isinstance(prompt, str)
+        is_query_call = 'Query:\n"q"' in prompt
+        if is_query_call:
+            self.query_calls += 1
+            if self.query_calls == self.malformed_on_query_call:
+                return {"response": '{"scores":[],"raw":"secret later subbatch response"}'}
+        matches = re.findall(r'Document (\d+):\n"passage-(\d+)"', prompt)
+        if matches:
+            scores = [
+                {"index": int(local_index), "score": int(global_index) / 100}
+                for local_index, global_index in matches
+            ]
+        else:
+            count = prompt.count("\nDocument ")
+            scores = [{"index": index, "score": 0.5} for index in range(count)]
+        return {"response": json.dumps({"scores": scores}, separators=(",", ":"))}
+
+    def close(self) -> None:
+        pass
 
 
 class FailingBackend(Backend):
@@ -150,9 +185,10 @@ def production_environment(**overrides: str) -> dict[str, str]:
         "OLLAMA_KEEP_ALIVE": "5m",
         "OLLAMA_REQUEST_TIMEOUT_SECONDS": "15",
         "OLLAMA_RERANK_FORMAT_JSON": "true",
-        "OLLAMA_RERANK_NUM_PREDICT": "256",
-        "RERANKER_BATCH_MAX_ITEMS": "4",
-        "RERANKER_QUEUE_MAX_ITEMS": "8",
+        "OLLAMA_RERANK_NUM_PREDICT": "512",
+        "OLLAMA_RERANK_BATCH_MAX_ITEMS": "8",
+        "RERANKER_BATCH_MAX_ITEMS": "32",
+        "RERANKER_QUEUE_MAX_ITEMS": "192",
         "RERANKER_BATCH_WAIT_MS": "0",
         **overrides,
     }
@@ -290,6 +326,13 @@ class RerankerServiceTest(unittest.TestCase):
             ("OLLAMA_RERANK_NUM_PREDICT", "-1", "positive integer"),
             ("OLLAMA_RERANK_NUM_PREDICT", "1.5", "positive integer"),
             ("OLLAMA_RERANK_NUM_PREDICT", "true", "positive integer"),
+            ("OLLAMA_RERANK_NUM_PREDICT", "511", "at least 512"),
+            ("OLLAMA_RERANK_BATCH_MAX_ITEMS", None, "integer from 1 through 32"),
+            ("OLLAMA_RERANK_BATCH_MAX_ITEMS", "   ", "integer from 1 through 32"),
+            ("OLLAMA_RERANK_BATCH_MAX_ITEMS", "0", "integer from 1 through 32"),
+            ("OLLAMA_RERANK_BATCH_MAX_ITEMS", "33", "integer from 1 through 32"),
+            ("OLLAMA_RERANK_BATCH_MAX_ITEMS", "1.5", "integer from 1 through 32"),
+            ("OLLAMA_RERANK_BATCH_MAX_ITEMS", "true", "integer from 1 through 32"),
         )
         for field, value, message in cases:
             with self.subTest(field=field, value=value):
@@ -334,7 +377,8 @@ class RerankerServiceTest(unittest.TestCase):
             path="/api/generate",
             keep_alive="5m",
             format_json=True,
-            num_predict=256,
+            num_predict=512,
+            batch_max_items=8,
         )
         self.assertEqual(backend.close_calls, 1)
 
@@ -388,6 +432,83 @@ class RerankerServiceTest(unittest.TestCase):
                 pass
 
         self.assertFalse(backend_type.call_args.kwargs["format_json"])
+
+    def test_production_rejects_batcher_limits_below_wire_contract_before_loader(self) -> None:
+        for value, message in (
+            ("0", "positive integer"),
+            ("8", "at least 32"),
+            ("31", "at least 32"),
+            ("not-an-integer", "positive integer"),
+        ):
+            loader_calls: list[object] = []
+            with self.subTest(value=value):
+                app = create_production_app(
+                    environ=production_environment(RERANKER_BATCH_MAX_ITEMS=value),
+                    backend_loader=lambda values, metadata: loader_calls.append(values),
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    with TestClient(app):
+                        pass
+                self.assertEqual(loader_calls, [])
+
+    def test_production_reranks_nine_passages_in_two_ollama_subbatches(self) -> None:
+        generated_client = GeneratedSubbatchClient()
+        backend = OllamaGenerativeRerankerBackend(
+            generated_client,
+            model="qwen-test",
+            path="/api/generate",
+            keep_alive="5m",
+            num_predict=512,
+            batch_max_items=8,
+        )
+        app = create_production_app(
+            environ=production_environment(),
+            backend_loader=lambda values, metadata: backend,
+        )
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            generated_client.calls.clear()
+            generated_client.query_calls = 0
+            response = client.post(
+                "/v1/rerank",
+                json={"query": "q", "passages": [f"passage-{index}" for index in range(9)]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["scores"], [index / 100 for index in range(9)])
+        self.assertEqual(generated_client.query_calls, 2)
+        prompts = [payload["prompt"] for _, payload in generated_client.calls]  # type: ignore[index]
+        self.assertEqual([prompt.count("\nDocument ") for prompt in prompts], [8, 1])
+
+    def test_later_malformed_ollama_subbatch_returns_sanitized_503_without_partial_scores(
+        self,
+    ) -> None:
+        generated_client = GeneratedSubbatchClient(malformed_on_query_call=2)
+        backend = OllamaGenerativeRerankerBackend(
+            generated_client,
+            model="qwen-test",
+            path="/api/generate",
+            keep_alive="5m",
+            num_predict=512,
+            batch_max_items=8,
+        )
+        app = create_production_app(
+            environ=production_environment(),
+            backend_loader=lambda values, metadata: backend,
+        )
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            generated_client.calls.clear()
+            generated_client.query_calls = 0
+            response = client.post(
+                "/v1/rerank",
+                json={"query": "q", "passages": [f"passage-{index}" for index in range(9)]},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"detail": "reranker backend failed"})
+        self.assertNotIn("secret", response.text)
+        self.assertNotIn("scores", response.json())
 
     def test_default_ollama_factory_closes_client_when_backend_constructor_fails(self) -> None:
         class Client:
@@ -560,6 +681,12 @@ class RerankerServiceTest(unittest.TestCase):
             response = client.post("/v1/rerank", json={"query": "q", "passages": ["good", "bad"]})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["scores"], [1.0, 0.0])
+
+    def test_nonproduction_factory_rejects_batch_limit_below_wire_contract(self) -> None:
+        metadata = RerankerModelMetadata("qwen", "1", "a" * 64, "b" * 64, "1")
+
+        with self.assertRaisesRegex(ValueError, "at least 32"):
+            create_reranker_app(Backend(), metadata, max_items=31)
 
     def test_backend_failures_are_sanitized_and_malformed_scores_are_500(self) -> None:
         metadata = RerankerModelMetadata("qwen", "1", "a" * 64, "b" * 64, "1")

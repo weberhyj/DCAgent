@@ -202,6 +202,12 @@ purpose-trained cross-encoder. The initial bounded configuration is
 `RETRIEVAL_FINAL_TOP_K=4`, and `RETRIEVAL_TOTAL_TIMEOUT_SECONDS=20`. Treat this 8/4/4/20 profile as a
 starting safety bound, not a quality or throughput guarantee. The mandatory 15-concurrent-user run
 must record latency, error rate, adapter 429/503, Ollama saturation and controlled fallback rate.
+The private `/v1/rerank` wire contract still accepts 1–32 passages: keep
+`RERANKER_BATCH_MAX_ITEMS=32` so one legal request fits the service batcher, while
+`OLLAMA_RERANK_BATCH_MAX_ITEMS=8` bounds each generation call and causes larger requests to run as
+ordered consecutive sub-batches. Configure at least 64 output tokens per sub-batch item
+(`OLLAMA_RERANK_NUM_PREDICT=512` for the default eight); changing either setting requires rerunning
+the target-host capacity gate. `RETRIEVAL_RERANK_TOP_K=8` is a retrieval policy, not the wire limit.
 
 ### Build, validate, and activate
 

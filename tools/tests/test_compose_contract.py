@@ -79,6 +79,7 @@ class ComposeContractTest(unittest.TestCase):
                 "OLLAMA_REQUEST_TIMEOUT_SECONDS",
                 "OLLAMA_RERANK_FORMAT_JSON",
                 "OLLAMA_RERANK_NUM_PREDICT",
+                "OLLAMA_RERANK_BATCH_MAX_ITEMS",
                 "RERANKER_BATCH_MAX_ITEMS",
                 "RERANKER_QUEUE_MAX_ITEMS",
                 "RERANKER_BATCH_WAIT_MS",

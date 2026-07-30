@@ -205,8 +205,8 @@ def _run_reranker_helper(
             "http://127.0.0.1:8082/v1/metadata": metadata,
             "http://127.0.0.1:8082/v1/rerank": {
                 **metadata,
-                "passageCount": 2,
-                "scores": [0.75, 0.25],
+                "passageCount": 9,
+                "scores": [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
             },
         },
     )
@@ -216,7 +216,7 @@ def _reranker_payload(**overrides: object) -> str:
     payload: dict[str, object] = {
         "ready": _operation(),
         "metadata": _operation(),
-        "rerank": _operation(scoreCount=2),
+        "rerank": _operation(scoreCount=9),
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -637,6 +637,7 @@ class ComposeSmokeTest(unittest.TestCase):
                 for name in ("ready", "metadata", "rerank")
             )
         )
+        self.assertEqual(reranker["rerank"]["scoreCount"], 9)
 
     def test_adapter_helpers_reject_wrong_models_even_when_service_env_agrees(
         self,
@@ -1351,7 +1352,7 @@ class ComposeSmokeTest(unittest.TestCase):
                     "passed": True,
                     "ready": _operation(),
                     "metadata": _operation(),
-                    "rerank": _operation(scoreCount=2),
+                    "rerank": _operation(scoreCount=9),
                 },
             )
             embedding = payload["readyResults"]["embedding"]

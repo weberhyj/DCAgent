@@ -21,8 +21,10 @@ from .inference_batching import DynamicBatcher, InferenceQueueFull
 from .offline_artifacts import is_local_filesystem_path
 from .ollama_client import SyncOllamaClient
 from .ollama_reranker_backend import (
+    MAX_OLLAMA_RERANK_BATCH_MAX_ITEMS,
     RERANK_PROMPT_PROFILE_SHA256,
     OllamaGenerativeRerankerBackend,
+    minimum_rerank_num_predict,
 )
 from .qwen3_reranker_runtime import (
     Qwen3RerankerMalformedOutput,
@@ -102,6 +104,7 @@ def create_reranker_app(
 ) -> FastAPI:
     if not isinstance(metadata, RerankerModelMetadata):
         raise ValueError("metadata must be RerankerModelMetadata")
+    _validate_batch_capacity(max_items)
     return _create_batched_app(
         backend,
         metadata,
@@ -224,6 +227,7 @@ def create_production_app(
             metadata = _load_environment_metadata(target)
             max_items = _positive_int(target, "RERANKER_BATCH_MAX_ITEMS", MAX_RERANK_PASSAGES)
             max_queue_items = _positive_int(target, "RERANKER_QUEUE_MAX_ITEMS", 192)
+            _validate_batch_capacity(max_items)
             wait_ms = _nonnegative_float(target, "RERANKER_BATCH_WAIT_MS", 10.0)
             loader = _load_ollama_reranker_backend if backend_loader is None else backend_loader
             backend = await run_in_threadpool(loader, target, metadata)
@@ -302,7 +306,19 @@ def _load_ollama_reranker_backend(
     keep_alive = _required(environ, "OLLAMA_KEEP_ALIVE")
     timeout_seconds = _required_positive_float(environ, "OLLAMA_REQUEST_TIMEOUT_SECONDS")
     format_json = _required_boolean(environ, "OLLAMA_RERANK_FORMAT_JSON")
+    batch_max_items = _required_int_in_range(
+        environ,
+        "OLLAMA_RERANK_BATCH_MAX_ITEMS",
+        minimum=1,
+        maximum=MAX_OLLAMA_RERANK_BATCH_MAX_ITEMS,
+    )
     num_predict = _required_positive_int(environ, "OLLAMA_RERANK_NUM_PREDICT")
+    minimum_num_predict = minimum_rerank_num_predict(batch_max_items)
+    if num_predict < minimum_num_predict:
+        raise ValueError(
+            f"OLLAMA_RERANK_NUM_PREDICT must be at least {minimum_num_predict} "
+            f"when OLLAMA_RERANK_BATCH_MAX_ITEMS={batch_max_items}"
+        )
     client = SyncOllamaClient(base_url, timeout_seconds=timeout_seconds)
     try:
         actual_digest = client.model_digest(model)
@@ -315,6 +331,7 @@ def _load_ollama_reranker_backend(
             keep_alive=keep_alive,
             format_json=format_json,
             num_predict=num_predict,
+            batch_max_items=batch_max_items,
         )
     except Exception:
         try:
@@ -482,6 +499,26 @@ def _required_positive_int(environ: Mapping[str, str], name: str) -> int:
     return value
 
 
+def _required_int_in_range(
+    environ: Mapping[str, str],
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw_value = environ.get(name)
+    message = f"{name} must be an integer from {minimum} through {maximum}"
+    if isinstance(raw_value, bool) or not isinstance(raw_value, str):
+        raise ValueError(message)
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(message) from error
+    if not minimum <= value <= maximum:
+        raise ValueError(message)
+    return value
+
+
 def _required_positive_float(environ: Mapping[str, str], name: str) -> float:
     raw_value = environ.get(name)
     if isinstance(raw_value, bool) or not isinstance(raw_value, str):
@@ -512,6 +549,14 @@ def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _validate_batch_capacity(max_items: int) -> None:
+    if max_items < MAX_RERANK_PASSAGES:
+        raise ValueError(
+            f"RERANKER_BATCH_MAX_ITEMS must be at least {MAX_RERANK_PASSAGES} "
+            "to preserve the reranker wire contract"
+        )
 
 
 def _nonnegative_float(environ: Mapping[str, str], name: str, default: float) -> float:

@@ -442,18 +442,24 @@ if PROBE in (None, "metadata"):
 if PROBE in (None, "rerank"):
     rerank_result, rerank = call(
         "http://127.0.0.1:8082/v1/rerank",
-        {"query": "compose-smoke", "passages": ["candidate-a", "candidate-b"]},
+        {
+            "query": "compose-smoke",
+            "passages": [
+                "candidate-a", "candidate-b", "candidate-c", "candidate-d", "candidate-e",
+                "candidate-f", "candidate-g", "candidate-h", "candidate-i",
+            ],
+        },
     )
     scores = rerank.get("scores") if rerank is not None else None
     rerank_result["scoreCount"] = len(scores) if isinstance(scores, list) else 0
     valid_scores = (
-        isinstance(scores, list) and len(scores) == 2 and
+        isinstance(scores, list) and len(scores) == 9 and
         all(type(score) in (int, float) and math.isfinite(float(score)) and 0 <= score <= 1
             for score in scores)
     )
     if rerank_result["errorCode"] is None and (
         not configured_model_matches or not metadata_matches(rerank) or
-        rerank.get("passageCount") != 2 or not valid_scores
+        rerank.get("passageCount") != 9 or not valid_scores
     ):
         rerank_result["errorCode"] = "rerank_mismatch"
     results["rerank"] = rerank_result
@@ -895,7 +901,7 @@ def _validate_check(
                 operation["status"] == 200 and operation["errorCode"] is None
                 for operation in (ready, metadata, rerank)
             )
-            and rerank["scoreCount"] == 2
+            and rerank["scoreCount"] == 9
         )
         return ok, None, {"ready": ready, "metadata": metadata, "rerank": rerank}
     if check.name == "api":

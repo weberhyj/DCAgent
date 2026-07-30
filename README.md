@@ -193,6 +193,12 @@ flowchart TD
 DC-Agent 本身不再运行 Embedding/Reranker 权重；只有两个 adapter 服务调用公司内网可达的
 Ollama，不依赖外部 API。`qwen2.5:3b` 生成式 rerank 是兼容模式，不等价于专用 cross-encoder，
 必须在目标服务器完成 15 并发容量测试并观测 429/503、延迟和 controlled fallback。
+`/v1/rerank` 的 wire contract 始终接受 1–32 个 passages；`RERANKER_BATCH_MAX_ITEMS=32`
+保证单个合法请求可以进入服务，`OLLAMA_RERANK_BATCH_MAX_ITEMS=8` 则只限制一次
+`/api/generate` 的候选数，较大请求按连续分块执行并恢复原顺序。输出预算必须满足
+`OLLAMA_RERANK_NUM_PREDICT >= 64 * OLLAMA_RERANK_BATCH_MAX_ITEMS`，默认 8 项使用 512；
+修改分块大小或预算后必须重新执行目标机容量 gate。`RETRIEVAL_RERANK_TOP_K=8` 是当前检索
+策略，不是 HTTP passages 上限。
 
 没有可靠证据时不会调用模型。Physoc 超时、返回非 2xx、SSE 格式异常或答案为空时，API
 返回 HTTP 502；`no raw-chunk answer on Physoc failure` 是强制规则，系统不得把检索切片、

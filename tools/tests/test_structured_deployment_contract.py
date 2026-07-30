@@ -37,6 +37,8 @@ REQUIRED_ENV_KEYS = (
     "OLLAMA_REQUEST_TIMEOUT_SECONDS",
     "OLLAMA_RERANK_FORMAT_JSON",
     "OLLAMA_RERANK_NUM_PREDICT",
+    "OLLAMA_RERANK_BATCH_MAX_ITEMS",
+    "RERANKER_BATCH_MAX_ITEMS",
 )
 
 REMOVED_LOCAL_ADAPTER_KEYS = (
@@ -148,7 +150,9 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(values["OLLAMA_KEEP_ALIVE"], "30m")
                 self.assertEqual(values["OLLAMA_REQUEST_TIMEOUT_SECONDS"], "15")
                 self.assertEqual(values["OLLAMA_RERANK_FORMAT_JSON"], "true")
-                self.assertEqual(values["OLLAMA_RERANK_NUM_PREDICT"], "256")
+                self.assertEqual(values["OLLAMA_RERANK_NUM_PREDICT"], "512")
+                self.assertEqual(values["OLLAMA_RERANK_BATCH_MAX_ITEMS"], "8")
+                self.assertEqual(values["RERANKER_BATCH_MAX_ITEMS"], "32")
                 for key in REMOVED_LOCAL_ADAPTER_KEYS:
                     self.assertNotIn(key, values)
 
@@ -157,7 +161,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(offline_values["RERANKER_BATCH_MAX_ITEMS"], "8")
+        self.assertEqual(offline_values["RERANKER_BATCH_MAX_ITEMS"], "32")
 
     def test_api_receives_retrieval_rollout_and_pinned_metadata(self) -> None:
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(

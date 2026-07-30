@@ -23,6 +23,10 @@ RERANK_PROMPT_PROFILE = (
 )
 RERANK_PROMPT_PROFILE_SHA256 = "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd"
 
+DEFAULT_OLLAMA_RERANK_BATCH_MAX_ITEMS = 8
+MAX_OLLAMA_RERANK_BATCH_MAX_ITEMS = 32
+OLLAMA_RERANK_MIN_PREDICT_TOKENS_PER_ITEM = 64
+
 _INVALID_RESPONSE_MESSAGE = "Ollama reranker returned an invalid response"
 
 
@@ -41,7 +45,8 @@ class OllamaGenerativeRerankerBackend:
         path: str,
         keep_alive: str,
         format_json: bool = True,
-        num_predict: int = 256,
+        num_predict: int = 512,
+        batch_max_items: int = DEFAULT_OLLAMA_RERANK_BATCH_MAX_ITEMS,
     ) -> None:
         self._client = client
         self._model = _require_nonblank_string(model, "model")
@@ -52,14 +57,38 @@ class OllamaGenerativeRerankerBackend:
         if not isinstance(format_json, bool):
             raise ValueError("Ollama reranker format_json must be a boolean")
         self._format_json = format_json
+        if (
+            isinstance(batch_max_items, bool)
+            or not isinstance(batch_max_items, int)
+            or not 1 <= batch_max_items <= MAX_OLLAMA_RERANK_BATCH_MAX_ITEMS
+        ):
+            raise ValueError("Ollama reranker batch_max_items must be an integer from 1 through 32")
+        self._batch_max_items = batch_max_items
         if isinstance(num_predict, bool) or not isinstance(num_predict, int) or num_predict <= 0:
             raise ValueError("Ollama reranker num_predict must be a positive integer")
+        minimum_num_predict = minimum_rerank_num_predict(batch_max_items)
+        if num_predict < minimum_num_predict:
+            raise ValueError(
+                f"Ollama reranker num_predict must be at least {minimum_num_predict} "
+                f"for batch_max_items={batch_max_items}"
+            )
         self._num_predict = num_predict
 
     def rerank(self, query: str, passages: Sequence[str]) -> list[float]:
         normalized_query = _require_nonblank_string(query, "query")
         normalized_passages = _validate_passages(passages)
-        prompt = _build_prompt(normalized_query, normalized_passages)
+        scores: list[float] = []
+        for offset in range(0, len(normalized_passages), self._batch_max_items):
+            scores.extend(
+                self._rerank_subbatch(
+                    normalized_query,
+                    normalized_passages[offset : offset + self._batch_max_items],
+                )
+            )
+        return scores
+
+    def _rerank_subbatch(self, query: str, passages: Sequence[str]) -> list[float]:
+        prompt = _build_prompt(query, passages)
         payload: dict[str, object] = {
             "model": self._model,
             "prompt": prompt,
@@ -71,7 +100,7 @@ class OllamaGenerativeRerankerBackend:
             payload["format"] = "json"
 
         response = self._client.post_json(self._path, payload)
-        return _parse_scores(response, len(normalized_passages))
+        return _parse_scores(response, len(passages))
 
     def score_pairs(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
         validated_pairs = _validate_pairs(pairs)
@@ -88,6 +117,10 @@ class OllamaGenerativeRerankerBackend:
 
     def close(self) -> None:
         self._client.close()
+
+
+def minimum_rerank_num_predict(batch_max_items: int) -> int:
+    return batch_max_items * OLLAMA_RERANK_MIN_PREDICT_TOKENS_PER_ITEM
 
 
 def _require_nonblank_string(value: object, field: str) -> str:
