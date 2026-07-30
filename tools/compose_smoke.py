@@ -10,6 +10,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -23,7 +24,6 @@ from collections.abc import Callable, Mapping, Sequence
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WRAPPER_PATH = REPO_ROOT / "tools" / "invoke_offline_compose.ps1"
 DEFAULT_REPORT_PATH = REPO_ROOT / "artifacts" / "benchmarks" / "compose-smoke.json"
-SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
@@ -176,56 +176,150 @@ printf 'GET / HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' 
 cat <&3
 """
 HTTP_HELPER_SCRIPT = r"""
-import json, os, urllib.error, urllib.request
-def get(url):
+import json, math, os, time, urllib.error, urllib.request
+def call(url, payload=None):
+    started = time.perf_counter()
+    request = urllib.request.Request(
+        url,
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+        headers={} if payload is None else {"Content-Type": "application/json"},
+        method="GET" if payload is None else "POST",
+    )
     try:
-        with urllib.request.urlopen(url, timeout=15) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=15) as response:
+            status = response.status
+            raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as error:
-        raw = error.read().decode("utf-8", "replace")
-        try: body = json.loads(raw)
-        except Exception: body = {"raw": raw[:256]}
-        return error.code, body
-    except Exception as error:
-        return 0, {"error": type(error).__name__}
-ready_status, ready = get("http://127.0.0.1:8081/readyz")
-metadata_status, metadata = get("http://127.0.0.1:8081/v1/metadata")
-configured_checksum = os.environ.get("EMBEDDING_MODEL_SHA256", "")
-print(json.dumps({"readyStatus": ready_status, "ready": ready,
-                  "metadataStatus": metadata_status, "metadata": metadata,
-                  "checksumMatchesConfigured": bool(configured_checksum) and
-                                               metadata.get("modelChecksum") == configured_checksum,
-                  "network": {"endpoint": "http://127.0.0.1:8081", "loopback": True}},
-                 sort_keys=True))
+        return {"status": error.code, "latencyMs": round((time.perf_counter()-started)*1000, 3),
+                "errorCode": "http_" + str(error.code)}, None
+    except (TimeoutError, urllib.error.URLError):
+        return {"status": 0, "latencyMs": round((time.perf_counter()-started)*1000, 3),
+                "errorCode": "transport_error"}, None
+    except Exception:
+        return {"status": 0, "latencyMs": round((time.perf_counter()-started)*1000, 3),
+                "errorCode": "unexpected_error"}, None
+    result = {"status": status, "latencyMs": round((time.perf_counter()-started)*1000, 3),
+              "errorCode": None}
+    try: body = json.loads(raw)
+    except Exception:
+        result["errorCode"] = "invalid_json"
+        return result, None
+    if not isinstance(body, dict):
+        result["errorCode"] = "malformed_response"
+        return result, None
+    return result, body
+def expected_metadata():
+    try: dimensions = int(os.environ.get("EMBEDDING_MODEL_DIMENSIONS", "0"))
+    except Exception: dimensions = 0
+    return {
+        "modelName": os.environ.get("EMBEDDING_MODEL_NAME", ""),
+        "modelVersion": os.environ.get("EMBEDDING_MODEL_VERSION", ""),
+        "modelChecksum": os.environ.get("EMBEDDING_MODEL_SHA256", ""),
+        "dimensions": dimensions,
+        "normalized": os.environ.get("EMBEDDING_MODEL_NORMALIZED", "").lower() == "true",
+        "encodingProfileSha256": os.environ.get("EMBEDDING_ENCODING_PROFILE_SHA256", ""),
+        "protocolVersion": os.environ.get("EMBEDDING_PROTOCOL_VERSION", ""),
+    }
+def metadata_matches(body, expected):
+    return body is not None and all(body.get(key) == value for key, value in expected.items())
+expected = expected_metadata()
+ready_result, ready = call("http://127.0.0.1:8081/readyz")
+if ready_result["errorCode"] is None and (
+    ready is None or ready.get("status") != "ready" or not metadata_matches(ready, expected)
+):
+    ready_result["errorCode"] = "metadata_mismatch"
+metadata_result, metadata = call("http://127.0.0.1:8081/v1/metadata")
+metadata_result["dimensions"] = metadata.get("dimensions") if metadata is not None else None
+if metadata_result["errorCode"] is None and not metadata_matches(metadata, expected):
+    metadata_result["errorCode"] = "metadata_mismatch"
+embedding_result, embedding = call(
+    "http://127.0.0.1:8081/v1/embeddings",
+    {"texts": ["compose-smoke"], "purpose": "query"},
+)
+vectors = embedding.get("vectors") if embedding is not None else None
+embedding_result["vectorCount"] = len(vectors) if isinstance(vectors, list) else 0
+embedding_result["dimensions"] = (
+    len(vectors[0]) if isinstance(vectors, list) and vectors and isinstance(vectors[0], list) else None
+)
+valid_vectors = (
+    isinstance(vectors, list) and len(vectors) == 1 and
+    all(isinstance(vector, list) and len(vector) == expected["dimensions"] for vector in vectors) and
+    all(type(value) in (int, float) and math.isfinite(float(value)) for vector in vectors for value in vector)
+)
+if embedding_result["errorCode"] is None and (
+    not metadata_matches(embedding, expected) or embedding.get("purpose") != "query" or not valid_vectors
+):
+    embedding_result["errorCode"] = "embedding_mismatch"
+print(json.dumps({"ready": ready_result, "metadata": metadata_result,
+                  "embeddings": embedding_result}, sort_keys=True))
 """.strip()
 RERANKER_HTTP_HELPER_SCRIPT = r"""
-import json, os, urllib.error, urllib.request
-def get(url):
+import json, math, os, time, urllib.error, urllib.request
+def call(url, payload=None):
+    started = time.perf_counter()
+    request = urllib.request.Request(
+        url,
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+        headers={} if payload is None else {"Content-Type": "application/json"},
+        method="GET" if payload is None else "POST",
+    )
     try:
-        with urllib.request.urlopen(url, timeout=15) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=15) as response:
+            status = response.status
+            raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as error:
-        raw = error.read().decode("utf-8", "replace")
-        try: body = json.loads(raw)
-        except Exception: body = {"raw": raw[:256]}
-        return error.code, body
-    except Exception as error:
-        return 0, {"error": type(error).__name__}
-ready_status, ready = get("http://127.0.0.1:8082/readyz")
-metadata_status, metadata = get("http://127.0.0.1:8082/v1/metadata")
-configured = {
+        return {"status": error.code, "latencyMs": round((time.perf_counter()-started)*1000, 3),
+                "errorCode": "http_" + str(error.code)}, None
+    except (TimeoutError, urllib.error.URLError):
+        return {"status": 0, "latencyMs": round((time.perf_counter()-started)*1000, 3),
+                "errorCode": "transport_error"}, None
+    except Exception:
+        return {"status": 0, "latencyMs": round((time.perf_counter()-started)*1000, 3),
+                "errorCode": "unexpected_error"}, None
+    result = {"status": status, "latencyMs": round((time.perf_counter()-started)*1000, 3),
+              "errorCode": None}
+    try: body = json.loads(raw)
+    except Exception:
+        result["errorCode"] = "invalid_json"
+        return result, None
+    if not isinstance(body, dict):
+        result["errorCode"] = "malformed_response"
+        return result, None
+    return result, body
+expected = {
     "modelName": os.environ.get("RERANKER_MODEL_NAME", ""),
     "modelVersion": os.environ.get("RERANKER_MODEL_VERSION", ""),
     "modelChecksum": os.environ.get("RERANKER_MODEL_SHA256", ""),
     "promptProfileSha256": os.environ.get("RERANKER_PROMPT_PROFILE_SHA256", ""),
     "protocolVersion": os.environ.get("RERANKER_PROTOCOL_VERSION", ""),
 }
-print(json.dumps({"readyStatus": ready_status, "ready": ready,
-                  "metadataStatus": metadata_status, "metadata": metadata,
-                  "metadataMatchesConfigured": all(configured.values()) and
-                                               metadata == configured,
-                  "network": {"endpoint": "http://127.0.0.1:8082", "loopback": True}},
-                 sort_keys=True))
+def metadata_matches(body):
+    return body is not None and all(body.get(key) == value for key, value in expected.items())
+ready_result, ready = call("http://127.0.0.1:8082/readyz")
+if ready_result["errorCode"] is None and (
+    ready is None or ready.get("status") != "ready" or not metadata_matches(ready)
+):
+    ready_result["errorCode"] = "metadata_mismatch"
+metadata_result, metadata = call("http://127.0.0.1:8082/v1/metadata")
+if metadata_result["errorCode"] is None and not metadata_matches(metadata):
+    metadata_result["errorCode"] = "metadata_mismatch"
+rerank_result, rerank = call(
+    "http://127.0.0.1:8082/v1/rerank",
+    {"query": "compose-smoke", "passages": ["candidate-a", "candidate-b"]},
+)
+scores = rerank.get("scores") if rerank is not None else None
+rerank_result["scoreCount"] = len(scores) if isinstance(scores, list) else 0
+valid_scores = (
+    isinstance(scores, list) and len(scores) == 2 and
+    all(type(score) in (int, float) and math.isfinite(float(score)) and 0 <= score <= 1
+        for score in scores)
+)
+if rerank_result["errorCode"] is None and (
+    not metadata_matches(rerank) or rerank.get("passageCount") != 2 or not valid_scores
+):
+    rerank_result["errorCode"] = "rerank_mismatch"
+print(json.dumps({"ready": ready_result, "metadata": metadata_result,
+                  "rerank": rerank_result}, sort_keys=True))
 """.strip()
 API_HELPER_SCRIPT = r"""
 import json, urllib.error, urllib.request
@@ -460,6 +554,56 @@ def _http_response(text: str, label: str) -> tuple[int, str]:
     return int(match.group(1)), _http_body(text)
 
 
+def _adapter_operation(
+    payload: Mapping[object, object],
+    name: str,
+    *,
+    metric_fields: Sequence[str] = (),
+) -> dict[str, object]:
+    operation = payload.get(name)
+    if not isinstance(operation, Mapping):
+        raise ValueError(f"{name} probe result is invalid")
+    status = operation.get("status")
+    latency = operation.get("latencyMs")
+    error_code = operation.get("errorCode")
+    if (
+        isinstance(status, bool)
+        or not isinstance(status, int)
+        or not 0 <= status <= 599
+    ):
+        raise ValueError(f"{name} probe status is invalid")
+    if (
+        isinstance(latency, bool)
+        or not isinstance(latency, (int, float))
+        or not math.isfinite(float(latency))
+        or float(latency) < 0
+    ):
+        raise ValueError(f"{name} probe latency is invalid")
+    if error_code is not None and (
+        not isinstance(error_code, str)
+        or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code) is None
+    ):
+        raise ValueError(f"{name} probe error code is invalid")
+    sanitized: dict[str, object] = {
+        "status": status,
+        "latencyMs": latency,
+        "errorCode": error_code,
+    }
+    for field in metric_fields:
+        value = operation.get(field)
+        if value is None and (status != 200 or error_code is not None):
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or (field == "dimensions" and value <= 0)
+            or (field != "dimensions" and value < 0)
+        ):
+            raise ValueError(f"{name} probe {field} is invalid")
+        sanitized[field] = value
+    return sanitized
+
+
 def _validate_check(
     check: _Check, output: str, *, migration_head: str
 ) -> tuple[bool, str | None, dict[str, object]]:
@@ -520,106 +664,43 @@ def _validate_check(
         return True, value, {}
     if check.name == "embedding":
         payload = _json_object(output, "embedding")
-        metadata = payload.get("metadata")
-        network = payload.get("network")
-        valid_metadata = (
-            isinstance(metadata, Mapping)
-            and all(
-                isinstance(metadata.get(field), expected)
-                for field, expected in (
-                    ("modelName", str),
-                    ("modelVersion", str),
-                    ("modelChecksum", str),
-                    ("dimensions", int),
-                    ("normalized", bool),
-                    ("encodingProfileSha256", str),
-                    ("protocolVersion", str),
-                )
-            )
-            and SHA256_PATTERN.fullmatch(str(metadata.get("modelChecksum", "")))
-            is not None
-            and SHA256_PATTERN.fullmatch(str(metadata.get("encodingProfileSha256", "")))
-            is not None
+        ready = _adapter_operation(payload, "ready")
+        metadata = _adapter_operation(
+            payload,
+            "metadata",
+            metric_fields=("dimensions",),
         )
-        valid_network = (
-            isinstance(network, Mapping)
-            and network.get("loopback") is True
-            and str(network.get("endpoint", "")).startswith("http://127.0.0.1:")
+        embeddings = _adapter_operation(
+            payload,
+            "embeddings",
+            metric_fields=("vectorCount", "dimensions"),
         )
         ok = (
-            payload.get("readyStatus") == 200
-            and payload.get("metadataStatus") == 200
-            and payload.get("checksumMatchesConfigured") is True
-            and valid_metadata
-            and valid_network
-        )
-        version = (
-            str(metadata.get("modelVersion"))
-            if isinstance(metadata, Mapping) and metadata.get("modelVersion")
-            else None
+            all(
+                operation["status"] == 200 and operation["errorCode"] is None
+                for operation in (ready, metadata, embeddings)
+            )
+            and embeddings["vectorCount"] == 1
+            and embeddings["dimensions"] == metadata["dimensions"]
         )
         return (
             ok,
-            version,
-            {
-                "readyStatus": payload.get("readyStatus"),
-                "metadataStatus": payload.get("metadataStatus"),
-                "checksumMatchesConfigured": payload.get("checksumMatchesConfigured")
-                is True,
-                "network": {"loopback": valid_network},
-            },
+            None,
+            {"ready": ready, "metadata": metadata, "embeddings": embeddings},
         )
     if check.name == "reranker":
         payload = _json_object(output, "reranker")
-        metadata = payload.get("metadata")
-        network = payload.get("network")
-        string_fields = (
-            "modelName",
-            "modelVersion",
-            "modelChecksum",
-            "promptProfileSha256",
-            "protocolVersion",
-        )
-        valid_metadata = (
-            isinstance(metadata, Mapping)
-            and all(
-                isinstance(metadata.get(field), str)
-                and bool(str(metadata.get(field)).strip())
-                for field in string_fields
-            )
-            and SHA256_PATTERN.fullmatch(str(metadata.get("modelChecksum", "")))
-            is not None
-            and SHA256_PATTERN.fullmatch(str(metadata.get("promptProfileSha256", "")))
-            is not None
-        )
-        valid_network = (
-            isinstance(network, Mapping)
-            and network.get("loopback") is True
-            and str(network.get("endpoint", "")).startswith("http://127.0.0.1:")
-        )
+        ready = _adapter_operation(payload, "ready")
+        metadata = _adapter_operation(payload, "metadata")
+        rerank = _adapter_operation(payload, "rerank", metric_fields=("scoreCount",))
         ok = (
-            payload.get("readyStatus") == 200
-            and payload.get("metadataStatus") == 200
-            and payload.get("metadataMatchesConfigured") is True
-            and valid_metadata
-            and valid_network
+            all(
+                operation["status"] == 200 and operation["errorCode"] is None
+                for operation in (ready, metadata, rerank)
+            )
+            and rerank["scoreCount"] == 2
         )
-        version = (
-            str(metadata.get("modelVersion"))
-            if isinstance(metadata, Mapping) and metadata.get("modelVersion")
-            else None
-        )
-        return (
-            ok,
-            version,
-            {
-                "readyStatus": payload.get("readyStatus"),
-                "metadataStatus": payload.get("metadataStatus"),
-                "metadataMatchesConfigured": payload.get("metadataMatchesConfigured")
-                is True,
-                "network": {"loopback": valid_network},
-            },
-        )
+        return ok, None, {"ready": ready, "metadata": metadata, "rerank": rerank}
     if check.name == "api":
         payload = _json_object(output, "api")
         network = payload.get("network")

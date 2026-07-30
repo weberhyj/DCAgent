@@ -154,9 +154,9 @@ flowchart TD
 
     M -->|"普通文档问题"| O["RetrievalRouter"]
     O -->|"legacy"| P0["PostgreSQL Legacy 检索"]
-    O -->|"shadow / qwen3"| P1["Qwen3 Embedding + BM25"]
+    O -->|"shadow / qwen3"| P1["Qwen2.5 Embedding adapter + BM25"]
     P1 --> P2["Qdrant Dense + Sparse"]
-    P2 --> P3["RRF 融合 + Qwen3 Reranker"]
+    P2 --> P3["RRF 融合 + Qwen2.5 生成式 Reranker adapter"]
     P3 --> P["Top 8 授权证据"]
     P0 --> P
     P -.->|"无可靠证据"| Y["拒绝回答，不调用模型"]
@@ -165,26 +165,34 @@ flowchart TD
     Q -.->|"超时、非 2xx 或异常 SSE"| Z["HTTP 502"]
 ```
 
-### Qwen3 混合检索链路
+### Ollama Qwen2.5 混合检索链路（保留 qwen3 兼容命名）
 
 普通文档问答采用 `Qdrant Dense + Sparse/BM25 + RRF`：
 
 1. PostgreSQL 保存权威文档、切片、权限标签和发布状态；Qdrant 保存版本化检索点。
-2. `Qwen/Qwen3-Embedding-0.6B` 生成 1024 维归一化 Dense query vector，本地 BM25
-   生成 Sparse query vector。
+2. 轻量 Embedding adapter 通过公司内网 Ollama 的 `qwen2.5:0.5b` 生成 Dense vector，并按
+   固定 profile 做归一化；维度必须以目标 `/api/embed` 的 `len(embeddings[0])` 实测值为准。
+   本地 BM25 生成 Sparse query vector。
 3. 两路检索都先应用 knowledge-base、permission-tag 和 publication filters，各取 Top 50。
-4. RRF（`k=60`）融合候选，`Qwen/Qwen3-Reranker-0.6B` 重排 Top 24，服务拥塞时使用
-   有界降级 Top 12，最终只向 Agent 提供 Top 8 及必要的相邻上下文。
+4. RRF（`k=60`）融合候选，Reranker adapter 通过 `qwen2.5:3b` 的 `/api/generate` 生成并严格
+   校验 `[0,1]` JSON scores。初始 8/4/4/20 配置是 `RETRIEVAL_RERANK_TOP_K=8`、
+   `RETRIEVAL_DEGRADED_RERANK_TOP_K=4`、`RETRIEVAL_FINAL_TOP_K=4`、
+   `RETRIEVAL_TOTAL_TIMEOUT_SECONDS=20`，最终只给 Agent 提供有界授权证据。
 5. Agent 把授权证据、调查摘要和近期会话组成完整 RAG 提示词，再通过
    `POST /api/physoc/deepseeks/stream` 交给私有 Physoc DeepSeek 归纳。
 
 `RETRIEVAL_MODE=legacy|shadow|qwen3` 的语义如下：
 
-- `legacy`：只运行 PostgreSQL Legacy 检索，不构造 Qwen3/Qdrant 查询资源。
-- `shadow`：前台仍返回 Legacy 结果；按 `RETRIEVAL_SHADOW_PERCENT` 在后台运行 Qwen3 对比，
+- `legacy`：只运行 PostgreSQL Legacy 检索，不构造混合检索/Qdrant 查询资源。
+- `shadow`：前台仍返回 Legacy 结果；按 `RETRIEVAL_SHADOW_PERCENT` 在后台运行混合检索对比，
   只存 case/chunk ID、排名指标、耗时和脱敏失败码，不保存原始问题或证据正文。
-- `qwen3`：按稳定会话哈希和 `RETRIEVAL_CANARY_PERCENT` 选择 Qwen3；未命中 canary 或
+- `qwen3`：为保持 collection、数据库记录和环境变量兼容而保留的路由名；按稳定会话哈希和
+  `RETRIEVAL_CANARY_PERCENT` 选择 Ollama-backed 混合检索；未命中 canary 或
   Embedding、Reranker、Qdrant、Alias、超时/熔断异常时安全回退 Legacy。
+
+DC-Agent 本身不再运行 Embedding/Reranker 权重；只有两个 adapter 服务调用公司内网可达的
+Ollama，不依赖外部 API。`qwen2.5:3b` 生成式 rerank 是兼容模式，不等价于专用 cross-encoder，
+必须在目标服务器完成 15 并发容量测试并观测 429/503、延迟和 controlled fallback。
 
 没有可靠证据时不会调用模型。Physoc 超时、返回非 2xx、SSE 格式异常或答案为空时，API
 返回 HTTP 502；`no raw-chunk answer on Physoc failure` 是强制规则，系统不得把检索切片、
@@ -239,7 +247,8 @@ Reranker Service、API，以及可选的 indexing worker 和 llama.cpp profile�
 - PostgreSQL 已用于会话、文档、切片、Agent 审计和结构化元数据。
 - ClickHouse 已用于启用后的 Excel/CSV 精确统计。
 - Physoc 是独立部署的公司内网模型服务，不包含在本 Compose 项目中。
-- Qdrant、Qwen3 Embedding、BM25、RRF 和 Qwen3 Reranker 已接入普通文档检索，并由
+- Qdrant、Ollama Qwen2.5 Embedding adapter、BM25、RRF 和生成式 Reranker adapter 已接入
+  普通文档检索，并由
   `RETRIEVAL_MODE` 控制 Legacy、Shadow 和 Qwen3 路由。
 - Redis 保留给后台任务和后续队列扩展；当前 Shadow 比较使用进程内有界队列。
 - ClamAV 服务当前进入了部署健康检查，但文件上传路由尚未调用病毒扫描。
@@ -264,96 +273,132 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 项目运行时可以不调用公共 API，但不能只复制仓库目录后直接开放使用。目标环境至少需要：
 
 1. 一台符合运行手册要求的 Linux 主机、rootful Docker 和 Compose v2。
-2. 已审核并预置的内部基础镜像、Python wheelhouse、Embedding/解析模型文件和镜像 digest。
+2. 已审核并预置的内部基础镜像、Python wheelhouse、解析/Sparse artifact 和镜像 digest。
    两个前端还需要预构建静态产物，或可用的 npm 离线缓存/公司内部 npm 源；仓库本身不包含
    所有运行所需 artifact。
 3. PostgreSQL、ClickHouse、Qdrant、Redis、ClamAV、Embedding Service 和 Reranker Service
-   所需的数据目录、权限、模型目录、校验和和 Secret 文件。
-4. API 容器可以访问的私有 Physoc 地址，以及正确的 `LLM_PROVIDER`、`LLM_API_BASE`、
+   所需的数据目录、权限、校验和和 Secret 文件；Embedding/Reranker 权重由公司内网 Ollama
+   承载，不再放入 DC-Agent 容器。
+4. 两个 adapter 容器可以访问的私有 Ollama 地址，以及 API 容器可以访问的私有 Physoc 地址；
+   Physoc 还需要正确的 `LLM_PROVIDER`、`LLM_API_BASE`、
    `LLM_STREAM_PATH` 和 `LLM_MODEL`。
 5. 同机反向代理。离线 Compose 只将 API 发布到 `127.0.0.1:8000`，内网客户端不应直接访问
    容器端口。
-6. 在目标服务器完成 Compose smoke、Physoc probe、Qwen3 索引发布、Shadow/Canary、真实文档
+6. 在目标服务器完成 Compose smoke、Ollama/Physoc probe、新索引发布、Shadow/Canary、真实文档
    问答、模型故障 HTTP 502、Alias/Legacy 回滚、结构化统计和 15 用户并发验收。
 
-### 本次 Qwen3 混合检索修改的部署准备
+### Ollama Qwen2.5 部署准备与上线门禁
 
-如果目标环境已经部署过旧版 DC-Agent，本次升级不能只替换后端代码。新增的 Qwen3 Dense、
-BM25 Sparse、Reranker、版本化 Qdrant publication 和 Shadow/Canary 路由还要求补齐以下资源。
+如果目标环境已经部署过旧版 DC-Agent，本次升级不能只替换后端代码。DC-Agent 本身不再运行
+Embedding/Reranker 权重；公司内网 Ollama 必须可达，且不依赖外部 API。先在批准的 Ollama
+主机拉取并探测两个模型：
 
-1. **准备并审核三个本地模型目录。** 内网服务器不得在启动时访问 Hugging Face 或其他公网源：
+#### 本次 Qwen3 混合检索修改的部署准备（历史兼容说明）
 
-   ```text
-   artifacts/models/qwen3-embedding-0.6b/
-   artifacts/models/qwen3-reranker-0.6b/
-   artifacts/models/qdrant-bm25/
-   ```
+数据库迁移名 `20260727_04_qwen3_retrieval`、`20260728_05_shadow_evaluation_labels`，以及
+`qwen3` route/collection 命名继续保留。旧手册中的
+`artifacts/models/qwen3-embedding-0.6b`、`artifacts/models/qwen3-reranker-0.6b` 不再承载
+运行权重，不得按旧方案恢复；`artifacts/models/qdrant-bm25` 仅用于批准的本地 Sparse artifact。
+原有文档切片不会自动变成新的 Qdrant 索引，必须按下文全量重建。首次构建保持
+`RETRIEVAL_MODE=shadow`、`RETRIEVAL_CANARY_PERCENT=0`，最终答案路由仍使用
+`/api/physoc/deepseeks/stream`。
 
-   前两个目录分别对应 `Qwen/Qwen3-Embedding-0.6B` 和
-   `Qwen/Qwen3-Reranker-0.6B`，必须包含批准的模型、tokenizer、metadata manifest 和模型目录
-   SHA-256；BM25 目录必须包含 FastEmbed Sparse 运行所需的批准文件和 profile SHA-256。
+```powershell
+ollama pull qwen2.5:0.5b
+ollama pull qwen2.5:3b
+$ollama = 'http://127.0.0.1:11434'
+$embedBody = @{ model = 'qwen2.5:0.5b'; input = @('dimension-probe'); truncate = $true; keep_alive = '30m' } | ConvertTo-Json -Compress
+$embedJson = curl.exe --fail-with-body --silent --show-error -H 'Content-Type: application/json' --data-binary $embedBody "$ollama/api/embed"
+$embedProbe = $embedJson | ConvertFrom-Json
+$dimensions = $embedProbe.embeddings[0].Count
+if ($dimensions -le 0) { throw 'Ollama returned no embedding dimensions' }
+```
 
-2. **按最新锁文件重建离线 wheelhouse 和服务镜像。** `artifacts/wheels` 必须覆盖当前
-   `backend/uv.lock` 在目标 Linux/Python 3.12 平台上的全部依赖，尤其是 Qdrant、FastEmbed、
-   Transformers、Torch、OpenVINO、Optimum、ONNX Runtime、FlagEmbedding、NumPy 和 Jieba。
-   需要重新构建 API、ingestion worker、Embedding Service 和新增的 Reranker Service 镜像，
-   并把镜像 digest 写入 `deploy/offline/.env`，不能继续使用示例占位校验和。
+把 `$dimensions` 填入 `EMBEDDING_MODEL_DIMENSIONS`。老 Ollama 只提供 legacy endpoint 时，显式
+设置 `OLLAMA_EMBEDDING_PATH=/api/embeddings`；不得在任意错误后自动切换路径。用原生生成接口
+确认 3B 模型能返回 JSON score shape：
 
-3. **备份 PostgreSQL 并执行新增迁移。** 本次升级新增：
+```powershell
+$prompt = 'Return only JSON: {"scores":[{"index":0,"score":0.0},{"index":1,"score":0.0}]}. Score relevance from 0 to 1. Query: leave policy. Passage 0: annual leave policy. Passage 1: cafeteria menu.'
+$generateBody = @{ model = 'qwen2.5:3b'; prompt = $prompt; stream = $false; format = 'json'; options = @{ temperature = 0; num_predict = 128 } } | ConvertTo-Json -Depth 5 -Compress
+$generateJson = curl.exe --fail-with-body --silent --show-error -H 'Content-Type: application/json' --data-binary $generateBody "$ollama/api/generate"
+$scoreProbe = (($generateJson | ConvertFrom-Json).response | ConvertFrom-Json)
+if ($scoreProbe.scores.Count -ne 2) { throw 'Ollama JSON score probe returned the wrong count' }
+```
 
-   ```text
-   20260727_04_qwen3_retrieval
-   20260728_05_shadow_evaluation_labels
-   ```
+从 `/api/tags` 提取目标模型的真实 digest，去掉可选 `sha256:` 前缀后再写入配置。不要复制示例
+占位符：
 
-   启动后必须确认 Alembic 当前 head 为 `20260728_05`。迁移前应完成数据库备份和恢复演练。
+```powershell
+$tags = (curl.exe --fail-with-body --silent --show-error "$ollama/api/tags") | ConvertFrom-Json
+function Get-OllamaDigest([string]$model) {
+  $entry = $tags.models | Where-Object { $_.name -eq $model -or $_.model -eq $model } | Select-Object -First 1
+  if ($null -eq $entry) { throw "Ollama model not found: $model" }
+  $digest = ([string]$entry.digest) -replace '^sha256:', ''
+  if ($digest -cnotmatch '^[0-9a-f]{64}$') { throw "Invalid Ollama digest for $model" }
+  $digest
+}
+$embeddingDigest = Get-OllamaDigest 'qwen2.5:0.5b'
+$rerankerDigest = Get-OllamaDigest 'qwen2.5:3b'
+```
 
-4. **补齐检索与 Physoc 配置。** 第一次构建索引时使用零流量 Shadow：
+关键配置必须绑定实测值和固定 profile：
 
-   ```env
-   RETRIEVAL_MODE=shadow
-   RETRIEVAL_SHADOW_PERCENT=0
-   RETRIEVAL_CANARY_PERCENT=0
-   RETRIEVAL_PERMISSION_TAGS=internal
-   RETRIEVAL_KNOWLEDGE_BASE_ID=default
-   QDRANT_COLLECTION_ALIAS=knowledge_chunks_current
+```env
+EMBEDDING_MODEL_NAME=qwen2.5:0.5b
+EMBEDDING_MODEL_DIMENSIONS=<len(embeddings[0])>
+EMBEDDING_MODEL_SHA256=<真实 embedding digest，无 sha256: 前缀>
+EMBEDDING_ENCODING_PROFILE_SHA256=deebb4d03b8c3b08d2865df27c96a1e1c2dacee0df2e7792c4980f73ceb127a4
+RERANKER_MODEL_NAME=qwen2.5:3b
+RERANKER_MODEL_SHA256=<真实 reranker digest，无 sha256: 前缀>
+RERANKER_PROMPT_PROFILE_SHA256=e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd
+```
 
-   EMBEDDING_MODEL_NAME=Qwen/Qwen3-Embedding-0.6B
-   EMBEDDING_MODEL_SHA256=<真实目录校验和>
-   RERANKER_MODEL_NAME=Qwen/Qwen3-Reranker-0.6B
-   RERANKER_MODEL_SHA256=<真实目录校验和>
-   SPARSE_PROFILE_SHA256=<真实 profile 校验和>
+目标防火墙只允许 DC-Agent 主机访问批准的 Ollama IP/端口；Ollama 侧代理/ACL 只开放
+`/api/tags`、`/api/embed`（或 `/api/embeddings`）和 `/api/generate`。Compose 中只有
+`embedding-service`、`reranker-service` 接入 `ollama-egress`，API、worker、数据库和 Qdrant
+不得借此获得通用出口。
 
-   LLM_PROVIDER=physoc_deepseek
-   LLM_API_BASE=http://<API容器可访问的内网Physoc地址>:<端口>
-   LLM_STREAM_PATH=/api/physoc/deepseeks/stream
-   LLM_MODEL=my_deepseek_r1_7b
-   ```
+所有已有 Word/PDF/TXT/Excel 内容必须用新 embedding 全量重建，不能复用 Qwen3 或其他模型旧
+向量。保持 `knowledge_chunks_qwen3_vN` 和 `RETRIEVAL_MODE=qwen3` 兼容命名，先构建新的不可变
+collection 并验证模型元数据、实测 dimensions、归一化、profile/digest、点数和检索质量：
 
-   Compose 容器内不得用 `127.0.0.1` 指代其他主机上的 Physoc。只使用 Physoc 时不要启用
-   `--profile generation`；当前 Compose 仍保留可选 llama.cpp profile，彻底移除该 profile
-   属于单独的部署清理任务。
+```powershell
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v1
+```
 
-5. **重新构建并发布 Qdrant 索引。** 原有文档切片不会自动变成新的 Qdrant 索引。先完成一次
-   不激活的全量演练：
+通过所有人工 gate 后才允许使用新版本执行 `--activate`，由现有 publisher 原子切换
+`knowledge_chunks_current` Alias 和 PostgreSQL publication 状态。保留旧 collection 与旧 env；
+回滚时先把 `RETRIEVAL_MODE=legacy`，恢复上一组模型 digest/profile/dimensions，再以新的版本号
+全量重建已知可用组合并执行受 fence 保护的 `--activate`，禁止直接修改 Qdrant Alias。
 
-   ```powershell
-   & tools/invoke_offline_compose.ps1 exec -T api `
-     python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v1
-   ```
+```powershell
+# 仅在目标 acceptance 全部通过后人工执行
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v2 --activate
+```
 
-   审核点数、维度、权限过滤、Dense/Sparse 命中和模型校验和后，再用新集合版本重新验证并原子
-   激活 Alias：
+`qwen2.5:3b` 生成式 rerank 只是兼容模式。8/4/4/20 配置分别为
+`RETRIEVAL_RERANK_TOP_K=8`、`RETRIEVAL_DEGRADED_RERANK_TOP_K=4`、
+`RETRIEVAL_FINAL_TOP_K=4`、`RETRIEVAL_TOTAL_TIMEOUT_SECONDS=20`；必须在目标服务器跑 15 并发
+容量测试并观测 controlled fallback。上线 acceptance 至少要求：向量维度一致；adapter 无 5xx；
+每个候选得到有限 `[0,1]` score 或记录脱敏 fallback；失败时不能只返回原始 chunks；Excel 聚合
+继续走结构化 ClickHouse 路径；15-user gate 达到批准的延迟/错误/fallback 阈值。全部通过后才能
+激活 Alias。
 
-   ```powershell
-   & tools/invoke_offline_compose.ps1 exec -T api `
-     python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v2 --activate
-   ```
+本机没有目标 wheelhouse。必须在真实离线构建环境中，用实际 artifacts/wheels 按 Dockerfile 的
+相同 `uv sync` flags 构建并验证镜像，以弥补本机限制：
 
-6. **按门禁逐级切换流量。** 索引激活后执行 `Shadow 10 -> 50 -> 100`，再执行
-   `Canary 5 -> 25 -> 50 -> 100`。达到 100% Qwen3 后必须完成 15 用户、150 请求验收；任一阶段
-   出现权限泄漏、关键 Top-8 回归、P95 超过 5 秒、错误率或 fallback rate 超过 1%，立即把
-   `RETRIEVAL_MODE` 切回 `legacy`。
+```powershell
+$env:UV_PYTHON_DOWNLOADS = 'never'
+uv sync --project backend --frozen --offline --no-install-project --no-dev --group offline --no-index --find-links artifacts/wheels
+uv sync --project backend --frozen --offline --no-install-project --no-dev --no-index --find-links artifacts/wheels
+& tools/invoke_offline_compose.ps1 build schema-migration embedding-service reranker-service api ingestion-worker
+```
+
+真实 Ollama probe、镜像构建、全量索引、15 用户容量、目标服务器 acceptance 和 Alias activation
+都是上线前人工 gate，本次仓库修改不会执行这些动作。
 
 详细的 artifact 校验、构建、索引发布、监控和回滚命令见
 [`deploy/offline/README.md`](deploy/offline/README.md)。
@@ -367,7 +412,7 @@ BM25 Sparse、Reranker、版本化 Qdrant publication 和 Shadow/Canary 路由�
 
 ### 当前规模限制与升级路线
 
-Qwen3 混合检索已经移除 Qwen3 路线中的 PostgreSQL 全表逐片评分瓶颈，但“代码已接入”不等于
+混合检索已经移除该路线中的 PostgreSQL 全表逐片评分瓶颈，但“代码已接入”不等于
 “千万级容量已证明”。必须用批准数据集验证 Qdrant 点数、过滤选择率、模型队列、CPU/内存、
 P95、错误率和 fallback rate；强制命令见离线部署手册。
 
@@ -425,10 +470,14 @@ Set-Location ..
 
 后端代码质量：
 
+> 历史文档曾写 `uv run --project backend --group dev ruff check backend` 和
+> `uv run --project backend --group dev ruff format backend`，但当前 `dev` group 不包含 Ruff；
+> 不要使用这些旧命令。以下 `uvx ruff` 调用已在本仓库实际验证。
+
 ```powershell
-uv run --project backend --group dev ruff check backend
-uv run --project backend --group dev ruff format --check backend
-uv run --project backend --group dev ruff format backend
+uvx ruff check backend tools
+uvx ruff format --check backend tools
+uvx ruff format backend tools
 ```
 
 用户检索端：

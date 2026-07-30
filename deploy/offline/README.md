@@ -31,76 +31,136 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 - `--profile generation` enables the private llama.cpp service after its locked local model is installed.
 - `--profile indexing` enables the structured spreadsheet worker (`app.structured_worker`). Keep it disabled while `STRUCTURED_QUERY_ENABLED=false`.
 
-## Qwen3 hybrid retrieval rollout and rollback
+## Ollama-backed Qwen2.5 hybrid retrieval rollout and rollback
 
-The selected private retrieval models are `Qwen/Qwen3-Embedding-0.6B` and
-`Qwen/Qwen3-Reranker-0.6B`. Ordinary document retrieval is
-`Qdrant Dense + Sparse/BM25 + RRF`, followed by bounded reranking and Top 8 evidence. Exact
-spreadsheet statistics use `ClickHouse complete-data aggregation`; spreadsheet averages are never
-calculated from RAG chunks.
+DC-Agent no longer loads or runs Embedding/Reranker weights. The lightweight adapter services keep
+the private `/v1/embeddings` and `/v1/rerank` contracts, while the approved company-intranet Ollama
+instance serves `qwen2.5:0.5b` through `/api/embed` and `qwen2.5:3b` through `/api/generate`.
+Ollama must be reachable from the adapter containers before startup; this deployment does not use
+an external model API. Ordinary document retrieval remains `Qdrant Dense + Sparse/BM25 + RRF`,
+followed by bounded reranking. Exact spreadsheet statistics remain on the structured ClickHouse
+path and are never calculated from RAG chunks.
 
 The deployment selector is `RETRIEVAL_MODE=legacy|shadow|qwen3`:
 
 - `legacy` returns only the PostgreSQL Legacy path and is the immediate safety rollback.
-- `shadow` returns Legacy results while a sampled, bounded background job compares Qwen3 rankings.
-- `qwen3` routes a stable conversation canary to Qwen3 and safely falls back to Legacy on a
+- `shadow` returns Legacy results while a sampled, bounded background job compares hybrid rankings.
+- `qwen3` is retained as the backward-compatible route name; it routes a stable conversation canary
+  to the Ollama-backed hybrid path and safely falls back to Legacy on a
   sanitized retrieval failure.
 
-### Artifact and wheel contract
+### Pull and probe the target Ollama models
 
-Provision this local-only layout before rendering Compose:
-
-```text
-artifacts/
-  offline-artifacts.json
-  wheels/                         # every Linux/Python 3.12 wheel required by backend/uv.lock
-  models/
-    qwen3-embedding-0.6b/
-      embedding-metadata.json
-      ... approved local tokenizer and model files
-    qwen3-reranker-0.6b/
-      reranker-metadata.json
-      ... approved local tokenizer and model files
-    qdrant-bm25/
-      ... approved FastEmbed BM25 files
-```
-
-`offline-artifacts.json` must validate against `deploy/offline/artifacts.schema.json` and contain
-separate `embedding-model`, `reranker-model`, and `sparse-embedding-model` entries with local paths,
-versions, licenses, and lowercase SHA-256 values. It must not contain a download URL. The two model
-metadata manifests must match the corresponding `.env` model name, version, dimensions/profile,
-and protocol fields.
-
-Generate the service-compatible model tree digests from the repository root on the staging host:
+Run these commands on the approved Ollama host. Pulling is an internal staging action and must not
+cause the production DC-Agent host to contact a public model service:
 
 ```powershell
-$embedding = (Resolve-Path artifacts/models/qwen3-embedding-0.6b).Path
-$reranker = (Resolve-Path artifacts/models/qwen3-reranker-0.6b).Path
-uv run --directory backend --group offline python -c "from pathlib import Path; from app.embedding_service import compute_model_directory_sha256; print(compute_model_directory_sha256(Path(r'$embedding')))"
-uv run --directory backend --group offline python -c "from pathlib import Path; from app.reranker_service import compute_model_directory_sha256; print(compute_model_directory_sha256(Path(r'$reranker')))"
+ollama pull qwen2.5:0.5b
+ollama pull qwen2.5:3b
 ```
 
-Copy the resulting values into `EMBEDDING_MODEL_SHA256` and `RERANKER_MODEL_SHA256`. Validate the
-manifest and prove that the locked wheel bundle is complete without public network access:
+Probe the embedding endpoint with `curl.exe` (PowerShell's `curl` alias is not used). Measure the
+target server instead of assuming a dimension from the model name:
+
+```powershell
+$ollama = 'http://127.0.0.1:11434'
+$embedBody = @{ model = 'qwen2.5:0.5b'; input = @('dimension-probe'); truncate = $true; keep_alive = '30m' } | ConvertTo-Json -Compress
+$embedJson = curl.exe --fail-with-body --silent --show-error `
+  -H 'Content-Type: application/json' --data-binary $embedBody "$ollama/api/embed"
+$embedProbe = $embedJson | ConvertFrom-Json
+$dimensions = $embedProbe.embeddings[0].Count
+if ($dimensions -le 0) { throw 'Ollama returned no embedding dimensions' }
+$dimensions
+```
+
+Set `EMBEDDING_MODEL_DIMENSIONS` to exactly that `$dimensions` value. Older Ollama releases that do
+not expose `/api/embed` must use `OLLAMA_EMBEDDING_PATH=/api/embeddings`; the adapter then sends one
+legacy `prompt` request per text. Do not silently switch paths after an arbitrary error.
+
+Probe JSON score generation separately. This only proves the native Ollama model can return the
+required shape; the adapter still applies its fixed prompt, index/count checks, finite `[0,1]`
+validation, and ordering before returning `/v1/rerank`:
+
+```powershell
+$generatePrompt = 'Return only JSON: {"scores":[{"index":0,"score":0.0},{"index":1,"score":0.0}]}. Score passage relevance to the query from 0 to 1. Query: leave policy. Passage 0: annual leave policy. Passage 1: cafeteria menu.'
+$generateBody = @{ model = 'qwen2.5:3b'; prompt = $generatePrompt; stream = $false; format = 'json'; options = @{ temperature = 0; num_predict = 128 } } | ConvertTo-Json -Depth 5 -Compress
+$generateJson = curl.exe --fail-with-body --silent --show-error `
+  -H 'Content-Type: application/json' --data-binary $generateBody "$ollama/api/generate"
+$generateEnvelope = $generateJson | ConvertFrom-Json
+$scoreProbe = $generateEnvelope.response | ConvertFrom-Json
+if ($scoreProbe.scores.Count -ne 2) { throw 'Ollama JSON score probe returned the wrong count' }
+$scoreProbe.scores | Select-Object index, score
+```
+
+Read the actual model digests from `/api/tags`, select the exact target model, remove only the
+optional `sha256:` prefix, and reject anything other than 64 lowercase hexadecimal characters:
+
+```powershell
+$tags = (curl.exe --fail-with-body --silent --show-error "$ollama/api/tags") | ConvertFrom-Json
+function Get-OllamaDigest([string]$model) {
+  $entry = $tags.models | Where-Object { $_.name -eq $model -or $_.model -eq $model } | Select-Object -First 1
+  if ($null -eq $entry) { throw "Ollama model not found: $model" }
+  $digest = ([string]$entry.digest) -replace '^sha256:', ''
+  if ($digest -cnotmatch '^[0-9a-f]{64}$') { throw "Invalid Ollama digest for $model" }
+  $digest
+}
+$embeddingDigest = Get-OllamaDigest 'qwen2.5:0.5b'
+$rerankerDigest = Get-OllamaDigest 'qwen2.5:3b'
+$embeddingDigest
+$rerankerDigest
+```
+
+Copy those two real values into `EMBEDDING_MODEL_SHA256` and `RERANKER_MODEL_SHA256`. Never copy the
+`aaaaaaaa...`/`cccccccc...` examples from `.env.example`; they are placeholders, not model digests.
+The locked adapter profiles are:
+
+```env
+EMBEDDING_MODEL_NAME=qwen2.5:0.5b
+EMBEDDING_MODEL_DIMENSIONS=<len(embeddings[0]) from the target /api/embed probe>
+EMBEDDING_MODEL_SHA256=<normalized qwen2.5:0.5b digest from /api/tags>
+EMBEDDING_ENCODING_PROFILE_SHA256=deebb4d03b8c3b08d2865df27c96a1e1c2dacee0df2e7792c4980f73ceb127a4
+RERANKER_MODEL_NAME=qwen2.5:3b
+RERANKER_MODEL_SHA256=<normalized qwen2.5:3b digest from /api/tags>
+RERANKER_PROMPT_PROFILE_SHA256=e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd
+```
+
+Startup checks `/api/tags` and fails closed when either configured digest differs from the target
+Ollama model. The embedding profile hash is derived from the canonical raw-text/normalization
+profile; the reranker hash pins the generated-score prompt contract.
+
+### Egress and wheel/image build contract
+
+Only `embedding-service` and `reranker-service` join `ollama-egress`; API, ingestion worker,
+databases, Qdrant, Redis, ClamAV, and other services stay off that network. Restrict the target
+firewall to the DC-Agent host and approved Ollama IP/port, and use the Ollama-side proxy/service ACL
+to allow only `/api/tags`, `/api/embed` (or the configured legacy `/api/embeddings`), and
+`/api/generate`. Do not expose unrestricted Ollama access to other company hosts.
+
+The wheel bundle must come from an approved internal staging process and cover the exact
+`backend/uv.lock` for target Linux/Python 3.12. This development machine does not have the target
+wheelhouse, so local tests cannot satisfy the image gate. In the actual offline build environment,
+use the real artifacts/wheels and verify the same flags used by the Dockerfiles:
 
 ```powershell
 $env:UV_PYTHON_DOWNLOADS = "never"
-uv run --directory backend --group offline python -c "import json; from pathlib import Path; from app.offline_artifacts import validate_artifact_manifest; validate_artifact_manifest(json.loads(Path('../artifacts/offline-artifacts.json').read_text(encoding='utf-8'))); print('artifact-manifest-ok')"
-uv sync --project backend --frozen --offline --group offline --no-dev --no-index --find-links artifacts/wheels
-uv sync --project backend --frozen --offline --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
+uv sync --project backend --frozen --offline --no-install-project --no-dev --group offline --no-index --find-links artifacts/wheels
+uv sync --project backend --frozen --offline --no-install-project --no-dev --no-index --find-links artifacts/wheels
+& tools/invoke_offline_compose.ps1 build schema-migration embedding-service reranker-service api ingestion-worker
 ```
 
-The wheel bundle must come from an approved internal staging process and must cover the exact
-`backend/uv.lock`; a missing wheel is a failed deployment gate, not permission to contact PyPI or
-Hugging Face.
+The first sync matches backend/worker images; the second matches the lightweight adapter images.
+The Compose build must use the actual reviewed `PYTHON_BASE_IMAGE`, artifacts and wheels. A missing
+wheel or failed image build is a failed deployment gate, not permission to contact PyPI.
 
 ### Starting CPU profile
 
-The checked-in starting point is 4 CPU / 6 GiB for Embedding, 4 CPU / 6 GiB for Reranker, 2 GiB for
-Qdrant, and 4 GiB for ClickHouse. Embedding uses a 64-item batch and 256-item queue; Reranker uses a
-24-pair batch and 192-item queue, both with a 10 ms collection window and OpenVINO. These are
-starting limits, not guaranteed capacity. Do not lower or raise them without recording the 15-user
-benchmark, model queue saturation, host CPU steal, RSS, and p95 impact.
+The adapters do not hold model weights, but Ollama capacity is still shared and model generation is
+the bottleneck. `qwen2.5:3b` generation-based reranking is a compatibility mode, not equivalent to a
+purpose-trained cross-encoder. The initial bounded configuration is
+`RETRIEVAL_RERANK_TOP_K=8`, `RETRIEVAL_DEGRADED_RERANK_TOP_K=4`,
+`RETRIEVAL_FINAL_TOP_K=4`, and `RETRIEVAL_TOTAL_TIMEOUT_SECONDS=20`. Treat this 8/4/4/20 profile as a
+starting safety bound, not a quality or throughput guarantee. The mandatory 15-concurrent-user run
+must record latency, error rate, adapter 429/503, Ollama saturation and controlled fallback rate.
 
 ### Build, validate, and activate
 
@@ -115,7 +175,11 @@ topology:
 & tools/invoke_offline_compose.ps1 up -d
 ```
 
-Run the first full rehearsal without `--activate`. The worker creates an immutable versioned
+Every existing Word, PDF, TXT, and Excel-derived text chunk must be embedded again. Never reuse
+Qwen3 or any other model's old dense vectors: the embedding space and measured dimension belong to
+the exact Ollama model/profile/digest combination.
+
+Run the first full rebuild without `--activate`. The worker creates an immutable versioned
 collection, validates dimensions, point count, filters, Dense/Sparse search and sample query hits,
 then records the publication as `validated` in PostgreSQL:
 
@@ -126,9 +190,16 @@ then records the publication as `validated` in PostgreSQL:
   psql -U dc_agent -d dc_agent -c "SELECT collection_name, alias_name, status, dimensions, point_count, embedding_model_version, sparse_profile_sha256 FROM retrieval_publications ORDER BY created_at DESC;"
 ```
 
-Review the publication row, Qdrant count/dimension, permission-filter samples, model checksums and
-the fixed quality set. Collections are immutable and names are unique, so promotion uses the next
-approved version and performs validation again immediately before the Alias switch:
+Review the publication row and verify the exact embedding model metadata, measured dimensions,
+normalized vectors, encoding profile hash, model digest, sparse profile, point count, filters and
+fixed quality set. Keep `knowledge_chunks_qwen3_vN` collection names and `RETRIEVAL_MODE=qwen3` for
+backward compatibility even though the dense/rerank backends now use Qwen2.5. Collections are
+immutable and names are unique.
+
+Run Shadow/Canary and the 15-user gate in an isolated acceptance deployment that uses its own
+PostgreSQL audit database and `QDRANT_COLLECTION_ALIAS=knowledge_chunks_acceptance`; it must not
+change the production `knowledge_chunks_current` Alias. Build and activate the next immutable
+version there through the same publication fence:
 
 ```powershell
 & tools/invoke_offline_compose.ps1 exec -T api `
@@ -136,10 +207,10 @@ approved version and performs validation again immediately before the Alias swit
 Invoke-RestMethod http://127.0.0.1:8000/api/readyz
 ```
 
-`--activate` atomically switches `knowledge_chunks_current` and the PostgreSQL active-publication
-record. If post-switch verification fails, the publisher restores the previous Alias and audit
-state. Never mutate the Qdrant Alias directly because that would bypass the PostgreSQL publication
-fence and make readiness fail closed.
+In that acceptance deployment, `--activate` switches only `knowledge_chunks_acceptance`. If
+post-switch verification fails, the publisher restores its previous Alias and audit state. Never
+mutate a Qdrant Alias directly because that would bypass the PostgreSQL publication fence and make
+readiness fail closed.
 
 ### Shadow and canary promotion
 
@@ -165,7 +236,7 @@ Stop promotion when any gate fails: Recall@50 below 0.90, NDCG@8 regression, tar
 0.05, a critical Top-8 regression, permission leakage, structured aggregate mismatch, retrieval
 P95 above 5 seconds, error rate above 1%, or fallback rate above 1%.
 
-At 100% Qwen3 canary, run the mandatory 15-user acceptance command from the repository root. The
+At 100% `qwen3` canary, run the mandatory 15-user acceptance command from the repository root. The
 benchmark deliberately rejects any mode other than `qwen3` and any canary value other than 100:
 
 ```powershell
@@ -174,6 +245,32 @@ uv run --project backend --group benchmark python tools/hybrid_retrieval_benchma
 
 Preserve the JSON report as deployment evidence and never commit sensitive question text or generated
 reports.
+
+Before alias activation, the target-server acceptance set must prove all of the following:
+
+- every indexed and query vector dimension equals the measured/configured dimension;
+- adapter `/readyz`, `/v1/metadata`, `/v1/embeddings`, and `/v1/rerank` produce no 5xx;
+- every reranked candidate has one finite `[0,1]` score, or the request records a controlled,
+  sanitized fallback code;
+- a reranker/answer-model failure never returns raw chunks as the final answer;
+- Excel aggregation still follows the structured ClickHouse publication path rather than chunk
+  arithmetic;
+- the 15-user gate meets the latency/error/fallback thresholds approved for the target server.
+
+Only after this set passes may an operator return to the production deployment, confirm
+`QDRANT_COLLECTION_ALIAS=knowledge_chunks_current`, build a fresh version, validate it again, and
+atomically activate it:
+
+```powershell
+& tools/invoke_offline_compose.ps1 exec -T api `
+  python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v3 --activate
+Invoke-RestMethod http://127.0.0.1:8000/api/readyz
+```
+
+That final `--activate` atomically switches `knowledge_chunks_current` and the production
+PostgreSQL active-publication record. Ollama probes, real image builds, capacity tests, acceptance
+promotion, and production Alias activation are manual pre-production gates; this repository change
+does not execute them.
 
 ### Monitoring
 
@@ -201,14 +298,16 @@ if ($next -eq $text -and $text -notmatch '(?m)^RETRIEVAL_MODE=legacy$') { throw 
 Invoke-RestMethod http://127.0.0.1:8000/api/readyz
 ```
 
-For an `Alias rollback`, remain in Legacy, restore the previously approved model directories and
-checksums, then rebuild that known-good model/data combination under a new collection version and
-activate it. Do not reuse an existing immutable collection name:
+For an `Alias rollback`, remain in Legacy and retain the previous collection plus the previous
+approved environment values. Restore the known-good Ollama model digests/profile/dimension values,
+reconcile the adapters, then rebuild that known-good model/data combination under a new collection
+version and activate it. Do not reuse an existing immutable collection name or point the Alias
+directly at an unaudited collection:
 
 ```powershell
 & tools/invoke_offline_compose.ps1 up -d
 & tools/invoke_offline_compose.ps1 exec -T api `
-  python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v3 --activate
+  python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v4 --activate
 ```
 
 For a model-service image rollback, check out the last approved release in the deployment release
@@ -375,6 +474,6 @@ This development machine has neither Docker nor a complete target wheelhouse. Re
 
 ## Offline Compose smoke check
 
-After preparing the offline environment, run `python tools/compose_smoke.py` from the repository root. The smoke runner uses the supported `tools/invoke_offline_compose.ps1` wrapper for `config`, `up`, `exec`, and `down`; it starts only `api` and its declared core dependencies, leaving the indexing worker and generation profile disabled. It validates PostgreSQL/Alembic, ClickHouse, Qdrant, Redis, ClamAV, Embedding metadata, Reranker metadata, and the host-published API readiness endpoint, then atomically writes the deterministic audit report to `artifacts/benchmarks/compose-smoke.json`. A failed command, missing executable, malformed response, non-loopback endpoint, or non-200 readiness response is a failed smoke check. The runner always attempts `down --remove-orphans` in cleanup, preserves data volumes by default, and removes them only when `--remove-volumes` is explicitly supplied. Docker is not available on this development machine, so this check is a target-host gate and must not be reported as passed locally.
+After preparing the offline environment, run `python tools/compose_smoke.py` from the repository root. The smoke runner uses the supported `tools/invoke_offline_compose.ps1` wrapper for `config`, `up`, `exec`, and `down`; it starts only `api` and its declared core dependencies, leaving the indexing worker and generation profile disabled. It validates PostgreSQL/Alembic, ClickHouse, Qdrant, Redis, ClamAV, adapter `/readyz`, `/v1/metadata`, `/v1/embeddings`, `/v1/rerank`, and the host-published API readiness endpoint, then atomically writes the audit report to `artifacts/benchmarks/compose-smoke.json`. Adapter results contain only status, latency, vector count/dimension, score count, and a sanitized error code; prompt/query text, document/passages, vector coordinates, raw scores, and generated Ollama response text are never persisted. A failed command, missing executable, malformed response, metadata/dimension mismatch, or non-200 readiness response is a failed smoke check. The runner always attempts `down --remove-orphans` in cleanup, preserves data volumes by default, and removes them only when `--remove-volumes` is explicitly supplied. Docker is not available on this development machine, so this check is a target-host gate and must not be reported as passed locally.
 
 The locked PostgreSQL image must be PostgreSQL 15 or newer (`POSTGRES_MIN_MAJOR=15`) because exact index validation uses `pg_index.indnullsnotdistinct`. Startup rejects older or unreported server versions before catalog inspection with an explicit `PostgreSQL 15+ required` error; there is no compatibility fallback. The PostgreSQL target host must also run the real baseline/stamp and drift-rejection tests against the approved PostgreSQL version. Local unit tests validate catalog-row normalization and advisory lock orchestration, but they do not prove the live `pg_catalog` queries, session advisory lock concurrency, or rollback behavior on the target server. Docker builds of the backend, worker, Embedding, and Reranker images plus the Compose configuration check remain target-host gates.

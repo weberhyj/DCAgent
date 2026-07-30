@@ -16,10 +16,17 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "tools" / "compose_smoke.py"
-MODEL_SHA256 = "a" * 64
-ENCODING_SHA256 = "b" * 64
-RERANKER_SHA256 = "c" * 64
-PROMPT_SHA256 = "d" * 64
+EMBEDDING_DIMENSIONS = 896
+
+
+def _operation(**overrides: object) -> dict[str, object]:
+    operation: dict[str, object] = {
+        "status": 200,
+        "latencyMs": 12.5,
+        "errorCode": None,
+    }
+    operation.update(overrides)
+    return operation
 
 
 def _module():
@@ -38,23 +45,12 @@ def _migration_head() -> str:
 
 def _embedding_payload(**overrides: object) -> str:
     payload: dict[str, object] = {
-        "readyStatus": 200,
-        "ready": {"status": "ready"},
-        "metadataStatus": 200,
-        "checksumMatchesConfigured": True,
-        "metadata": {
-            "modelName": "bge-small",
-            "modelVersion": "1",
-            "modelChecksum": MODEL_SHA256,
-            "dimensions": 384,
-            "normalized": True,
-            "encodingProfileSha256": ENCODING_SHA256,
-            "protocolVersion": "1",
-        },
-        "network": {
-            "endpoint": "http://127.0.0.1:8081",
-            "loopback": True,
-        },
+        "ready": _operation(),
+        "metadata": _operation(dimensions=EMBEDDING_DIMENSIONS),
+        "embeddings": _operation(
+            vectorCount=1,
+            dimensions=EMBEDDING_DIMENSIONS,
+        ),
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -62,21 +58,9 @@ def _embedding_payload(**overrides: object) -> str:
 
 def _reranker_payload(**overrides: object) -> str:
     payload: dict[str, object] = {
-        "readyStatus": 200,
-        "ready": {"status": "ready"},
-        "metadataStatus": 200,
-        "metadataMatchesConfigured": True,
-        "metadata": {
-            "modelName": "Qwen/Qwen3-Reranker-0.6B",
-            "modelVersion": "1.0.0",
-            "modelChecksum": RERANKER_SHA256,
-            "promptProfileSha256": PROMPT_SHA256,
-            "protocolVersion": "v1",
-        },
-        "network": {
-            "endpoint": "http://127.0.0.1:8082",
-            "loopback": True,
-        },
+        "ready": _operation(),
+        "metadata": _operation(),
+        "rerank": _operation(scoreCount=2),
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -422,6 +406,8 @@ class ComposeSmokeTest(unittest.TestCase):
             "exec -T embedding-service python -c",
             "exec -T reranker-service python -c",
             "/v1/metadata",
+            "/v1/embeddings",
+            "/v1/rerank",
             "http://127.0.0.1:8000/api/readyz",
         ):
             self.assertIn(token, joined)
@@ -477,27 +463,29 @@ class ComposeSmokeTest(unittest.TestCase):
                 self.assertFalse(report["passed"])
                 self.assertIn(f"check:{key}", report["failures"])
 
-    def test_embedding_metadata_rejects_malformed_checksums_and_non_loopback_network(
-        self,
-    ) -> None:
+    def test_embedding_probe_requires_ready_metadata_and_measured_vectors(self) -> None:
         compose_smoke = _module()
         cases = {
             "malformed": "not-json",
-            "checksum": _embedding_payload(
-                metadata={
-                    "modelName": "bge-small",
-                    "modelVersion": "1",
-                    "modelChecksum": "not-a-checksum",
-                    "dimensions": 384,
-                    "normalized": True,
-                    "encodingProfileSha256": ENCODING_SHA256,
-                    "protocolVersion": "1",
-                }
+            "ready": _embedding_payload(
+                ready=_operation(status=503, errorCode="http_503")
             ),
-            "network": _embedding_payload(
-                network={"endpoint": "https://public.example", "loopback": False}
+            "metadata": _embedding_payload(
+                metadata=_operation(
+                    status=200,
+                    dimensions=EMBEDDING_DIMENSIONS,
+                    errorCode="metadata_mismatch",
+                )
             ),
-            "configured_checksum": _embedding_payload(checksumMatchesConfigured=False),
+            "dimensions": _embedding_payload(
+                embeddings=_operation(vectorCount=1, dimensions=384)
+            ),
+            "count": _embedding_payload(
+                embeddings=_operation(
+                    vectorCount=0,
+                    dimensions=EMBEDDING_DIMENSIONS,
+                )
+            ),
         }
         for label, output in cases.items():
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
@@ -510,29 +498,17 @@ class ComposeSmokeTest(unittest.TestCase):
                 self.assertFalse(report["passed"])
                 self.assertIn("check:embedding", report["failures"])
 
-    def test_reranker_metadata_rejects_mismatch_malformed_checksums_and_network(
-        self,
-    ) -> None:
+    def test_reranker_probe_requires_ready_metadata_and_bounded_scores(self) -> None:
         compose_smoke = _module()
-        valid_metadata = {
-            "modelName": "Qwen/Qwen3-Reranker-0.6B",
-            "modelVersion": "1.0.0",
-            "modelChecksum": RERANKER_SHA256,
-            "promptProfileSha256": PROMPT_SHA256,
-            "protocolVersion": "v1",
-        }
         cases = {
             "malformed": "not-json",
-            "checksum": _reranker_payload(
-                metadata={**valid_metadata, "modelChecksum": "not-a-checksum"}
+            "ready": _reranker_payload(
+                ready=_operation(status=503, errorCode="http_503")
             ),
-            "prompt": _reranker_payload(
-                metadata={**valid_metadata, "promptProfileSha256": "invalid"}
+            "metadata": _reranker_payload(
+                metadata=_operation(errorCode="metadata_mismatch")
             ),
-            "network": _reranker_payload(
-                network={"endpoint": "https://public.example", "loopback": False}
-            ),
-            "configured_metadata": _reranker_payload(metadataMatchesConfigured=False),
+            "scores": _reranker_payload(rerank=_operation(scoreCount=0)),
         }
         for label, output in cases.items():
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
@@ -544,6 +520,35 @@ class ComposeSmokeTest(unittest.TestCase):
                 )
                 self.assertFalse(report["passed"])
                 self.assertIn("check:reranker", report["failures"])
+
+    def test_adapter_http_failure_preserves_sanitized_status_latency_and_error(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        embedding_failure = _operation(status=503, errorCode="http_503")
+        reranker_failure = _operation(status=429, errorCode="http_429")
+        with tempfile.TemporaryDirectory() as directory:
+            report = compose_smoke.run_compose_smoke(
+                report_path=Path(directory) / "report.json",
+                runner=FakeRunner(
+                    outputs={
+                        "embedding": _embedding_payload(embeddings=embedding_failure),
+                        "reranker": _reranker_payload(rerank=reranker_failure),
+                    }
+                ),
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(
+            report["readyResults"]["embedding"]["embeddings"],
+            embedding_failure,
+        )
+        self.assertEqual(
+            report["readyResults"]["reranker"]["rerank"],
+            reranker_failure,
+        )
 
     def test_invalid_qdrant_json_and_missing_native_output_fail_closed(self) -> None:
         compose_smoke = _module()
@@ -712,16 +717,82 @@ class ComposeSmokeTest(unittest.TestCase):
             self.assertIn("reranker", payload["readyResults"])
             reranker = payload["readyResults"]["reranker"]
             self.assertTrue(reranker["passed"])
-            self.assertTrue(reranker["metadataMatchesConfigured"])
-            self.assertNotIn("metadata", reranker)
-            self.assertNotIn("ready", reranker)
-            self.assertEqual(payload["componentVersions"]["reranker"], "1.0.0")
+            self.assertEqual(
+                reranker,
+                {
+                    "passed": True,
+                    "ready": _operation(),
+                    "metadata": _operation(),
+                    "rerank": _operation(scoreCount=2),
+                },
+            )
+            embedding = payload["readyResults"]["embedding"]
+            self.assertEqual(
+                embedding,
+                {
+                    "passed": True,
+                    "ready": _operation(),
+                    "metadata": _operation(dimensions=EMBEDDING_DIMENSIONS),
+                    "embeddings": _operation(
+                        vectorCount=1,
+                        dimensions=EMBEDDING_DIMENSIONS,
+                    ),
+                },
+            )
+            self.assertNotIn("embedding", payload["componentVersions"])
+            self.assertNotIn("reranker", payload["componentVersions"])
             self.assertEqual(
                 payload["checksums"]["composeYamlSha256"],
                 hashlib.sha256(
                     (REPO_ROOT / "deploy/offline/compose.yaml").read_bytes()
                 ).hexdigest(),
             )
+
+    def test_adapter_probe_report_never_persists_input_vectors_scores_or_generated_text(
+        self,
+    ) -> None:
+        prompt = "PROMPT-CANARY-DO-NOT-PERSIST"
+        document = "DOCUMENT-CANARY-DO-NOT-PERSIST"
+        coordinates = "0.123456789,-0.987654321"
+        scores = "0.87654321,0.12345678"
+        generated = "OLLAMA-GENERATED-RAW-CANARY"
+        embedding = json.loads(_embedding_payload())
+        embedding.update(
+            {
+                "prompt": prompt,
+                "document": document,
+                "vectors": coordinates,
+            }
+        )
+        reranker = json.loads(_reranker_payload())
+        reranker.update(
+            {
+                "query": prompt,
+                "passages": [document],
+                "scores": scores,
+                "response": generated,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "compose-smoke.json"
+            compose_smoke = _module()
+            report = compose_smoke.run_compose_smoke(
+                report_path=report_path,
+                runner=FakeRunner(
+                    outputs={
+                        "embedding": json.dumps(embedding),
+                        "reranker": json.dumps(reranker),
+                    }
+                ),
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+
+            self.assertTrue(report["passed"])
+            persisted = report_path.read_text(encoding="utf-8")
+
+        for forbidden in (prompt, document, coordinates, scores, generated):
+            self.assertNotIn(forbidden, persisted)
 
     def test_exception_removes_stale_report_instead_of_leaving_false_pass(self) -> None:
         compose_smoke = _module()
