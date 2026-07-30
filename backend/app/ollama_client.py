@@ -367,7 +367,11 @@ def _read_bounded_json(response: httpx.Response, max_response_bytes: int) -> obj
         body = _read_bounded_gzip(response, max_response_bytes, raw_limit)
     else:
         body = _read_bounded_identity(response, max_response_bytes)
-    return json.loads(body.decode("utf-8"))
+    decoded_body = body.decode("utf-8")
+    try:
+        return json.loads(decoded_body)
+    except RecursionError:
+        raise OllamaResponseError("Ollama service returned invalid JSON") from None
 
 
 def _read_bounded_identity(response: httpx.Response, max_response_bytes: int) -> bytearray:

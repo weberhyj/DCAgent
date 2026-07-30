@@ -463,6 +463,42 @@ class OllamaClientTest(unittest.TestCase):
                 self.assertNotIn("10.20.30.40", message)
                 self.assertNotIn("unterminated", message)
 
+    def test_deeply_nested_identity_get_and_gzip_post_map_recursion_safely(self) -> None:
+        canary = "PRIVATE-DEEP-JSON-CANARY"
+        body = ("[" * 10_000 + f'"{canary}"' + "]" * 10_000).encode("utf-8")
+        cases = (("GET", None), ("POST", "gzip"))
+        for method, content_encoding in cases:
+            with self.subTest(method=method, content_encoding=content_encoding):
+                wire_body = body if content_encoding is None else gzip.compress(body)
+                stream = TrackingByteStream([wire_body])
+                headers = {"Content-Length": str(len(wire_body))}
+                if content_encoding is not None:
+                    headers["Content-Encoding"] = content_encoding
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        200,
+                        headers=headers,
+                        stream=stream,
+                        request=request,
+                    )
+
+                client, _ = self._default_client_with_handler(
+                    handler,
+                    max_response_bytes=len(body),
+                )
+                with self.assertRaises(OllamaResponseError) as caught:
+                    if method == "GET":
+                        client.get_json("/api/tags")
+                    else:
+                        client.post_json("/api/generate", {"prompt": "PRIVATE-PROMPT"})
+
+                message = str(caught.exception)
+                self.assertNotIn(canary, message)
+                self.assertNotIn("PRIVATE-PROMPT", message)
+                self.assertNotIn("10.20.30.40", message)
+                self.assertEqual(stream.close_calls, 1)
+
     def test_http_status_fails_before_oversized_content_length_validation(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
