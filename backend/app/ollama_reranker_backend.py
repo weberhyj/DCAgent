@@ -116,13 +116,22 @@ def _validate_pairs(pairs: object) -> list[tuple[str, str]]:
     return validated
 
 
+def _json_prompt_string(value: str) -> str:
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("\u0085", r"\u0085")
+        .replace("\u2028", r"\u2028")
+        .replace("\u2029", r"\u2029")
+    )
+
+
 def _build_prompt(query: str, passages: Sequence[str]) -> str:
     documents = "\n\n".join(
-        f"Document {index}:\n{json.dumps(passage, ensure_ascii=False)}"
+        f"Document {index}:\n{_json_prompt_string(passage)}"
         for index, passage in enumerate(passages)
     )
     return RERANK_PROMPT_PROFILE.format(
-        query=json.dumps(query, ensure_ascii=False),
+        query=_json_prompt_string(query),
         documents=documents,
     )
 
