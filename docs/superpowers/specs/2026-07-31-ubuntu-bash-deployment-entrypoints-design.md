@@ -1,44 +1,44 @@
-# Ubuntu Bash Deployment Entrypoints Design
+# Ubuntu Bash 部署入口设计
 
-## Goal
+## 目标
 
-Make Ubuntu 20.04 the primary production deployment environment for DC-Agent by adding Bash entrypoints for environment preparation and validated Docker Compose execution, while preserving the existing PowerShell entrypoints for Windows development compatibility.
+为 DC-Agent 增加 Ubuntu 20.04 Bash 部署入口，将 Ubuntu 作为生产部署的主要运行环境，同时保留现有 PowerShell 入口供 Windows 开发机兼容使用。
 
-## Scope
+## 范围
 
-This change will:
+本次修改包括：
 
-- add `tools/prepare_offline_env.sh`;
-- add `tools/invoke_offline_compose.sh`;
-- keep `tools/prepare_offline_env.ps1` and `tools/invoke_offline_compose.ps1` available;
-- make Bash the documented production path for Ubuntu 20.04;
-- remove PowerShell commands from `docs/intranet-deployment-configuration.md`;
-- update Linux-oriented deployment documentation and smoke tooling to select the Bash wrapper on POSIX systems;
-- retain the current security and fail-closed behavior of the PowerShell deployment path.
+- 新增 `tools/prepare_offline_env.sh`；
+- 新增 `tools/invoke_offline_compose.sh`；
+- 保留 `tools/prepare_offline_env.ps1` 和 `tools/invoke_offline_compose.ps1`；
+- Ubuntu 20.04 生产部署文档默认使用 Bash；
+- 从 `docs/intranet-deployment-configuration.md` 中移除所有 PowerShell 命令；
+- 更新面向 Linux 的部署文档和 smoke 工具，使其在 POSIX 系统上选择 Bash wrapper；
+- 保留当前 PowerShell 部署路线的安全校验和失败关闭行为。
 
-This change will not remove Windows development support, relax Compose validation, enable raw `docker compose` as a supported production path, or change the deployed application topology.
+本次修改不会删除 Windows 开发支持，不会放宽 Compose 校验，不会把直接运行 `docker compose` 作为受支持的生产方式，也不会改变系统部署拓扑。
 
-## Architecture
+## 架构
 
-The Bash files will be small executable entrypoints using `#!/usr/bin/env bash` and `set -Eeuo pipefail`. They will resolve the repository root without depending on the caller's current directory and will execute Python 3 helpers that implement the complex validation logic.
+Bash 文件使用 `#!/usr/bin/env bash` 和 `set -Eeuo pipefail`，作为小型可执行入口。脚本必须能够在任意当前目录下正确定位仓库根目录，并调用 Python 3 辅助程序完成复杂校验。
 
-Two Python helpers will provide the Ubuntu implementation:
+Ubuntu 路线包含两个 Python 辅助程序：
 
-- `tools/offline_env.py`: creates or validates `deploy/offline/.env`, records the current non-root Linux UID/GID, creates the managed secret files atomically, enforces owner/mode rules, validates bind roots, and supports explicit secret rotation.
-- `tools/offline_compose.py`: validates the requested Compose arguments, forces the local `default` Docker context, clears conflicting environment overrides, renders every profile as JSON, validates images, networks, bind mounts and secret paths, and only then executes Docker Compose.
+- `tools/offline_env.py`：创建或校验 `deploy/offline/.env`，记录当前非 root Linux UID/GID，原子创建受管 secret 文件，校验所有者和权限，校验 bind 根目录，并支持显式轮换 secret。
+- `tools/offline_compose.py`：校验 Compose 参数，强制使用本地 `default` Docker context，清除冲突的环境变量覆盖，渲染所有 profile 的 Compose JSON，校验镜像、网络、bind mount 和 secret 路径，通过后才执行 Docker Compose。
 
-The existing PowerShell scripts remain valid compatibility entrypoints. They will not be required on Ubuntu and the Ubuntu path must not invoke `pwsh` internally.
+现有 PowerShell 脚本继续作为兼容入口。Ubuntu 不需要安装 PowerShell，Bash 路线内部也不得调用 `pwsh`。
 
-## Command Contracts
+## 命令约定
 
-Ubuntu environment preparation:
+Ubuntu 环境准备命令：
 
 ```bash
 ./tools/prepare_offline_env.sh
 ./tools/prepare_offline_env.sh --rotate-secrets
 ```
 
-Ubuntu validated Compose execution:
+Ubuntu 受控 Compose 命令：
 
 ```bash
 ./tools/invoke_offline_compose.sh config
@@ -47,88 +47,88 @@ Ubuntu validated Compose execution:
 ./tools/invoke_offline_compose.sh exec -T api python -m app.physoc_probe
 ```
 
-Unknown preparation arguments must fail. Missing Compose arguments must fail. The Compose wrapper must preserve argument boundaries exactly and must reject the same unsafe commands and options rejected by the PowerShell implementation.
+环境准备脚本收到未知参数时必须失败。Compose wrapper 没有收到 Compose 参数时必须失败。Compose wrapper 必须完整保留参数边界，并拒绝 PowerShell 实现当前已经禁止的危险命令和选项。
 
-## Environment Preparation Behavior
+## 环境准备行为
 
-The Ubuntu preparation path must preserve these contracts:
+Ubuntu 环境准备路线必须保留以下约定：
 
-1. Copy `deploy/offline/.env.example` only when `deploy/offline/.env` does not exist.
-2. Never overwrite a valid existing `.env` automatically.
-3. Record `id -u` and `id -g` on first preparation and reject root UID/GID or later mismatches.
-4. Require local rootful Docker with the default context contract used by the existing deployment.
-5. Keep repository-managed secrets under `artifacts/secrets` and reject redirected, quoted, unresolved or symbolic-link paths.
-6. Keep the secret directory at mode `0700` and secret files at mode `0600` on Linux.
-7. Create the PostgreSQL password/database URL pair atomically and reject partial pairs.
-8. Create separate ClickHouse query and ingest passwords without printing secret values.
-9. Preserve existing valid secrets unless `--rotate-secrets` is explicitly supplied.
-10. Validate the data/model bind roots and create only the approved writable `raw` and `parquet` directories.
+1. 只有 `deploy/offline/.env` 不存在时，才复制 `deploy/offline/.env.example`。
+2. 不得自动覆盖已有且有效的 `.env`。
+3. 第一次准备时记录 `id -u` 和 `id -g`，拒绝 root UID/GID，并在后续执行时拒绝身份不一致。
+4. 要求使用本地 rootful Docker 和现有部署规定的 `default` context。
+5. secret 必须位于仓库管理的 `artifacts/secrets`，拒绝重定向、引号、未解析变量或符号链接路径。
+6. Linux 上 secret 目录权限保持 `0700`，secret 文件权限保持 `0600`。
+7. PostgreSQL 密码和数据库 URL 必须成对原子创建，缺少其中一个时必须拒绝继续。
+8. 分别创建 ClickHouse 查询账号和写入账号密码，且不得输出密码内容。
+9. 除非明确传入 `--rotate-secrets`，否则必须保留已有且有效的 secret。
+10. 校验数据和模型 bind 根目录，只创建允许写入的 `raw` 和 `parquet` 目录。
 
-Secret generation will use Python's `secrets` module so Ubuntu does not require OpenSSL solely for password generation.
+密码生成使用 Python `secrets` 模块，Ubuntu 不需要为了生成密码额外依赖 OpenSSL。
 
-## Compose Wrapper Behavior
+## Compose Wrapper 行为
 
-The Ubuntu Compose wrapper must preserve these contracts:
+Ubuntu Compose wrapper 必须保留以下约定：
 
-1. Use only `docker --context default compose` with `deploy/offline/.env` and `deploy/offline/compose.yaml`.
-2. Reject remote Docker endpoints, non-default contexts and environment-based Compose project/file/profile overrides.
-3. Reject unsupported or dangerous commands and flags, including one-off `run`, direct `create`, `start`, `restart`, scale changes and options that bypass builds, dependencies or recreation.
-4. Render all profiles with `config --format json` before executing the requested command.
-5. Validate the fixed project name, digest-pinned internal images, internal network isolation, API exposure, approved bind sources and repository-managed secret paths.
-6. Restore the caller environment after execution and return the real Docker Compose exit code.
-7. Never print secret file contents or resolved database credentials.
+1. 只允许使用 `docker --context default compose`，并固定使用 `deploy/offline/.env` 和 `deploy/offline/compose.yaml`。
+2. 拒绝远程 Docker endpoint、非默认 context，以及通过环境变量覆盖 Compose project、file 或 profile。
+3. 拒绝不受支持或危险的命令和参数，包括一次性 `run`、直接 `create`、`start`、`restart`、修改 scale，以及跳过 build、依赖或重建的参数。
+4. 执行实际命令前，必须使用 `config --format json` 渲染全部 profile。
+5. 校验固定 project 名称、使用 digest 固定的内部镜像、内部网络隔离、API 暴露范围、允许的 bind source 和仓库管理的 secret 路径。
+6. 执行结束后恢复调用者环境，并返回真实的 Docker Compose 退出码。
+7. 不得打印 secret 内容或解析后的数据库凭据。
 
-## Smoke Tool Selection
+## Smoke 工具选择
 
-`tools/compose_smoke.py` will choose the wrapper by operating system:
+`tools/compose_smoke.py` 根据操作系统选择 wrapper：
 
-- POSIX/Linux: `tools/invoke_offline_compose.sh`;
-- Windows: `tools/invoke_offline_compose.ps1`.
+- POSIX/Linux：`tools/invoke_offline_compose.sh`；
+- Windows：`tools/invoke_offline_compose.ps1`。
 
-An explicitly supplied wrapper path will continue to override the default. Existing Windows process handling remains available, while Linux executes the Bash wrapper directly.
+显式传入的 wrapper 路径继续拥有最高优先级。现有 Windows 进程处理逻辑继续保留，Linux 则直接执行 Bash wrapper。
 
-## Documentation Rules
+## 文档规则
 
-The following documents will use Ubuntu Bash commands as their primary deployment examples:
+以下文档以 Ubuntu Bash 命令作为主要部署示例：
 
-- `docs/intranet-deployment-configuration.md`;
-- `docs/offline-platform-runbook.md`;
-- `deploy/offline/README.md`;
-- the production deployment sections of `README.md`.
+- `docs/intranet-deployment-configuration.md`；
+- `docs/offline-platform-runbook.md`；
+- `deploy/offline/README.md`；
+- `README.md` 中的生产部署部分。
 
-`docs/intranet-deployment-configuration.md` must contain no `.ps1`, `Copy-Item`, PowerShell backtick continuation, or `& tools/...` invocation. Multiline commands will use Bash `\` continuation.
+`docs/intranet-deployment-configuration.md` 不得包含 `.ps1`、`Copy-Item`、PowerShell 反引号续行符或 `& tools/...` 调用。多行命令统一使用 Bash `\` 续行符。
 
-The general and Compose README files may retain one short Windows-development compatibility note pointing to the `.ps1` scripts, but Ubuntu remains the only documented production server route.
+项目 README 和 Compose README 可以保留一段简短的 Windows 开发兼容说明，指向 `.ps1` 脚本，但 Ubuntu 是唯一的生产服务器部署路线。
 
-## Testing
+## 测试
 
-Testing will follow a contract-first approach:
+测试采用契约优先方式：
 
-1. Add failing tests for the two new `.sh` entrypoints, LF line endings, executable Git mode and expected Python helper invocation.
-2. Add failing unit tests for environment parsing, duplicate keys, secret path confinement, UID/GID validation, secret pair atomicity, rotation and permissions.
-3. Add failing unit tests for Compose argument rejection, environment cleanup, rendered JSON validation, internal image digests, networks, binds and secrets.
-4. Add failing tests proving `compose_smoke.py` selects `.sh` on POSIX and `.ps1` on Windows.
-5. Add documentation contract tests proving the intranet deployment guide is Bash-only and the supported Ubuntu commands are present.
-6. Run the existing Compose, Physoc, structured deployment and smoke test suites to prevent regressions in the PowerShell compatibility path.
-7. Run Ruff and `git diff --check`.
+1. 先添加失败测试，检查两个 `.sh` 入口、LF 换行、Git 可执行权限和预期的 Python 辅助程序调用。
+2. 先添加失败单元测试，覆盖环境变量解析、重复键、secret 路径限制、UID/GID 校验、secret 成对原子创建、轮换和权限。
+3. 先添加失败单元测试，覆盖 Compose 参数拦截、环境清理、渲染 JSON 校验、内部镜像 digest、网络、bind 和 secret。
+4. 添加失败测试，证明 `compose_smoke.py` 在 POSIX 上选择 `.sh`，在 Windows 上选择 `.ps1`。
+5. 添加文档契约测试，证明公司内网部署清单只使用 Bash，并包含受支持的 Ubuntu 命令。
+6. 运行现有 Compose、Physoc、结构化部署和 smoke 测试，防止 PowerShell 兼容路线回归。
+7. 运行 Ruff 和 `git diff --check`。
 
-Real Docker Compose execution remains a target Ubuntu host gate because the current development machine does not provide the production Docker topology.
+真实 Docker Compose 执行仍属于目标 Ubuntu 服务器验收项，因为当前开发机不具备生产 Docker 拓扑。
 
-## Compatibility and Rollout
+## 兼容和上线
 
-- Existing Windows developers can continue using the `.ps1` scripts.
-- Ubuntu operators will not need PowerShell 7.
-- Existing `.env`, bind data and secret files remain compatible; the Bash preparation command validates and preserves them.
-- The first Ubuntu deployment must run the Bash preparation command, render Compose configuration, execute the service smoke checks, and verify the Physoc/Ollama routes before receiving production traffic.
-- Behavioral drift between Bash and PowerShell paths is treated as a test failure; security checks cannot be silently omitted from either supported entrypoint.
+- Windows 开发人员可以继续使用 `.ps1` 脚本。
+- Ubuntu 运维人员不需要安装 PowerShell 7。
+- 现有 `.env`、bind 数据和 secret 文件保持兼容，Bash 环境准备命令负责校验并保留它们。
+- 第一次 Ubuntu 部署必须运行 Bash 环境准备命令、渲染 Compose 配置、执行服务 smoke，并验证 Physoc/Ollama 路线后才能接入生产流量。
+- Bash 和 PowerShell 路线出现行为差异时视为测试失败，任何一条受支持路线都不能静默省略安全校验。
 
-## Acceptance Criteria
+## 验收标准
 
-The design is complete when:
+满足以下条件后视为完成：
 
-- both Bash entrypoints work without `pwsh` on Ubuntu 20.04;
-- Bash and PowerShell entrypoints preserve the same deployment safety contract;
-- the intranet deployment guide is entirely Bash-based;
-- POSIX smoke tooling defaults to the Bash Compose wrapper;
-- all affected automated tests, Ruff checks and Markdown/diff checks pass;
-- the Ubuntu target-host Compose and connectivity gates are documented as required production verification.
+- 两个 Bash 入口可以在 Ubuntu 20.04 上运行，且不依赖 `pwsh`；
+- Bash 和 PowerShell 入口保持相同的部署安全契约；
+- 公司内网部署清单完全使用 Bash；
+- POSIX smoke 工具默认使用 Bash Compose wrapper；
+- 所有受影响的自动化测试、Ruff 和 Markdown/diff 检查通过；
+- 文档明确要求在 Ubuntu 目标服务器执行 Compose 和网络连通性验收。
