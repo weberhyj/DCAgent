@@ -559,16 +559,18 @@ class InMemoryChatRepository:
             self._find_conversation(conversation_id)
             previous_messages = deepcopy(self._messages_for(conversation_id))
 
-        agent_result = (
-            None
-            if self._structured_service is None
-            else self._structured_service.try_answer(
+        agent_result = self._agent.try_answer_greeting(
+            conversation_id=conversation_id,
+            content=clean_content,
+            mode=mode,
+        )
+        if agent_result is None and self._structured_service is not None:
+            agent_result = self._structured_service.try_answer(
                 conversation_id=conversation_id,
                 content=clean_content,
                 mode=mode,
                 previous_messages=previous_messages,
             )
-        )
         if agent_result is None:
             agent_result = self._agent.run(
                 conversation_id=conversation_id,
