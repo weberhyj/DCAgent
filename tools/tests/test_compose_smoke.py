@@ -121,7 +121,7 @@ def _reranker_metadata(*, model: str = QWEN25_RERANKER_MODEL) -> dict[str, objec
     }
 
 
-def _bash_block_after_heading(text: str, heading: str) -> list[str]:
+def _bash_blocks_after_heading(text: str, heading: str) -> list[str]:
     heading_level = len(heading) - len(heading.lstrip("#"))
     if heading_level == 0:
         return []
@@ -135,11 +135,41 @@ def _bash_block_after_heading(text: str, heading: str) -> list[str]:
     section_end = (
         section_start + next_heading.start() if next_heading is not None else len(text)
     )
-    block_match = re.search(
+    return re.findall(
         r"(?ms)^[ \t]*```bash[ \t]*$\n(?P<body>.*?)^[ \t]*```[ \t]*$",
         text[section_start:section_end],
     )
-    return [block_match.group("body")] if block_match is not None else []
+
+
+def _ollama_probe_blocks(blocks: list[str]) -> list[str]:
+    endpoints = ("/api/embed", "/api/generate", "/api/tags")
+    return [
+        block for block in blocks if all(endpoint in block for endpoint in endpoints)
+    ]
+
+
+def _windows_markers_in_bash(block: str) -> list[str]:
+    markers = []
+    lower_block = block.casefold()
+    for forbidden in (
+        "curl.exe",
+        "Invoke-RestMethod",
+        "Where-Object",
+        "$env:",
+        "$ErrorActionPreference",
+        "Set-Location",
+        "ConvertTo-Json",
+        "Select-Object",
+        "Out-File",
+        "Write-Host",
+    ):
+        if forbidden.casefold() in lower_block:
+            markers.append(forbidden)
+    if re.search(r"(?m)`[ \t]*$", block):
+        markers.append("PowerShell backtick continuation")
+    if re.search(r"(?m)^[ \t]*&[ \t]+tools/", block):
+        markers.append("& tools/")
+    return markers
 
 
 class _HelperResponse:
@@ -1684,7 +1714,7 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertIn("--remove-volumes", text)
         self.assertIn("preserves data volumes by default", text)
 
-    def test_linux_bash_block_selector_allows_explanatory_prose(self) -> None:
+    def test_linux_bash_block_selector_returns_every_fence_after_prose(self) -> None:
         text = """
 #### Linux (Bash)
 
@@ -1694,15 +1724,23 @@ Run this only on the approved Ollama host.
 set -Eeuo pipefail
 curl --fail-with-body http://127.0.0.1:11434/api/tags
 ```
+
+```bash
+Write-Host 'This second fence must also be audited'
+```
 """
 
         self.assertEqual(
             [
                 "set -Eeuo pipefail\n"
-                "curl --fail-with-body http://127.0.0.1:11434/api/tags\n"
+                "curl --fail-with-body http://127.0.0.1:11434/api/tags\n",
+                "Write-Host 'This second fence must also be audited'\n",
             ],
-            _bash_block_after_heading(text, "#### Linux (Bash)"),
+            _bash_blocks_after_heading(text, "#### Linux (Bash)"),
         )
+        blocks = _bash_blocks_after_heading(text, "#### Linux (Bash)")
+        self.assertEqual([], _windows_markers_in_bash(blocks[0]))
+        self.assertIn("Write-Host", _windows_markers_in_bash(blocks[1]))
 
     def test_readme_linux_bash_ollama_probes_exclude_windows_commands(
         self,
@@ -1710,9 +1748,17 @@ curl --fail-with-body http://127.0.0.1:11434/api/tags
         for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                linux_blocks = _bash_block_after_heading(text, "#### Linux (Bash)")
-                self.assertEqual(1, len(linux_blocks))
-                linux = linux_blocks[0]
+                linux_blocks = _bash_blocks_after_heading(text, "#### Linux (Bash)")
+                self.assertGreaterEqual(len(linux_blocks), 1)
+                for index, block in enumerate(linux_blocks):
+                    self.assertEqual(
+                        [],
+                        _windows_markers_in_bash(block),
+                        f"Windows command leaked into Bash block {index} in {path}",
+                    )
+                probe_blocks = _ollama_probe_blocks(linux_blocks)
+                self.assertEqual(1, len(probe_blocks))
+                linux = probe_blocks[0]
                 first_command = next(
                     line.strip()
                     for line in linux.splitlines()
@@ -1720,21 +1766,6 @@ curl --fail-with-body http://127.0.0.1:11434/api/tags
                 )
                 self.assertEqual("set -Eeuo pipefail", first_command)
                 self.assertIn("curl --fail-with-body", linux)
-                for forbidden in (
-                    "curl.exe",
-                    "Invoke-RestMethod",
-                    "Where-Object",
-                    "$env:",
-                    "$ErrorActionPreference",
-                    "Set-Location",
-                    "ConvertTo-Json",
-                    "Select-Object",
-                    "Out-File",
-                    "Write-Host",
-                ):
-                    self.assertNotIn(forbidden.casefold(), linux.casefold())
-                self.assertNotRegex(linux, r"(?m)`[ \t]*$")
-                self.assertNotRegex(linux, r"(?m)^[ \t]*&[ \t]+tools/")
                 for endpoint in ("/api/embed", "/api/generate", "/api/tags"):
                     self.assertIn(endpoint, linux)
 
@@ -1742,9 +1773,10 @@ curl --fail-with-body http://127.0.0.1:11434/api/tags
         for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                linux_blocks = _bash_block_after_heading(text, "#### Linux (Bash)")
-                self.assertEqual(1, len(linux_blocks))
-                linux = linux_blocks[0]
+                linux_blocks = _bash_blocks_after_heading(text, "#### Linux (Bash)")
+                probe_blocks = _ollama_probe_blocks(linux_blocks)
+                self.assertEqual(1, len(probe_blocks))
+                linux = probe_blocks[0]
 
                 self.assertIn('matches=[item for item in body["models"]', linux)
                 self.assertIn("len(matches) == 1 or sys.exit", linux)

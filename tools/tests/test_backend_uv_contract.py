@@ -1,3 +1,4 @@
+import ast
 import re
 import tomllib
 import unittest
@@ -57,15 +58,9 @@ class BackendUvContractTest(unittest.TestCase):
         section = self.markdown_section(text, heading)
         matches = []
         for block in self.bash_blocks(section):
-            without_bash_continuations = re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", block)
-            logical_commands = (
-                line.strip()
-                for line in without_bash_continuations.splitlines()
-                if line.strip() and not line.lstrip().startswith("#")
-            )
             if any(
                 logical_command == command or logical_command.startswith(f"{command} ")
-                for logical_command in logical_commands
+                for logical_command in self.bash_logical_commands(block)
             ):
                 matches.append(block)
         self.assertEqual(
@@ -74,6 +69,100 @@ class BackendUvContractTest(unittest.TestCase):
             f"Expected one Bash block under {heading} containing: {command}",
         )
         return matches[0]
+
+    def bash_logical_commands(self, block: str) -> list[str]:
+        without_bash_continuations = re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", block)
+        return [
+            line.strip()
+            for line in without_bash_continuations.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+    def assert_offline_dependency_commands(
+        self,
+        block: str,
+        lock_command: str,
+        offline_sync: str,
+        benchmark_sync: str,
+    ) -> None:
+        logical_commands = self.bash_logical_commands(block)
+        required_commands = (
+            (
+                "UV_PYTHON_DOWNLOADS export",
+                r"export\s+UV_PYTHON_DOWNLOADS\s*=\s*[\"']?never[\"']?",
+            ),
+            ("uv lock", re.escape(lock_command)),
+            ("offline sync", re.escape(offline_sync)),
+            ("benchmark sync", re.escape(benchmark_sync)),
+        )
+        required_indices = []
+        for label, pattern in required_commands:
+            matches = [
+                index
+                for index, logical_command in enumerate(logical_commands)
+                if re.fullmatch(pattern, logical_command)
+            ]
+            self.assertEqual(
+                1,
+                len(matches),
+                f"Expected one executable {label}; commands: {logical_commands}",
+            )
+            required_indices.append(matches[0])
+        self.assertEqual(
+            sorted(required_indices),
+            required_indices,
+            f"Offline dependency commands are out of order: {logical_commands}",
+        )
+
+    def assert_manifest_validation_command(self, block: str, offline_uv: str) -> None:
+        logical_commands = self.bash_logical_commands(block)
+        pythonpath_indices = [
+            index
+            for index, logical_command in enumerate(logical_commands)
+            if re.fullmatch(
+                r"export\s+PYTHONPATH\s*=\s*[\"']?backend[\"']?",
+                logical_command,
+            )
+        ]
+        self.assertEqual(
+            1,
+            len(pythonpath_indices),
+            f"Expected one executable PYTHONPATH export; commands: {logical_commands}",
+        )
+        validation_commands = [
+            (index, logical_command)
+            for index, logical_command in enumerate(logical_commands)
+            if logical_command.startswith(f"{offline_uv} -c ")
+        ]
+        self.assertEqual(
+            1,
+            len(validation_commands),
+            f"Expected one executable manifest validation command: {logical_commands}",
+        )
+        validation_index, validation_logical_command = validation_commands[0]
+        self.assertLess(pythonpath_indices[0], validation_index)
+        validation_command = re.fullmatch(
+            rf'{re.escape(offline_uv)}\s+-c\s+"(?P<code>[^"]+)"',
+            validation_logical_command,
+        )
+        self.assertIsNotNone(validation_command)
+        assert validation_command is not None
+        validation_code = validation_command.group("code")
+        self.assertIn(
+            "from app.offline_artifacts import validate_artifact_manifest",
+            validation_code,
+        )
+        validation_tree = ast.parse(validation_code)
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "validate_artifact_manifest"
+                for node in ast.walk(validation_tree)
+            ),
+            "Manifest validation command imports but never calls "
+            "validate_artifact_manifest",
+        )
 
     def test_bash_block_selector_scopes_commands_to_the_documented_heading(
         self,
@@ -112,6 +201,91 @@ export UV_PYTHON_DOWNLOADS=never
                 "uv lock --project backend \\\n                  --python 3.12"
             ),
         )
+
+    def test_offline_documentation_requires_executable_commands_in_order(
+        self,
+    ) -> None:
+        lock_command = "uv lock --project backend --python 3.12"
+        offline_sync = (
+            "uv sync --project backend --frozen --offline --group offline --no-dev "
+            "--no-index --find-links artifacts/wheels"
+        )
+        benchmark_sync = (
+            "uv sync --project backend --frozen --offline --no-default-groups "
+            "--group benchmark --no-index --find-links artifacts/wheels"
+        )
+        valid_dependency_block = "\n".join(
+            (
+                "export UV_PYTHON_DOWNLOADS=never",
+                lock_command,
+                offline_sync,
+                benchmark_sync,
+            )
+        )
+        misleading_dependency_block = "\n".join(
+            (
+                "# export UV_PYTHON_DOWNLOADS=never",
+                lock_command,
+                f"printf '%s\\n' '{offline_sync}'",
+                f"# {benchmark_sync}",
+            )
+        )
+        out_of_order_dependency_block = "\n".join(
+            (
+                "export UV_PYTHON_DOWNLOADS=never",
+                benchmark_sync,
+                lock_command,
+                offline_sync,
+            )
+        )
+
+        self.assert_offline_dependency_commands(
+            valid_dependency_block, lock_command, offline_sync, benchmark_sync
+        )
+        for invalid_block in (
+            misleading_dependency_block,
+            out_of_order_dependency_block,
+        ):
+            with self.subTest(block=invalid_block), self.assertRaises(AssertionError):
+                self.assert_offline_dependency_commands(
+                    invalid_block, lock_command, offline_sync, benchmark_sync
+                )
+
+        offline_uv = "uv run --project backend --frozen --offline --no-default-groups --group offline python"
+        valid_validation_block = "\n".join(
+            (
+                "export PYTHONPATH=backend",
+                f'{offline_uv} -c "from app.offline_artifacts import validate_artifact_manifest; validate_artifact_manifest({{}})"',
+            )
+        )
+        misleading_pythonpath_block = "\n".join(
+            (
+                "# export PYTHONPATH=backend",
+                "printf '%s\\n' 'export PYTHONPATH=backend'",
+                f'{offline_uv} -c "from app.offline_artifacts import validate_artifact_manifest; validate_artifact_manifest({{}})"',
+            )
+        )
+        import_only_block = "\n".join(
+            (
+                "export PYTHONPATH=backend",
+                f"{offline_uv} -c \"from app.offline_artifacts import validate_artifact_manifest; print('loaded')\"",
+            )
+        )
+        string_only_call_block = "\n".join(
+            (
+                "export PYTHONPATH=backend",
+                f"{offline_uv} -c \"from app.offline_artifacts import validate_artifact_manifest; print('; validate_artifact_manifest({{}})')\"",
+            )
+        )
+
+        self.assert_manifest_validation_command(valid_validation_block, offline_uv)
+        for invalid_block in (
+            misleading_pythonpath_block,
+            import_only_block,
+            string_only_call_block,
+        ):
+            with self.subTest(block=invalid_block), self.assertRaises(AssertionError):
+                self.assert_manifest_validation_command(invalid_block, offline_uv)
 
     def assert_exact_requirements(
         self, requirements: list[object], expected: set[str]
@@ -643,22 +817,12 @@ export UV_PYTHON_DOWNLOADS=never
                 dependency_block = self.bash_block_under_heading_containing(
                     text, dependency_heading, lock_command
                 )
-                normalized_dependency_block = self.normalize_command_text(
-                    dependency_block
+                self.assert_offline_dependency_commands(
+                    dependency_block,
+                    lock_command,
+                    offline_sync,
+                    benchmark_sync,
                 )
-                environment_match = re.search(
-                    r"\bexport\s+UV_PYTHON_DOWNLOADS\s*=\s*[\"']?never[\"']?",
-                    normalized_dependency_block,
-                )
-                self.assertIsNotNone(environment_match)
-                assert environment_match is not None
-                environment_index = environment_match.start()
-                lock_index = normalized_dependency_block.index(lock_command)
-                offline_index = normalized_dependency_block.index(offline_sync)
-                benchmark_index = normalized_dependency_block.index(benchmark_sync)
-                self.assertLess(environment_index, lock_index)
-                self.assertLess(environment_index, offline_index)
-                self.assertLess(environment_index, benchmark_index)
 
         offline_readme = (
             REPOSITORY_ROOT / "deploy" / "offline" / "README.md"
@@ -719,28 +883,7 @@ export UV_PYTHON_DOWNLOADS=never
             "## 3. Artifact manifest 与许可证审核",
             f"{offline_uv} -c",
         )
-        normalized_validation = self.normalize_command_text(validation_block)
-        pythonpath_match = re.search(
-            r"\bexport\s+PYTHONPATH\s*=\s*[\"']?backend[\"']?",
-            normalized_validation,
-        )
-        self.assertIsNotNone(pythonpath_match)
-        assert pythonpath_match is not None
-        pythonpath_index = pythonpath_match.start()
-        validation_index = normalized_validation.index(
-            f"{offline_uv} -c", pythonpath_index
-        )
-        self.assertLess(pythonpath_index, validation_index)
-        validation_command = re.search(
-            rf'{re.escape(offline_uv)}\s+-c\s+"(?P<code>[^"]+)"',
-            normalized_validation,
-        )
-        self.assertIsNotNone(validation_command)
-        assert validation_command is not None
-        self.assertIn(
-            "from app.offline_artifacts import validate_artifact_manifest",
-            validation_command.group("code"),
-        )
+        self.assert_manifest_validation_command(validation_block, offline_uv)
 
     def test_smoke_backend_uses_uv_from_the_backend_project(self) -> None:
         path = REPOSITORY_ROOT / "tools" / "start_smoke_backend.cmd"
