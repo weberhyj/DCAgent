@@ -514,14 +514,12 @@ def prepare_environment(
 
     # Existing deployments before the ClickHouse pair was introduced are
     # upgraded in memory and committed with one atomic .env replacement.
-    clickhouse_configured = {
-        name: bool(values.get(name, "").strip()) for name in CLICKHOUSE_ENV_DEFAULTS
-    }
-    if not any(clickhouse_configured.values()):
+    clickhouse_keys_present = {name: name in values for name in CLICKHOUSE_ENV_DEFAULTS}
+    if not any(clickhouse_keys_present.values()):
         env_updates.update(CLICKHOUSE_ENV_DEFAULTS)
         env_text = _render_env_values(env_text, env_updates)
         values = _load_env_text(env_text)
-    elif not all(clickhouse_configured.values()):
+    elif not all(clickhouse_keys_present.values()):
         raise DeploymentError(
             "Both ClickHouse password file paths must be configured together"
         )

@@ -381,6 +381,66 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             self.assertFalse((root / "artifacts" / "data" / "parquet").exists())
             self.assertFalse((root / "artifacts" / "secrets").exists())
 
+    def test_clickhouse_key_presence_distinguishes_missing_from_empty_values(
+        self,
+    ) -> None:
+        base_env = (
+            "DATA_ROOT=../../artifacts/data\n"
+            "MODEL_ROOT=../../artifacts/models\n"
+            "POSTGRES_PASSWORD_FILE=../../artifacts/secrets/postgres-password\n"
+            "DATABASE_URL_SECRET_FILE=../../artifacts/secrets/database-url\n"
+            "DCAGENT_UID=1000\n"
+            "DCAGENT_GID=1000\n"
+        )
+        cases = (
+            (
+                "query empty ingest missing",
+                "CLICKHOUSE_QUERY_PASSWORD_FILE=\n",
+                "configured together",
+            ),
+            (
+                "query missing ingest empty",
+                "CLICKHOUSE_INGEST_PASSWORD_FILE=\n",
+                "configured together",
+            ),
+            (
+                "query empty ingest present",
+                "CLICKHOUSE_QUERY_PASSWORD_FILE=\n"
+                "CLICKHOUSE_INGEST_PASSWORD_FILE=../../artifacts/secrets/clickhouse-ingest-password\n",
+                "direct path",
+            ),
+            (
+                "query present ingest empty",
+                "CLICKHOUSE_QUERY_PASSWORD_FILE=../../artifacts/secrets/clickhouse-query-password\n"
+                "CLICKHOUSE_INGEST_PASSWORD_FILE=\n",
+                "direct path",
+            ),
+            (
+                "query and ingest empty",
+                "CLICKHOUSE_QUERY_PASSWORD_FILE=\nCLICKHOUSE_INGEST_PASSWORD_FILE=\n",
+                "direct path",
+            ),
+        )
+        for label, clickhouse_env, error_pattern in cases:
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._repository(root)
+                    env_path = self._write_existing_env(root, base_env + clickhouse_env)
+                    before = self._snapshot_tree(root)
+
+                    with self.assertRaisesRegex(DeploymentError, error_pattern):
+                        self._prepare(root)
+
+                    self.assertEqual(before, self._snapshot_tree(root))
+                    self.assertEqual(
+                        before[env_path.relative_to(root).as_posix()][2],
+                        env_path.read_bytes(),
+                    )
+                    self.assertFalse((root / "artifacts" / "data" / "raw").exists())
+                    self.assertFalse((root / "artifacts" / "data" / "parquet").exists())
+                    self.assertFalse((root / "artifacts" / "secrets").exists())
+
     def test_existing_postgres_pair_is_preserved_when_clickhouse_is_added(
         self,
     ) -> None:
