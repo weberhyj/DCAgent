@@ -121,6 +121,14 @@ def _reranker_metadata(*, model: str = QWEN25_RERANKER_MODEL) -> dict[str, objec
     }
 
 
+def _bash_block_after_heading(text: str, heading: str) -> list[str]:
+    return re.findall(
+        rf"(?ms)^{re.escape(heading)}[ \t]*$\n(?:[ \t]*\n)*"
+        r"^[ \t]*```bash[ \t]*$\n(?P<body>.*?)^[ \t]*```[ \t]*$",
+        text,
+    )
+
+
 class _HelperResponse:
     def __init__(self, payload: dict[str, object] | bytes, status: int = 200) -> None:
         self.status = status
@@ -1669,41 +1677,35 @@ class ComposeSmokeTest(unittest.TestCase):
         for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                linux_match = re.search(
-                    r"(?ms)^#### Linux \(Bash\)\s*$\n(?P<body>.*?)^#### Windows \(PowerShell\)\s*$",
-                    text,
+                linux_blocks = _bash_block_after_heading(text, "#### Linux (Bash)")
+                self.assertEqual(1, len(linux_blocks))
+                linux = linux_blocks[0]
+                first_command = next(
+                    line.strip()
+                    for line in linux.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")
                 )
-                self.assertIsNotNone(linux_match)
-                assert linux_match is not None
-                linux = linux_match.group("body")
-                windows = text[linux_match.end() :]
+                self.assertEqual("set -Eeuo pipefail", first_command)
                 self.assertIn("curl --fail-with-body", linux)
                 self.assertNotIn("curl.exe", linux)
-                self.assertTrue("Invoke-RestMethod" in windows or "curl.exe" in windows)
+                self.assertNotIn("Invoke-RestMethod", linux)
+                self.assertNotIn("Where-Object", linux)
                 for endpoint in ("/api/embed", "/api/generate", "/api/tags"):
                     self.assertIn(endpoint, linux)
-                    self.assertIn(endpoint, windows)
 
     def test_readme_digest_probes_require_one_exact_model_match(self) -> None:
         for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                linux_match = re.search(
-                    r"(?ms)^#### Linux \(Bash\)\s*$\n(?P<body>.*?)^#### Windows \(PowerShell\)\s*$",
-                    text,
-                )
-                self.assertIsNotNone(linux_match)
-                assert linux_match is not None
-                linux = linux_match.group("body")
-                windows = text[linux_match.end() :]
+                linux_blocks = _bash_block_after_heading(text, "#### Linux (Bash)")
+                self.assertEqual(1, len(linux_blocks))
+                linux = linux_blocks[0]
 
                 self.assertIn('matches=[item for item in body["models"]', linux)
                 self.assertIn("len(matches) == 1 or sys.exit", linux)
                 self.assertNotIn("entry=next(", linux)
-                self.assertIn("$modelMatches = @($tags.models | Where-Object", windows)
-                self.assertIn("$modelMatches.Count -ne 1", windows)
-                self.assertIn("-ceq $model", windows)
-                self.assertNotIn("Select-Object -First 1", windows)
+                self.assertNotIn("$modelMatches", linux)
+                self.assertNotIn("Select-Object -First 1", linux)
 
                 command_match = re.search(
                     r"python3 -c '(?P<code>[^']+)' \"\$model\"", linux

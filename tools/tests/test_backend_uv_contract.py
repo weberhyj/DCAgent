@@ -18,6 +18,11 @@ class BackendUvContractTest(unittest.TestCase):
             r"```powershell[ \t]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL
         )
 
+    def bash_blocks(self, text: str) -> list[str]:
+        return re.findall(
+            r"```bash[ \t]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL
+        )
+
     def powershell_block_containing(self, text: str, command: str) -> str:
         matches = [
             block
@@ -26,6 +31,17 @@ class BackendUvContractTest(unittest.TestCase):
         ]
         self.assertEqual(
             len(matches), 1, f"Expected one PowerShell block containing: {command}"
+        )
+        return matches[0]
+
+    def bash_block_containing(self, text: str, command: str) -> str:
+        matches = [
+            block
+            for block in self.bash_blocks(text)
+            if command in self.normalize_command_text(block)
+        ]
+        self.assertEqual(
+            len(matches), 1, f"Expected one Bash block containing: {command}"
         )
         return matches[0]
 
@@ -553,12 +569,12 @@ class BackendUvContractTest(unittest.TestCase):
                     "uv sync --project backend --frozen --offline --no-default-groups "
                     "--group benchmark --no-index --find-links artifacts/wheels"
                 )
-                dependency_block = self.powershell_block_containing(text, lock_command)
+                dependency_block = self.bash_block_containing(text, lock_command)
                 normalized_dependency_block = self.normalize_command_text(
                     dependency_block
                 )
                 environment_match = re.search(
-                    r"\$env:UV_PYTHON_DOWNLOADS\s*=\s*[\"']never[\"']",
+                    r"\bexport\s+UV_PYTHON_DOWNLOADS\s*=\s*[\"']?never[\"']?",
                     normalized_dependency_block,
                 )
                 self.assertIsNotNone(environment_match)
@@ -625,11 +641,15 @@ class BackendUvContractTest(unittest.TestCase):
         )
         self.assertIn(f"{benchmark_uv} -m compileall -q tools", normalized_runbook)
 
-        validation_block = self.powershell_block_containing(
-            runbook, "app.offline_artifacts"
-        )
+        validation_block = self.bash_block_containing(runbook, "app.offline_artifacts")
         normalized_validation = self.normalize_command_text(validation_block)
-        pythonpath_index = normalized_validation.index('$env:PYTHONPATH = "backend"')
+        pythonpath_match = re.search(
+            r"\bexport\s+PYTHONPATH\s*=\s*[\"']?backend[\"']?",
+            normalized_validation,
+        )
+        self.assertIsNotNone(pythonpath_match)
+        assert pythonpath_match is not None
+        pythonpath_index = pythonpath_match.start()
         validation_index = normalized_validation.index(
             f"{offline_uv} -c", pythonpath_index
         )
