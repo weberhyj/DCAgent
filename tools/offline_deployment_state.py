@@ -52,6 +52,7 @@ OPERATION_KINDS = (
     "env_replace",
     "unlink",
 )
+OBJECT_TYPES = ("file", "directory", "environment", "secret")
 
 _MARKER_OPERATIONS = frozenset({"up", "exec", "cp", "legacy_adoption"})
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
@@ -59,6 +60,7 @@ _UUID4_HEX = re.compile(r"^[0-9a-f]{32}$")
 _RFC3339_MICROSECONDS_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SAFE_CATEGORY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+_CLEANUP_TOMBSTONE = re.compile(r"^\.([0-9a-f]{32})\.journal-cleanup$")
 _SAFE_METADATA_KEYS = frozenset(
     {
         "mode",
@@ -605,6 +607,68 @@ def _safe_metadata(value: object, description: str) -> dict[str, object]:
     return output
 
 
+_UNDO_METADATA_FIELDS = {
+    "mkdir": {
+        "before": {"existed", "exists", "absent", "object_type"},
+        "after": {
+            "existed",
+            "exists",
+            "absent",
+            "object_type",
+            "mode",
+            "owner_uid",
+            "owner_gid",
+            "empty",
+        },
+    },
+    "chmod": {
+        "before": {"mode", "owner_uid", "owner_gid", "object_type"},
+        "after": {"mode", "owner_uid", "owner_gid", "object_type"},
+    },
+    "active_to_backup": {
+        "before": {"exists", "object_type", "mode", "owner_uid", "owner_gid"},
+        "after": {"exists", "object_type", "mode", "owner_uid", "owner_gid"},
+    },
+    "staging_to_active": {
+        "before": {"exists", "object_type", "mode", "owner_uid", "owner_gid"},
+        "after": {"exists", "object_type", "mode", "owner_uid", "owner_gid"},
+    },
+    "env_replace": {
+        "before": {"exists", "absent", "object_type", "mode", "owner_uid", "owner_gid"},
+        "after": {"exists", "absent", "object_type", "mode", "owner_uid", "owner_gid"},
+    },
+    "unlink": {
+        "before": {"exists", "object_type", "mode", "owner_uid", "owner_gid"},
+        "after": {"exists", "absent", "object_type"},
+    },
+}
+
+
+def _validate_undo_metadata(
+    action: str, side: str, value: object, description: str
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise DeploymentStateError(f"invalid {description}")
+    allowed = _UNDO_METADATA_FIELDS[action][side]
+    if any(not isinstance(key, str) or key not in allowed for key in value):
+        raise DeploymentStateError(f"invalid {description}")
+    result = dict(value)
+    for key, item in result.items():
+        if key == "mode":
+            _validate_mode(item, f"{description} mode")
+        elif key in {"owner_uid", "owner_gid"}:
+            _validate_optional_int(item, f"{description} {key}")
+        elif key == "object_type":
+            if item not in OBJECT_TYPES:
+                raise DeploymentStateError(f"invalid {description} object type")
+        elif key in {"exists", "existed", "absent", "empty"}:
+            if type(item) is not bool:
+                raise DeploymentStateError(f"invalid {description} flag")
+        else:
+            raise DeploymentStateError(f"invalid {description}")
+    return result
+
+
 def _validate_categories(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise DeploymentStateError("invalid transaction object categories")
@@ -694,7 +758,7 @@ class UndoEntry:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", _validate_abs_path(self.path, "undo path"))
-        if not isinstance(self.object_type, str) or not self.object_type:
+        if self.object_type not in OBJECT_TYPES:
             raise DeploymentStateError("invalid undo object type")
         if type(self.existed) is not bool:
             raise DeploymentStateError("invalid undo existed flag")
@@ -714,10 +778,18 @@ class UndoEntry:
         if self.expected_action not in OPERATION_KINDS:
             raise DeploymentStateError("invalid undo expected action")
         object.__setattr__(
-            self, "before", _safe_metadata(self.before, "undo before metadata")
+            self,
+            "before",
+            _validate_undo_metadata(
+                self.expected_action, "before", self.before, "undo before metadata"
+            ),
         )
         object.__setattr__(
-            self, "after", _safe_metadata(self.after, "undo after metadata")
+            self,
+            "after",
+            _validate_undo_metadata(
+                self.expected_action, "after", self.after, "undo after metadata"
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -750,6 +822,10 @@ class UndoEntry:
         }
         if not isinstance(payload, Mapping) or set(payload) != required:
             raise DeploymentStateError("invalid undo manifest entry")
+        if not isinstance(payload["before"], Mapping) or not isinstance(
+            payload["after"], Mapping
+        ):
+            raise DeploymentStateError("invalid undo manifest metadata")
         return cls(
             path=payload["path"],
             object_type=payload["object_type"],
@@ -760,7 +836,7 @@ class UndoEntry:
             backup_name=payload["backup_name"],
             expected_action=payload["expected_action"],
             before=dict(payload["before"]),
-            after=dict(payload["after"]),  # type: ignore[arg-type]
+            after=dict(payload["after"]),
         )
 
 
@@ -851,10 +927,11 @@ def _validate_operation_mapping(
             raise DeploymentStateError("absent environment cannot have before digest")
         if not result["before_absent"] and not isinstance(result["before_digest"], str):
             raise DeploymentStateError("existing environment requires before digest")
+        if not isinstance(result["after_digest"], str):
+            raise DeploymentStateError("environment replacement requires after digest")
     if "object_type" in result and (
         not isinstance(result["object_type"], str)
-        or result["object_type"]
-        not in {"file", "regular", "secret", "env", "directory", "dir", "any"}
+        or result["object_type"] not in OBJECT_TYPES
     ):
         raise DeploymentStateError("invalid operation object type")
     return result
@@ -875,6 +952,7 @@ class TransactionJournal:
     env_backup_path: Path = dataclasses.field(init=False)
     env_backup_meta_path: Path = dataclasses.field(init=False)
     rollback_path: Path = dataclasses.field(init=False)
+    rollback_intents_path: Path = dataclasses.field(init=False)
     history_receipt_path: Path = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
@@ -891,6 +969,7 @@ class TransactionJournal:
         self.env_backup_path = self.root / "env-backup"
         self.env_backup_meta_path = self.root / "env-backup.json"
         self.rollback_path = self.root / "rollback.json"
+        self.rollback_intents_path = self.root / "rollback-intents.json"
         self.history_receipt_path = (
             self.root.parent.parent / "history" / f"{self.transaction_id}.json"
         )
@@ -963,6 +1042,7 @@ class TransactionJournal:
             journal.write_undo_manifest([])
             journal._write_operations([])
             journal._write_rollback_done([])
+            journal._write_rollback_intents([])
             journal._write_env_backup_meta(absent=True)
             return journal
         except Exception:
@@ -983,11 +1063,23 @@ class TransactionJournal:
         if st is None or _is_symlink(st) or not stat.S_ISDIR(st.st_mode):
             raise DeploymentStateError(f"unsafe transaction journal: {root}")
         _require_owner_and_mode(root, st, 0o700, "transaction journal")
-        transaction_id = _validate_uuid4_hex(root.name)
         parent_name = root.parent.name
-        if parent_name not in {"transactions", "control-transactions"}:
+        tombstone_match = (
+            _CLEANUP_TOMBSTONE.fullmatch(root.name)
+            if parent_name == "history"
+            else None
+        )
+        if tombstone_match is not None:
+            transaction_id = _validate_uuid4_hex(tombstone_match.group(1))
+            tombstone = True
+        else:
+            transaction_id = _validate_uuid4_hex(root.name)
+            tombstone = False
+        if (
+            parent_name not in {"transactions", "control-transactions"}
+            and not tombstone
+        ):
             raise DeploymentStateError(f"unsafe transaction journal: {root}")
-        control = parent_name == "control-transactions"
         metadata_path = root / "journal.json"
         metadata = _read_json_value(metadata_path, "transaction metadata")
         required = {
@@ -1006,9 +1098,11 @@ class TransactionJournal:
             or metadata["transaction_id"] != transaction_id
             or metadata["deployment_identity_hash"] != identity_hash
             or type(metadata["control"]) is not bool
-            or metadata["control"] != control
             or not isinstance(metadata["object_categories"], list)
         ):
+            raise DeploymentStateError(f"invalid transaction metadata: {metadata_path}")
+        control = metadata["control"]
+        if not tombstone and control != (parent_name == "control-transactions"):
             raise DeploymentStateError(f"invalid transaction metadata: {metadata_path}")
         companion_value = metadata["secret_companion_root"]
         if control:
@@ -1043,9 +1137,23 @@ class TransactionJournal:
         journal._read_undo_manifest()
         operations = journal._read_operations_internal()
         rollback_done = journal._read_rollback_done()
+        rollback_intents = journal._read_rollback_intents()
+        operation_sequences = {operation["sequence"] for operation in operations}
+        if (
+            not set(rollback_done) <= operation_sequences
+            or not set(rollback_intents) <= operation_sequences
+        ):
+            raise DeploymentStateError(f"invalid rollback state: {root}")
         journal._read_env_backup_meta()
         journal._validate_root_entries()
         receipt = journal.read_history_receipt()
+        if tombstone and (
+            phase.phase not in {"committed", "committed_cleanup_required"}
+            or receipt is None
+            or receipt["cleanup_status"]
+            not in {"committed_cleanup_pending", "complete"}
+        ):
+            raise DeploymentStateError(f"invalid cleanup tombstone: {root}")
         allow_partial_companion = (
             receipt is not None
             and receipt["cleanup_status"] in {"committed_cleanup_pending", "complete"}
@@ -1104,6 +1212,7 @@ class TransactionJournal:
             "undo-manifest.json",
             "operations.json",
             "rollback.json",
+            "rollback-intents.json",
             "env-backup.json",
         }
         try:
@@ -1222,6 +1331,8 @@ class TransactionJournal:
             if validated["object_category"] not in self.object_categories:
                 raise DeploymentStateError("operation object category is not declared")
             self._validate_operation_boundaries(validated)
+            if validated["kind"] == "env_replace":
+                self.validate_env_backup_for_operation(validated)
             if validated["sequence"] <= previous:
                 raise DeploymentStateError(
                     f"invalid transaction operation sequence: {self.operations_path}"
@@ -1288,6 +1399,8 @@ class TransactionJournal:
         if validated["object_category"] not in self.object_categories:
             raise DeploymentStateError("operation object category is not declared")
         self._validate_operation_boundaries(validated)
+        if validated["kind"] == "env_replace":
+            self.validate_env_backup_for_operation(validated)
         records = self._read_operations_internal()
         if records and sequence <= records[-1]["sequence"]:
             raise DeploymentStateError("transaction operation sequence must increase")
@@ -1320,6 +1433,50 @@ class TransactionJournal:
             },
         )
 
+    def _write_rollback_intents(self, sequences: Sequence[int]) -> None:
+        atomic_write_json(
+            self.rollback_intents_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "transaction_id": self.transaction_id,
+                "sequences": list(sequences),
+            },
+        )
+
+    def _read_rollback_intents(self) -> list[int]:
+        payload = _read_json_value(self.rollback_intents_path, "rollback intents")
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != {"schema_version", "transaction_id", "sequences"}
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != SCHEMA_VERSION
+            or payload["transaction_id"] != self.transaction_id
+            or not isinstance(payload["sequences"], list)
+            or any(
+                type(value) is not int or value <= 0 for value in payload["sequences"]
+            )
+            or len(set(payload["sequences"])) != len(payload["sequences"])
+        ):
+            raise DeploymentStateError(
+                f"invalid rollback intents: {self.rollback_intents_path}"
+            )
+        return list(payload["sequences"])
+
+    def record_rollback_intent(self, sequence: int) -> None:
+        if type(sequence) is not int or sequence <= 0:
+            raise DeploymentStateError("invalid rollback sequence")
+        operation_sequences = {
+            record["sequence"] for record in self._read_operations_internal()
+        }
+        if sequence not in operation_sequences:
+            raise DeploymentStateError("unknown rollback operation sequence")
+        if sequence in self._read_rollback_done():
+            return
+        intents = self._read_rollback_intents()
+        if sequence not in intents:
+            intents.append(sequence)
+            self._write_rollback_intents(sorted(intents))
+
     def _read_rollback_done(self) -> list[int]:
         payload = _read_json_value(self.rollback_path, "rollback record")
         if (
@@ -1334,9 +1491,14 @@ class TransactionJournal:
                 type(value) is not int or value <= 0
                 for value in payload["completed_sequences"]
             )
+            or len(set(payload["completed_sequences"]))
+            != len(payload["completed_sequences"])
         ):
             raise DeploymentStateError(f"invalid rollback record: {self.rollback_path}")
         return list(payload["completed_sequences"])
+
+    def read_rollback_intents(self) -> tuple[int, ...]:
+        return tuple(self._read_rollback_intents())
 
     def record_rollback_done(self, sequence: int) -> None:
         if type(sequence) is not int or sequence <= 0:
@@ -1350,14 +1512,20 @@ class TransactionJournal:
         if sequence not in done:
             done.append(sequence)
             self._write_rollback_done(sorted(done))
+        intents = self._read_rollback_intents()
+        if sequence in intents:
+            intents.remove(sequence)
+            self._write_rollback_intents(intents)
 
     def persist_env_backup(self, env_path: Path | None) -> None:
         if env_path is None:
+            self._remove_env_backup_if_present()
             self._write_env_backup_meta(absent=True)
             return
         path = _validate_abs_path(env_path, "environment path")
         st = _lstat_optional(path)
         if st is None:
+            self._remove_env_backup_if_present()
             self._write_env_backup_meta(absent=True)
             return
         if _is_symlink(st) or not stat.S_ISREG(st.st_mode):
@@ -1369,6 +1537,18 @@ class TransactionJournal:
         )
         atomic_write_bytes(self.env_backup_path, data, mode=0o600)
         self._write_env_backup_meta(absent=False)
+
+    def _remove_env_backup_if_present(self) -> None:
+        existing = _lstat_optional(self.env_backup_path)
+        if existing is None:
+            return
+        if _is_symlink(existing) or not stat.S_ISREG(existing.st_mode):
+            raise DeploymentStateError("unsafe environment backup")
+        _require_owner_and_mode(
+            self.env_backup_path, existing, 0o600, "environment backup"
+        )
+        self.env_backup_path.unlink()
+        fsync_directory(self.root)
 
     def _write_env_backup_meta(self, *, absent: bool) -> None:
         atomic_write_json(
@@ -1397,6 +1577,10 @@ class TransactionJournal:
             )
         if not payload["absent"]:
             _verify_regular_file(self.env_backup_path, "environment backup")
+        elif _lstat_optional(self.env_backup_path) is not None:
+            raise DeploymentStateError(
+                f"invalid environment backup metadata: {self.env_backup_meta_path}"
+            )
         return bool(payload["absent"])
 
     def read_env_backup(self) -> bytes | None:
@@ -1405,6 +1589,30 @@ class TransactionJournal:
             if self._read_env_backup_meta()
             else _read_secure_regular_file(self.env_backup_path, "environment backup")
         )
+
+    def validate_env_backup_for_operation(
+        self, operation: Mapping[str, object]
+    ) -> bytes | None:
+        if operation.get("kind") != "env_replace":
+            raise DeploymentStateError("operation is not an environment replacement")
+        before_absent = operation.get("before_absent")
+        before_digest = operation.get("before_digest")
+        if type(before_absent) is not bool:
+            raise DeploymentStateError("invalid environment operation")
+        backup_absent = self._read_env_backup_meta()
+        if backup_absent != before_absent:
+            raise DeploymentStateError("environment backup metadata mismatch")
+        if backup_absent:
+            if before_digest is not None:
+                raise DeploymentStateError("environment backup digest mismatch")
+            return None
+        backup = _read_secure_regular_file(self.env_backup_path, "environment backup")
+        if (
+            not isinstance(before_digest, str)
+            or hashlib.sha256(backup).hexdigest() != before_digest
+        ):
+            raise DeploymentStateError("environment backup digest mismatch")
+        return backup
 
     def write_history_receipt(self, cleanup_status: str) -> None:
         if cleanup_status not in {"committed_cleanup_pending", "complete"}:
@@ -1924,6 +2132,7 @@ def scan_transaction_journals(
         )
     journals: list[TransactionJournal] = []
     normal_ids: set[str] = set()
+    seen_ids: set[str] = set()
     for directory, control in (
         (paths.transactions, False),
         (paths.control_transactions, True),
@@ -1948,7 +2157,34 @@ def scan_transaction_journals(
                         f"secret companion root mismatch: {journal.root}"
                     )
                 normal_ids.add(journal.transaction_id)
+            if journal.transaction_id in seen_ids:
+                raise DeploymentStateError(
+                    f"duplicate transaction state: {journal.root}"
+                )
+            seen_ids.add(journal.transaction_id)
             journals.append(journal)
+
+    _verify_directory(paths.history, "history directory")
+    try:
+        history_entries = list(os.scandir(paths.history))
+    except OSError as exc:
+        raise DeploymentStateError(
+            f"cannot inspect history directory: {paths.history}"
+        ) from exc
+    for entry in history_entries:
+        if not entry.name.startswith(".") or not entry.name.endswith(
+            ".journal-cleanup"
+        ):
+            continue
+        if _CLEANUP_TOMBSTONE.fullmatch(entry.name) is None:
+            raise DeploymentStateError(f"invalid cleanup tombstone: {Path(entry.path)}")
+        journal = TransactionJournal.open(entry.path, expected_hash)
+        if journal.transaction_id in seen_ids:
+            raise DeploymentStateError(f"duplicate transaction state: {journal.root}")
+        seen_ids.add(journal.transaction_id)
+        if not journal.control:
+            normal_ids.add(journal.transaction_id)
+        journals.append(journal)
 
     companion_state = _lstat_optional(companion_parent)
     if companion_state is None:
@@ -2006,3 +2242,15 @@ def assert_no_incomplete_transactions(
         except OSError as exc:
             raise DeploymentStateError(f"incomplete transaction: {entry_path}") from exc
         raise DeploymentStateError(f"incomplete transaction: {entry_path}")
+    _verify_directory(paths.history, "history directory")
+    try:
+        history_entries = list(os.scandir(paths.history))
+    except OSError as exc:
+        raise DeploymentStateError(
+            f"cannot inspect history directory: {paths.history}"
+        ) from exc
+    for entry in history_entries:
+        if entry.name.startswith(".") and entry.name.endswith(".journal-cleanup"):
+            raise DeploymentStateError(
+                f"incomplete transaction cleanup: {Path(entry.path)}"
+            )

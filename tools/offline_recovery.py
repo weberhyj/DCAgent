@@ -58,13 +58,23 @@ def _matches_type(st: os.stat_result, object_type: object) -> bool:
         return False
     if state._is_symlink(st):
         return False
-    if object_type in {"file", "regular", "secret", "env"}:
+    if object_type in {"file", "secret", "environment"}:
         return stat.S_ISREG(st.st_mode)
-    if object_type in {"directory", "dir"}:
+    if object_type == "directory":
         return stat.S_ISDIR(st.st_mode)
-    return object_type == "any" and (
-        stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)
-    )
+    return False
+
+
+def _matches_undo_entry(entry: state.UndoEntry, st: os.stat_result) -> bool:
+    if not _matches_type(st, entry.object_type):
+        return False
+    if os.name != "posix":
+        return True
+    if entry.original_mode is None or stat.S_IMODE(st.st_mode) != entry.original_mode:
+        return False
+    expected_uid = os.getuid() if entry.owner_uid is None else entry.owner_uid
+    expected_gid = os.getgid() if entry.owner_gid is None else entry.owner_gid
+    return st.st_uid == expected_uid and st.st_gid == expected_gid
 
 
 def _owner_matches(st: os.stat_result, operation: Mapping[str, object]) -> bool:
@@ -158,7 +168,9 @@ def _classify_intent(
         if left is not None and right is None:
             return "not_executed"
         if left is None and right is not None:
-            if kind == "staging_to_active" and secret_validator is not None:
+            if kind == "staging_to_active":
+                if secret_validator is None:
+                    raise _conflict(operation)
                 try:
                     valid = secret_validator(right_path, operation)
                 except Exception:  # noqa: BLE001 - validator details may contain secrets.
@@ -276,7 +288,10 @@ def reverse_operation(
     kind = operation["kind"]
     if kind == "env_replace":
         path = _path(operation, "env_path")
-        backup = journal.read_env_backup()
+        try:
+            backup = journal.validate_env_backup_for_operation(operation)
+        except state.DeploymentStateError:
+            raise _conflict(operation) from None
         if operation.get("before_absent") is True:
             _unlink_expected(path, {**operation, "object_type": "file"})
         elif backup is None:
@@ -311,19 +326,34 @@ def reverse_operation(
         return
     if kind == "unlink":
         target = _path(operation, "path")
-        entry = next(
-            (item for item in journal.read_undo_manifest() if item.path == target), None
-        )
+        entries = [item for item in journal.read_undo_manifest() if item.path == target]
         if (
-            entry is None
-            or not entry.existed
+            len(entries) != 1
+            or entries[0].expected_action != "unlink"
+            or entries[0].object_type != operation.get("object_type")
+        ):
+            raise _conflict(operation)
+        entry = entries[0]
+        if (
+            not entry.existed
             or entry.backup_name is None
             or journal.secret_companion_root is None
         ):
             raise _conflict(operation)
         source = journal.secret_companion_root / "backup" / entry.backup_name
-        if _lstat(source, operation) is None or _lstat(target, operation) is not None:
+        if source.parent != journal.secret_companion_root / "backup":
             raise _conflict(operation)
+        source_state = _lstat(source, operation)
+        if (
+            source_state is None
+            or not _matches_undo_entry(entry, source_state)
+            or _lstat(target, operation) is not None
+        ):
+            raise _conflict(operation)
+        try:
+            state.normalize_absolute_root(target.parent, "unlink restore parent")
+        except state.DeploymentStateError:
+            raise _conflict(operation) from None
         os.replace(source, target)
         state.fsync_directory(source.parent)
         if source.parent != target.parent:
@@ -340,7 +370,9 @@ def _reverse_state_is_safe(
     if operation.get("kind") == "staging_to_active":
         active = _lstat(_path(operation, "active_path"), operation)
         staging = _lstat(_path(operation, "staging_path"), operation)
-        return active is None and staging is None
+        return active is None and (
+            staging is None or _matches_type(staging, operation.get("object_type"))
+        )
     intent = dict(operation)
     intent["status"] = "intent"
     try:
@@ -387,6 +419,7 @@ def resume_transaction_rollback(
     try:
         journal.write_phase("rollback_in_progress")
         completed = set(journal._read_rollback_done())
+        rollback_intents = set(journal._read_rollback_intents())
         operations = sorted(journal.read_operations(), key=_rollback_order)
         for operation in operations:
             sequence = operation["sequence"]
@@ -396,12 +429,21 @@ def resume_transaction_rollback(
                 ):
                     raise _conflict(operation)
                 continue
+            if sequence not in rollback_intents:
+                journal.record_rollback_intent(sequence)
+                rollback_intents.add(sequence)
+            if _reverse_state_is_safe(operation, secret_validator=secret_validator):
+                journal.record_rollback_done(sequence)
+                completed.add(sequence)
+                rollback_intents.discard(sequence)
+                continue
             classification = classify_operation(
                 operation, secret_validator=secret_validator
             )
             if classification == "not_executed":
                 journal.record_rollback_done(sequence)
                 completed.add(sequence)
+                rollback_intents.discard(sequence)
                 continue
             reverse_operation(journal, operation, secret_validator=secret_validator)
             if not _reverse_state_is_safe(operation, secret_validator=secret_validator):
@@ -437,7 +479,14 @@ def finalize_committed_cleanup(journal: state.TransactionJournal) -> None:
                     / f".{journal.transaction_id}.journal-cleanup"
                 )
                 if state._lstat_optional(tombstone) is not None:
-                    state._remove_private_tree(tombstone)
+                    reopened = state.TransactionJournal.open(
+                        tombstone, journal.deployment_identity_hash
+                    )
+                    if reopened.transaction_id != journal.transaction_id:
+                        raise state.DeploymentStateError(
+                            f"cleanup tombstone identity mismatch: {tombstone}"
+                        )
+                    finalize_committed_cleanup(reopened)
                 return
             raise state.DeploymentStateError(
                 f"missing committed transaction journal: {journal.root}"
@@ -462,6 +511,9 @@ def finalize_committed_cleanup(journal: state.TransactionJournal) -> None:
             journal.history_receipt_path.parent
             / f".{journal.transaction_id}.journal-cleanup"
         )
+        if journal.root == tombstone:
+            state._remove_private_tree(journal.root)
+            return
         if state._lstat_optional(tombstone) is not None:
             raise state.DeploymentStateError(
                 f"committed cleanup tombstone already exists: {tombstone}"
