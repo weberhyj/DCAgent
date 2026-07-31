@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -115,10 +116,19 @@ class DeploymentStateTests(unittest.TestCase):
         with self.assertRaises(state.DeploymentStateError):
             state.normalize_absolute_root(link / "new-child", "root")
 
-    @unittest.skipUnless(os.name == "posix", "POSIX identity rejects Windows drives")
-    def test_normalize_rejects_windows_drive_on_posix(self) -> None:
-        with self.assertRaises(state.DeploymentStateError):
-            state.normalize_absolute_root("C:/deployment", "root")
+    def test_normalize_requires_platform_absolute_path_syntax(self) -> None:
+        if os.name == "nt":
+            for raw in ("/root", r"\root", r"\\root"):
+                with (
+                    self.subTest(raw=raw),
+                    self.assertRaises(state.DeploymentStateError),
+                ):
+                    state.normalize_absolute_root(raw, "root")
+            normalized = state.normalize_absolute_root(self.base.as_posix(), "root")
+            self.assertTrue(normalized.is_absolute())
+        else:
+            with self.assertRaises(state.DeploymentStateError):
+                state.normalize_absolute_root("C:/deployment", "root")
 
     def test_state_paths_exposes_required_paths_and_compatibility_alias(self) -> None:
         expected = {
@@ -159,8 +169,15 @@ class DeploymentStateTests(unittest.TestCase):
             },
         )
         self.assertEqual(identity.deployment_uuid, generated.hex)
+        canonical = json.dumps(
+            mapping,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
         self.assertEqual(
-            state.identity_digest(identity), state.identity_digest(identity)
+            state.identity_digest(identity), hashlib.sha256(canonical).hexdigest()
         )
         self.assertNotIn("checkout", json.dumps(mapping))
 
@@ -191,6 +208,14 @@ class DeploymentStateTests(unittest.TestCase):
         identity = self.make_identity()
         state.write_identity_exclusive(self.paths, identity)
         state.write_identity_exclusive(self.paths, identity)
+        canonical = json.dumps(
+            identity.to_mapping(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        self.assertEqual(self.paths.identity.read_bytes(), canonical)
         self.assertEqual(state.load_identity(self.paths), identity)
         self.assertEqual(state.assert_identity_matches(self.paths, identity), identity)
         other = self.make_identity("abcdefabcdef4abc8abcdefabcdefabc")
@@ -436,6 +461,29 @@ class DeploymentStateTests(unittest.TestCase):
             )
         self.assertFalse((relocated / self.paths.start_marker.name).exists())
 
+    def test_marker_read_failures_are_already_started_without_sensitive_details(
+        self,
+    ) -> None:
+        self.ensure_layout()
+        digest = "a" * 64
+        state.create_start_marker(
+            self.paths, operation="up", deployment_identity_hash=digest
+        )
+        sensitive = "SENSITIVE_MARKER_READ_DETAIL"
+        for method_name in ("open", "read"):
+            with (
+                self.subTest(method_name=method_name),
+                mock.patch.object(
+                    state.os, method_name, side_effect=PermissionError(sensitive)
+                ),
+                self.assertRaises(state.DeploymentStateError) as caught,
+            ):
+                state.create_start_marker(
+                    self.paths, operation="exec", deployment_identity_hash=digest
+                )
+            self.assertIn("already started", str(caught.exception))
+            self.assertNotIn(sensitive, str(caught.exception))
+
     def test_assert_start_marker_absent_fails_on_any_object_or_inspection_error(
         self,
     ) -> None:
@@ -491,7 +539,7 @@ class DeploymentStateTests(unittest.TestCase):
         self.ensure_layout()
         destination = self.paths.root / "payload.json"
         state.atomic_write_json(destination, {"z": 1, "a": [2]})
-        self.assertEqual(destination.read_bytes(), b'{"a":[2],"z":1}\n')
+        self.assertEqual(destination.read_bytes(), b'{"a":[2],"z":1}')
         with (
             mock.patch.object(
                 state.os, "replace", side_effect=OSError("replace failed")

@@ -37,16 +37,13 @@ class DeploymentStateError(RuntimeError):
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
-    return (
-        json.dumps(
-            payload,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        + b"\n"
-    )
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def _is_posix() -> bool:
@@ -165,7 +162,12 @@ def _read_secure_regular_file(path: Path, description: str, mode: int = 0o600) -
     try:
         chunks: list[bytes] = []
         while True:
-            chunk = os.read(fd, 65536)
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError as exc:
+                raise DeploymentStateError(
+                    f"cannot safely read {description}: {path}"
+                ) from exc
             if not chunk:
                 return b"".join(chunks)
             chunks.append(chunk)
@@ -209,6 +211,10 @@ def normalize_absolute_root(raw: str | Path, name: str) -> Path:
         cursor = Path(lexical[:2] + "/")
         normalized_components = suffix[1:].split("/")
     else:
+        if os.name == "nt":
+            raise DeploymentStateError(
+                f"{name} must be a drive-qualified absolute path"
+            )
         if not lexical.startswith("/"):
             raise DeploymentStateError(f"{name} must be an absolute path")
         raw_components = lexical[1:].split("/")
