@@ -8,13 +8,16 @@ reverses a pre-commit transaction or finishes post-commit cleanup.
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
 import hashlib
 import os
 import stat
+import sys
 import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from tools import offline_deployment_state as state
 
@@ -25,6 +28,215 @@ class RecoveryConflict(state.DeploymentStateError):
 
 SecretValidator = Callable[[Path, Mapping[str, object]], bool]
 Classification = Literal["not_executed", "executed"]
+_RENAME_NOREPLACE = 1
+
+
+class FilesystemMutationBackend(Protocol):
+    """Filesystem mutations whose safe implementation is platform-specific."""
+
+    def rename_noreplace(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None: ...
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> None: ...
+
+
+class PosixFilesystemMutationBackend:
+    """Linux fd-based mutations for rollback object moves and mode changes."""
+
+    @staticmethod
+    def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+        return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+    @classmethod
+    def _verify_source(cls, observed: os.stat_result, expected: os.stat_result) -> None:
+        if (
+            not cls._same_identity(observed, expected)
+            or stat.S_IFMT(observed.st_mode) != stat.S_IFMT(expected.st_mode)
+            or stat.S_IMODE(observed.st_mode) != stat.S_IMODE(expected.st_mode)
+            or observed.st_uid != expected.st_uid
+            or observed.st_gid != expected.st_gid
+            or state._is_symlink(observed)
+        ):
+            raise OSError(errno.EAGAIN, "rollback source changed")
+
+    @staticmethod
+    def _open_parent(path: Path) -> int:
+        if os.name != "posix" or not sys.platform.startswith("linux"):
+            raise OSError(errno.ENOTSUP, "secure rollback mutation requires Linux")
+        state._verify_directory(path, "rollback mutation parent", exact_mode=False)
+        normalized = state.normalize_absolute_root(path, "rollback mutation parent")
+        if normalized != path:
+            raise OSError(errno.EINVAL, "rollback mutation parent changed")
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise OSError(errno.ENOTSUP, "secure rollback mutation needs O_NOFOLLOW")
+        flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            current = os.lstat(path)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or state._is_symlink(current)
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise OSError(errno.EAGAIN, "rollback mutation parent changed")
+            return fd
+        except Exception:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _renameat2(
+        source_fd: int, source_name: str, target_fd: int, target_name: str
+    ) -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable")
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            source_fd,
+            os.fsencode(source_name),
+            target_fd,
+            os.fsencode(target_name),
+            _RENAME_NOREPLACE,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+    def rename_noreplace(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        source_fd = self._open_parent(source.parent)
+        target_fd = source_fd
+        try:
+            if source.parent != target.parent:
+                target_fd = self._open_parent(target.parent)
+            current = os.stat(source.name, dir_fd=source_fd, follow_symlinks=False)
+            self._verify_source(current, expected_source)
+            try:
+                os.stat(target.name, dir_fd=target_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise OSError(errno.EEXIST, "rollback target exists")
+            self._renameat2(source_fd, source.name, target_fd, target.name)
+            moved = os.stat(target.name, dir_fd=target_fd, follow_symlinks=False)
+            self._verify_source(moved, expected_source)
+            os.fsync(target_fd)
+            if source_fd != target_fd:
+                os.fsync(source_fd)
+        finally:
+            os.close(source_fd)
+            if target_fd != source_fd:
+                os.close(target_fd)
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        parent_fd = self._open_parent(path.parent)
+        fd: int | None = None
+        try:
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+            current = os.fstat(fd)
+            self._verify_source(current, expected_source)
+            os.fchmod(fd, mode)
+            changed = os.fstat(fd)
+            if (
+                not self._same_identity(changed, expected_source)
+                or stat.S_IFMT(changed.st_mode) != stat.S_IFMT(expected_source.st_mode)
+                or stat.S_IMODE(changed.st_mode) != mode
+                or changed.st_uid != expected_source.st_uid
+                or changed.st_gid != expected_source.st_gid
+            ):
+                raise OSError(errno.EAGAIN, "rollback chmod target changed")
+            path_state = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not self._same_identity(path_state, changed)
+                or stat.S_IMODE(path_state.st_mode) != mode
+            ):
+                raise OSError(errno.EAGAIN, "rollback chmod path changed")
+            os.fsync(fd)
+            os.fsync(parent_fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            os.close(parent_fd)
+
+
+def _filesystem_mutations(
+    backend: FilesystemMutationBackend | None,
+) -> FilesystemMutationBackend:
+    if backend is not None:
+        return backend
+    if os.name != "posix" or not sys.platform.startswith("linux"):
+        raise state.DeploymentStateError(
+            "secure filesystem mutation backend requires Linux"
+        )
+    return PosixFilesystemMutationBackend()
+
+
+def _rename_noreplace(
+    backend: FilesystemMutationBackend | None,
+    source: Path,
+    target: Path,
+    expected_source: os.stat_result,
+    operation: Mapping[str, object],
+) -> None:
+    try:
+        _filesystem_mutations(backend).rename_noreplace(
+            source, target, expected_source=expected_source
+        )
+    except (OSError, state.DeploymentStateError):
+        raise _conflict(operation) from None
+
+
+def _chmod(
+    backend: FilesystemMutationBackend | None,
+    path: Path,
+    mode: int,
+    expected_source: os.stat_result,
+    operation: Mapping[str, object],
+) -> None:
+    try:
+        _filesystem_mutations(backend).chmod(
+            path, mode, expected_source=expected_source
+        )
+    except (OSError, state.DeploymentStateError):
+        raise _conflict(operation) from None
 
 
 def _operation_label(operation: Mapping[str, object]) -> str:
@@ -340,13 +552,83 @@ def _unlink_expected(path: Path, operation: Mapping[str, object]) -> None:
     state.fsync_directory(path.parent)
 
 
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _mutation_source_path(operation: Mapping[str, object]) -> Path | None:
+    kind = operation.get("kind")
+    if kind == "staging_to_active":
+        return _path(operation, "active_path")
+    if kind == "active_to_backup":
+        return _path(operation, "backup_path")
+    if kind == "chmod":
+        return _path(operation, "path")
+    return None
+
+
+def _revalidate_rename_source(
+    path: Path,
+    expected: os.stat_result,
+    operation: Mapping[str, object],
+    *,
+    secret_validator: SecretValidator | None = None,
+) -> os.stat_result:
+    current = _lstat(path, operation)
+    if (
+        current is None
+        or not _same_identity(current, expected)
+        or not _matches_type(current, operation.get("object_type"))
+        or not _authority_matches(current, operation)
+    ):
+        raise _conflict(operation)
+    if secret_validator is None:
+        return current
+    try:
+        valid = secret_validator(path, operation)
+    except Exception:  # noqa: BLE001 - validator details may contain secrets.
+        raise _conflict(operation) from None
+    after = _lstat(path, operation)
+    if (
+        valid is not True
+        or after is None
+        or not _same_identity(after, expected)
+        or not _matches_type(after, operation.get("object_type"))
+        or not _authority_matches(after, operation)
+    ):
+        raise _conflict(operation)
+    return after
+
+
+def _revalidate_chmod_source(
+    path: Path,
+    expected: os.stat_result,
+    operation: Mapping[str, object],
+) -> os.stat_result:
+    current = _lstat(path, operation)
+    if (
+        current is None
+        or not _same_identity(current, expected)
+        or not _matches_type(current, operation.get("object_type"))
+        or not _owner_matches(current, operation)
+        or stat.S_IMODE(current.st_mode) != operation.get("after_mode")
+    ):
+        raise _conflict(operation)
+    return current
+
+
 def reverse_operation(
     journal: state.TransactionJournal,
     operation: Mapping[str, object],
     *,
     secret_validator: SecretValidator | None = None,
+    mutation_backend: FilesystemMutationBackend | None = None,
 ) -> None:
     """Reverse one operation that has been deterministically classified executed."""
+    source_path = _mutation_source_path(operation)
+    source_snapshot = None if source_path is None else _lstat(source_path, operation)
+    if source_path is not None and source_snapshot is None:
+        raise _conflict(operation)
     if classify_operation(operation, secret_validator=secret_validator) != "executed":
         raise _conflict(operation)
     kind = operation["kind"]
@@ -383,23 +665,38 @@ def reverse_operation(
         active = _path(operation, "active_path")
         if _lstat(staging, operation) is not None:
             raise _conflict(operation)
-        os.replace(active, staging)
-        state.fsync_directory(active.parent)
-        if active.parent != staging.parent:
-            state.fsync_directory(staging.parent)
+        if source_snapshot is None:
+            raise _conflict(operation)
+        active_state = _revalidate_rename_source(
+            active,
+            source_snapshot,
+            operation,
+            secret_validator=secret_validator,
+        )
+        _rename_noreplace(mutation_backend, active, staging, active_state, operation)
         return
     if kind == "active_to_backup":
         active = _path(operation, "active_path")
         backup = _path(operation, "backup_path")
         if _lstat(active, operation) is not None or _lstat(backup, operation) is None:
             raise _conflict(operation)
-        os.replace(backup, active)
-        state.fsync_directory(backup.parent)
-        if backup.parent != active.parent:
-            state.fsync_directory(active.parent)
+        if source_snapshot is None:
+            raise _conflict(operation)
+        backup_state = _revalidate_rename_source(backup, source_snapshot, operation)
+        _rename_noreplace(mutation_backend, backup, active, backup_state, operation)
         return
     if kind == "chmod":
-        os.chmod(_path(operation, "path"), operation["before_mode"])
+        path = _path(operation, "path")
+        if source_snapshot is None:
+            raise _conflict(operation)
+        current = _revalidate_chmod_source(path, source_snapshot, operation)
+        _chmod(
+            mutation_backend,
+            path,
+            operation["before_mode"],
+            current,
+            operation,
+        )
         return
     if kind == "mkdir":
         path = _path(operation, "path")
@@ -440,10 +737,7 @@ def reverse_operation(
             state.normalize_absolute_root(target.parent, "unlink restore parent")
         except state.DeploymentStateError:
             raise _conflict(operation) from None
-        os.replace(source, target)
-        state.fsync_directory(source.parent)
-        if source.parent != target.parent:
-            state.fsync_directory(target.parent)
+        _rename_noreplace(mutation_backend, source, target, source_state, operation)
         return
     raise _conflict(operation)
 
@@ -605,6 +899,7 @@ def resume_transaction_rollback(
     journal: state.TransactionJournal | state.RollbackTombstoneJournal,
     *,
     secret_validator: SecretValidator | None = None,
+    mutation_backend: FilesystemMutationBackend | None = None,
 ) -> None:
     """Resume a pre-commit rollback and remove all transaction material on success."""
     if isinstance(journal, state.RollbackTombstoneJournal):
@@ -655,7 +950,12 @@ def resume_transaction_rollback(
             if not has_rollback_intent:
                 journal.record_rollback_intent(sequence)
                 rollback_intents.add(sequence)
-            reverse_operation(journal, operation, secret_validator=secret_validator)
+            reverse_operation(
+                journal,
+                operation,
+                secret_validator=secret_validator,
+                mutation_backend=mutation_backend,
+            )
             if not _reverse_state_is_safe(operation, secret_validator=secret_validator):
                 raise _conflict(operation)
             journal.record_rollback_done(sequence)

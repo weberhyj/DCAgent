@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 import uuid
@@ -86,6 +87,42 @@ def install_legacy_record_intent(
 
     journal.record_intent = compat  # type: ignore[method-assign]
     return journal
+
+
+class PortableMutationBackend:
+    """Test-only backend used where Linux fd primitives are unavailable."""
+
+    @staticmethod
+    def _assert_identity(path: Path, expected: os.stat_result) -> None:
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OSError("test mutation source changed")
+
+    def rename_noreplace(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        self._assert_identity(source, expected_source)
+        try:
+            os.lstat(target)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(target)
+        os.rename(source, target)
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        self._assert_identity(path, expected_source)
+        os.chmod(path, mode)
 
 
 class TransactionJournalTests(unittest.TestCase):
@@ -1117,6 +1154,67 @@ class RecoveryClassificationTests(unittest.TestCase):
                         self.assertNotEqual(result, classification)
 
 
+@unittest.skipUnless(
+    os.name == "posix" and sys.platform.startswith("linux"),
+    "Linux renameat2 and fd chmod primitives require Linux",
+)
+class PosixFilesystemMutationBackendTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        os.chmod(self.base, 0o700)
+        self.backend = recovery.PosixFilesystemMutationBackend()
+
+    def test_rename_noreplace_preserves_an_existing_target(self) -> None:
+        source = self.base / "source"
+        target = self.base / "target"
+        source.write_text("source", encoding="utf-8")
+        target.write_text("target", encoding="utf-8")
+        expected = os.lstat(source)
+
+        with self.assertRaises(OSError):
+            self.backend.rename_noreplace(source, target, expected_source=expected)
+
+        self.assertEqual(source.read_text(encoding="utf-8"), "source")
+        self.assertEqual(target.read_text(encoding="utf-8"), "target")
+
+    def test_rename_noreplace_revalidates_source_identity(self) -> None:
+        source = self.base / "source"
+        target = self.base / "target"
+        source.write_text("original", encoding="utf-8")
+        expected = os.lstat(source)
+        source.unlink()
+        source.write_text("replacement", encoding="utf-8")
+
+        with self.assertRaises(OSError):
+            self.backend.rename_noreplace(source, target, expected_source=expected)
+
+        self.assertEqual(source.read_text(encoding="utf-8"), "replacement")
+        self.assertFalse(target.exists())
+
+    def test_chmod_uses_expected_fd_identity_and_rejects_symlink_swap(self) -> None:
+        path = self.base / "mode-target"
+        path.write_text("value", encoding="utf-8")
+        os.chmod(path, 0o640)
+        expected = os.lstat(path)
+
+        self.backend.chmod(path, 0o600, expected_source=expected)
+        self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o600)
+
+        victim = self.base / "victim"
+        victim.write_text("victim", encoding="utf-8")
+        os.chmod(victim, 0o640)
+        expected = os.lstat(path)
+        path.unlink()
+        path.symlink_to(victim)
+
+        with self.assertRaises(OSError):
+            self.backend.chmod(path, 0o700, expected_source=expected)
+
+        self.assertEqual(stat.S_IMODE(os.lstat(victim).st_mode), 0o640)
+
+
 class RecoveryExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -1131,6 +1229,31 @@ class RecoveryExecutionTests(unittest.TestCase):
         )
         self.secret_parent = self.base / "secrets" / ".dcagent-transactions"
         self.identity_hash = "c" * 64
+        if os.name != "posix":
+            original_resume = recovery.resume_transaction_rollback
+            backend = PortableMutationBackend()
+
+            def injected_resume(
+                journal: state.TransactionJournal | state.RollbackTombstoneJournal,
+                *,
+                secret_validator: recovery.SecretValidator | None = None,
+                mutation_backend: recovery.FilesystemMutationBackend | None = None,
+            ) -> None:
+                original_resume(
+                    journal,
+                    secret_validator=secret_validator,
+                    mutation_backend=(
+                        backend if mutation_backend is None else mutation_backend
+                    ),
+                )
+
+            patcher = mock.patch.object(
+                recovery,
+                "resume_transaction_rollback",
+                side_effect=injected_resume,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def journal(self) -> state.TransactionJournal:
         return install_legacy_record_intent(
@@ -1272,7 +1395,11 @@ class RecoveryExecutionTests(unittest.TestCase):
                 },
             )
             os.chmod(path, 0o640)
-            restore_before = lambda: os.chmod(path, 0o600)
+
+            def restore_chmod() -> None:
+                os.chmod(path, 0o600)
+
+            restore_before = restore_chmod
         elif kind == "active_to_backup":
             assert journal.secret_companion_root is not None
             active = self.base / f"active-{suffix}"
@@ -1289,7 +1416,11 @@ class RecoveryExecutionTests(unittest.TestCase):
                 },
             )
             active.replace(backup)
-            restore_before = lambda: backup.replace(active)
+
+            def restore_active() -> Path:
+                return backup.replace(active)
+
+            restore_before = restore_active
         elif kind == "staging_to_active":
             assert journal.secret_companion_root is not None
             staging = journal.secret_companion_root / "staging" / f"staging-{suffix}"
@@ -1308,10 +1439,15 @@ class RecoveryExecutionTests(unittest.TestCase):
                 },
             )
             staging.replace(active)
-            restore_before = lambda: active.replace(staging)
-            validator = lambda path, _operation: (
-                path.read_text(encoding="utf-8") == "candidate"
-            )
+
+            def restore_staging() -> Path:
+                return active.replace(staging)
+
+            def validate_staging(path: Path, _operation: Mapping[str, object]) -> bool:
+                return path.read_text(encoding="utf-8") == "candidate"
+
+            restore_before = restore_staging
+            validator = validate_staging
         elif kind == "env_replace":
             path = self.base / f"env-{suffix}"
             before = b"A=before\n"
@@ -1330,7 +1466,11 @@ class RecoveryExecutionTests(unittest.TestCase):
                 },
             )
             path.write_bytes(after)
-            restore_before = lambda: path.write_bytes(before)
+
+            def restore_env() -> int:
+                return path.write_bytes(before)
+
+            restore_before = restore_env
         elif kind == "unlink":
             assert journal.secret_companion_root is not None
             path = self.base / f"unlink-{suffix}"
@@ -1349,11 +1489,193 @@ class RecoveryExecutionTests(unittest.TestCase):
                 },
             )
             path.replace(backup)
-            restore_before = lambda: backup.replace(path)
+
+            def restore_unlink() -> Path:
+                return backup.replace(path)
+
+            restore_before = restore_unlink
         else:
             raise AssertionError(f"unsupported rollback test kind: {kind}")
         journal.record_done(1)
         return journal, restore_before, validator
+
+    def test_reverse_operation_uses_injected_mutation_backend(self) -> None:
+        journal, _restore_before, _validator = self.executed_rollback_case(
+            "active_to_backup"
+        )
+        operation = journal.read_operations()[0]
+        source = Path(operation["backup_path"])
+        target = Path(operation["active_path"])
+        observed: list[tuple[Path, Path, tuple[int, int]]] = []
+
+        class RecordingBackend:
+            def rename_noreplace(
+                self,
+                current_source: Path,
+                current_target: Path,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                observed.append(
+                    (
+                        current_source,
+                        current_target,
+                        (expected_source.st_dev, expected_source.st_ino),
+                    )
+                )
+                os.rename(current_source, current_target)
+
+            def chmod(
+                self,
+                path: Path,
+                mode: int,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                raise AssertionError("chmod was not expected")
+
+        expected_identity = (os.lstat(source).st_dev, os.lstat(source).st_ino)
+        recovery.reverse_operation(
+            journal,
+            operation,
+            mutation_backend=RecordingBackend(),
+        )
+
+        self.assertEqual(observed, [(source, target, expected_identity)])
+        self.assertTrue(target.exists())
+        self.assertFalse(source.exists())
+
+    def test_chmod_uses_injected_mutation_backend(self) -> None:
+        journal = self.journal()
+        path = self.base / "injected-chmod"
+        path.write_text("value", encoding="utf-8")
+        expected = os.lstat(path)
+        operation = {
+            "kind": "chmod",
+            "sequence": 1,
+            "path": str(path),
+            "before_mode": 0o600,
+        }
+        observed: list[tuple[Path, int, tuple[int, int]]] = []
+
+        class RecordingBackend:
+            def rename_noreplace(
+                self,
+                source: Path,
+                target: Path,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                raise AssertionError("rename was not expected")
+
+            def chmod(
+                self,
+                current_path: Path,
+                mode: int,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                observed.append(
+                    (
+                        current_path,
+                        mode,
+                        (expected_source.st_dev, expected_source.st_ino),
+                    )
+                )
+
+        with (
+            mock.patch.object(recovery, "classify_operation", return_value="executed"),
+            mock.patch.object(
+                recovery, "_revalidate_chmod_source", return_value=expected
+            ),
+        ):
+            recovery.reverse_operation(
+                journal,
+                operation,
+                mutation_backend=RecordingBackend(),
+            )
+
+        self.assertEqual(
+            observed,
+            [(path, 0o600, (expected.st_dev, expected.st_ino))],
+        )
+
+    @unittest.skipIf(os.name == "posix", "non-POSIX backend selection only")
+    def test_non_posix_rollback_requires_injected_mutation_backend(self) -> None:
+        journal, _restore_before, _validator = self.executed_rollback_case(
+            "active_to_backup"
+        )
+        operation = journal.read_operations()[0]
+        source = Path(operation["backup_path"])
+        target = Path(operation["active_path"])
+
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.reverse_operation(journal, operation)
+
+        self.assertTrue(source.exists())
+        self.assertFalse(target.exists())
+
+    def test_mutation_backend_errors_are_sanitized_as_recovery_conflicts(self) -> None:
+        journal, _restore_before, _validator = self.executed_rollback_case(
+            "active_to_backup"
+        )
+        operation = journal.read_operations()[0]
+
+        class FailingBackend:
+            def rename_noreplace(
+                self,
+                source: Path,
+                target: Path,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                raise OSError("CANARY")
+
+            def chmod(
+                self,
+                path: Path,
+                mode: int,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                raise OSError("CANARY")
+
+        with self.assertRaises(recovery.RecoveryConflict) as caught:
+            recovery.reverse_operation(
+                journal,
+                operation,
+                mutation_backend=FailingBackend(),
+            )
+        self.assertNotIn("CANARY", str(caught.exception))
+
+    def test_rename_source_identity_is_bound_before_classification(self) -> None:
+        journal, _restore_before, _validator = self.executed_rollback_case(
+            "staging_to_active"
+        )
+        operation = journal.read_operations()[0]
+        active = Path(operation["active_path"])
+        staging = Path(operation["staging_path"])
+        backend = PortableMutationBackend()
+        calls = 0
+
+        def swapping_validator(path: Path, _operation: Mapping[str, object]) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                path.unlink()
+                path.write_text("replacement", encoding="utf-8")
+            return True
+
+        with self.assertRaises(recovery.RecoveryConflict):
+            recovery.reverse_operation(
+                journal,
+                operation,
+                secret_validator=swapping_validator,
+                mutation_backend=backend,
+            )
+
+        self.assertEqual(active.read_text(encoding="utf-8"), "replacement")
+        self.assertFalse(staging.exists())
 
     def test_done_before_state_without_rollback_intent_fails_closed_for_all_kinds(
         self,
@@ -1390,6 +1712,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                     operation: Mapping[str, object],
                     *,
                     secret_validator: recovery.SecretValidator | None = None,
+                    mutation_backend: recovery.FilesystemMutationBackend | None = None,
                     reverse: Callable[..., None] = original_reverse,
                 ) -> None:
                     nonlocal saw_intent
@@ -1399,6 +1722,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                         current,
                         operation,
                         secret_validator=secret_validator,
+                        mutation_backend=mutation_backend,
                     )
 
                 with mock.patch.object(
