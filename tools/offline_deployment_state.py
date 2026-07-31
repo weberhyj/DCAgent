@@ -81,18 +81,63 @@ _SAFE_METADATA_KEYS = frozenset(
 )
 
 _OPERATION_FIELDS = {
-    "mkdir": ({"path", "existed", "mode"}, {"owner_uid", "owner_gid", "object_type"}),
-    "chmod": (
-        {"path", "before_mode", "after_mode", "object_type"},
-        {"owner_uid", "owner_gid"},
-    ),
-    "active_to_backup": ({"active_path", "backup_path", "object_type"}, set()),
-    "staging_to_active": ({"staging_path", "active_path", "object_type"}, set()),
-    "env_replace": (
-        {"env_path", "before_digest", "after_digest", "before_absent"},
+    "mkdir": (
+        {"path", "existed", "mode", "owner_uid", "owner_gid", "object_type"},
         set(),
     ),
-    "unlink": ({"path", "object_type"}, set()),
+    "chmod": (
+        {
+            "path",
+            "before_mode",
+            "after_mode",
+            "object_type",
+            "owner_uid",
+            "owner_gid",
+        },
+        set(),
+    ),
+    "active_to_backup": (
+        {
+            "active_path",
+            "backup_path",
+            "object_type",
+            "mode",
+            "owner_uid",
+            "owner_gid",
+        },
+        set(),
+    ),
+    "staging_to_active": (
+        {
+            "staging_path",
+            "active_path",
+            "object_type",
+            "mode",
+            "owner_uid",
+            "owner_gid",
+        },
+        set(),
+    ),
+    "env_replace": (
+        {
+            "env_path",
+            "before_digest",
+            "after_digest",
+            "before_absent",
+            "object_type",
+            "before_mode",
+            "before_owner_uid",
+            "before_owner_gid",
+            "after_mode",
+            "after_owner_uid",
+            "after_owner_gid",
+        },
+        set(),
+    ),
+    "unlink": (
+        {"path", "object_type", "mode", "owner_uid", "owner_gid", "backup_name"},
+        set(),
+    ),
 }
 
 
@@ -623,8 +668,8 @@ _UNDO_METADATA_FIELDS = {
         },
     },
     "chmod": {
-        "before": {"mode", "owner_uid", "owner_gid", "object_type"},
-        "after": {"mode", "owner_uid", "owner_gid", "object_type"},
+        "before": {"exists", "mode", "owner_uid", "owner_gid", "object_type"},
+        "after": {"exists", "mode", "owner_uid", "owner_gid", "object_type"},
     },
     "active_to_backup": {
         "before": {"exists", "object_type", "mode", "owner_uid", "owner_gid"},
@@ -746,6 +791,7 @@ class PhaseRecord:
 
 @dataclasses.dataclass(frozen=True)
 class UndoEntry:
+    sequence: int
     path: Path
     object_type: str
     existed: bool
@@ -758,6 +804,8 @@ class UndoEntry:
     after: dict[str, object]
 
     def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise DeploymentStateError("invalid undo sequence")
         object.__setattr__(self, "path", _validate_abs_path(self.path, "undo path"))
         if self.object_type not in OBJECT_TYPES:
             raise DeploymentStateError("invalid undo object type")
@@ -792,9 +840,97 @@ class UndoEntry:
                 self.expected_action, "after", self.after, "undo after metadata"
             ),
         )
+        absent = {"exists": False, "object_type": self.object_type}
+        if self.existed:
+            if (
+                self.original_mode is None
+                or self.owner_uid is None
+                or self.owner_gid is None
+            ):
+                raise DeploymentStateError("existing undo object requires authority")
+            before = {
+                "exists": True,
+                "object_type": self.object_type,
+                "mode": self.original_mode,
+                "owner_uid": self.owner_uid,
+                "owner_gid": self.owner_gid,
+            }
+        else:
+            if (
+                self.original_mode is not None
+                or self.owner_uid is not None
+                or self.owner_gid is not None
+            ):
+                raise DeploymentStateError("absent undo object has authority")
+            before = absent
+        if self.before != before:
+            raise DeploymentStateError("undo before metadata is inconsistent")
+        action = self.expected_action
+        if action == "mkdir":
+            if self.existed or self.backup_name is not None:
+                raise DeploymentStateError("invalid mkdir undo entry")
+            expected_after = {
+                "exists": True,
+                "object_type": self.object_type,
+                "mode": self.after.get("mode"),
+                "owner_uid": self.after.get("owner_uid"),
+                "owner_gid": self.after.get("owner_gid"),
+                "empty": True,
+            }
+        elif action == "chmod":
+            if not self.existed or self.backup_name is not None:
+                raise DeploymentStateError("invalid chmod undo entry")
+            expected_after = {
+                "exists": True,
+                "object_type": self.object_type,
+                "mode": self.after.get("mode"),
+                "owner_uid": self.owner_uid,
+                "owner_gid": self.owner_gid,
+            }
+        elif action == "active_to_backup":
+            if not self.existed or self.backup_name is None:
+                raise DeploymentStateError("invalid backup undo entry")
+            expected_after = absent
+        elif action == "staging_to_active":
+            if self.existed or self.backup_name is not None:
+                raise DeploymentStateError("invalid publish undo entry")
+            expected_after = {
+                "exists": True,
+                "object_type": self.object_type,
+                "mode": self.after.get("mode"),
+                "owner_uid": self.after.get("owner_uid"),
+                "owner_gid": self.after.get("owner_gid"),
+            }
+        elif action == "env_replace":
+            if self.backup_name != ("env-backup" if self.existed else None):
+                raise DeploymentStateError("invalid environment undo entry")
+            expected_after = {
+                "exists": True,
+                "object_type": self.object_type,
+                "mode": self.after.get("mode"),
+                "owner_uid": self.after.get("owner_uid"),
+                "owner_gid": self.after.get("owner_gid"),
+            }
+        elif action == "unlink":
+            if not self.existed or self.backup_name is None:
+                raise DeploymentStateError("invalid unlink undo entry")
+            expected_after = absent
+        else:  # pragma: no cover - expected_action is validated above.
+            raise DeploymentStateError("invalid undo expected action")
+        if self.after != expected_after:
+            raise DeploymentStateError("undo after metadata is inconsistent")
+        if self.after.get("exists") is True:
+            _validate_mode(self.after.get("mode"), "undo after mode")
+            for field in ("owner_uid", "owner_gid"):
+                if (
+                    _validate_optional_int(self.after.get(field), f"undo after {field}")
+                    is None
+                ):
+                    raise DeploymentStateError("undo after authority is required")
 
     def to_mapping(self) -> dict[str, object]:
         return {
+            "sequence": self.sequence,
             "path": self.path.as_posix(),
             "object_type": self.object_type,
             "existed": self.existed,
@@ -810,6 +946,7 @@ class UndoEntry:
     @classmethod
     def from_mapping(cls, payload: object) -> UndoEntry:
         required = {
+            "sequence",
             "path",
             "object_type",
             "existed",
@@ -828,6 +965,7 @@ class UndoEntry:
         ):
             raise DeploymentStateError("invalid undo manifest metadata")
         return cls(
+            sequence=payload["sequence"],
             path=payload["path"],
             object_type=payload["object_type"],
             existed=payload["existed"],
@@ -889,29 +1027,40 @@ def _validate_operation_mapping(
         raise DeploymentStateError("invalid transaction operation fields")
     result = dict(payload)
     if kind in {"mkdir", "chmod"}:
-        for field in ("path", "active_path", "backup_path", "staging_path"):
-            if field in result:
-                result[field] = _validate_abs_path(
-                    result[field], f"operation {field}"
-                ).as_posix()
+        result["path"] = _validate_abs_path(result["path"], "operation path").as_posix()
         for field in ("mode", "before_mode", "after_mode"):
             if field in result:
                 result[field] = _validate_mode(result[field], f"operation {field}")
         for field in ("owner_uid", "owner_gid"):
-            if field in result:
-                result[field] = _validate_optional_int(
-                    result[field], f"operation {field}"
-                )
-        if kind == "mkdir" and type(result["existed"]) is not bool:
-            raise DeploymentStateError("invalid operation existed flag")
+            result[field] = _validate_optional_int(result[field], f"operation {field}")
+            if result[field] is None:
+                raise DeploymentStateError(f"operation {field} is required")
+        if kind == "mkdir" and (
+            result["existed"] is not False or result["object_type"] != "directory"
+        ):
+            raise DeploymentStateError("invalid mkdir operation authority")
     elif kind in {"active_to_backup", "staging_to_active"}:
         for field in ("active_path", "backup_path", "staging_path"):
             if field in result:
                 result[field] = _validate_abs_path(
                     result[field], f"operation {field}"
                 ).as_posix()
+        result["mode"] = _validate_mode(result["mode"], "operation mode")
+        for field in ("owner_uid", "owner_gid"):
+            result[field] = _validate_optional_int(result[field], f"operation {field}")
+            if result[field] is None:
+                raise DeploymentStateError(f"operation {field} is required")
     elif kind == "unlink":
         result["path"] = _validate_abs_path(result["path"], "operation path").as_posix()
+        result["mode"] = _validate_mode(result["mode"], "operation mode")
+        for field in ("owner_uid", "owner_gid"):
+            result[field] = _validate_optional_int(result[field], f"operation {field}")
+            if result[field] is None:
+                raise DeploymentStateError(f"operation {field} is required")
+        if not isinstance(result["backup_name"], str) or not _SAFE_NAME.fullmatch(
+            result["backup_name"]
+        ):
+            raise DeploymentStateError("invalid unlink backup name")
     elif kind == "env_replace":
         result["env_path"] = _validate_abs_path(
             result["env_path"], "operation env path"
@@ -930,6 +1079,35 @@ def _validate_operation_mapping(
             raise DeploymentStateError("existing environment requires before digest")
         if not isinstance(result["after_digest"], str):
             raise DeploymentStateError("environment replacement requires after digest")
+        if result["object_type"] != "environment":
+            raise DeploymentStateError("invalid environment object type")
+        result["after_mode"] = _validate_mode(
+            result["after_mode"], "operation after_mode"
+        )
+        for field in ("after_owner_uid", "after_owner_gid"):
+            result[field] = _validate_optional_int(result[field], f"operation {field}")
+            if result[field] is None:
+                raise DeploymentStateError(f"operation {field} is required")
+        before_authority = (
+            result["before_mode"],
+            result["before_owner_uid"],
+            result["before_owner_gid"],
+        )
+        if result["before_absent"]:
+            if before_authority != (None, None, None):
+                raise DeploymentStateError(
+                    "absent environment cannot have before authority"
+                )
+        else:
+            result["before_mode"] = _validate_mode(
+                result["before_mode"], "operation before_mode"
+            )
+            for field in ("before_owner_uid", "before_owner_gid"):
+                result[field] = _validate_optional_int(
+                    result[field], f"operation {field}"
+                )
+                if result[field] is None:
+                    raise DeploymentStateError(f"operation {field} is required")
     if "object_type" in result and (
         not isinstance(result["object_type"], str)
         or result["object_type"] not in OBJECT_TYPES
@@ -1135,8 +1313,9 @@ class TransactionJournal:
                 f"transaction metadata mismatch: {metadata_path}"
             )
         journal.object_categories = phase.object_categories
-        journal._read_undo_manifest()
+        undo_entries = journal._read_undo_manifest()
         operations = journal._read_operations_internal()
+        journal._validate_manifest_operations(undo_entries, operations)
         rollback_done = journal._read_rollback_done()
         rollback_intents = journal._read_rollback_intents()
         operation_sequences = {operation["sequence"] for operation in operations}
@@ -1300,6 +1479,163 @@ class TransactionJournal:
             )
         return [UndoEntry.from_mapping(entry) for entry in payload["entries"]]
 
+    def _undo_entry_for_operation(self, operation: Mapping[str, object]) -> UndoEntry:
+        sequence = operation["sequence"]
+        kind = operation["kind"]
+        object_type = operation["object_type"]
+        if kind == "mkdir":
+            return UndoEntry(
+                sequence=sequence,
+                path=Path(operation["path"]),
+                object_type=object_type,
+                existed=False,
+                original_mode=None,
+                owner_uid=None,
+                owner_gid=None,
+                backup_name=None,
+                expected_action=kind,
+                before={"exists": False, "object_type": object_type},
+                after={
+                    "exists": True,
+                    "object_type": object_type,
+                    "mode": operation["mode"],
+                    "owner_uid": operation["owner_uid"],
+                    "owner_gid": operation["owner_gid"],
+                    "empty": True,
+                },
+            )
+        if kind == "chmod":
+            before = {
+                "exists": True,
+                "object_type": object_type,
+                "mode": operation["before_mode"],
+                "owner_uid": operation["owner_uid"],
+                "owner_gid": operation["owner_gid"],
+            }
+            return UndoEntry(
+                sequence=sequence,
+                path=Path(operation["path"]),
+                object_type=object_type,
+                existed=True,
+                original_mode=operation["before_mode"],
+                owner_uid=operation["owner_uid"],
+                owner_gid=operation["owner_gid"],
+                backup_name=None,
+                expected_action=kind,
+                before=before,
+                after={**before, "mode": operation["after_mode"]},
+            )
+        if kind == "active_to_backup":
+            return UndoEntry(
+                sequence=sequence,
+                path=Path(operation["active_path"]),
+                object_type=object_type,
+                existed=True,
+                original_mode=operation["mode"],
+                owner_uid=operation["owner_uid"],
+                owner_gid=operation["owner_gid"],
+                backup_name=Path(operation["backup_path"]).name,
+                expected_action=kind,
+                before={
+                    "exists": True,
+                    "object_type": object_type,
+                    "mode": operation["mode"],
+                    "owner_uid": operation["owner_uid"],
+                    "owner_gid": operation["owner_gid"],
+                },
+                after={"exists": False, "object_type": object_type},
+            )
+        if kind == "staging_to_active":
+            return UndoEntry(
+                sequence=sequence,
+                path=Path(operation["active_path"]),
+                object_type=object_type,
+                existed=False,
+                original_mode=None,
+                owner_uid=None,
+                owner_gid=None,
+                backup_name=None,
+                expected_action=kind,
+                before={"exists": False, "object_type": object_type},
+                after={
+                    "exists": True,
+                    "object_type": object_type,
+                    "mode": operation["mode"],
+                    "owner_uid": operation["owner_uid"],
+                    "owner_gid": operation["owner_gid"],
+                },
+            )
+        if kind == "env_replace":
+            existed = operation["before_absent"] is False
+            before = (
+                {
+                    "exists": True,
+                    "object_type": object_type,
+                    "mode": operation["before_mode"],
+                    "owner_uid": operation["before_owner_uid"],
+                    "owner_gid": operation["before_owner_gid"],
+                }
+                if existed
+                else {"exists": False, "object_type": object_type}
+            )
+            return UndoEntry(
+                sequence=sequence,
+                path=Path(operation["env_path"]),
+                object_type=object_type,
+                existed=existed,
+                original_mode=operation["before_mode"] if existed else None,
+                owner_uid=operation["before_owner_uid"] if existed else None,
+                owner_gid=operation["before_owner_gid"] if existed else None,
+                backup_name="env-backup" if existed else None,
+                expected_action=kind,
+                before=before,
+                after={
+                    "exists": True,
+                    "object_type": object_type,
+                    "mode": operation["after_mode"],
+                    "owner_uid": operation["after_owner_uid"],
+                    "owner_gid": operation["after_owner_gid"],
+                },
+            )
+        if kind == "unlink":
+            return UndoEntry(
+                sequence=sequence,
+                path=Path(operation["path"]),
+                object_type=object_type,
+                existed=True,
+                original_mode=operation["mode"],
+                owner_uid=operation["owner_uid"],
+                owner_gid=operation["owner_gid"],
+                backup_name=operation["backup_name"],
+                expected_action=kind,
+                before={
+                    "exists": True,
+                    "object_type": object_type,
+                    "mode": operation["mode"],
+                    "owner_uid": operation["owner_uid"],
+                    "owner_gid": operation["owner_gid"],
+                },
+                after={"exists": False, "object_type": object_type},
+            )
+        raise DeploymentStateError("invalid operation undo action")
+
+    def _validate_manifest_operations(
+        self,
+        entries: Sequence[UndoEntry],
+        operations: Sequence[Mapping[str, object]],
+    ) -> None:
+        entry_by_sequence = {entry.sequence: entry for entry in entries}
+        if len(entry_by_sequence) != len(entries):
+            raise DeploymentStateError("duplicate undo manifest sequence")
+        operation_sequences = {operation["sequence"] for operation in operations}
+        if set(entry_by_sequence) != operation_sequences:
+            raise DeploymentStateError("undo manifest operation mismatch")
+        for operation in operations:
+            expected = self._undo_entry_for_operation(operation)
+            actual = entry_by_sequence[operation["sequence"]]
+            if actual.to_mapping() != expected.to_mapping():
+                raise DeploymentStateError("undo manifest operation mismatch")
+
     def _write_operations(self, records: Sequence[Mapping[str, object]]) -> None:
         atomic_write_json(
             self.operations_path,
@@ -1362,7 +1698,9 @@ class TransactionJournal:
                 )
 
     def read_operations(self) -> tuple[dict[str, object], ...]:
-        return tuple(self._read_operations_internal())
+        operations = self._read_operations_internal()
+        self._validate_manifest_operations(self._read_undo_manifest(), operations)
+        return tuple(operations)
 
     @property
     def operations(self) -> tuple[dict[str, object], ...]:
@@ -1403,8 +1741,12 @@ class TransactionJournal:
         if validated["kind"] == "env_replace":
             self.validate_env_backup_for_operation(validated)
         records = self._read_operations_internal()
+        entries = self._read_undo_manifest()
+        self._validate_manifest_operations(entries, records)
         if records and sequence <= records[-1]["sequence"]:
             raise DeploymentStateError("transaction operation sequence must increase")
+        entries.append(self._undo_entry_for_operation(validated))
+        self.write_undo_manifest(entries)
         records.append(validated)
         self._write_operations(records)
 
@@ -1412,6 +1754,7 @@ class TransactionJournal:
         if type(sequence) is not int or sequence <= 0:
             raise DeploymentStateError("invalid transaction operation sequence")
         records = self._read_operations_internal()
+        self._validate_manifest_operations(self._read_undo_manifest(), records)
         found = False
         for record in records:
             if record["sequence"] == sequence:
@@ -1685,7 +2028,10 @@ class TombstoneJournal(TransactionJournal):
 
     @classmethod
     def open_cleanup_metadata(
-        cls, metadata_path: str | Path, expected_identity_hash: str
+        cls,
+        metadata_path: str | Path,
+        expected_identity_hash: str,
+        authoritative_companion_parent: str | Path | None,
     ) -> TombstoneJournal:
         path = Path(metadata_path)
         expected_hash = _validate_identity_hash(expected_identity_hash)
@@ -1730,12 +2076,20 @@ class TombstoneJournal(TransactionJournal):
                 raise DeploymentStateError(f"invalid cleanup metadata: {path}")
             companion = None
         else:
+            if authoritative_companion_parent is None:
+                raise DeploymentStateError("cleanup companion authority is required")
+            companion_parent = _validate_abs_path(
+                authoritative_companion_parent, "cleanup companion parent"
+            )
+            if companion_parent.name != ".dcagent-transactions":
+                raise DeploymentStateError("invalid cleanup companion parent")
             companion = _validate_abs_path(
                 companion_value, "cleanup secret companion root"
             )
             if (
                 companion.name != transaction_id
                 or companion.parent.name != ".dcagent-transactions"
+                or companion != companion_parent / transaction_id
             ):
                 raise DeploymentStateError(f"invalid cleanup metadata: {path}")
         journal = cls(
@@ -2267,7 +2621,9 @@ def scan_transaction_journals(
         match = _CLEANUP_TOMBSTONE_METADATA.fullmatch(entry.name)
         if match is None:
             continue
-        journal = TombstoneJournal.open_cleanup_metadata(entry.path, expected_hash)
+        journal = TombstoneJournal.open_cleanup_metadata(
+            entry.path, expected_hash, companion_parent
+        )
         transaction_id = journal.transaction_id
         if transaction_id in cleanup_metadata:
             raise DeploymentStateError(f"duplicate cleanup metadata: {journal.root}")

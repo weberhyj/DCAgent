@@ -77,14 +77,36 @@ def _matches_undo_entry(entry: state.UndoEntry, st: os.stat_result) -> bool:
     return st.st_uid == expected_uid and st.st_gid == expected_gid
 
 
-def _owner_matches(st: os.stat_result, operation: Mapping[str, object]) -> bool:
+def _authority_matches(
+    st: os.stat_result,
+    operation: Mapping[str, object],
+    *,
+    mode_field: str = "mode",
+    uid_field: str = "owner_uid",
+    gid_field: str = "owner_gid",
+) -> bool:
+    mode = operation.get(mode_field)
+    uid = operation.get(uid_field)
+    gid = operation.get(gid_field)
+    if type(mode) is not int or type(uid) is not int or type(gid) is not int:
+        return False
     if os.name != "posix":
         return True
-    uid = operation.get("owner_uid")
-    gid = operation.get("owner_gid")
-    return (uid is None or type(uid) is int and st.st_uid == uid) and (
-        gid is None or type(gid) is int and st.st_gid == gid
-    )
+    return stat.S_IMODE(st.st_mode) == mode and st.st_uid == uid and st.st_gid == gid
+
+
+def _owner_matches(
+    st: os.stat_result,
+    operation: Mapping[str, object],
+    *,
+    uid_field: str = "owner_uid",
+    gid_field: str = "owner_gid",
+) -> bool:
+    uid = operation.get(uid_field)
+    gid = operation.get(gid_field)
+    if type(uid) is not int or type(gid) is not int:
+        return False
+    return os.name != "posix" or st.st_uid == uid and st.st_gid == gid
 
 
 def _directory_empty(path: Path, operation: Mapping[str, object]) -> bool:
@@ -126,8 +148,7 @@ def _classify_intent(
             and not state._is_symlink(current)
             and stat.S_ISDIR(current.st_mode)
             and type(mode) is int
-            and (os.name != "posix" or stat.S_IMODE(current.st_mode) == mode)
-            and _owner_matches(current, operation)
+            and _authority_matches(current, operation)
             and _directory_empty(path, operation)
         ):
             return "executed"
@@ -161,9 +182,15 @@ def _classify_intent(
         left = _lstat(left_path, operation)
         right = _lstat(right_path, operation)
         expected_type = operation.get("object_type")
-        if left is not None and not _matches_type(left, expected_type):
+        if left is not None and (
+            not _matches_type(left, expected_type)
+            or not _authority_matches(left, operation)
+        ):
             raise _conflict(operation)
-        if right is not None and not _matches_type(right, expected_type):
+        if right is not None and (
+            not _matches_type(right, expected_type)
+            or not _authority_matches(right, operation)
+        ):
             raise _conflict(operation)
         if left is not None and right is None:
             if kind == "staging_to_active":
@@ -207,8 +234,24 @@ def _classify_intent(
             and isinstance(before_digest, str)
             and digest == before_digest
         ):
+            if not _authority_matches(
+                current,
+                operation,
+                mode_field="before_mode",
+                uid_field="before_owner_uid",
+                gid_field="before_owner_gid",
+            ):
+                raise _conflict(operation)
             return "not_executed"
         if digest == after_digest:
+            if not _authority_matches(
+                current,
+                operation,
+                mode_field="after_mode",
+                uid_field="after_owner_uid",
+                gid_field="after_owner_gid",
+            ):
+                raise _conflict(operation)
             return "executed"
         raise _conflict(operation)
 
@@ -217,7 +260,9 @@ def _classify_intent(
         current = _lstat(path, operation)
         if current is None:
             return "executed"
-        if _matches_type(current, operation.get("object_type")):
+        if _matches_type(current, operation.get("object_type")) and _authority_matches(
+            current, operation
+        ):
             return "not_executed"
         raise _conflict(operation)
 
@@ -241,7 +286,9 @@ def classify_operation(
     return classification
 
 
-def _atomic_replace_bytes(path: Path, data: bytes) -> None:
+def _atomic_replace_bytes(
+    path: Path, data: bytes, *, mode: int, owner_uid: int, owner_gid: int
+) -> None:
     parent = path.parent
     parent_st = state._lstat(parent, "environment parent directory")
     if state._is_symlink(parent_st) or not stat.S_ISDIR(parent_st.st_mode):
@@ -252,7 +299,8 @@ def _atomic_replace_bytes(path: Path, data: bytes) -> None:
         fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=parent)
         temporary = Path(name)
         if os.name == "posix":
-            os.fchmod(fd, 0o600)
+            os.fchown(fd, owner_uid, owner_gid)
+            os.fchmod(fd, mode)
         state._write_all(fd, data)
         os.fsync(fd)
         os.close(fd)
@@ -273,7 +321,9 @@ def _unlink_expected(path: Path, operation: Mapping[str, object]) -> None:
     current = _lstat(path, operation)
     if current is None:
         return
-    if not _matches_type(current, operation.get("object_type")):
+    if not _matches_type(
+        current, operation.get("object_type")
+    ) or not _authority_matches(current, operation):
         raise _conflict(operation)
     if stat.S_ISDIR(current.st_mode):
         try:
@@ -302,11 +352,26 @@ def reverse_operation(
         except state.DeploymentStateError:
             raise _conflict(operation) from None
         if operation.get("before_absent") is True:
-            _unlink_expected(path, {**operation, "object_type": "file"})
+            _unlink_expected(
+                path,
+                {
+                    **operation,
+                    "object_type": "file",
+                    "mode": operation["after_mode"],
+                    "owner_uid": operation["after_owner_uid"],
+                    "owner_gid": operation["after_owner_gid"],
+                },
+            )
         elif backup is None:
             raise _conflict(operation)
         else:
-            _atomic_replace_bytes(path, backup)
+            _atomic_replace_bytes(
+                path,
+                backup,
+                mode=operation["before_mode"],
+                owner_uid=operation["before_owner_uid"],
+                owner_gid=operation["before_owner_gid"],
+            )
         return
     if kind == "staging_to_active":
         staging = _path(operation, "staging_path")
@@ -391,6 +456,7 @@ def _reverse_state_is_safe(
             active is not None
             or staging is None
             or not _matches_type(staging, operation.get("object_type"))
+            or not _authority_matches(staging, operation)
             or secret_validator is None
         ):
             return False
@@ -553,7 +619,9 @@ def finalize_committed_cleanup(
         if not root_exists and not isinstance(journal, state.TombstoneJournal):
             if state._lstat_optional(metadata) is not None:
                 reopened = state.TombstoneJournal.open_cleanup_metadata(
-                    metadata, journal.deployment_identity_hash
+                    metadata,
+                    journal.deployment_identity_hash,
+                    journal.secret_companion_parent,
                 )
                 finalize_committed_cleanup(reopened)
                 return
@@ -570,7 +638,9 @@ def finalize_committed_cleanup(
                     str(receipt["cleanup_status"]),
                 )
                 reopened = state.TombstoneJournal.open_cleanup_metadata(
-                    metadata, journal.deployment_identity_hash
+                    metadata,
+                    journal.deployment_identity_hash,
+                    journal.secret_companion_parent,
                 )
                 finalize_committed_cleanup(reopened)
                 return
@@ -608,10 +678,13 @@ def finalize_committed_cleanup(
             )
         else:
             state.TombstoneJournal.open_cleanup_metadata(
-                metadata, journal.deployment_identity_hash
+                metadata,
+                journal.deployment_identity_hash,
+                journal.secret_companion_parent,
             )
         if journal.secret_companion_root is not None:
             state._remove_private_tree(journal.secret_companion_root)
+        _mark_receipt_complete(journal)
         if journal.root != tombstone:
             if state._lstat_optional(tombstone) is not None:
                 raise state.DeploymentStateError(
@@ -621,7 +694,6 @@ def finalize_committed_cleanup(
             state.fsync_directory(journal.root.parent)
             state.fsync_directory(tombstone.parent)
         state._remove_private_tree(tombstone)
-        _mark_receipt_complete(journal)
         metadata_state = state._lstat_optional(metadata)
         if metadata_state is not None:
             if state._is_symlink(metadata_state) or not stat.S_ISREG(
