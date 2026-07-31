@@ -23,13 +23,14 @@ from collections.abc import Callable, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_WRAPPER_PATHS = (
+    REPO_ROOT / "tools" / "invoke_offline_compose.sh",
+    REPO_ROOT / "tools" / "invoke_offline_compose.ps1",
+)
 
 
 def default_wrapper_path() -> Path:
-    wrapper_name = (
-        "invoke_offline_compose.ps1" if os.name == "nt" else "invoke_offline_compose.sh"
-    )
-    return REPO_ROOT / "tools" / wrapper_name
+    return REPOSITORY_WRAPPER_PATHS[1 if os.name == "nt" else 0]
 
 
 DEFAULT_WRAPPER_PATH = default_wrapper_path()
@@ -1022,10 +1023,12 @@ def run_compose_smoke(
     destination.unlink(missing_ok=True)
     try:
         wrapper = Path(wrapper_path).resolve(strict=True)
-        expected_wrapper = DEFAULT_WRAPPER_PATH.resolve(strict=True)
+        expected_wrappers = {
+            path.resolve(strict=True) for path in REPOSITORY_WRAPPER_PATHS
+        }
     except OSError as error:
         raise ValueError("offline smoke wrapper is unavailable") from error
-    if wrapper != expected_wrapper:
+    if wrapper not in expected_wrappers:
         raise ValueError("offline smoke must use the repository Compose wrapper")
     migration_head = _discover_migration_head()
     failures: list[str] = []

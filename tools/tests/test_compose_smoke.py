@@ -265,15 +265,17 @@ class FakeRunner:
 
     @staticmethod
     def _arguments(argv: list[str]) -> list[str]:
-        index = argv.index("-File")
-        return argv[index + 2 :]
+        if "-File" in argv:
+            index = argv.index("-File")
+            return argv[index + 2 :]
+        if argv and Path(argv[0]).suffix.casefold() == ".sh":
+            return argv[1:]
+        raise AssertionError(f"unexpected wrapper command: {argv!r}")
 
     @classmethod
     def _key(cls, argv: list[str]) -> str:
-        if "-File" not in argv:
-            if argv[0] == sys.executable and "/api/readyz" in " ".join(argv):
-                return "api"
-            raise AssertionError(f"unexpected host command: {argv!r}")
+        if argv[0] == sys.executable and "/api/readyz" in " ".join(argv):
+            return "api"
         arguments = cls._arguments(argv)
         action = arguments[0]
         if action != "exec":
@@ -928,13 +930,103 @@ class ComposeSmokeTest(unittest.TestCase):
     def test_production_runner_rejects_non_repository_wrapper(self) -> None:
         compose_smoke = _module()
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(ValueError):
-                compose_smoke.run_compose_smoke(
-                    wrapper_path=Path(directory) / "other.ps1",
+            for name in (
+                "invoke_offline_compose.sh",
+                "invoke_offline_compose.ps1",
+                "invoke_offline_compose.py",
+            ):
+                with self.subTest(name=name):
+                    wrapper = Path(directory) / name
+                    wrapper.touch()
+                    with self.assertRaises(ValueError):
+                        compose_smoke.run_compose_smoke(
+                            wrapper_path=wrapper,
+                            report_path=Path(directory) / "report.json",
+                            runner=FakeRunner(),
+                            hardware_collector=lambda: {},
+                            software_collector=lambda: {},
+                        )
+
+    def test_fake_runner_parses_bash_and_powershell_wrapper_arguments(self) -> None:
+        arguments = ["config", "--quiet"]
+        bash = [str(REPO_ROOT / "tools" / "invoke_offline_compose.sh"), *arguments]
+        powershell = [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(REPO_ROOT / "tools" / "invoke_offline_compose.ps1"),
+            *arguments,
+        ]
+
+        self.assertEqual(FakeRunner._arguments(bash), arguments)
+        self.assertEqual(FakeRunner._arguments(powershell), arguments)
+
+    def test_production_runner_supports_each_repository_wrapper_override(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        wrappers = {
+            "invoke_offline_compose.sh": [
+                str(REPO_ROOT / "tools" / "invoke_offline_compose.sh")
+            ],
+            "invoke_offline_compose.ps1": [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(REPO_ROOT / "tools" / "invoke_offline_compose.ps1"),
+            ],
+        }
+
+        for wrapper_name, prefix in wrappers.items():
+            with (
+                self.subTest(wrapper_name=wrapper_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = FakeRunner()
+                report = compose_smoke.run_compose_smoke(
+                    wrapper_path=REPO_ROOT / "tools" / wrapper_name,
                     report_path=Path(directory) / "report.json",
-                    runner=FakeRunner(),
+                    runner=runner,
                     hardware_collector=lambda: {},
                     software_collector=lambda: {},
+                )
+
+                self.assertTrue(report["passed"])
+                wrapper_calls = [
+                    command
+                    for command, _ in runner.calls
+                    if command[0] != sys.executable
+                ]
+                self.assertTrue(wrapper_calls)
+                self.assertTrue(
+                    all(command[: len(prefix)] == prefix for command in wrapper_calls)
+                )
+                self.assertEqual(
+                    [runner._key(command) for command, _ in runner.calls],
+                    [
+                        "config",
+                        "up",
+                        "version",
+                        "postgres",
+                        "clickhouse_ping",
+                        "clickhouse_version",
+                        "qdrant_ready",
+                        "qdrant_version",
+                        "redis_ping",
+                        "redis_version",
+                        "clamav_ping",
+                        "clamav_version",
+                        "embedding.ready",
+                        "embedding.metadata",
+                        "embedding.embeddings",
+                        "reranker.ready",
+                        "reranker.metadata",
+                        "reranker.rerank",
+                        "api",
+                        "down",
+                    ],
                 )
 
     def test_runner_uses_argument_vectors_shell_false_and_never_direct_compose(
