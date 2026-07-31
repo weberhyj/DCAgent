@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import math
 import os
 import stat
+import subprocess
+import sys
 import tempfile
+import traceback
 import unittest
 import uuid
 from pathlib import Path
@@ -47,6 +52,12 @@ class RaisingLock:
         raise AssertionError("release must not be called when acquisition fails")
 
 
+class RaisingReleaseLock(RecordingLock):
+    def release(self, fd: int) -> None:
+        super().release(fd)
+        raise RuntimeError("SENSITIVE_RELEASE_CANARY")
+
+
 class DeploymentStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -70,6 +81,50 @@ class DeploymentStateTests(unittest.TestCase):
             model_root=self.base / "models",
             secret_root=self.base / "secrets",
         )
+
+    def make_canonical_identity_collision(
+        self,
+    ) -> tuple[
+        state.StatePaths,
+        state.DeploymentIdentity,
+        state.DeploymentIdentity,
+    ]:
+        if os.name == "nt":
+            upper_data = self.base / "Data"
+            paths = state.StatePaths(state.derive_state_root(upper_data))
+            paths.ensure_layout(self.uid, self.gid)
+            stored = state.DeploymentIdentity(
+                schema_version=state.SCHEMA_VERSION,
+                deployment_uuid="1234567890ab4def81234567890abcde",
+                state_root=state.derive_state_root(upper_data),
+                data_root=upper_data,
+                model_root=self.base / "Models",
+                secret_root=self.base / "Secrets",
+            )
+            lower_data = self.base / "data"
+            expected = state.DeploymentIdentity(
+                schema_version=state.SCHEMA_VERSION,
+                deployment_uuid=stored.deployment_uuid,
+                state_root=state.derive_state_root(lower_data),
+                data_root=lower_data,
+                model_root=self.base / "models",
+                secret_root=self.base / "secrets",
+            )
+        else:
+            self.ensure_layout()
+            paths = self.paths
+            stored = self.make_identity()
+            expected = state.DeploymentIdentity(
+                **{
+                    **stored.to_mapping(),
+                    "model_root": (self.base / "Models").as_posix(),
+                }
+            )
+        self.assertNotEqual(stored.to_mapping(), expected.to_mapping())
+        self.assertNotEqual(
+            state.identity_digest(stored), state.identity_digest(expected)
+        )
+        return paths, stored, expected
 
     def ensure_layout(self) -> None:
         self.paths.ensure_layout(self.uid, self.gid)
@@ -149,13 +204,16 @@ class DeploymentStateTests(unittest.TestCase):
 
     def test_identity_mapping_digest_and_new_uuid_are_canonical(self) -> None:
         generated = uuid.UUID("00112233-4455-4677-8899-aabbccddeeff")
-        with mock.patch.object(state.uuid, "uuid4", return_value=generated):
+        try:
             identity = state.DeploymentIdentity.new(
                 state_root=self.state_root,
                 data_root=self.data_root,
                 model_root=self.base / "models",
                 secret_root=self.base / "secrets",
+                deployment_uuid=generated.hex,
             )
+        except TypeError as exc:
+            self.fail(f"DeploymentIdentity.new rejected deterministic UUID: {exc}")
         mapping = identity.to_mapping()
         self.assertEqual(
             set(mapping),
@@ -180,6 +238,14 @@ class DeploymentStateTests(unittest.TestCase):
             state.identity_digest(identity), hashlib.sha256(canonical).hexdigest()
         )
         self.assertNotIn("checkout", json.dumps(mapping))
+        with self.assertRaises(state.DeploymentStateError):
+            state.DeploymentIdentity.new(
+                state_root=self.state_root,
+                data_root=self.data_root,
+                model_root=self.base / "models",
+                secret_root=self.base / "secrets",
+                deployment_uuid="not-a-uuid",
+            )
 
     def test_identity_rejects_non_uuid4_and_wrong_state_root(self) -> None:
         invalid_uuids: list[object] = [
@@ -202,6 +268,14 @@ class DeploymentStateTests(unittest.TestCase):
             state.DeploymentIdentity(
                 **{**mapping, "state_root": self.base / "wrong-state"}
             )
+        with self.assertRaises(state.DeploymentStateError):
+            state.DeploymentIdentity(
+                **{
+                    **mapping,
+                    "state_root": self.base / "Data" / ".dcagent-deployment-state",
+                    "data_root": self.base / "data",
+                }
+            )
 
     def test_identity_exclusive_create_is_idempotent_but_different_fails(self) -> None:
         self.ensure_layout()
@@ -221,6 +295,94 @@ class DeploymentStateTests(unittest.TestCase):
         other = self.make_identity("abcdefabcdef4abc8abcdefabcdefabc")
         with self.assertRaises(state.DeploymentStateError):
             state.write_identity_exclusive(self.paths, other)
+
+    def test_exclusive_identity_publish_survives_interrupted_child_write(self) -> None:
+        self.ensure_layout()
+        identity = self.make_identity()
+        child_code = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "from tools import offline_deployment_state as state\n"
+            "paths = state.StatePaths(Path(sys.argv[1]))\n"
+            "identity = state.DeploymentIdentity("
+            "schema_version=state.SCHEMA_VERSION, deployment_uuid=sys.argv[2], "
+            "state_root=Path(sys.argv[1]), data_root=Path(sys.argv[3]), "
+            "model_root=Path(sys.argv[4]), secret_root=Path(sys.argv[5]))\n"
+            "def interrupted_write(fd, data):\n"
+            "    os.write(fd, data[:7])\n"
+            "    os._exit(73)\n"
+            "state._write_all = interrupted_write\n"
+            "state.write_identity_exclusive(paths, identity)\n"
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                str(self.paths.root),
+                identity.deployment_uuid,
+                str(identity.data_root),
+                str(identity.model_root),
+                str(identity.secret_root),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 73, completed.stderr)
+        if self.paths.identity.exists():
+            self.fail(
+                f"partial final identity remained: {self.paths.identity.read_bytes()!r}"
+            )
+        state.write_identity_exclusive(self.paths, identity)
+        self.assertEqual(
+            state.load_identity(self.paths).to_mapping(), identity.to_mapping()
+        )
+
+    def test_exclusive_identity_write_error_cleans_temporary_file(self) -> None:
+        self.ensure_layout()
+        with (
+            mock.patch.object(
+                state, "_write_all", side_effect=OSError("interrupted write")
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            state.write_identity_exclusive(self.paths, self.make_identity())
+        self.assertFalse(self.paths.identity.exists())
+        self.assertEqual(
+            list(self.paths.root.glob(f".{self.paths.identity.name}.*.tmp")), []
+        )
+
+    def test_write_identity_compares_canonical_mapping(self) -> None:
+        paths, stored, expected = self.make_canonical_identity_collision()
+        state.write_identity_exclusive(paths, stored)
+        comparison = (
+            contextlib.nullcontext()
+            if os.name == "nt"
+            else mock.patch.object(
+                state.DeploymentIdentity, "__eq__", return_value=True
+            )
+        )
+        if os.name == "nt":
+            self.assertEqual(stored, expected)
+        with comparison, self.assertRaises(state.DeploymentStateError):
+            state.write_identity_exclusive(paths, expected)
+
+    def test_assert_identity_matches_compares_canonical_mapping(self) -> None:
+        paths, stored, expected = self.make_canonical_identity_collision()
+        state.write_identity_exclusive(paths, stored)
+        comparison = (
+            contextlib.nullcontext()
+            if os.name == "nt"
+            else mock.patch.object(
+                state.DeploymentIdentity, "__eq__", return_value=True
+            )
+        )
+        if os.name == "nt":
+            self.assertEqual(stored, expected)
+        with comparison, self.assertRaises(state.DeploymentStateError):
+            state.assert_identity_matches(paths, expected)
 
     @unittest.skipUnless(os.name == "posix", "POSIX modes require POSIX")
     def test_identity_file_is_0600_and_bad_mode_is_rejected(self) -> None:
@@ -286,6 +448,34 @@ class DeploymentStateTests(unittest.TestCase):
         ):
             pass
         self.assertNotIn("TOP_SECRET_ENV_VALUE", str(backend_error.exception))
+        formatted = "".join(traceback.format_exception(backend_error.exception))
+        self.assertNotIn("TOP_SECRET_ENV_VALUE", formatted)
+
+    def test_lock_timeout_rejects_bool_nonfinite_and_negative_values(self) -> None:
+        self.ensure_layout()
+        for timeout in (
+            True,
+            False,
+            -1,
+            math.nan,
+            math.inf,
+            -math.inf,
+            10**10000,
+            "30",
+            None,
+        ):
+            backend = RecordingLock()
+            with (
+                self.subTest(timeout=timeout),
+                self.assertRaises(state.DeploymentStateError),
+                state.acquire_deployment_lock(
+                    self.paths,
+                    timeout_seconds=timeout,  # type: ignore[arg-type]
+                    backend=backend,
+                ),
+            ):
+                pass
+            self.assertIsNone(backend.acquired_timeout)
 
     def test_recording_lock_releases_and_closes_when_body_raises(self) -> None:
         self.ensure_layout()
@@ -297,6 +487,38 @@ class DeploymentStateTests(unittest.TestCase):
             self.assertEqual(backend.acquired_timeout, state.LOCK_TIMEOUT_SECONDS)
             raise ValueError("body failed")
         self.assertTrue(backend.released)
+        assert backend.fd is not None
+        with self.assertRaises(OSError):
+            os.fstat(backend.fd)
+
+    def test_release_failure_is_sanitized_and_descriptor_is_closed(self) -> None:
+        self.ensure_layout()
+        backend = RaisingReleaseLock()
+        with (
+            self.assertRaises(state.DeploymentStateError) as caught,
+            state.acquire_deployment_lock(self.paths, backend=backend),
+        ):
+            pass
+        formatted = "".join(traceback.format_exception(caught.exception))
+        self.assertNotIn("SENSITIVE_RELEASE_CANARY", formatted)
+        assert backend.fd is not None
+        with self.assertRaises(OSError):
+            os.fstat(backend.fd)
+
+    def test_release_failure_preserves_body_exception_with_sanitized_note(self) -> None:
+        self.ensure_layout()
+        backend = RaisingReleaseLock()
+        with (
+            self.assertRaises(ValueError) as caught,
+            state.acquire_deployment_lock(self.paths, backend=backend),
+        ):
+            raise ValueError("body failed")
+        self.assertIn(
+            "deployment lock release failed",
+            "\n".join(getattr(caught.exception, "__notes__", [])),
+        )
+        formatted = "".join(traceback.format_exception(caught.exception))
+        self.assertNotIn("SENSITIVE_RELEASE_CANARY", formatted)
         assert backend.fd is not None
         with self.assertRaises(OSError):
             os.fstat(backend.fd)
@@ -319,14 +541,24 @@ class DeploymentStateTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "fcntl is POSIX-only")
     def test_real_flock_competes_then_releases(self) -> None:
         self.ensure_layout()
-        with (
-            state.acquire_deployment_lock(self.paths),
-            self.assertRaises(state.DeploymentStateError),
-            state.acquire_deployment_lock(self.paths, timeout_seconds=0.01),
-        ):
-            pass
-        with state.acquire_deployment_lock(self.paths, timeout_seconds=0.01):
-            pass
+        child_code = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from tools.offline_deployment_state import ("
+            "DeploymentStateError, StatePaths, acquire_deployment_lock)\n"
+            "paths = StatePaths(Path(sys.argv[1]))\n"
+            "try:\n"
+            "    with acquire_deployment_lock(paths, timeout_seconds=0.05):\n"
+            "        pass\n"
+            "except DeploymentStateError:\n"
+            "    raise SystemExit(23)\n"
+        )
+        command = [sys.executable, "-c", child_code, str(self.paths.root)]
+        with state.acquire_deployment_lock(self.paths):
+            contender = subprocess.run(command, check=False, timeout=5)
+        acquired = subprocess.run(command, check=False, timeout=5)
+        self.assertEqual(contender.returncode, 23)
+        self.assertEqual(acquired.returncode, 0)
 
     def test_marker_has_fixed_schema_and_same_hash_is_idempotent(self) -> None:
         self.ensure_layout()
@@ -470,12 +702,29 @@ class DeploymentStateTests(unittest.TestCase):
             self.paths, operation="up", deployment_identity_hash=digest
         )
         sensitive = "SENSITIVE_MARKER_READ_DETAIL"
+        original_open = state.os.open
+
+        def fail_marker_open(
+            path: str | os.PathLike[str],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            if Path(path) == self.paths.start_marker:
+                raise PermissionError(sensitive)
+            if dir_fd is None:
+                return original_open(path, flags, mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
         for method_name in ("open", "read"):
+            if method_name == "open":
+                side_effect: object = fail_marker_open
+            else:
+                side_effect = PermissionError(sensitive)
             with (
                 self.subTest(method_name=method_name),
-                mock.patch.object(
-                    state.os, method_name, side_effect=PermissionError(sensitive)
-                ),
+                mock.patch.object(state.os, method_name, side_effect=side_effect),
                 self.assertRaises(state.DeploymentStateError) as caught,
             ):
                 state.create_start_marker(
@@ -483,6 +732,8 @@ class DeploymentStateTests(unittest.TestCase):
                 )
             self.assertIn("already started", str(caught.exception))
             self.assertNotIn(sensitive, str(caught.exception))
+            formatted = "".join(traceback.format_exception(caught.exception))
+            self.assertNotIn(sensitive, formatted)
 
     def test_assert_start_marker_absent_fails_on_any_object_or_inspection_error(
         self,

@@ -12,6 +12,7 @@ import datetime as dt
 import errno
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -275,7 +276,7 @@ class DeploymentIdentity:
         for field_name in ("state_root", "data_root", "model_root", "secret_root"):
             normalized = normalize_absolute_root(getattr(self, field_name), field_name)
             object.__setattr__(self, field_name, normalized)
-        if self.state_root != derive_state_root(self.data_root):
+        if self.state_root.as_posix() != derive_state_root(self.data_root).as_posix():
             raise DeploymentStateError(
                 "state_root must be data_root/.dcagent-deployment-state"
             )
@@ -288,10 +289,13 @@ class DeploymentIdentity:
         data_root: str | Path,
         model_root: str | Path,
         secret_root: str | Path,
+        deployment_uuid: str | None = None,
     ) -> DeploymentIdentity:
         return cls(
             schema_version=SCHEMA_VERSION,
-            deployment_uuid=uuid.uuid4().hex,
+            deployment_uuid=uuid.uuid4().hex
+            if deployment_uuid is None
+            else deployment_uuid,
             state_root=Path(state_root),
             data_root=Path(data_root),
             model_root=Path(model_root),
@@ -311,6 +315,12 @@ class DeploymentIdentity:
 
 def identity_digest(identity: DeploymentIdentity) -> str:
     return hashlib.sha256(_canonical_json_bytes(identity.to_mapping())).hexdigest()
+
+
+def _identity_mappings_match(
+    first: DeploymentIdentity, second: DeploymentIdentity
+) -> bool:
+    return first.to_mapping() == second.to_mapping()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -492,41 +502,36 @@ def atomic_write_json(
 def _exclusive_write_json(path: Path, payload: object, description: str) -> bool:
     encoded = _canonical_json_bytes(payload)
     _verify_directory(path.parent, f"{description} parent directory")
+    fd: int | None = None
+    temporary: Path | None = None
     try:
-        existing = _lstat_optional(path)
-    except OSError as exc:
-        raise DeploymentStateError(
-            f"cannot safely inspect {description}: {path}"
-        ) from exc
-    if existing is not None:
-        return False
-
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError:
-        return False
-    except OSError as exc:
-        raise DeploymentStateError(f"cannot create {description}: {path}") from exc
-
-    persisted = False
-    try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary = Path(temporary_name)
         if _is_posix():
             os.fchmod(fd, 0o600)
         _write_all(fd, encoded)
         os.fsync(fd)
-        persisted = True
-    except OSError as exc:
-        raise DeploymentStateError(f"cannot persist {description}: {path}") from exc
-    finally:
         os.close(fd)
-        if not persisted:
+        fd = None
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        temporary.unlink()
+        temporary = None
+        fsync_directory(path.parent)
+        return True
+    except OSError:
+        raise DeploymentStateError(f"cannot persist {description}: {path}") from None
+    finally:
+        if fd is not None:
             with contextlib.suppress(OSError):
-                path.unlink()
-    fsync_directory(path.parent)
-    return True
+                os.close(fd)
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
 
 
 def _verify_state_root(paths: StatePaths) -> None:
@@ -556,7 +561,7 @@ def load_identity(paths: StatePaths) -> DeploymentIdentity:
         raise DeploymentStateError(
             f"invalid deployment identity: {paths.identity}"
         ) from exc
-    if identity.state_root != paths.root:
+    if identity.state_root.as_posix() != paths.root.as_posix():
         raise DeploymentStateError(
             f"identity state root does not match: {paths.identity}"
         )
@@ -564,12 +569,12 @@ def load_identity(paths: StatePaths) -> DeploymentIdentity:
 
 
 def write_identity_exclusive(paths: StatePaths, identity: DeploymentIdentity) -> None:
-    if identity.state_root != paths.root:
+    if identity.state_root.as_posix() != paths.root.as_posix():
         raise DeploymentStateError("identity state_root does not match StatePaths root")
     created = _exclusive_write_json(
         paths.identity, identity.to_mapping(), "deployment identity"
     )
-    if not created and load_identity(paths) != identity:
+    if not created and not _identity_mappings_match(load_identity(paths), identity):
         raise DeploymentStateError(
             f"existing deployment identity differs: {paths.identity}"
         )
@@ -579,7 +584,7 @@ def assert_identity_matches(
     paths: StatePaths, expected: DeploymentIdentity
 ) -> DeploymentIdentity:
     actual = load_identity(paths)
-    if actual != expected:
+    if not _identity_mappings_match(actual, expected):
         raise DeploymentStateError(
             f"deployment identity does not match expected identity: {paths.identity}"
         )
@@ -633,32 +638,55 @@ def acquire_deployment_lock(
     timeout_seconds: float = LOCK_TIMEOUT_SECONDS,
     backend: LockBackend | None = None,
 ) -> Iterator[None]:
-    if not isinstance(timeout_seconds, (int, float)) or timeout_seconds < 0:
-        raise DeploymentStateError("lock timeout must not be negative")
+    if type(timeout_seconds) not in (int, float):
+        raise DeploymentStateError("lock timeout must be a finite non-negative number")
+    try:
+        normalized_timeout = float(timeout_seconds)
+    except OverflowError:
+        raise DeploymentStateError(
+            "lock timeout must be a finite non-negative number"
+        ) from None
+    if not math.isfinite(normalized_timeout) or normalized_timeout < 0:
+        raise DeploymentStateError("lock timeout must be a finite non-negative number")
     _verify_state_root(paths)
     fd = _open_verified_regular_file(paths.lock, os.O_RDWR, "deployment lock")
     selected_backend = backend if backend is not None else FcntlLockBackend()
     acquired = False
+    body_error: BaseException | None = None
     try:
         try:
-            acquired = selected_backend.acquire(fd, float(timeout_seconds))
-        except Exception as exc:
+            acquired = selected_backend.acquire(fd, normalized_timeout)
+        except Exception:  # noqa: BLE001 - backend failures cross a trust boundary.
             raise DeploymentStateError(
                 f"could not acquire deployment lock at {paths.lock} "
                 f"within {timeout_seconds:g} seconds"
-            ) from exc
+            ) from None
         if not acquired:
             raise DeploymentStateError(
                 f"could not acquire deployment lock at {paths.lock} "
                 f"within {timeout_seconds:g} seconds"
             )
-        yield
+        try:
+            yield
+        except BaseException as exc:
+            body_error = exc
+            raise
     finally:
+        release_failed = False
         try:
             if acquired:
-                selected_backend.release(fd)
+                try:
+                    selected_backend.release(fd)
+                except Exception:  # noqa: BLE001 - release failures must be sanitized.
+                    release_failed = True
         finally:
             os.close(fd)
+        if release_failed:
+            message = f"deployment lock release failed at {paths.lock}"
+            if body_error is not None:
+                body_error.add_note(message)
+            else:
+                raise DeploymentStateError(message) from None
 
 
 def _validate_marker(
@@ -724,27 +752,27 @@ def create_start_marker(
             paths.start_marker,
         )
         _validate_marker(payload, deployment_identity_hash, paths.start_marker)
-    except DeploymentStateError as exc:
+    except DeploymentStateError:
         raise DeploymentStateError(
             f"deployment already started: {paths.start_marker}"
-        ) from exc
+        ) from None
 
 
 def assert_start_marker_absent(paths: StatePaths) -> None:
     try:
         _verify_state_root(paths)
-    except DeploymentStateError as exc:
+    except DeploymentStateError:
         raise DeploymentStateError(
             f"deployment already started: {paths.start_marker}"
-        ) from exc
+        ) from None
     try:
         os.lstat(paths.start_marker)
     except FileNotFoundError:
         return
-    except OSError as exc:
+    except OSError:
         raise DeploymentStateError(
             f"deployment already started: {paths.start_marker}"
-        ) from exc
+        ) from None
     raise DeploymentStateError(f"deployment already started: {paths.start_marker}")
 
 
