@@ -100,6 +100,9 @@ LLM_MODEL=my_deepseek_r1_7b
 脱敏报告复制到 host：
 
 ```bash
+set -Eeuo pipefail
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh up -d
 if ! ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.physoc_probe --report /tmp/physoc-probe.json
 then
@@ -299,6 +302,7 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 Ubuntu 20.04 生产部署从仓库根目录统一使用 Bash 入口：
 
 ```bash
+set -Eeuo pipefail
 ./tools/prepare_offline_env.sh
 ./tools/invoke_offline_compose.sh config
 ./tools/invoke_offline_compose.sh up -d
@@ -327,7 +331,7 @@ Embedding/Reranker 权重；公司内网 Ollama 必须可达，且不依赖外�
 #### Linux (Bash)
 
 ```bash
-set -euo pipefail
+set -Eeuo pipefail
 ollama pull qwen2.5:0.5b
 ollama pull qwen2.5:3b
 ollama_url='http://127.0.0.1:11434'
@@ -414,6 +418,7 @@ collection 并验证模型元数据、实测 dimensions、归一化、profile/di
 相同 `uv sync` flags 构建并验证镜像，以弥补本机限制：
 
 ```bash
+set -Eeuo pipefail
 export UV_PYTHON_DOWNLOADS=never
 uv sync --project backend --frozen --offline --no-install-project --no-dev --group offline --no-index --find-links artifacts/wheels
 uv sync --project backend --frozen --offline --no-install-project --no-dev --no-index --find-links artifacts/wheels

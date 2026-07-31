@@ -57,7 +57,7 @@ cause the production DC-Agent host to contact a public model service:
 #### Linux (Bash)
 
 ```bash
-set -euo pipefail
+set -Eeuo pipefail
 ollama pull qwen2.5:0.5b
 ollama pull qwen2.5:3b
 ollama_url='http://127.0.0.1:11434'
@@ -136,6 +136,7 @@ wheelhouse, so local tests cannot satisfy the image gate. In the actual offline 
 use the real artifacts/wheels and verify the same flags used by the Dockerfiles:
 
 ```bash
+set -Eeuo pipefail
 export UV_PYTHON_DOWNLOADS=never
 uv sync --project backend --frozen --offline --no-install-project --no-dev --group offline --no-index --find-links artifacts/wheels
 uv sync --project backend --frozen --offline --no-install-project --no-dev --no-index --find-links artifacts/wheels
@@ -169,6 +170,7 @@ Keep the API in `shadow` with `RETRIEVAL_SHADOW_PERCENT=0` and
 topology:
 
 ```bash
+set -Eeuo pipefail
 ./tools/prepare_offline_env.sh
 ./tools/invoke_offline_compose.sh config
 ./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
@@ -184,6 +186,7 @@ collection, validates dimensions, point count, filters, Dense/Sparse search and 
 then records the publication as `validated` in PostgreSQL:
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v1
 ./tools/invoke_offline_compose.sh exec -T postgres \
@@ -202,6 +205,7 @@ change the production `knowledge_chunks_current` Alias. Build and activate the n
 version there through the same publication fence:
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v2 --activate
 curl --fail-with-body --silent --show-error http://127.0.0.1:8000/api/readyz
@@ -227,6 +231,7 @@ For Shadow, set `RETRIEVAL_MODE=shadow`, keep `RETRIEVAL_CANARY_PERCENT=0`, and 
 edit run:
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh config
 ./tools/invoke_offline_compose.sh up -d
 curl --fail-with-body --silent --show-error http://127.0.0.1:8000/api/readyz
@@ -240,6 +245,7 @@ At 100% `qwen3` canary, run the mandatory 15-user acceptance command from the re
 benchmark deliberately rejects any mode other than `qwen3` and any canary value other than 100:
 
 ```bash
+set -Eeuo pipefail
 uv run --project backend --group benchmark python tools/hybrid_retrieval_benchmark.py --concurrency 15 --requests 150 --p95-seconds 5 --max-error-rate 0.01 --max-fallback-rate 0.01 --questions-jsonl artifacts/benchmarks/hybrid-questions.jsonl --output-json artifacts/benchmarks/hybrid-retrieval-report.json
 ```
 
@@ -262,6 +268,7 @@ Only after this set passes may an operator return to the production deployment, 
 atomically activate it:
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v3 --activate
 curl --fail-with-body --silent --show-error http://127.0.0.1:8000/api/readyz
@@ -288,6 +295,7 @@ URLs, or raw exception strings.
 key in `deploy/offline/.env`, then reconcile and verify readiness:
 
 ```bash
+set -Eeuo pipefail
 grep -q '^RETRIEVAL_MODE=' deploy/offline/.env || {
   echo 'RETRIEVAL_MODE key not found' >&2
   exit 1
@@ -305,6 +313,7 @@ version and activate it. Do not reuse an existing immutable collection name or p
 directly at an unaudited collection:
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh up -d
 ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v4 --activate
@@ -314,6 +323,7 @@ For a model-service image rollback, check out the last approved release in the d
 directory, restore its `backend/uv.lock`, Dockerfiles and wheel bundle, then run:
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh build embedding-service reranker-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d
 curl --fail-with-body --silent --show-error http://127.0.0.1:8000/api/readyz
@@ -339,6 +349,7 @@ LLM_MODEL=my_deepseek_r1_7b
 地址后，执行以下切换门禁：
 
 ```bash
+set -Eeuo pipefail
 ./tools/prepare_offline_env.sh
 # Edit LLM_API_BASE to the approved private Physoc address.
 ./tools/invoke_offline_compose.sh config
@@ -408,6 +419,7 @@ without the indexing profile:
    bootstrap before enabling structured queries:
 
    ```bash
+   set -Eeuo pipefail
    ./tools/invoke_offline_compose.sh up -d clickhouse
    ./tools/invoke_offline_compose.sh exec -T clickhouse /bin/sh /docker-entrypoint-initdb.d/010-dcagent-structured-users.sh
    ```
@@ -419,6 +431,7 @@ without the indexing profile:
 4. Start the default topology once so migration succeeds:
 
    ```bash
+   set -Eeuo pipefail
    ./tools/invoke_offline_compose.sh up -d
    ```
 
@@ -428,6 +441,7 @@ without the indexing profile:
    indexing profile:
 
    ```bash
+   set -Eeuo pipefail
    ./tools/invoke_offline_compose.sh --profile indexing up -d
    ```
 
@@ -454,6 +468,7 @@ profile. The worker refuses to start while the feature flag is false, so rollbac
 publishing in the background:
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh down
 ./tools/invoke_offline_compose.sh up -d
 ```
@@ -467,6 +482,7 @@ rollback; retaining them permits a reviewed re-enable.
 `backend/uv.lock` is the only backend Python/uv dependency lock. Python 3.12 must be preinstalled on the target host; uv is forbidden from downloading or installing Python. From the repository root, resolve the lock, then verify both offline groups only against the reviewed wheelhouse:
 
 ```bash
+set -Eeuo pipefail
 export UV_PYTHON_DOWNLOADS=never
 uv lock --project backend --python 3.12
 uv sync --project backend --frozen --offline --group offline --no-dev --no-index --find-links artifacts/wheels

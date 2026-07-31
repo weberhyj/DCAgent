@@ -15,6 +15,7 @@
 `backend/uv.lock` 是仓库唯一的后端 Python/uv 依赖锁。Python 3.12 必须预先安装在目标主机上，禁止 uv 下载或自动安装 Python。先在可审核的解析环境中从仓库根目录更新该锁；再把仓库与锁文件带到目标 Linux 主机，只使用已审核的内部 wheelhouse 执行冻结同步：
 
 ```bash
+set -Eeuo pipefail
 export UV_PYTHON_DOWNLOADS=never
 uv lock --project backend --python 3.12
 uv sync --project backend --frozen --offline --group offline --no-dev --no-index --find-links artifacts/wheels
@@ -70,10 +71,13 @@ uv run --project backend --frozen --offline --no-default-groups --group offline 
 
 ## 4. Compose profile、内存预算与准备
 
-先复制并填写 `deploy/offline/.env.example`：
+首次准备不要手工复制 `deploy/offline/.env.example`。首次运行
+`./tools/prepare_offline_env.sh` 会自动创建 `deploy/offline/.env`，读取当前非 root 部署账号的
+`id -u` 和 `id -g`，并写入 `DCAGENT_UID` 和 `DCAGENT_GID`。如果已有配置中的
+`DCAGENT_UID` 或 `DCAGENT_GID` 与当前账号不匹配，脚本会 fail closed，不匹配时拒绝继续：
 
 ```bash
-cp deploy/offline/.env.example deploy/offline/.env
+set -Eeuo pipefail
 ./tools/prepare_offline_env.sh
 ```
 
@@ -95,6 +99,7 @@ profile 约定：
 所有 Compose 操作必须经由受信 wrapper：
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh config --quiet
 ./tools/invoke_offline_compose.sh up -d
 ```
@@ -130,6 +135,7 @@ uv run --project backend --frozen --offline --no-default-groups --group offline 
 命令形状如下（将最后的 benchmark command 替换为目标主机已审核的本地命令）：
 
 ```bash
+set -Eeuo pipefail
 hardware_class=32gb # 64GB 主机必须改为 64gb
 uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark \
   --manifest tools/benchmarks/manifests/smoke.json \
@@ -151,6 +157,7 @@ uv run --project backend --frozen --offline --no-default-groups --group benchmar
 冷缓存示例（768 维、2 个模型槽位）如下。外层 capacity runner 会把绝对路径注入 `BENCHMARK_METRICS_PATH`，仓库的 `tools/benchmarks/locustfile.py` 在 Locust `test_stop` 事件中汇总请求并原子写出该 JSON；普通 stock Locust 单独运行不会生成 capacity metrics：
 
 ```bash
+set -Eeuo pipefail
 hardware_class=32gb # 64GB 主机必须改为 64gb
 uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark \
   --manifest tools/benchmarks/manifests/acceptance-30m-5m.json \
@@ -205,6 +212,7 @@ artifacts/benchmarks/64gb/
 目标 Linux 主机本地、无需 Docker 的回归统一使用锁定的 uv 项目环境：
 
 ```bash
+set -Eeuo pipefail
 cd backend
 uv run --project . --frozen --offline --no-default-groups --group offline python -m unittest discover -s tests -p "test_*.py" -v
 cd ..
@@ -216,6 +224,7 @@ git diff --check
 目标主机 gate：
 
 ```bash
+set -Eeuo pipefail
 uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py
 uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark --help
 ```

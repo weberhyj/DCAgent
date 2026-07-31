@@ -20,10 +20,13 @@
 
 ## 2. 创建实际环境文件
 
-Compose 部署使用：
+Compose 部署首次准备时直接运行脚本；不要手工复制模板。首次运行
+`./tools/prepare_offline_env.sh` 会自动创建 `deploy/offline/.env`，读取当前非 root 部署账号的
+`id -u` 和 `id -g`，并写入 `DCAGENT_UID` 和 `DCAGENT_GID`。如果已有配置中的
+`DCAGENT_UID` 或 `DCAGENT_GID` 与当前账号不匹配，脚本会 fail closed，不匹配时拒绝继续。
 
 ```bash
-cp deploy/offline/.env.example deploy/offline/.env
+set -Eeuo pipefail
 ./tools/prepare_offline_env.sh
 ```
 
@@ -69,6 +72,9 @@ LLM_API_BASE=http://172.16.0.10:8090
 部署后可以在 API 容器中运行探针：
 
 ```bash
+set -Eeuo pipefail
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh up -d
 if ! ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.physoc_probe --report /tmp/physoc-probe.json
 then
@@ -84,6 +90,7 @@ fi
 在 Ollama 服务器上准备模型：
 
 ```bash
+set -Eeuo pipefail
 ollama pull qwen2.5:0.5b
 ollama pull qwen2.5:3b
 ```
@@ -251,6 +258,7 @@ STRUCTURED_INGEST_BATCH_ROWS=50000
 启动包含结构化 worker 的服务：
 
 ```bash
+set -Eeuo pipefail
 ./tools/invoke_offline_compose.sh --profile indexing up -d
 ```
 
@@ -334,6 +342,7 @@ https://cdn.jsdelivr.net/npm/cn-fontsource-ding-talk-jin-bu-ti-regular@1.0.3/fon
 从仓库根目录执行：
 
 ```bash
+set -Eeuo pipefail
 ./tools/prepare_offline_env.sh
 ./tools/invoke_offline_compose.sh config
 ./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker

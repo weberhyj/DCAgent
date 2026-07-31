@@ -92,6 +92,10 @@ def active_assignments(text: str) -> dict[str, str]:
     return values
 
 
+def bash_fenced_blocks(text: str) -> list[str]:
+    return re.findall(r"(?ms)^[ \t]*```bash\s*$\n(.*?)^[ \t]*```\s*$", text)
+
+
 class PhysocLlmDocumentationContractTests(unittest.TestCase):
     def test_env_examples_document_the_keyless_physoc_configuration(self) -> None:
         for path in ENV_EXAMPLES:
@@ -332,6 +336,36 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         self.assertNotIn("cp deploy/offline/.env.example deploy/offline/.env", section)
         for forbidden in (".ps1", "$LASTEXITCODE", "New-Item"):
             self.assertNotIn(forbidden, section)
+
+    def test_physoc_evidence_blocks_fail_fast_in_safe_order(self) -> None:
+        for path in (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        ):
+            text = path.read_text(encoding="utf-8")
+            matching = [
+                block
+                for block in bash_fenced_blocks(text)
+                if "python -m app.physoc_probe --report /tmp/physoc-probe.json" in block
+                and "artifacts/benchmarks/physoc-probe.json" in block
+            ]
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertEqual(1, len(matching))
+                block = matching[0]
+                expected_order = (
+                    "set -Eeuo pipefail",
+                    "./tools/invoke_offline_compose.sh config",
+                    "./tools/invoke_offline_compose.sh up -d",
+                    "if ! ./tools/invoke_offline_compose.sh exec -T api",
+                    "then",
+                    "mkdir -p artifacts/benchmarks",
+                    "./tools/invoke_offline_compose.sh cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json",
+                )
+                for token in expected_order:
+                    self.assertIn(token, block)
+                positions = [block.index(token) for token in expected_order]
+                self.assertEqual(sorted(positions), positions)
+                self.assertIn("exit 1\nfi", block)
 
     def test_design_documents_bounded_raw_sse_parsing(self) -> None:
         decoder_source = (REPO_ROOT / "backend" / "app" / "physoc_sse.py").read_text(

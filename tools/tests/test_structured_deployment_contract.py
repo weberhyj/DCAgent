@@ -529,6 +529,29 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             intranet,
         )
 
+    def test_structured_indexing_startup_blocks_fail_fast(self) -> None:
+        for path in (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        ):
+            text = path.read_text(encoding="utf-8")
+            blocks = re.findall(r"(?ms)^[ \t]*```bash\s*$\n(.*?)^[ \t]*```\s*$", text)
+            matching = [
+                block
+                for block in blocks
+                if "./tools/invoke_offline_compose.sh --profile indexing up -d" in block
+            ]
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertTrue(matching)
+                for block in matching:
+                    first_command = next(
+                        line.strip()
+                        for line in block.splitlines()
+                        if line.strip() and not line.lstrip().startswith("#")
+                    )
+                    self.assertEqual("set -Eeuo pipefail", first_command)
+
     def test_docs_define_qwen3_hybrid_retrieval_operations(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         offline_readme = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(

@@ -14,6 +14,18 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def bash_fenced_blocks(text: str) -> list[str]:
+    return re.findall(r"(?ms)^[ \t]*```bash\s*$\n(.*?)^[ \t]*```\s*$", text)
+
+
+def first_effective_bash_command(block: str) -> str:
+    return next(
+        line.strip()
+        for line in block.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
 def service_block(compose: str, service: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n|^networks:)",
@@ -2079,6 +2091,61 @@ class ComposeContractTest(unittest.TestCase):
         self.assertEqual(1, root_readme.count("Windows 开发机兼容"))
         self.assertEqual(1, root_readme.count("tools/prepare_offline_env.ps1"))
         self.assertEqual(1, root_readme.count("tools/invoke_offline_compose.ps1"))
+
+    def test_ubuntu_prepare_docs_delegate_env_creation_and_identity_to_script(
+        self,
+    ) -> None:
+        for path in (
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+        ):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertNotIn(
+                    "cp deploy/offline/.env.example deploy/offline/.env", text
+                )
+                for phrase in (
+                    "首次运行",
+                    "./tools/prepare_offline_env.sh",
+                    "自动创建 `deploy/offline/.env`",
+                    "非 root 部署账号",
+                    "`id -u`",
+                    "`id -g`",
+                    "`DCAGENT_UID`",
+                    "`DCAGENT_GID`",
+                    "不匹配时拒绝继续",
+                ):
+                    self.assertIn(phrase, text)
+
+    def test_multi_step_production_bash_blocks_fail_fast(self) -> None:
+        paths = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        )
+        operation_tokens = (
+            "./tools/invoke_offline_compose.sh",
+            "curl --fail-with-body",
+            "python -m app.physoc_probe",
+            "mkdir -p ",
+            "ollama pull ",
+            "uv run ",
+            "uv sync ",
+        )
+        checked = 0
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            for index, block in enumerate(bash_fenced_blocks(text)):
+                operation_count = sum(block.count(token) for token in operation_tokens)
+                if operation_count < 2:
+                    continue
+                checked += 1
+                with self.subTest(path=path.relative_to(REPO_ROOT), block=index):
+                    self.assertRegex(
+                        first_effective_bash_command(block), r"^set -E?euo pipefail$"
+                    )
+        self.assertGreaterEqual(checked, 10)
 
 
 if __name__ == "__main__":
