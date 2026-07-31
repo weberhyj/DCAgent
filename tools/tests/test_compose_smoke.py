@@ -122,11 +122,24 @@ def _reranker_metadata(*, model: str = QWEN25_RERANKER_MODEL) -> dict[str, objec
 
 
 def _bash_block_after_heading(text: str, heading: str) -> list[str]:
-    return re.findall(
-        rf"(?ms)^{re.escape(heading)}[ \t]*$\n(?:[ \t]*\n)*"
-        r"^[ \t]*```bash[ \t]*$\n(?P<body>.*?)^[ \t]*```[ \t]*$",
-        text,
+    heading_level = len(heading) - len(heading.lstrip("#"))
+    if heading_level == 0:
+        return []
+    heading_match = re.search(rf"(?m)^{re.escape(heading)}[ \t]*$", text)
+    if heading_match is None:
+        return []
+    section_start = heading_match.end()
+    next_heading = re.search(
+        rf"(?m)^#{{1,{heading_level}}}[ \t]+", text[section_start:]
     )
+    section_end = (
+        section_start + next_heading.start() if next_heading is not None else len(text)
+    )
+    block_match = re.search(
+        r"(?ms)^[ \t]*```bash[ \t]*$\n(?P<body>.*?)^[ \t]*```[ \t]*$",
+        text[section_start:section_end],
+    )
+    return [block_match.group("body")] if block_match is not None else []
 
 
 class _HelperResponse:
@@ -1671,7 +1684,27 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertIn("--remove-volumes", text)
         self.assertIn("preserves data volumes by default", text)
 
-    def test_readmes_separate_linux_curl_and_windows_powershell_ollama_probes(
+    def test_linux_bash_block_selector_allows_explanatory_prose(self) -> None:
+        text = """
+#### Linux (Bash)
+
+Run this only on the approved Ollama host.
+
+```bash
+set -Eeuo pipefail
+curl --fail-with-body http://127.0.0.1:11434/api/tags
+```
+"""
+
+        self.assertEqual(
+            [
+                "set -Eeuo pipefail\n"
+                "curl --fail-with-body http://127.0.0.1:11434/api/tags\n"
+            ],
+            _bash_block_after_heading(text, "#### Linux (Bash)"),
+        )
+
+    def test_readme_linux_bash_ollama_probes_exclude_windows_commands(
         self,
     ) -> None:
         for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
@@ -1687,9 +1720,21 @@ class ComposeSmokeTest(unittest.TestCase):
                 )
                 self.assertEqual("set -Eeuo pipefail", first_command)
                 self.assertIn("curl --fail-with-body", linux)
-                self.assertNotIn("curl.exe", linux)
-                self.assertNotIn("Invoke-RestMethod", linux)
-                self.assertNotIn("Where-Object", linux)
+                for forbidden in (
+                    "curl.exe",
+                    "Invoke-RestMethod",
+                    "Where-Object",
+                    "$env:",
+                    "$ErrorActionPreference",
+                    "Set-Location",
+                    "ConvertTo-Json",
+                    "Select-Object",
+                    "Out-File",
+                    "Write-Host",
+                ):
+                    self.assertNotIn(forbidden.casefold(), linux.casefold())
+                self.assertNotRegex(linux, r"(?m)`[ \t]*$")
+                self.assertNotRegex(linux, r"(?m)^[ \t]*&[ \t]+tools/")
                 for endpoint in ("/api/embed", "/api/generate", "/api/tags"):
                     self.assertIn(endpoint, linux)
 
@@ -1717,6 +1762,22 @@ class ComposeSmokeTest(unittest.TestCase):
                 inventories = (
                     ({"models": []}, 1),
                     ({"models": [{"name": "qwen2.5:0.5b", "digest": digest}]}, 0),
+                    (
+                        {"models": [{"name": "qwen2.5:0.5b-extra", "digest": digest}]},
+                        1,
+                    ),
+                    (
+                        {"models": [{"model": "qwen2.5:0.5b-extra", "digest": digest}]},
+                        1,
+                    ),
+                    (
+                        {"models": [{"name": "QWEN2.5:0.5B", "digest": digest}]},
+                        1,
+                    ),
+                    (
+                        {"models": [{"model": " qwen2.5:0.5b", "digest": digest}]},
+                        1,
+                    ),
                     (
                         {
                             "models": [

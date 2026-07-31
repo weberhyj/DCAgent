@@ -10,8 +10,8 @@ BACKEND_ROOT = REPOSITORY_ROOT / "backend"
 
 class BackendUvContractTest(unittest.TestCase):
     def normalize_command_text(self, text: str) -> str:
-        without_powershell_continuations = re.sub(r"`[ \t]*\r?\n[ \t]*", " ", text)
-        return re.sub(r"\s+", " ", without_powershell_continuations).strip()
+        without_shell_continuations = re.sub(r"(?:`|\\)[ \t]*\r?\n[ \t]*", " ", text)
+        return re.sub(r"\s+", " ", without_shell_continuations).strip()
 
     def powershell_blocks(self, text: str) -> list[str]:
         return re.findall(
@@ -34,16 +34,84 @@ class BackendUvContractTest(unittest.TestCase):
         )
         return matches[0]
 
-    def bash_block_containing(self, text: str, command: str) -> str:
-        matches = [
-            block
-            for block in self.bash_blocks(text)
-            if command in self.normalize_command_text(block)
-        ]
+    def markdown_section(self, text: str, heading: str) -> str:
+        heading_level = len(heading) - len(heading.lstrip("#"))
+        self.assertGreater(heading_level, 0, f"Expected Markdown heading: {heading}")
+        heading_match = re.search(rf"(?m)^{re.escape(heading)}[ \t]*$", text)
+        self.assertIsNotNone(heading_match, f"Missing Markdown heading: {heading}")
+        assert heading_match is not None
+        section_start = heading_match.end()
+        next_heading = re.search(
+            rf"(?m)^#{{1,{heading_level}}}[ \t]+", text[section_start:]
+        )
+        section_end = (
+            section_start + next_heading.start()
+            if next_heading is not None
+            else len(text)
+        )
+        return text[section_start:section_end]
+
+    def bash_block_under_heading_containing(
+        self, text: str, heading: str, command: str
+    ) -> str:
+        section = self.markdown_section(text, heading)
+        matches = []
+        for block in self.bash_blocks(section):
+            without_bash_continuations = re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", block)
+            logical_commands = (
+                line.strip()
+                for line in without_bash_continuations.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+            if any(
+                logical_command == command or logical_command.startswith(f"{command} ")
+                for logical_command in logical_commands
+            ):
+                matches.append(block)
         self.assertEqual(
-            len(matches), 1, f"Expected one Bash block containing: {command}"
+            len(matches),
+            1,
+            f"Expected one Bash block under {heading} containing: {command}",
         )
         return matches[0]
+
+    def test_bash_block_selector_scopes_commands_to_the_documented_heading(
+        self,
+    ) -> None:
+        command = "uv lock --project backend --python 3.12"
+        text = f"""
+## Unrelated notes
+
+```bash
+# Do not use this stale example: {command}
+printf 'not the dependency workflow\\n'
+```
+
+## Offline dependencies
+
+Use the reviewed lock and wheelhouse from the repository root.
+
+```bash
+printf 'This prose mentions: {command}\\n'
+```
+
+```bash
+export UV_PYTHON_DOWNLOADS=never
+{command}
+```
+"""
+
+        block = self.bash_block_under_heading_containing(
+            text, "## Offline dependencies", command
+        )
+
+        self.assertIn("export UV_PYTHON_DOWNLOADS=never", block)
+        self.assertEqual(
+            command,
+            self.normalize_command_text(
+                "uv lock --project backend \\\n                  --python 3.12"
+            ),
+        )
 
     def assert_exact_requirements(
         self, requirements: list[object], expected: set[str]
@@ -527,6 +595,7 @@ class BackendUvContractTest(unittest.TestCase):
         documentation_contracts = (
             (
                 REPOSITORY_ROOT / "deploy" / "offline" / "README.md",
+                "## Current development gates",
                 r"`backend/uv\.lock` is the only backend Python/uv dependency lock\b",
                 r"Python 3\.12 must be preinstalled\b",
                 (
@@ -537,6 +606,7 @@ class BackendUvContractTest(unittest.TestCase):
             ),
             (
                 REPOSITORY_ROOT / "docs" / "offline-platform-runbook.md",
+                "## 2. 离线依赖与 Python 3.12",
                 r"`backend/uv\.lock` 是仓库唯一的后端 Python/uv 依赖锁",
                 r"Python 3\.12 必须预先安装",
                 (
@@ -548,6 +618,7 @@ class BackendUvContractTest(unittest.TestCase):
         )
         for (
             path,
+            dependency_heading,
             lock_pattern,
             python_pattern,
             wheelhouse_pattern,
@@ -569,7 +640,9 @@ class BackendUvContractTest(unittest.TestCase):
                     "uv sync --project backend --frozen --offline --no-default-groups "
                     "--group benchmark --no-index --find-links artifacts/wheels"
                 )
-                dependency_block = self.bash_block_containing(text, lock_command)
+                dependency_block = self.bash_block_under_heading_containing(
+                    text, dependency_heading, lock_command
+                )
                 normalized_dependency_block = self.normalize_command_text(
                     dependency_block
                 )
@@ -641,7 +714,11 @@ class BackendUvContractTest(unittest.TestCase):
         )
         self.assertIn(f"{benchmark_uv} -m compileall -q tools", normalized_runbook)
 
-        validation_block = self.bash_block_containing(runbook, "app.offline_artifacts")
+        validation_block = self.bash_block_under_heading_containing(
+            runbook,
+            "## 3. Artifact manifest 与许可证审核",
+            f"{offline_uv} -c",
+        )
         normalized_validation = self.normalize_command_text(validation_block)
         pythonpath_match = re.search(
             r"\bexport\s+PYTHONPATH\s*=\s*[\"']?backend[\"']?",
@@ -654,6 +731,16 @@ class BackendUvContractTest(unittest.TestCase):
             f"{offline_uv} -c", pythonpath_index
         )
         self.assertLess(pythonpath_index, validation_index)
+        validation_command = re.search(
+            rf'{re.escape(offline_uv)}\s+-c\s+"(?P<code>[^"]+)"',
+            normalized_validation,
+        )
+        self.assertIsNotNone(validation_command)
+        assert validation_command is not None
+        self.assertIn(
+            "from app.offline_artifacts import validate_artifact_manifest",
+            validation_command.group("code"),
+        )
 
     def test_smoke_backend_uses_uv_from_the_backend_project(self) -> None:
         path = REPOSITORY_ROOT / "tools" / "start_smoke_backend.cmd"
