@@ -432,6 +432,104 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
 
             self.assertEqual(before, self._snapshot_tree(root))
 
+    def test_existing_secret_owner_mismatch_fails_before_any_mutation(self) -> None:
+        secret_names = (
+            "postgres-password",
+            "database-url",
+            "clickhouse-query-password",
+            "clickhouse-ingest-password",
+        )
+        for mismatched_name in secret_names:
+            with self.subTest(secret=mismatched_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._repository(root)
+                    env_example = root / "deploy" / "offline" / ".env.example"
+                    env_text = env_example.read_text(encoding="utf-8")
+                    include_clickhouse = mismatched_name.startswith("clickhouse-")
+                    if not include_clickhouse:
+                        env_text = (
+                            "\n".join(
+                                line
+                                for line in env_text.splitlines()
+                                if not line.startswith("CLICKHOUSE_")
+                            )
+                            + "\n"
+                        )
+                    env_path = self._write_existing_env(root, env_text)
+
+                    secret_dir = root / "artifacts" / "secrets"
+                    secret_dir.mkdir(parents=True)
+                    postgres_password = "p" * 43
+                    (secret_dir / "postgres-password").write_text(
+                        postgres_password, encoding="ascii"
+                    )
+                    (secret_dir / "database-url").write_text(
+                        "postgresql+psycopg://dc_agent:"
+                        f"{postgres_password}@postgres:5432/dc_agent",
+                        encoding="ascii",
+                    )
+                    if include_clickhouse:
+                        (secret_dir / "clickhouse-query-password").write_text(
+                            "q" * 43, encoding="ascii"
+                        )
+                        (secret_dir / "clickhouse-ingest-password").write_text(
+                            "i" * 43, encoding="ascii"
+                        )
+
+                    mismatched_path = secret_dir / mismatched_name
+                    before = self._snapshot_tree(root)
+                    fake_os = mock.Mock(wraps=os)
+                    fake_os.name = "posix"
+
+                    def reject_mismatched_owner(
+                        path: Path,
+                        *,
+                        uid: int,
+                        gid: int,
+                        mode: int,
+                        context: str,
+                    ) -> None:
+                        del uid, gid, mode, context
+                        if path == mismatched_path:
+                            raise DeploymentError(
+                                f"Offline secret owner or mode is unsafe: {path}"
+                            )
+
+                    with (
+                        mock.patch("tools.offline_env.os", fake_os),
+                        mock.patch(
+                            "tools.offline_env._current_identity",
+                            return_value=("1000", "1000"),
+                        ),
+                        mock.patch(
+                            "tools.offline_env._assert_posix_metadata",
+                            side_effect=reject_mismatched_owner,
+                        ),
+                    ):
+                        with self.assertRaisesRegex(DeploymentError, "owner"):
+                            prepare_environment(
+                                root,
+                                environ={},
+                                verify_posix_metadata=True,
+                            )
+
+                    fake_os.chmod.assert_not_called()
+                    self.assertEqual(before, self._snapshot_tree(root))
+                    self.assertEqual(
+                        before[env_path.relative_to(root).as_posix()][2],
+                        env_path.read_bytes(),
+                    )
+                    self.assertFalse((root / "artifacts" / "data" / "raw").exists())
+                    self.assertFalse((root / "artifacts" / "data" / "parquet").exists())
+                    if not include_clickhouse:
+                        self.assertFalse(
+                            (secret_dir / "clickhouse-query-password").exists()
+                        )
+                        self.assertFalse(
+                            (secret_dir / "clickhouse-ingest-password").exists()
+                        )
+
     def test_valid_clickhouse_pair_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

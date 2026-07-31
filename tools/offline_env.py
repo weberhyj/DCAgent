@@ -376,6 +376,22 @@ def _assert_posix_metadata(
         raise DeploymentError(f"{context} owner or mode is unsafe: {path}")
 
 
+def _assert_posix_owner(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    context: str,
+) -> None:
+    _assert_posix_metadata(
+        path,
+        uid=uid,
+        gid=gid,
+        mode=stat.S_IMODE(path.stat().st_mode),
+        context=context,
+    )
+
+
 def _validate_postgres_secret_pair(paths: Mapping[str, Path]) -> None:
     postgres_password = paths["postgres-password"].read_text(encoding="ascii")
     if PASSWORD.fullmatch(postgres_password) is None:
@@ -560,6 +576,16 @@ def prepare_environment(
         _validate_secret_set(postgres_paths)
     if clickhouse_present:
         _validate_secret_set(clickhouse_paths)
+    if verify_posix_metadata and os.name == "posix":
+        for name in MANAGED_SECRET_NAMES:
+            path = paths[name]
+            if path.exists():
+                _assert_posix_owner(
+                    path,
+                    uid=numeric_uid,
+                    gid=numeric_gid,
+                    context="Offline secret",
+                )
 
     managed_targets = [data_root, model_root, secret_dir, *paths.values()]
     for target in managed_targets:
