@@ -432,8 +432,10 @@ ClickHouse 自身失败时仍按结构化统计的显式失败规则处理。
 
 ## Structured aggregation rollout and rollback
 
-Structured Excel/CSV aggregation is disabled by default. Keep
-`STRUCTURED_QUERY_ENABLED=false` until all of the following gates are complete:
+The shipped environment template enables structured Excel/CSV aggregation with
+`STRUCTURED_QUERY_ENABLED=true`. Complete all of the following gates before starting from that
+template. If the target environment is not ready, explicitly set the flag to `false` and start
+without the indexing profile:
 
 1. Back up PostgreSQL, verify restore, and let the one-shot `schema-migration` service apply the
    structured metadata migration.
@@ -466,7 +468,7 @@ Structured Excel/CSV aggregation is disabled by default. Keep
 
 5. In the administrator UI, upload the XLSX/CSV file, inspect inferred types and aliases, and save a
    confirmed schema. Unconfirmed datasets cannot be published or queried.
-6. Set `STRUCTURED_QUERY_ENABLED=true`, then reconcile the API and start the worker with the
+6. Verify `STRUCTURED_QUERY_ENABLED=true`, then reconcile the API and start the worker with the
    indexing profile:
 
    ```powershell

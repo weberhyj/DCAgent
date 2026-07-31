@@ -82,7 +82,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 for key in REQUIRED_ENV_KEYS:
                     self.assertIn(key, values)
-                self.assertEqual(values["STRUCTURED_QUERY_ENABLED"].lower(), "false")
+                self.assertEqual(values["STRUCTURED_QUERY_ENABLED"].lower(), "true")
                 self.assertEqual(values["STRUCTURED_QUERY_TIMEOUT_SECONDS"], "4")
                 self.assertEqual(values["STRUCTURED_INGEST_BATCH_ROWS"], "50000")
                 self.assertEqual(values["RETRIEVAL_MODE"], "shadow")

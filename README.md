@@ -111,10 +111,10 @@ New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null
 
 ## Structured spreadsheet aggregation
 
-Exact Excel/CSV aggregation is an opt-in local feature. The shipped default is
-`STRUCTURED_QUERY_ENABLED=false`, which preserves the existing template/legacy document RAG path.
-Enabling it does not add an external API: published rows stay in local Parquet staging and the
-private ClickHouse service.
+Exact Excel/CSV aggregation is enabled in the shipped environment templates with
+`STRUCTURED_QUERY_ENABLED=true`. This does not add an external API: published rows stay in local
+Parquet staging and the private ClickHouse service. Set the flag to `false` only when intentionally
+rolling back to the legacy document RAG path.
 
 The query API uses the `CLICKHOUSE_QUERY_USER` account and its password file; the indexing worker
 uses the separate `CLICKHOUSE_INGEST_USER` account and password file. Password values must not be
@@ -209,9 +209,9 @@ Legacy 结果或模板文本伪装成模型答案。
 
 ### Excel/CSV 的两条处理路线
 
-- `STRUCTURED_QUERY_ENABLED=false`（默认）：XLSX/CSV 被展开为普通文本并进入切片 RAG。
+- `STRUCTURED_QUERY_ENABLED=false`（回滚/兼容模式）：XLSX/CSV 被展开为普通文本并进入切片 RAG。
   这种模式适合查找某行或某项说明，不适合计算整列平均值、总和等全量统计。
-- `STRUCTURED_QUERY_ENABLED=true`：管理员必须确认字段类型、别名和统计权限，随后由
+- `STRUCTURED_QUERY_ENABLED=true`（环境模板默认）：管理员必须确认字段类型、别名和统计权限，随后由
   `--profile indexing` worker 分批写入 Parquet 并发布到 ClickHouse。对于已成功发布且已通过
   行数和内容校验的 ClickHouse publication，`avg`、`sum`、`count`、`min`、`max` 由
   ClickHouse 对该 publication 的数据确定性计算，不调用 Physoc，也不会从文档切片估算结果。
