@@ -208,6 +208,63 @@ class TransactionJournalTests(unittest.TestCase):
         with self.assertRaises(state.DeploymentStateError):
             state.TransactionJournal.open(journal.root, self.identity_hash)
 
+    def test_record_intent_recovers_only_the_single_trailing_manifest_prefix(
+        self,
+    ) -> None:
+        payload = {
+            "kind": "mkdir",
+            "object_category": "secret",
+            "path": str(self.base / "created"),
+            "existed": False,
+            "mode": 0o700,
+        }
+
+        before_operations = self.make_journal()
+        with (
+            mock.patch.object(
+                before_operations,
+                "_write_operations",
+                side_effect=SystemExit("simulated SIGKILL before operation publish"),
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            before_operations.record_intent(1, payload)
+
+        repaired = state.TransactionJournal.open(
+            before_operations.root, self.identity_hash
+        )
+        self.assertEqual(repaired.read_operations(), ())
+        self.assertEqual(repaired.read_undo_manifest(), ())
+
+        after_operations = self.make_journal()
+        original_publish = after_operations._write_operations
+
+        def publish_then_die(records: list[Mapping[str, object]]) -> None:
+            original_publish(records)
+            raise SystemExit("simulated SIGKILL after operation publish")
+
+        with (
+            mock.patch.object(
+                after_operations, "_write_operations", side_effect=publish_then_die
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            after_operations.record_intent(1, payload)
+
+        durable = state.TransactionJournal.open(
+            after_operations.root, self.identity_hash
+        )
+        self.assertEqual(len(durable.read_operations()), 1)
+        self.assertEqual(len(durable.read_undo_manifest()), 1)
+
+        manifest = json.loads(durable.undo_manifest_path.read_text(encoding="utf-8"))
+        manifest["entries"].append(
+            dict(manifest["entries"][0], sequence=3, path=str(self.base / "gap"))
+        )
+        state.atomic_write_json(durable.undo_manifest_path, manifest)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(durable.root, self.identity_hash)
+
     def test_strict_schema_rejects_sensitive_extra_and_identity(self) -> None:
         journal = self.make_journal()
         journal.phase_path.write_text(
@@ -244,6 +301,199 @@ class TransactionJournalTests(unittest.TestCase):
         journal.persist_env_backup(missing)
         self.assertTrue(journal.env_backup_meta_path.exists())
         self.assertTrue(json.loads(journal.env_backup_meta_path.read_text())["absent"])
+
+    def test_env_backup_preparing_state_is_reconciled_deterministically(self) -> None:
+        data = b"A=before\n"
+        digest = hashlib.sha256(data).hexdigest()
+
+        complete = self.make_journal()
+        state.atomic_write_json(
+            complete.env_backup_meta_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": complete.transaction_id,
+                "state": "preparing",
+                "absent": False,
+                "digest": digest,
+            },
+        )
+        state.atomic_write_bytes(complete.env_backup_path, data)
+        reopened = state.TransactionJournal.open(complete.root, self.identity_hash)
+        self.assertEqual(reopened.read_env_backup(), data)
+        self.assertEqual(
+            json.loads(reopened.env_backup_meta_path.read_text(encoding="utf-8"))[
+                "state"
+            ],
+            "ready",
+        )
+
+        rollback = self.make_journal()
+        state.atomic_write_json(
+            rollback.env_backup_meta_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": rollback.transaction_id,
+                "state": "preparing",
+                "absent": False,
+                "digest": digest,
+            },
+        )
+        reopened = state.TransactionJournal.open(rollback.root, self.identity_hash)
+        self.assertIsNone(reopened.read_env_backup())
+
+        tampered = self.make_journal()
+        state.atomic_write_json(
+            tampered.env_backup_meta_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": tampered.transaction_id,
+                "state": "preparing",
+                "absent": False,
+                "digest": digest,
+            },
+        )
+        state.atomic_write_bytes(tampered.env_backup_path, b"A=tampered\n")
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(tampered.root, self.identity_hash)
+
+        missing_ready = self.make_journal()
+        state.atomic_write_json(
+            missing_ready.env_backup_meta_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": missing_ready.transaction_id,
+                "state": "ready",
+                "absent": False,
+                "digest": digest,
+            },
+        )
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(missing_ready.root, self.identity_hash)
+
+        tampered_ready = self.make_journal()
+        state.atomic_write_json(
+            tampered_ready.env_backup_meta_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": tampered_ready.transaction_id,
+                "state": "ready",
+                "absent": False,
+                "digest": digest,
+            },
+        )
+        state.atomic_write_bytes(tampered_ready.env_backup_path, b"A=tampered\n")
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(tampered_ready.root, self.identity_hash)
+
+    def test_protocol_atomic_temps_are_cleaned_but_unsafe_temps_fail_closed(
+        self,
+    ) -> None:
+        journal = self.make_journal()
+        journal_temp = journal.root / ".phase.json.deadbeef.tmp"
+        journal_temp.write_bytes(b"partial")
+        if os.name == "posix":
+            os.chmod(journal_temp, 0o600)
+
+        history_temp = self.paths.history / (
+            f".{journal.transaction_id}.json.deadbeef.tmp"
+        )
+        history_temp.write_bytes(b"partial")
+        if os.name == "posix":
+            os.chmod(history_temp, 0o600)
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+        self.assertFalse(journal_temp.exists())
+        found = state.scan_transaction_journals(
+            self.paths, self.secret_root, self.identity_hash
+        )
+        self.assertIn(reopened.transaction_id, {item.transaction_id for item in found})
+        self.assertFalse(history_temp.exists())
+
+        unsafe_history_temp = self.paths.history / ".not-protocol.deadbeef.tmp"
+        unsafe_history_temp.write_bytes(b"partial")
+        if os.name == "posix":
+            os.chmod(unsafe_history_temp, 0o600)
+        with self.assertRaises(state.DeploymentStateError):
+            state.scan_transaction_journals(
+                self.paths, self.secret_root, self.identity_hash
+            )
+        unsafe_history_temp.unlink()
+
+        unsafe = self.make_journal()
+        unsafe_temp = unsafe.root / ".not-a-record.deadbeef.tmp"
+        unsafe_temp.write_bytes(b"partial")
+        if os.name == "posix":
+            os.chmod(unsafe_temp, 0o600)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(unsafe.root, self.identity_hash)
+
+    def test_assert_no_incomplete_transactions_detects_cleanup_metadata_and_temps(
+        self,
+    ) -> None:
+        transaction_id = uuid.uuid4().hex
+        names = (
+            f".{transaction_id}.journal-cleanup.json",
+            f".{transaction_id}.json.deadbeef.tmp",
+            f"..{transaction_id}.journal-cleanup.json.deadbeef.tmp",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                path = self.paths.history / name
+                path.write_bytes(b"partial")
+                if os.name == "posix":
+                    os.chmod(path, 0o600)
+                with self.assertRaises(state.DeploymentStateError):
+                    state.assert_no_incomplete_transactions(self.paths)
+                path.unlink()
+
+    def test_record_intent_rejects_degenerate_operations(self) -> None:
+        journal = self.make_journal()
+        same = self.base / "same"
+        same.write_bytes(b"same\n")
+        journal.persist_env_backup(same)
+        digest = hashlib.sha256(same.read_bytes()).hexdigest()
+        assert journal.secret_companion_root is not None
+        backup_same = journal.secret_companion_root / "backup" / "same"
+        staging_same = journal.secret_companion_root / "staging" / "same"
+        cases = (
+            {
+                "kind": "chmod",
+                "object_category": "secret",
+                "path": str(same),
+                "before_mode": 0o600,
+                "after_mode": 0o600,
+                "object_type": "file",
+            },
+            {
+                "kind": "active_to_backup",
+                "object_category": "secret",
+                "active_path": str(backup_same),
+                "backup_path": str(backup_same),
+                "object_type": "file",
+            },
+            {
+                "kind": "staging_to_active",
+                "object_category": "secret",
+                "staging_path": str(staging_same),
+                "active_path": str(staging_same),
+                "object_type": "file",
+            },
+            {
+                "kind": "env_replace",
+                "object_category": "env",
+                "env_path": str(same),
+                "before_digest": digest,
+                "after_digest": digest,
+                "before_absent": False,
+                **env_authority(before_absent=False),
+            },
+        )
+        for sequence, payload in enumerate(cases, start=1):
+            with (
+                self.subTest(kind=payload["kind"]),
+                self.assertRaises(state.DeploymentStateError),
+            ):
+                journal.record_intent(sequence, payload)
 
     def test_bidirectional_scan_rejects_missing_and_orphan_companions(self) -> None:
         journal = self.make_journal()
@@ -690,6 +940,34 @@ class RecoveryClassificationTests(unittest.TestCase):
         file_path.mkdir()
         with self.assertRaises(recovery.RecoveryConflict):
             recovery.classify_operation(unlink)
+
+    def test_classification_rejects_overlapping_before_and_after_predicates(
+        self,
+    ) -> None:
+        path = self.base / "overlap"
+        data = b"same\n"
+        path.write_bytes(data)
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+        chmod = self.op(
+            "chmod",
+            path=str(path),
+            before_mode=mode,
+            after_mode=mode,
+            object_type="file",
+        )
+        with self.assertRaises(recovery.RecoveryConflict):
+            recovery.classify_operation(chmod)
+
+        digest = hashlib.sha256(data).hexdigest()
+        env = self.op(
+            "env_replace",
+            env_path=str(path),
+            before_digest=digest,
+            after_digest=digest,
+            before_absent=False,
+        )
+        with self.assertRaises(recovery.RecoveryConflict):
+            recovery.classify_operation(env)
 
     def test_all_operation_kinds_reject_mode_and_owner_mismatch(self) -> None:
         cases: list[tuple[dict[str, object], Path, str]] = []

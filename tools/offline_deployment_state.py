@@ -62,6 +62,8 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SAFE_CATEGORY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _CLEANUP_TOMBSTONE = re.compile(r"^\.([0-9a-f]{32})\.journal-cleanup$")
 _CLEANUP_TOMBSTONE_METADATA = re.compile(r"^\.([0-9a-f]{32})\.journal-cleanup\.json$")
+_HISTORY_RECEIPT = re.compile(r"^([0-9a-f]{32})\.json$")
+_ATOMIC_TEMP = re.compile(r"^\.(?P<target>.+)\.(?P<nonce>[a-z0-9_]{8})\.tmp$")
 _SAFE_METADATA_KEYS = frozenset(
     {
         "mode",
@@ -618,6 +620,28 @@ def _validate_optional_int(value: object, description: str) -> int | None:
     return value
 
 
+def _atomic_temp_target(name: str) -> str | None:
+    match = _ATOMIC_TEMP.fullmatch(name)
+    return None if match is None else match.group("target")
+
+
+def _remove_verified_atomic_temp(path: Path, description: str) -> None:
+    _verify_regular_file(path, description)
+    path.unlink()
+    fsync_directory(path.parent)
+
+
+def _history_temp_transaction_id(target: str) -> str | None:
+    for pattern in (
+        _HISTORY_RECEIPT,
+        _CLEANUP_TOMBSTONE_METADATA,
+    ):
+        match = pattern.fullmatch(target)
+        if match is not None:
+            return _validate_uuid4_hex(match.group(1))
+    return None
+
+
 def _safe_metadata(value: object, description: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise DeploymentStateError(f"invalid {description}")
@@ -1039,6 +1063,8 @@ def _validate_operation_mapping(
             result["existed"] is not False or result["object_type"] != "directory"
         ):
             raise DeploymentStateError("invalid mkdir operation authority")
+        if kind == "chmod" and result["before_mode"] == result["after_mode"]:
+            raise DeploymentStateError("chmod operation must change mode")
     elif kind in {"active_to_backup", "staging_to_active"}:
         for field in ("active_path", "backup_path", "staging_path"):
             if field in result:
@@ -1050,6 +1076,12 @@ def _validate_operation_mapping(
             result[field] = _validate_optional_int(result[field], f"operation {field}")
             if result[field] is None:
                 raise DeploymentStateError(f"operation {field} is required")
+        source_field = "active_path" if kind == "active_to_backup" else "staging_path"
+        if (
+            result[source_field]
+            == result["active_path" if kind == "staging_to_active" else "backup_path"]
+        ):
+            raise DeploymentStateError("rename operation requires distinct paths")
     elif kind == "unlink":
         result["path"] = _validate_abs_path(result["path"], "operation path").as_posix()
         result["mode"] = _validate_mode(result["mode"], "operation mode")
@@ -1079,6 +1111,8 @@ def _validate_operation_mapping(
             raise DeploymentStateError("existing environment requires before digest")
         if not isinstance(result["after_digest"], str):
             raise DeploymentStateError("environment replacement requires after digest")
+        if result["before_digest"] == result["after_digest"]:
+            raise DeploymentStateError("environment replacement must change content")
         if result["object_type"] != "environment":
             raise DeploymentStateError("invalid environment object type")
         result["after_mode"] = _validate_mode(
@@ -1222,7 +1256,7 @@ class TransactionJournal:
             journal._write_operations([])
             journal._write_rollback_done([])
             journal._write_rollback_intents([])
-            journal._write_env_backup_meta(absent=True)
+            journal._write_env_backup_meta(state="ready", absent=True, digest=None)
             return journal
         except Exception:
             with contextlib.suppress(Exception):
@@ -1315,7 +1349,15 @@ class TransactionJournal:
         journal.object_categories = phase.object_categories
         undo_entries = journal._read_undo_manifest()
         operations = journal._read_operations_internal()
-        journal._validate_manifest_operations(undo_entries, operations)
+        try:
+            journal._validate_manifest_operations(undo_entries, operations)
+        except DeploymentStateError:
+            if not journal._repair_trailing_manifest_prefix(
+                undo_entries, operations, phase.phase
+            ):
+                raise
+            undo_entries = journal._read_undo_manifest()
+            journal._validate_manifest_operations(undo_entries, operations)
         rollback_done = journal._read_rollback_done()
         rollback_intents = journal._read_rollback_intents()
         operation_sequences = {operation["sequence"] for operation in operations}
@@ -1395,6 +1437,22 @@ class TransactionJournal:
             "rollback-intents.json",
             "env-backup.json",
         }
+        allowed_temp_targets = expected | {"env-backup"}
+        try:
+            entries = list(os.scandir(self.root))
+        except OSError as exc:
+            raise DeploymentStateError(
+                f"cannot inspect transaction journal: {self.root}"
+            ) from exc
+        for entry in entries:
+            target = _atomic_temp_target(entry.name)
+            if target is None:
+                continue
+            if target not in allowed_temp_targets:
+                raise DeploymentStateError(f"invalid transaction journal: {self.root}")
+            _remove_verified_atomic_temp(
+                Path(entry.path), "transaction journal atomic temp"
+            )
         try:
             entries = list(os.scandir(self.root))
         except OSError as exc:
@@ -1636,6 +1694,34 @@ class TransactionJournal:
             if actual.to_mapping() != expected.to_mapping():
                 raise DeploymentStateError("undo manifest operation mismatch")
 
+    def _repair_trailing_manifest_prefix(
+        self,
+        entries: Sequence[UndoEntry],
+        operations: Sequence[Mapping[str, object]],
+        phase: str,
+    ) -> bool:
+        if (
+            phase
+            in {
+                "committed",
+                "committed_cleanup_required",
+                "rollback_in_progress",
+                "rollback_failed",
+            }
+            or len(entries) != len(operations) + 1
+        ):
+            return False
+        prefix = entries[:-1]
+        try:
+            self._validate_manifest_operations(prefix, operations)
+        except DeploymentStateError:
+            return False
+        expected_sequence = 1 if not operations else operations[-1]["sequence"] + 1
+        if entries[-1].sequence != expected_sequence:
+            return False
+        self.write_undo_manifest(prefix)
+        return True
+
     def _write_operations(self, records: Sequence[Mapping[str, object]]) -> None:
         atomic_write_json(
             self.operations_path,
@@ -1863,14 +1949,16 @@ class TransactionJournal:
 
     def persist_env_backup(self, env_path: Path | None) -> None:
         if env_path is None:
+            self._write_env_backup_meta(state="preparing", absent=True, digest=None)
             self._remove_env_backup_if_present()
-            self._write_env_backup_meta(absent=True)
+            self._write_env_backup_meta(state="ready", absent=True, digest=None)
             return
         path = _validate_abs_path(env_path, "environment path")
         st = _lstat_optional(path)
         if st is None:
+            self._write_env_backup_meta(state="preparing", absent=True, digest=None)
             self._remove_env_backup_if_present()
-            self._write_env_backup_meta(absent=True)
+            self._write_env_backup_meta(state="ready", absent=True, digest=None)
             return
         if _is_symlink(st) or not stat.S_ISREG(st.st_mode):
             raise DeploymentStateError("unsafe environment path")
@@ -1879,8 +1967,10 @@ class TransactionJournal:
             "environment file",
             mode=stat.S_IMODE(st.st_mode) if _is_posix() else 0o600,
         )
+        digest = hashlib.sha256(data).hexdigest()
+        self._write_env_backup_meta(state="preparing", absent=False, digest=digest)
         atomic_write_bytes(self.env_backup_path, data, mode=0o600)
-        self._write_env_backup_meta(absent=False)
+        self._write_env_backup_meta(state="ready", absent=False, digest=digest)
 
     def _remove_env_backup_if_present(self) -> None:
         existing = _lstat_optional(self.env_backup_path)
@@ -1894,13 +1984,21 @@ class TransactionJournal:
         self.env_backup_path.unlink()
         fsync_directory(self.root)
 
-    def _write_env_backup_meta(self, *, absent: bool) -> None:
+    def _write_env_backup_meta(
+        self, *, state: str, absent: bool, digest: str | None
+    ) -> None:
+        if state not in {"preparing", "ready"}:
+            raise DeploymentStateError("invalid environment backup state")
+        if absent != (digest is None):
+            raise DeploymentStateError("invalid environment backup digest state")
         atomic_write_json(
             self.env_backup_meta_path,
             {
                 "schema_version": SCHEMA_VERSION,
                 "transaction_id": self.transaction_id,
+                "state": state,
                 "absent": absent,
+                "digest": digest,
             },
         )
 
@@ -1910,22 +2008,58 @@ class TransactionJournal:
         )
         if (
             not isinstance(payload, Mapping)
-            or set(payload) != {"schema_version", "transaction_id", "absent"}
+            or set(payload)
+            != {"schema_version", "transaction_id", "state", "absent", "digest"}
             or type(payload["schema_version"]) is not int
             or payload["schema_version"] != SCHEMA_VERSION
             or payload["transaction_id"] != self.transaction_id
+            or payload["state"] not in {"preparing", "ready"}
             or type(payload["absent"]) is not bool
+            or (
+                payload["digest"] is not None
+                and (
+                    not isinstance(payload["digest"], str)
+                    or not _HEX_64.fullmatch(payload["digest"])
+                )
+            )
+            or payload["absent"] != (payload["digest"] is None)
         ):
             raise DeploymentStateError(
                 f"invalid environment backup metadata: {self.env_backup_meta_path}"
             )
-        if not payload["absent"]:
-            _verify_regular_file(self.env_backup_path, "environment backup")
-        elif _lstat_optional(self.env_backup_path) is not None:
-            raise DeploymentStateError(
-                f"invalid environment backup metadata: {self.env_backup_meta_path}"
+        backup = _lstat_optional(self.env_backup_path)
+        if payload["state"] == "preparing":
+            if payload["absent"]:
+                if backup is not None:
+                    _remove_verified_atomic_temp(
+                        self.env_backup_path, "environment backup"
+                    )
+                self._write_env_backup_meta(state="ready", absent=True, digest=None)
+                return True
+            if backup is None:
+                self._write_env_backup_meta(state="ready", absent=True, digest=None)
+                return True
+            data = _read_secure_regular_file(self.env_backup_path, "environment backup")
+            if hashlib.sha256(data).hexdigest() != payload["digest"]:
+                raise DeploymentStateError(
+                    f"environment backup digest mismatch: {self.env_backup_meta_path}"
+                )
+            self._write_env_backup_meta(
+                state="ready", absent=False, digest=payload["digest"]
             )
-        return bool(payload["absent"])
+            return False
+        if payload["absent"]:
+            if backup is not None:
+                raise DeploymentStateError(
+                    f"invalid environment backup metadata: {self.env_backup_meta_path}"
+                )
+            return True
+        data = _read_secure_regular_file(self.env_backup_path, "environment backup")
+        if hashlib.sha256(data).hexdigest() != payload["digest"]:
+            raise DeploymentStateError(
+                f"environment backup digest mismatch: {self.env_backup_meta_path}"
+            )
+        return False
 
     def read_env_backup(self) -> bytes | None:
         return (
@@ -2616,6 +2750,40 @@ def scan_transaction_journals(
         raise DeploymentStateError(
             f"cannot inspect history directory: {paths.history}"
         ) from exc
+    recoverable_ids = set(seen_ids)
+    for entry in history_entries:
+        for pattern in (
+            _HISTORY_RECEIPT,
+            _CLEANUP_TOMBSTONE,
+            _CLEANUP_TOMBSTONE_METADATA,
+        ):
+            match = pattern.fullmatch(entry.name)
+            if match is not None:
+                recoverable_ids.add(_validate_uuid4_hex(match.group(1)))
+                break
+    removed_temp = False
+    for entry in history_entries:
+        target = _atomic_temp_target(entry.name)
+        if target is None:
+            if entry.name.endswith(".tmp"):
+                raise DeploymentStateError(
+                    f"invalid history atomic temp: {Path(entry.path)}"
+                )
+            continue
+        transaction_id = _history_temp_transaction_id(target)
+        if transaction_id is None or transaction_id not in recoverable_ids:
+            raise DeploymentStateError(
+                f"orphan history atomic temp: {Path(entry.path)}"
+            )
+        _remove_verified_atomic_temp(Path(entry.path), "history atomic temp")
+        removed_temp = True
+    if removed_temp:
+        try:
+            history_entries = list(os.scandir(paths.history))
+        except OSError as exc:
+            raise DeploymentStateError(
+                f"cannot inspect history directory: {paths.history}"
+            ) from exc
     cleanup_metadata: dict[str, TombstoneJournal] = {}
     for entry in sorted(history_entries, key=lambda item: item.name):
         match = _CLEANUP_TOMBSTONE_METADATA.fullmatch(entry.name)
@@ -2735,7 +2903,11 @@ def assert_no_incomplete_transactions(
             f"cannot inspect history directory: {paths.history}"
         ) from exc
     for entry in history_entries:
-        if entry.name.startswith(".") and entry.name.endswith(".journal-cleanup"):
+        if entry.name.startswith(".") and (
+            entry.name.endswith(".journal-cleanup")
+            or entry.name.endswith(".journal-cleanup.json")
+            or entry.name.endswith(".tmp")
+        ):
             raise DeploymentStateError(
                 f"incomplete transaction cleanup: {Path(entry.path)}"
             )

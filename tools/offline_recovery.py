@@ -165,6 +165,7 @@ def _classify_intent(
             or not _owner_matches(current, operation)
             or type(before) is not int
             or type(after) is not int
+            or before == after
         ):
             raise _conflict(operation)
         mode = stat.S_IMODE(current.st_mode)
@@ -179,6 +180,8 @@ def _classify_intent(
         right_field = "backup_path" if kind == "active_to_backup" else "active_path"
         left_path = _path(operation, left_field)
         right_path = _path(operation, right_field)
+        if left_path == right_path:
+            raise _conflict(operation)
         left = _lstat(left_path, operation)
         right = _lstat(right_path, operation)
         expected_type = operation.get("object_type")
@@ -223,6 +226,8 @@ def _classify_intent(
         before_digest = operation.get("before_digest")
         after_digest = operation.get("after_digest")
         if type(before_absent) is not bool or not isinstance(after_digest, str):
+            raise _conflict(operation)
+        if before_digest == after_digest:
             raise _conflict(operation)
         if current is None:
             if before_absent:
