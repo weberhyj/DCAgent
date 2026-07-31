@@ -247,7 +247,7 @@ def derive_state_root(data_root: str | Path) -> Path:
     return normalize_absolute_root(data_root, "data_root") / ".dcagent-deployment-state"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, eq=False)
 class DeploymentIdentity:
     schema_version: int
     deployment_uuid: str
@@ -311,6 +311,14 @@ class DeploymentIdentity:
             "model_root": self.model_root.as_posix(),
             "secret_root": self.secret_root.as_posix(),
         }
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DeploymentIdentity):
+            return NotImplemented
+        return self.to_mapping() == other.to_mapping()
+
+    def __hash__(self) -> int:
+        return hash(_canonical_json_bytes(self.to_mapping()))
 
 
 def identity_digest(identity: DeploymentIdentity) -> str:
@@ -502,6 +510,14 @@ def atomic_write_json(
 def _exclusive_write_json(path: Path, payload: object, description: str) -> bool:
     encoded = _canonical_json_bytes(payload)
     _verify_directory(path.parent, f"{description} parent directory")
+    try:
+        existing = _lstat_optional(path)
+    except OSError:
+        raise DeploymentStateError(
+            f"cannot safely inspect {description}: {path}"
+        ) from None
+    if existing is not None:
+        return False
     fd: int | None = None
     temporary: Path | None = None
     try:

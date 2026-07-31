@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -296,6 +296,58 @@ class DeploymentStateTests(unittest.TestCase):
         with self.assertRaises(state.DeploymentStateError):
             state.write_identity_exclusive(self.paths, other)
 
+    def test_existing_identity_and_marker_idempotency_skips_temp_creation(self) -> None:
+        self.ensure_layout()
+        identity = self.make_identity()
+        state.write_identity_exclusive(self.paths, identity)
+        identity_bytes = self.paths.identity.read_bytes()
+        with mock.patch.object(
+            state.tempfile,
+            "mkstemp",
+            side_effect=OSError(errno.ENOSPC, "no space"),
+        ):
+            try:
+                state.write_identity_exclusive(self.paths, identity)
+            except state.DeploymentStateError as exc:
+                self.fail(f"idempotent identity write allocated a temp file: {exc}")
+        self.assertEqual(self.paths.identity.read_bytes(), identity_bytes)
+
+        digest = state.identity_digest(identity)
+        state.create_start_marker(
+            self.paths, operation="up", deployment_identity_hash=digest
+        )
+        marker_bytes = self.paths.start_marker.read_bytes()
+        with mock.patch.object(
+            state.tempfile,
+            "mkstemp",
+            side_effect=PermissionError("permission denied"),
+        ):
+            try:
+                state.create_start_marker(
+                    self.paths, operation="exec", deployment_identity_hash=digest
+                )
+            except state.DeploymentStateError as exc:
+                self.fail(f"idempotent marker write allocated a temp file: {exc}")
+        self.assertEqual(self.paths.start_marker.read_bytes(), marker_bytes)
+
+    def test_exclusive_target_lstat_errors_fail_closed_without_treating_missing(
+        self,
+    ) -> None:
+        self.ensure_layout()
+        identity = self.make_identity()
+        original_lstat = state.os.lstat
+
+        def fail_identity_lstat(path: object) -> object:
+            if Path(path) == self.paths.identity:  # type: ignore[arg-type]
+                raise PermissionError("identity lstat canary")
+            return original_lstat(path)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(state.os, "lstat", side_effect=fail_identity_lstat),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            state.write_identity_exclusive(self.paths, identity)
+
     def test_exclusive_identity_publish_survives_interrupted_child_write(self) -> None:
         self.ensure_layout()
         identity = self.make_identity()
@@ -357,31 +409,21 @@ class DeploymentStateTests(unittest.TestCase):
     def test_write_identity_compares_canonical_mapping(self) -> None:
         paths, stored, expected = self.make_canonical_identity_collision()
         state.write_identity_exclusive(paths, stored)
-        comparison = (
-            contextlib.nullcontext()
-            if os.name == "nt"
-            else mock.patch.object(
-                state.DeploymentIdentity, "__eq__", return_value=True
-            )
-        )
-        if os.name == "nt":
-            self.assertEqual(stored, expected)
-        with comparison, self.assertRaises(state.DeploymentStateError):
+        with self.assertRaises(state.DeploymentStateError):
             state.write_identity_exclusive(paths, expected)
+
+    def test_identity_equality_matches_canonical_mapping_and_digest(self) -> None:
+        _, stored, expected = self.make_canonical_identity_collision()
+        self.assertNotEqual(stored, expected)
+        clone = state.DeploymentIdentity(**stored.to_mapping())
+        self.assertEqual(stored, clone)
+        self.assertEqual(state.identity_digest(stored), state.identity_digest(clone))
+        self.assertEqual(hash(stored), hash(clone))
 
     def test_assert_identity_matches_compares_canonical_mapping(self) -> None:
         paths, stored, expected = self.make_canonical_identity_collision()
         state.write_identity_exclusive(paths, stored)
-        comparison = (
-            contextlib.nullcontext()
-            if os.name == "nt"
-            else mock.patch.object(
-                state.DeploymentIdentity, "__eq__", return_value=True
-            )
-        )
-        if os.name == "nt":
-            self.assertEqual(stored, expected)
-        with comparison, self.assertRaises(state.DeploymentStateError):
+        with self.assertRaises(state.DeploymentStateError):
             state.assert_identity_matches(paths, expected)
 
     @unittest.skipUnless(os.name == "posix", "POSIX modes require POSIX")
