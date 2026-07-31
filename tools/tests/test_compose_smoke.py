@@ -852,6 +852,50 @@ class ComposeSmokeTest(unittest.TestCase):
                 compose_smoke.build_compose_command("up", wrapper_path=wrapper),
             )
 
+        bash_wrapper = Path("/repo/tools/invoke_offline_compose.sh")
+        self.assertEqual(
+            [str(bash_wrapper), "config", "--quiet"],
+            compose_smoke.build_compose_command("config", wrapper_path=bash_wrapper),
+        )
+
+    def test_default_wrapper_uses_bash_on_posix_and_powershell_on_windows(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        with mock.patch.object(compose_smoke.os, "name", "posix"):
+            self.assertEqual(
+                compose_smoke.REPO_ROOT / "tools" / "invoke_offline_compose.sh",
+                compose_smoke.default_wrapper_path(),
+            )
+        with mock.patch.object(compose_smoke.os, "name", "nt"):
+            self.assertEqual(
+                compose_smoke.REPO_ROOT / "tools" / "invoke_offline_compose.ps1",
+                compose_smoke.default_wrapper_path(),
+            )
+
+    def test_wrapper_prefix_supports_bash_and_powershell(self) -> None:
+        compose_smoke = _module()
+        bash = Path("/repo/tools/invoke_offline_compose.sh")
+        powershell = Path("/repo/tools/invoke_offline_compose.ps1")
+
+        self.assertEqual([str(bash)], compose_smoke._wrapper_prefix(bash))
+        self.assertEqual(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(powershell),
+            ],
+            compose_smoke._wrapper_prefix(powershell),
+        )
+
+    def test_wrapper_prefix_rejects_unsupported_script_extensions(self) -> None:
+        compose_smoke = _module()
+
+        with self.assertRaisesRegex(ValueError, r"\.sh or \.ps1"):
+            compose_smoke._wrapper_prefix(Path("/repo/tools/invoke_offline_compose.py"))
+
     def test_standard_stack_starts_models_without_consumer_health_dependencies(
         self,
     ) -> None:
@@ -909,8 +953,15 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertTrue(runner.calls)
         self.assertTrue(all(shell is False for _, shell in runner.calls))
         self.assertTrue(all(isinstance(command, list) for command, _ in runner.calls))
+        wrapper_commands = {
+            "pwsh",
+            str(REPO_ROOT / "tools" / "invoke_offline_compose.sh"),
+        }
         self.assertTrue(
-            all(command[0] in {"pwsh", sys.executable} for command, _ in runner.calls)
+            all(
+                command[0] in wrapper_commands | {sys.executable}
+                for command, _ in runner.calls
+            )
         )
         host_calls = [
             command for command, _ in runner.calls if command[0] == sys.executable
