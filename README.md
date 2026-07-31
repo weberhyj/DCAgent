@@ -99,12 +99,15 @@ LLM_MODEL=my_deepseek_r1_7b
 部署后必须从仓库根目录通过受支持的 Compose wrapper 在 API 容器内执行。probe 成功后再把
 脱敏报告复制到 host：
 
-```powershell
-& tools/invoke_offline_compose.ps1 exec -T api `
+```bash
+if ! ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.physoc_probe --report /tmp/physoc-probe.json
-if ($LASTEXITCODE -ne 0) { throw "Physoc probe failed; do not persist evidence." }
-New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null
-& tools/invoke_offline_compose.ps1 cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json
+then
+  echo "Physoc probe failed; do not persist evidence." >&2
+  exit 1
+fi
+mkdir -p artifacts/benchmarks
+./tools/invoke_offline_compose.sh cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json
 ```
 
 探针成功报告只记录 provider、model、streamPath、elapsedMs、answerChars 和 citationCount 等运行元数据，不会输出提示词、证据正文或模型回答正文。只有容器内 probe exit 0 后才创建 host 目录并执行 `cp`；将 `artifacts/benchmarks/physoc-probe.json` 作为切换门禁证据保存。探针失败时不得复制旧报告或启用该生产路由。
@@ -293,6 +296,18 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 6. 在目标服务器完成 Compose smoke、Ollama/Physoc probe、新索引发布、Shadow/Canary、真实文档
    问答、模型故障 HTTP 502、Alias/Legacy 回滚、结构化统计和 15 用户并发验收。
 
+Ubuntu 20.04 生产部署从仓库根目录统一使用 Bash 入口：
+
+```bash
+./tools/prepare_offline_env.sh
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh up -d
+./tools/invoke_offline_compose.sh --profile indexing up -d
+```
+
+Windows 开发机兼容：本地开发者可以继续使用 `tools/prepare_offline_env.ps1` 和
+`tools/invoke_offline_compose.ps1`；这两个入口不是 Ubuntu 生产部署路径。
+
 ### Ollama Qwen2.5 部署准备与上线门禁
 
 如果目标环境已经部署过旧版 DC-Agent，本次升级不能只替换后端代码。DC-Agent 本身不再运行
@@ -342,48 +357,10 @@ for model in qwen2.5:0.5b qwen2.5:3b; do
 done
 ```
 
-#### Windows (PowerShell)
-
-```powershell
-ollama pull qwen2.5:0.5b
-ollama pull qwen2.5:3b
-$ollama = 'http://127.0.0.1:11434'
-$embedBody = @{ model = 'qwen2.5:0.5b'; input = @('dimension-probe'); truncate = $true; keep_alive = '30m' } | ConvertTo-Json -Compress
-$embedJson = curl.exe --fail-with-body --silent --show-error -H 'Content-Type: application/json' --data-binary $embedBody "$ollama/api/embed"
-$embedProbe = $embedJson | ConvertFrom-Json
-$dimensions = $embedProbe.embeddings[0].Count
-if ($dimensions -le 0) { throw 'Ollama returned no embedding dimensions' }
-```
-
-把 `$dimensions` 填入 `EMBEDDING_MODEL_DIMENSIONS`。老 Ollama 只提供 legacy endpoint 时，显式
+把 Bash 探针输出的 `EMBEDDING_MODEL_DIMENSIONS` 填入实际环境文件。老 Ollama 只提供 legacy endpoint 时，显式
 设置 `OLLAMA_EMBEDDING_PATH=/api/embeddings`，并把
 `EMBEDDING_ENCODING_PROFILE_SHA256` 改为 legacy profile hash
-`23e5b954b6099dcc4427a33745ad03b9ce7dc6fbf2d8fd4728f1d7e1ce7db34c`；不得在任意错误后自动切换路径。用原生生成接口
-确认 3B 模型能返回 JSON score shape：
-
-```powershell
-$prompt = 'Return only JSON: {"scores":[{"index":0,"score":0.0},{"index":1,"score":0.0}]}. Score relevance from 0 to 1. Query: leave policy. Passage 0: annual leave policy. Passage 1: cafeteria menu.'
-$generateBody = @{ model = 'qwen2.5:3b'; prompt = $prompt; stream = $false; format = 'json'; options = @{ temperature = 0; num_predict = 128 } } | ConvertTo-Json -Depth 5 -Compress
-$generateJson = curl.exe --fail-with-body --silent --show-error -H 'Content-Type: application/json' --data-binary $generateBody "$ollama/api/generate"
-$scoreProbe = (($generateJson | ConvertFrom-Json).response | ConvertFrom-Json)
-if ($scoreProbe.scores.Count -ne 2) { throw 'Ollama JSON score probe returned the wrong count' }
-```
-
-从 `/api/tags` 提取目标模型的真实 digest，去掉可选 `sha256:` 前缀后再写入配置。不要复制示例
-占位符：
-
-```powershell
-$tags = (curl.exe --fail-with-body --silent --show-error "$ollama/api/tags") | ConvertFrom-Json
-function Get-OllamaDigest([string]$model) {
-  $modelMatches = @($tags.models | Where-Object { $_.name -ceq $model -or $_.model -ceq $model })
-  if ($modelMatches.Count -ne 1) { throw "Expected exactly one Ollama model match: $model" }
-  $digest = ([string]$modelMatches[0].digest) -replace '^sha256:', ''
-  if ($digest -cnotmatch '^[0-9a-f]{64}$') { throw "Invalid Ollama digest for $model" }
-  $digest
-}
-$embeddingDigest = Get-OllamaDigest 'qwen2.5:0.5b'
-$rerankerDigest = Get-OllamaDigest 'qwen2.5:3b'
-```
+`23e5b954b6099dcc4427a33745ad03b9ce7dc6fbf2d8fd4728f1d7e1ce7db34c`；不得在任意错误后自动切换路径。上面的 Bash 命令还必须确认 3B 模型能返回 JSON score shape，并从 `/api/tags` 提取目标模型的真实 digest；去掉可选 `sha256:` 前缀后再写入配置，不要复制示例占位符。
 
 关键配置必须绑定实测值和固定 profile：
 
@@ -409,8 +386,8 @@ model digest、dimensions、protocol 和所选 endpoint profile 重新构建并�
 向量。保持 `knowledge_chunks_qwen3_vN` 和 `RETRIEVAL_MODE=qwen3` 兼容命名，先构建新的不可变
 collection 并验证模型元数据、实测 dimensions、归一化、profile/digest、点数和检索质量：
 
-```powershell
-& tools/invoke_offline_compose.ps1 exec -T api `
+```bash
+./tools/invoke_offline_compose.sh exec -T api \
   python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v1
 ```
 
@@ -419,9 +396,9 @@ collection 并验证模型元数据、实测 dimensions、归一化、profile/di
 回滚时先把 `RETRIEVAL_MODE=legacy`，恢复上一组模型 digest/profile/dimensions，再以新的版本号
 全量重建已知可用组合并执行受 fence 保护的 `--activate`，禁止直接修改 Qdrant Alias。
 
-```powershell
+```bash
 # 仅在目标 acceptance 全部通过后人工执行
-& tools/invoke_offline_compose.ps1 exec -T api `
+./tools/invoke_offline_compose.sh exec -T api \
   python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v2 --activate
 ```
 
@@ -436,11 +413,11 @@ collection 并验证模型元数据、实测 dimensions、归一化、profile/di
 本机没有目标 wheelhouse。必须在真实离线构建环境中，用实际 artifacts/wheels 按 Dockerfile 的
 相同 `uv sync` flags 构建并验证镜像，以弥补本机限制：
 
-```powershell
-$env:UV_PYTHON_DOWNLOADS = 'never'
+```bash
+export UV_PYTHON_DOWNLOADS=never
 uv sync --project backend --frozen --offline --no-install-project --no-dev --group offline --no-index --find-links artifacts/wheels
 uv sync --project backend --frozen --offline --no-install-project --no-dev --no-index --find-links artifacts/wheels
-& tools/invoke_offline_compose.ps1 build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
 ```
 
 真实 Ollama probe、镜像构建、全量索引、15 用户容量、目标服务器 acceptance 和 Alias activation

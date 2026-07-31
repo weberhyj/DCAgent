@@ -509,6 +509,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             "structured_query_enabled=false",
             "schema-migration",
             "profile indexing",
+            "./tools/invoke_offline_compose.sh --profile indexing up -d",
             "smoke aggregate",
             "rollback",
             "clickhouse",
@@ -519,6 +520,14 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, combined)
+
+        intranet = (
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "./tools/invoke_offline_compose.sh --profile indexing up -d",
+            intranet,
+        )
 
     def test_docs_define_qwen3_hybrid_retrieval_operations(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")

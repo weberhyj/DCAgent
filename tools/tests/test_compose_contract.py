@@ -2034,6 +2034,52 @@ class ComposeContractTest(unittest.TestCase):
         self.assertIn("unsupported Compose expansion", text)
         self.assertIn("missing environment variable", text)
 
+    def test_ubuntu_production_docs_use_bash_compose_entrypoints(self) -> None:
+        documents = {
+            "root readme": REPO_ROOT / "README.md",
+            "intranet checklist": (
+                REPO_ROOT / "docs" / "intranet-deployment-configuration.md"
+            ),
+            "offline runbook": REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            "offline compose readme": REPO_ROOT / "deploy" / "offline" / "README.md",
+        }
+        required_commands = (
+            "./tools/prepare_offline_env.sh",
+            "./tools/invoke_offline_compose.sh config",
+            "./tools/invoke_offline_compose.sh up -d",
+        )
+        for label, path in documents.items():
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(document=label):
+                for command in required_commands:
+                    self.assertIn(command, text)
+
+        intranet = documents["intranet checklist"].read_text(encoding="utf-8")
+        for forbidden in (
+            ".ps1",
+            "Copy-Item",
+            "$LASTEXITCODE",
+            "New-Item",
+            "& tools/",
+            "pwsh",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, intranet)
+        self.assertNotRegex(intranet, r"(?m)[ \t]+`[ \t]*$")
+
+        for label in ("offline runbook", "offline compose readme"):
+            text = documents[label].read_text(encoding="utf-8")
+            with self.subTest(document=label):
+                self.assertNotIn(".ps1", text)
+                self.assertNotIn("$LASTEXITCODE", text)
+                self.assertNotIn("New-Item", text)
+                self.assertNotRegex(text, r"(?m)[ \t]+`[ \t]*$")
+
+        root_readme = documents["root readme"].read_text(encoding="utf-8")
+        self.assertEqual(1, root_readme.count("Windows 开发机兼容"))
+        self.assertEqual(1, root_readme.count("tools/prepare_offline_env.ps1"))
+        self.assertEqual(1, root_readme.count("tools/invoke_offline_compose.ps1"))
+
 
 if __name__ == "__main__":
     unittest.main()

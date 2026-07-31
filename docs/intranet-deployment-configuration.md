@@ -11,7 +11,7 @@
 ## 1. 部署前检查
 
 1. 从 GitHub `main` 分支拉取最新代码，并记录部署的 Commit SHA。
-2. 准备 Python 3.12、uv、Docker Engine、Docker Compose v2 和 PowerShell 7（`pwsh`）。
+2. 准备 Ubuntu 20.04、Bash、Python 3.12、uv、Docker Engine 和 Docker Compose v2。
 3. 确认后端服务器或 API 容器可以访问 PostgreSQL、ClickHouse、Qdrant、Redis、Ollama 和 Physoc。
 4. 确认内网 DNS、防火墙、端口和容器网络已经放行。
 5. 不要把真实密码、Token、私有 IP 清单或证书提交到 Git。
@@ -22,9 +22,9 @@
 
 Compose 部署使用：
 
-```powershell
-Copy-Item deploy/offline/.env.example deploy/offline/.env
-& tools/prepare_offline_env.ps1
+```bash
+cp deploy/offline/.env.example deploy/offline/.env
+./tools/prepare_offline_env.sh
 ```
 
 随后修改：
@@ -35,8 +35,8 @@ deploy/offline/.env
 
 如果不使用 Compose、直接运行后端，则创建并修改：
 
-```powershell
-Copy-Item backend/.env.example backend/.env
+```bash
+cp backend/.env.example backend/.env
 ```
 
 `.env.example` 只是模板。生产配置必须写入实际 `.env` 或由部署平台注入系统环境变量。
@@ -68,9 +68,13 @@ LLM_API_BASE=http://172.16.0.10:8090
 
 部署后可以在 API 容器中运行探针：
 
-```powershell
-& tools/invoke_offline_compose.ps1 exec -T api `
+```bash
+if ! ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.physoc_probe --report /tmp/physoc-probe.json
+then
+  echo "Physoc probe failed; do not persist evidence." >&2
+  exit 1
+fi
 ```
 
 探针返回非零状态时，不要切换生产流量。
@@ -215,8 +219,8 @@ eeeeeeee...
 
 渲染 Compose 前执行：
 
-```powershell
-& tools/invoke_offline_compose.ps1 config
+```bash
+./tools/invoke_offline_compose.sh config
 ```
 
 配置渲染失败时不要直接绕过 wrapper，也不要临时改用公网镜像。
@@ -246,8 +250,8 @@ STRUCTURED_INGEST_BATCH_ROWS=50000
 
 启动包含结构化 worker 的服务：
 
-```powershell
-& tools/invoke_offline_compose.ps1 --profile indexing up -d
+```bash
+./tools/invoke_offline_compose.sh --profile indexing up -d
 ```
 
 在 publication 成为 `published` 之前，不要验收平均值等全量统计问题。如果 ClickHouse 不可用或查询超时，系统应明确失败，不应退回文档切片估算平均值。
@@ -264,18 +268,18 @@ RETRIEVAL_CANARY_PERCENT=0
 
 影子模式仍把 Legacy 结果返回给用户，混合检索主要用于后台对比。首次上线应先保持影子模式，重建全部文档向量：
 
-```powershell
-& tools/invoke_offline_compose.ps1 exec -T api `
-  python -m app.retrieval_index_worker `
+```bash
+./tools/invoke_offline_compose.sh exec -T api \
+  python -m app.retrieval_index_worker \
   --collection knowledge_chunks_qwen3_v1
 ```
 
 确认 publication、向量维度、点数量、权限过滤和检索样本均正确后，再激活 collection：
 
-```powershell
-& tools/invoke_offline_compose.ps1 exec -T api `
-  python -m app.retrieval_index_worker `
-  --collection knowledge_chunks_qwen3_v1 `
+```bash
+./tools/invoke_offline_compose.sh exec -T api \
+  python -m app.retrieval_index_worker \
+  --collection knowledge_chunks_qwen3_v1 \
   --activate
 ```
 
@@ -329,12 +333,12 @@ https://cdn.jsdelivr.net/npm/cn-fontsource-ding-talk-jin-bu-ti-regular@1.0.3/fon
 
 从仓库根目录执行：
 
-```powershell
-& tools/prepare_offline_env.ps1
-& tools/invoke_offline_compose.ps1 config
-& tools/invoke_offline_compose.ps1 build schema-migration embedding-service reranker-service api ingestion-worker
-& tools/invoke_offline_compose.ps1 up -d
-& tools/invoke_offline_compose.ps1 --profile indexing up -d
+```bash
+./tools/prepare_offline_env.sh
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh up -d
+./tools/invoke_offline_compose.sh --profile indexing up -d
 ```
 
 然后依次完成：
