@@ -61,6 +61,7 @@ _RFC3339_MICROSECONDS_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SAFE_CATEGORY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _CLEANUP_TOMBSTONE = re.compile(r"^\.([0-9a-f]{32})\.journal-cleanup$")
+_CLEANUP_TOMBSTONE_METADATA = re.compile(r"^\.([0-9a-f]{32})\.journal-cleanup\.json$")
 _SAFE_METADATA_KEYS = frozenset(
     {
         "mode",
@@ -1670,6 +1671,96 @@ class TransactionJournal:
         return dict(payload)
 
 
+@dataclasses.dataclass
+class TombstoneJournal(TransactionJournal):
+    """Minimal cleanup journal reconstructed from metadata outside the tombstone."""
+
+    cleanup_metadata_path: Path = dataclasses.field(init=False)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.cleanup_metadata_path = self.root.parent / (
+            f".{self.transaction_id}.journal-cleanup.json"
+        )
+
+    @classmethod
+    def open_cleanup_metadata(
+        cls, metadata_path: str | Path, expected_identity_hash: str
+    ) -> TombstoneJournal:
+        path = Path(metadata_path)
+        expected_hash = _validate_identity_hash(expected_identity_hash)
+        _verify_directory(path.parent, "history directory")
+        _verify_directory(path.parent.parent, "state root")
+        match = _CLEANUP_TOMBSTONE_METADATA.fullmatch(path.name)
+        if match is None:
+            raise DeploymentStateError(f"invalid cleanup metadata: {path}")
+        transaction_id = _validate_uuid4_hex(match.group(1))
+        payload = _read_json_value(path, "cleanup metadata")
+        required = {
+            "schema_version",
+            "transaction_id",
+            "deployment_identity_hash",
+            "object_categories",
+            "cleanup_status",
+            "tombstone_path",
+            "secret_companion_root",
+            "control",
+        }
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != required
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != SCHEMA_VERSION
+            or payload["transaction_id"] != transaction_id
+            or payload["deployment_identity_hash"] != expected_hash
+            or not isinstance(payload["object_categories"], list)
+            or payload["cleanup_status"]
+            not in {"committed_cleanup_pending", "complete"}
+            or type(payload["control"]) is not bool
+        ):
+            raise DeploymentStateError(f"invalid cleanup metadata: {path}")
+        tombstone = _validate_abs_path(payload["tombstone_path"], "cleanup tombstone")
+        expected_tombstone = path.parent / f".{transaction_id}.journal-cleanup"
+        if tombstone != expected_tombstone:
+            raise DeploymentStateError(f"invalid cleanup metadata: {path}")
+        control = payload["control"]
+        companion_value = payload["secret_companion_root"]
+        if control:
+            if companion_value is not None:
+                raise DeploymentStateError(f"invalid cleanup metadata: {path}")
+            companion = None
+        else:
+            companion = _validate_abs_path(
+                companion_value, "cleanup secret companion root"
+            )
+            if (
+                companion.name != transaction_id
+                or companion.parent.name != ".dcagent-transactions"
+            ):
+                raise DeploymentStateError(f"invalid cleanup metadata: {path}")
+        journal = cls(
+            tombstone,
+            transaction_id,
+            expected_hash,
+            companion,
+            tuple(payload["object_categories"]),
+            control,
+        )
+        receipt = journal.read_history_receipt()
+        if receipt is None:
+            raise DeploymentStateError(f"cleanup metadata has no receipt: {path}")
+        tombstone_state = _lstat_optional(tombstone)
+        if tombstone_state is not None:
+            if _is_symlink(tombstone_state) or not stat.S_ISDIR(
+                tombstone_state.st_mode
+            ):
+                raise DeploymentStateError(f"unsafe cleanup tombstone: {tombstone}")
+            _require_owner_and_mode(
+                tombstone, tombstone_state, 0o700, "cleanup tombstone"
+            )
+        return journal
+
+
 def utc_now() -> str:
     return (
         dt.datetime.now(dt.UTC)
@@ -2119,7 +2210,7 @@ def scan_transaction_journals(
     paths: StatePaths,
     secret_companion_root: str | Path,
     expected_identity_hash: str,
-) -> tuple[TransactionJournal, ...]:
+) -> tuple[TransactionJournal | TombstoneJournal, ...]:
     """Validate both journal namespaces and normal companion links fail-closed."""
     _verify_state_root(paths)
     expected_hash = _validate_identity_hash(expected_identity_hash)
@@ -2130,7 +2221,7 @@ def scan_transaction_journals(
         raise DeploymentStateError(
             "secret companion root must be .dcagent-transactions"
         )
-    journals: list[TransactionJournal] = []
+    journals: list[TransactionJournal | TombstoneJournal] = []
     normal_ids: set[str] = set()
     seen_ids: set[str] = set()
     for directory, control in (
@@ -2171,13 +2262,51 @@ def scan_transaction_journals(
         raise DeploymentStateError(
             f"cannot inspect history directory: {paths.history}"
         ) from exc
-    for entry in history_entries:
-        if not entry.name.startswith(".") or not entry.name.endswith(
-            ".journal-cleanup"
-        ):
+    cleanup_metadata: dict[str, TombstoneJournal] = {}
+    for entry in sorted(history_entries, key=lambda item: item.name):
+        match = _CLEANUP_TOMBSTONE_METADATA.fullmatch(entry.name)
+        if match is None:
             continue
-        if _CLEANUP_TOMBSTONE.fullmatch(entry.name) is None:
-            raise DeploymentStateError(f"invalid cleanup tombstone: {Path(entry.path)}")
+        journal = TombstoneJournal.open_cleanup_metadata(entry.path, expected_hash)
+        transaction_id = journal.transaction_id
+        if transaction_id in cleanup_metadata:
+            raise DeploymentStateError(f"duplicate cleanup metadata: {journal.root}")
+        cleanup_metadata[transaction_id] = journal
+        if transaction_id in seen_ids:
+            active = next(
+                item for item in journals if item.transaction_id == transaction_id
+            )
+            if (
+                active.deployment_identity_hash != journal.deployment_identity_hash
+                or active.object_categories != journal.object_categories
+                or active.control != journal.control
+                or active.secret_companion_root != journal.secret_companion_root
+                or _lstat_optional(journal.root) is not None
+            ):
+                raise DeploymentStateError(
+                    f"duplicate transaction state: {journal.root}"
+                )
+            continue
+        seen_ids.add(transaction_id)
+        if not journal.control:
+            normal_ids.add(transaction_id)
+        journals.append(journal)
+
+    for entry in sorted(history_entries, key=lambda item: item.name):
+        match = _CLEANUP_TOMBSTONE.fullmatch(entry.name)
+        if match is None:
+            if (
+                entry.name.startswith(".")
+                and ".journal-cleanup" in entry.name
+                and _CLEANUP_TOMBSTONE_METADATA.fullmatch(entry.name) is None
+            ):
+                raise DeploymentStateError(
+                    f"invalid cleanup tombstone: {Path(entry.path)}"
+                )
+            continue
+        transaction_id = _validate_uuid4_hex(match.group(1))
+        if transaction_id in cleanup_metadata:
+            continue
         journal = TransactionJournal.open(entry.path, expected_hash)
         if journal.transaction_id in seen_ids:
             raise DeploymentStateError(f"duplicate transaction state: {journal.root}")

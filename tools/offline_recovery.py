@@ -166,6 +166,15 @@ def _classify_intent(
         if right is not None and not _matches_type(right, expected_type):
             raise _conflict(operation)
         if left is not None and right is None:
+            if kind == "staging_to_active":
+                if secret_validator is None:
+                    raise _conflict(operation)
+                try:
+                    valid = secret_validator(left_path, operation)
+                except Exception:  # noqa: BLE001 - validator details may contain secrets.
+                    raise _conflict(operation) from None
+                if valid is not True:
+                    raise _conflict(operation)
             return "not_executed"
         if left is None and right is not None:
             if kind == "staging_to_active":
@@ -300,7 +309,14 @@ def reverse_operation(
             _atomic_replace_bytes(path, backup)
         return
     if kind == "staging_to_active":
-        _unlink_expected(_path(operation, "active_path"), operation)
+        staging = _path(operation, "staging_path")
+        active = _path(operation, "active_path")
+        if _lstat(staging, operation) is not None:
+            raise _conflict(operation)
+        os.replace(active, staging)
+        state.fsync_directory(active.parent)
+        if active.parent != staging.parent:
+            state.fsync_directory(staging.parent)
         return
     if kind == "active_to_backup":
         active = _path(operation, "active_path")
@@ -369,10 +385,19 @@ def _reverse_state_is_safe(
 ) -> bool:
     if operation.get("kind") == "staging_to_active":
         active = _lstat(_path(operation, "active_path"), operation)
-        staging = _lstat(_path(operation, "staging_path"), operation)
-        return active is None and (
-            staging is None or _matches_type(staging, operation.get("object_type"))
-        )
+        staging_path = _path(operation, "staging_path")
+        staging = _lstat(staging_path, operation)
+        if (
+            active is not None
+            or staging is None
+            or not _matches_type(staging, operation.get("object_type"))
+            or secret_validator is None
+        ):
+            return False
+        try:
+            return secret_validator(staging_path, operation) is True
+        except Exception:  # noqa: BLE001 - validator details may contain secrets.
+            return False
     intent = dict(operation)
     intent["status"] = "intent"
     try:
@@ -429,22 +454,26 @@ def resume_transaction_rollback(
                 ):
                     raise _conflict(operation)
                 continue
-            if sequence not in rollback_intents:
-                journal.record_rollback_intent(sequence)
-                rollback_intents.add(sequence)
-            if _reverse_state_is_safe(operation, secret_validator=secret_validator):
+            has_rollback_intent = sequence in rollback_intents
+            if has_rollback_intent and _reverse_state_is_safe(
+                operation, secret_validator=secret_validator
+            ):
                 journal.record_rollback_done(sequence)
                 completed.add(sequence)
                 rollback_intents.discard(sequence)
                 continue
-            classification = classify_operation(
+            classification = _classify_intent(
                 operation, secret_validator=secret_validator
             )
             if classification == "not_executed":
+                if operation.get("status") == "done" or has_rollback_intent:
+                    raise _conflict(operation)
                 journal.record_rollback_done(sequence)
                 completed.add(sequence)
-                rollback_intents.discard(sequence)
                 continue
+            if not has_rollback_intent:
+                journal.record_rollback_intent(sequence)
+                rollback_intents.add(sequence)
             reverse_operation(journal, operation, secret_validator=secret_validator)
             if not _reverse_state_is_safe(operation, secret_validator=secret_validator):
                 raise _conflict(operation)
@@ -467,63 +496,145 @@ def _read_receipt(journal: state.TransactionJournal) -> Mapping[str, object] | N
     return journal.read_history_receipt()
 
 
-def finalize_committed_cleanup(journal: state.TransactionJournal) -> None:
+def _cleanup_paths(journal: state.TransactionJournal) -> tuple[Path, Path]:
+    history = journal.history_receipt_path.parent
+    return (
+        history / f".{journal.transaction_id}.journal-cleanup",
+        history / f".{journal.transaction_id}.journal-cleanup.json",
+    )
+
+
+def _write_cleanup_metadata(
+    journal: state.TransactionJournal, cleanup_status: str
+) -> None:
+    tombstone, metadata = _cleanup_paths(journal)
+    state.atomic_write_json(
+        metadata,
+        {
+            "schema_version": state.SCHEMA_VERSION,
+            "transaction_id": journal.transaction_id,
+            "deployment_identity_hash": journal.deployment_identity_hash,
+            "object_categories": list(journal.object_categories),
+            "cleanup_status": cleanup_status,
+            "tombstone_path": tombstone.as_posix(),
+            "secret_companion_root": (
+                None
+                if journal.secret_companion_root is None
+                else journal.secret_companion_root.as_posix()
+            ),
+            "control": journal.control,
+        },
+    )
+
+
+def _mark_receipt_complete(journal: state.TransactionJournal) -> None:
+    receipt = journal.read_history_receipt()
+    if receipt is None:
+        raise state.DeploymentStateError(
+            f"missing cleanup receipt: {journal.history_receipt_path}"
+        )
+    if receipt["cleanup_status"] == "complete":
+        return
+    payload = dict(receipt)
+    payload["completed_at"] = state.utc_now()
+    payload["cleanup_status"] = "complete"
+    state.atomic_write_json(journal.history_receipt_path, payload)
+
+
+def finalize_committed_cleanup(
+    journal: state.TransactionJournal | state.TombstoneJournal,
+) -> None:
     """Idempotently finish post-commit cleanup without touching active objects."""
+    original_root = journal.root
+    tombstone, metadata = _cleanup_paths(journal)
     try:
         receipt = _read_receipt(journal)
         root_exists = state._lstat_optional(journal.root) is not None
-        if not root_exists:
-            if receipt is not None and receipt["cleanup_status"] == "complete":
-                tombstone = (
-                    journal.history_receipt_path.parent
-                    / f".{journal.transaction_id}.journal-cleanup"
+        if not root_exists and not isinstance(journal, state.TombstoneJournal):
+            if state._lstat_optional(metadata) is not None:
+                reopened = state.TombstoneJournal.open_cleanup_metadata(
+                    metadata, journal.deployment_identity_hash
                 )
-                if state._lstat_optional(tombstone) is not None:
-                    reopened = state.TransactionJournal.open(
-                        tombstone, journal.deployment_identity_hash
+                finalize_committed_cleanup(reopened)
+                return
+            if state._lstat_optional(tombstone) is not None:
+                if receipt is None or receipt["cleanup_status"] not in {
+                    "committed_cleanup_pending",
+                    "complete",
+                }:
+                    raise state.DeploymentStateError(
+                        f"missing committed transaction journal: {journal.root}"
                     )
-                    if reopened.transaction_id != journal.transaction_id:
-                        raise state.DeploymentStateError(
-                            f"cleanup tombstone identity mismatch: {tombstone}"
-                        )
-                    finalize_committed_cleanup(reopened)
+                _write_cleanup_metadata(
+                    journal,
+                    str(receipt["cleanup_status"]),
+                )
+                reopened = state.TombstoneJournal.open_cleanup_metadata(
+                    metadata, journal.deployment_identity_hash
+                )
+                finalize_committed_cleanup(reopened)
+                return
+            if receipt is not None and receipt["cleanup_status"] == "complete":
                 return
             raise state.DeploymentStateError(
                 f"missing committed transaction journal: {journal.root}"
             )
-        phase = journal.read_phase().phase
-        if phase not in {"committed", "committed_cleanup_required"} and (
-            receipt is None
-            or receipt["cleanup_status"]
-            not in {"committed_cleanup_pending", "complete"}
-        ):
+        if not isinstance(journal, state.TombstoneJournal):
+            phase = journal.read_phase().phase
+            if phase not in {"committed", "committed_cleanup_required"} and (
+                receipt is None
+                or receipt["cleanup_status"]
+                not in {"committed_cleanup_pending", "complete"}
+            ):
+                raise state.DeploymentStateError(
+                    f"transaction is not committed: {journal.root}"
+                )
+            if receipt is None:
+                journal.write_history_receipt("committed_cleanup_pending")
+                receipt = _read_receipt(journal)
+        elif receipt is None or receipt["cleanup_status"] not in {
+            "committed_cleanup_pending",
+            "complete",
+        }:
             raise state.DeploymentStateError(
                 f"transaction is not committed: {journal.root}"
             )
-        if receipt is None:
-            journal.write_history_receipt("committed_cleanup_pending")
-            receipt = _read_receipt(journal)
+        if state._lstat_optional(metadata) is None:
+            _write_cleanup_metadata(
+                journal,
+                "committed_cleanup_pending"
+                if receipt is None
+                else str(receipt["cleanup_status"]),
+            )
+        else:
+            state.TombstoneJournal.open_cleanup_metadata(
+                metadata, journal.deployment_identity_hash
+            )
         if journal.secret_companion_root is not None:
             state._remove_private_tree(journal.secret_companion_root)
-        if receipt is None or receipt["cleanup_status"] != "complete":
-            journal.write_history_receipt("complete")
-        tombstone = (
-            journal.history_receipt_path.parent
-            / f".{journal.transaction_id}.journal-cleanup"
-        )
-        if journal.root == tombstone:
-            state._remove_private_tree(journal.root)
-            return
-        if state._lstat_optional(tombstone) is not None:
-            raise state.DeploymentStateError(
-                f"committed cleanup tombstone already exists: {tombstone}"
-            )
-        os.replace(journal.root, tombstone)
-        state.fsync_directory(journal.root.parent)
-        state.fsync_directory(tombstone.parent)
+        if journal.root != tombstone:
+            if state._lstat_optional(tombstone) is not None:
+                raise state.DeploymentStateError(
+                    f"committed cleanup tombstone already exists: {tombstone}"
+                )
+            os.replace(journal.root, tombstone)
+            state.fsync_directory(journal.root.parent)
+            state.fsync_directory(tombstone.parent)
         state._remove_private_tree(tombstone)
+        _mark_receipt_complete(journal)
+        metadata_state = state._lstat_optional(metadata)
+        if metadata_state is not None:
+            if state._is_symlink(metadata_state) or not stat.S_ISREG(
+                metadata_state.st_mode
+            ):
+                raise state.DeploymentStateError(f"unsafe cleanup metadata: {metadata}")
+            metadata.unlink()
+            state.fsync_directory(metadata.parent)
     except Exception as exc:
-        if state._lstat_optional(journal.root) is not None:
+        if (
+            original_root.parent.name in {"transactions", "control-transactions"}
+            and state._lstat_optional(original_root) is not None
+        ):
             with contextlib.suppress(Exception):
                 journal.write_phase("committed_cleanup_required")
         if isinstance(exc, state.DeploymentStateError):

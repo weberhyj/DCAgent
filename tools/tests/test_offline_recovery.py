@@ -9,6 +9,7 @@ import stat
 import tempfile
 import unittest
 import uuid
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -436,7 +437,14 @@ class RecoveryClassificationTests(unittest.TestCase):
             active_path=str(active),
             object_type="file",
         )
-        self.assertEqual(recovery.classify_operation(publish), "not_executed")
+        with self.assertRaises(recovery.RecoveryConflict):
+            recovery.classify_operation(publish)
+        self.assertEqual(
+            recovery.classify_operation(
+                publish, secret_validator=lambda _path, _operation: True
+            ),
+            "not_executed",
+        )
         staging.replace(active)
         self.assertEqual(
             recovery.classify_operation(
@@ -520,6 +528,221 @@ class RecoveryExecutionTests(unittest.TestCase):
         return state.TransactionJournal.create(
             self.paths, self.identity_hash, ["secret", "env"], self.secret_parent
         )
+
+    def executed_rollback_case(
+        self, kind: str
+    ) -> tuple[
+        state.TransactionJournal, Callable[[], object], recovery.SecretValidator | None
+    ]:
+        journal = self.journal()
+        suffix = journal.transaction_id
+        validator = None
+        if kind == "mkdir":
+            path = self.base / f"mkdir-{suffix}"
+            journal.record_intent(
+                1,
+                {
+                    "kind": kind,
+                    "object_category": "secret",
+                    "path": str(path),
+                    "existed": False,
+                    "mode": 0o700,
+                },
+            )
+            path.mkdir(mode=0o700)
+            restore_before = path.rmdir
+        elif kind == "chmod":
+            path = self.base / f"chmod-{suffix}"
+            path.write_text("x", encoding="utf-8")
+            os.chmod(path, 0o600)
+            journal.record_intent(
+                1,
+                {
+                    "kind": kind,
+                    "object_category": "secret",
+                    "path": str(path),
+                    "before_mode": 0o600,
+                    "after_mode": 0o640,
+                    "object_type": "file",
+                },
+            )
+            os.chmod(path, 0o640)
+            restore_before = lambda: os.chmod(path, 0o600)
+        elif kind == "active_to_backup":
+            assert journal.secret_companion_root is not None
+            active = self.base / f"active-{suffix}"
+            backup = journal.secret_companion_root / "backup" / f"backup-{suffix}"
+            active.write_text("old", encoding="utf-8")
+            journal.record_intent(
+                1,
+                {
+                    "kind": kind,
+                    "object_category": "secret",
+                    "active_path": str(active),
+                    "backup_path": str(backup),
+                    "object_type": "file",
+                },
+            )
+            active.replace(backup)
+            restore_before = lambda: backup.replace(active)
+        elif kind == "staging_to_active":
+            assert journal.secret_companion_root is not None
+            staging = journal.secret_companion_root / "staging" / f"staging-{suffix}"
+            active = self.base / f"published-{suffix}"
+            staging.write_text("candidate", encoding="utf-8")
+            if os.name == "posix":
+                os.chmod(staging, 0o600)
+            journal.record_intent(
+                1,
+                {
+                    "kind": kind,
+                    "object_category": "secret",
+                    "staging_path": str(staging),
+                    "active_path": str(active),
+                    "object_type": "file",
+                },
+            )
+            staging.replace(active)
+            restore_before = lambda: active.replace(staging)
+            validator = lambda path, _operation: (
+                path.read_text(encoding="utf-8") == "candidate"
+            )
+        elif kind == "env_replace":
+            path = self.base / f"env-{suffix}"
+            before = b"A=before\n"
+            after = b"A=after\n"
+            path.write_bytes(before)
+            journal.persist_env_backup(path)
+            journal.record_intent(
+                1,
+                {
+                    "kind": kind,
+                    "object_category": "env",
+                    "env_path": str(path),
+                    "before_digest": hashlib.sha256(before).hexdigest(),
+                    "after_digest": hashlib.sha256(after).hexdigest(),
+                    "before_absent": False,
+                },
+            )
+            path.write_bytes(after)
+            restore_before = lambda: path.write_bytes(before)
+        elif kind == "unlink":
+            assert journal.secret_companion_root is not None
+            path = self.base / f"unlink-{suffix}"
+            backup_name = f"unlink-{suffix}"
+            backup = journal.secret_companion_root / "backup" / backup_name
+            path.write_text("old", encoding="utf-8")
+            if os.name == "posix":
+                os.chmod(path, 0o600)
+            journal.write_undo_manifest(
+                [
+                    state.UndoEntry(
+                        path=path,
+                        object_type="file",
+                        existed=True,
+                        original_mode=0o600 if os.name == "posix" else None,
+                        owner_uid=None,
+                        owner_gid=None,
+                        backup_name=backup_name,
+                        expected_action="unlink",
+                        before={"exists": True, "object_type": "file"},
+                        after={"exists": False, "object_type": "file"},
+                    )
+                ]
+            )
+            journal.record_intent(
+                1,
+                {
+                    "kind": kind,
+                    "object_category": "secret",
+                    "path": str(path),
+                    "object_type": "file",
+                },
+            )
+            path.replace(backup)
+            restore_before = lambda: backup.replace(path)
+        else:
+            raise AssertionError(f"unsupported rollback test kind: {kind}")
+        journal.record_done(1)
+        return journal, restore_before, validator
+
+    def test_done_before_state_without_rollback_intent_fails_closed_for_all_kinds(
+        self,
+    ) -> None:
+        for kind in state.OPERATION_KINDS:
+            if kind == "chmod" and os.name != "posix":
+                continue
+            with self.subTest(kind=kind):
+                journal, restore_before, validator = self.executed_rollback_case(kind)
+                restore_before()
+
+                with self.assertRaises(recovery.RecoveryConflict):
+                    recovery.resume_transaction_rollback(
+                        journal, secret_validator=validator
+                    )
+
+                self.assertEqual(journal.read_phase().phase, "rollback_failed")
+                self.assertEqual(journal.read_rollback_intents(), ())
+                self.assertTrue(journal.root.exists())
+
+    def test_done_after_state_records_intent_before_reversing_for_all_kinds(
+        self,
+    ) -> None:
+        for kind in state.OPERATION_KINDS:
+            if kind == "chmod" and os.name != "posix":
+                continue
+            with self.subTest(kind=kind):
+                journal, _restore_before, validator = self.executed_rollback_case(kind)
+                original_reverse = recovery.reverse_operation
+                saw_intent = False
+
+                def checked_reverse(
+                    current: state.TransactionJournal,
+                    operation: Mapping[str, object],
+                    *,
+                    secret_validator: recovery.SecretValidator | None = None,
+                    reverse: Callable[..., None] = original_reverse,
+                ) -> None:
+                    nonlocal saw_intent
+                    self.assertEqual(current.read_rollback_intents(), (1,))
+                    saw_intent = True
+                    reverse(
+                        current,
+                        operation,
+                        secret_validator=secret_validator,
+                    )
+
+                with mock.patch.object(
+                    recovery, "reverse_operation", side_effect=checked_reverse
+                ):
+                    recovery.resume_transaction_rollback(
+                        journal, secret_validator=validator
+                    )
+                self.assertTrue(saw_intent)
+                self.assertFalse(journal.root.exists())
+
+    def test_staging_before_state_requires_strict_validator_with_rollback_intent(
+        self,
+    ) -> None:
+        validators = (
+            None,
+            lambda _path, _operation: False,
+            lambda _path, _operation: (_ for _ in ()).throw(RuntimeError("CANARY")),
+        )
+        for validator in validators:
+            with self.subTest(validator=validator):
+                journal, restore_before, _valid = self.executed_rollback_case(
+                    "staging_to_active"
+                )
+                journal.record_rollback_intent(1)
+                restore_before()
+
+                with self.assertRaises(recovery.RecoveryConflict):
+                    recovery.resume_transaction_rollback(
+                        journal, secret_validator=validator
+                    )
+
+                self.assertEqual(journal.read_phase().phase, "rollback_failed")
 
     def test_env_rollback_uses_persisted_backup_and_removes_journal(self) -> None:
         journal = self.journal()
@@ -1140,6 +1363,147 @@ class RecoveryExecutionTests(unittest.TestCase):
             )
         recovery.finalize_committed_cleanup(tombstones[0])
         self.assertFalse(tombstone.exists())
+
+    def test_partial_tombstone_cleanup_has_external_resume_metadata(self) -> None:
+        journal = self.journal()
+        journal.write_phase("committed")
+
+        original_remove = state._remove_private_tree
+
+        def interrupt_after_rename(root: Path) -> None:
+            if root.name == f".{journal.transaction_id}.journal-cleanup":
+                for name in ("journal.json", "phase.json"):
+                    path = root / name
+                    if path.exists():
+                        path.unlink()
+                raise OSError("simulated interruption during tombstone cleanup")
+            original_remove(root)
+
+        with (
+            mock.patch.object(
+                state, "_remove_private_tree", side_effect=interrupt_after_rename
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.finalize_committed_cleanup(journal)
+
+        tombstone = journal.history_receipt_path.parent / (
+            f".{journal.transaction_id}.journal-cleanup"
+        )
+        metadata = journal.history_receipt_path.parent / (
+            f".{journal.transaction_id}.journal-cleanup.json"
+        )
+        self.assertTrue(tombstone.exists())
+        self.assertTrue(metadata.exists())
+        metadata_payload = json.loads(metadata.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(metadata_payload),
+            {
+                "schema_version",
+                "transaction_id",
+                "deployment_identity_hash",
+                "object_categories",
+                "cleanup_status",
+                "tombstone_path",
+                "secret_companion_root",
+                "control",
+            },
+        )
+        self.assertNotIn("CANARY", metadata.read_text(encoding="utf-8"))
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(os.lstat(metadata).st_mode), 0o600)
+
+        reopened_paths = state.StatePaths(self.paths.root)
+        try:
+            found = state.scan_transaction_journals(
+                reopened_paths, self.secret_parent, self.identity_hash
+            )
+        except state.DeploymentStateError as exc:
+            self.fail(f"partial cleanup tombstone was not resumable: {exc}")
+        tombstones = [item for item in found if item.root == tombstone]
+        self.assertEqual(len(tombstones), 1)
+        with self.assertRaises(state.DeploymentStateError):
+            state.assert_no_incomplete_transactions(
+                reopened_paths,
+                expected_identity_hash=self.identity_hash,
+                secret_companion_root=self.secret_parent,
+            )
+
+        recovery.finalize_committed_cleanup(tombstones[0])
+        self.assertFalse(tombstone.exists())
+        self.assertFalse(metadata.exists())
+        receipt = json.loads(journal.history_receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["cleanup_status"], "complete")
+
+    def test_complete_receipt_with_partial_tombstone_is_idempotently_cleaned(
+        self,
+    ) -> None:
+        journal = self.journal()
+        journal.write_phase("committed")
+        original_remove = state._remove_private_tree
+
+        def interrupt_after_rename(root: Path) -> None:
+            if root.name == f".{journal.transaction_id}.journal-cleanup":
+                (root / "operations.json").unlink()
+                raise OSError("simulated cleanup interruption")
+            original_remove(root)
+
+        with (
+            mock.patch.object(
+                state, "_remove_private_tree", side_effect=interrupt_after_rename
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.finalize_committed_cleanup(journal)
+
+        receipt = json.loads(journal.history_receipt_path.read_text(encoding="utf-8"))
+        receipt["cleanup_status"] = "complete"
+        receipt["completed_at"] = state.utc_now()
+        state.atomic_write_json(journal.history_receipt_path, receipt)
+        found = state.scan_transaction_journals(
+            state.StatePaths(self.paths.root), self.secret_parent, self.identity_hash
+        )
+        cleanup = [
+            item for item in found if item.transaction_id == journal.transaction_id
+        ]
+        self.assertEqual(len(cleanup), 1)
+
+        recovery.finalize_committed_cleanup(cleanup[0])
+        recovery.finalize_committed_cleanup(journal)
+        tombstone, metadata = recovery._cleanup_paths(journal)
+        self.assertFalse(tombstone.exists())
+        self.assertFalse(metadata.exists())
+
+    def test_cleanup_metadata_identity_mismatch_fails_closed(self) -> None:
+        journal = self.journal()
+        journal.write_phase("committed")
+        original_remove = state._remove_private_tree
+
+        def interrupt_after_rename(root: Path) -> None:
+            if root.name == f".{journal.transaction_id}.journal-cleanup":
+                (root / "rollback.json").unlink()
+                raise OSError("simulated cleanup interruption")
+            original_remove(root)
+
+        with (
+            mock.patch.object(
+                state, "_remove_private_tree", side_effect=interrupt_after_rename
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.finalize_committed_cleanup(journal)
+
+        _tombstone, metadata = recovery._cleanup_paths(journal)
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        payload["deployment_identity_hash"] = "d" * 64
+        state.atomic_write_json(metadata, payload)
+
+        with self.assertRaises(state.DeploymentStateError):
+            state.scan_transaction_journals(
+                state.StatePaths(self.paths.root),
+                self.secret_parent,
+                self.identity_hash,
+            )
 
     def test_corrupt_cleanup_tombstone_fails_closed(self) -> None:
         journal = self.journal()
