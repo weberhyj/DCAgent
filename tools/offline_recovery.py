@@ -497,12 +497,119 @@ def _rollback_order(operation: Mapping[str, object]) -> tuple[int, int, int]:
     return priority, depth, -sequence if type(sequence) is int else 0
 
 
+def _rollback_cleanup_paths(
+    journal: state.TransactionJournal | state.RollbackTombstoneJournal,
+) -> tuple[Path, Path]:
+    history = journal.history_receipt_path.parent
+    return (
+        history / f".{journal.transaction_id}.rollback-cleanup",
+        history / f".{journal.transaction_id}.rollback-cleanup.json",
+    )
+
+
+def _write_rollback_cleanup_metadata(
+    journal: state.TransactionJournal | state.RollbackTombstoneJournal,
+) -> None:
+    tombstone, metadata = _rollback_cleanup_paths(journal)
+    state.atomic_write_json(
+        metadata,
+        {
+            "schema_version": state.SCHEMA_VERSION,
+            "transaction_id": journal.transaction_id,
+            "deployment_identity_hash": journal.deployment_identity_hash,
+            "object_categories": list(journal.object_categories),
+            "cleanup_status": "rollback_complete",
+            "tombstone_path": tombstone.as_posix(),
+            "secret_companion_root": (
+                None
+                if journal.secret_companion_root is None
+                else journal.secret_companion_root.as_posix()
+            ),
+            "control": journal.control,
+        },
+    )
+
+
+def finalize_rollback_cleanup(
+    journal: state.TransactionJournal | state.RollbackTombstoneJournal,
+) -> None:
+    """Idempotently remove a durably completed rollback journal."""
+    original_root = journal.root
+    tombstone, metadata = _rollback_cleanup_paths(journal)
+    try:
+        root_exists = state._lstat_optional(journal.root) is not None
+        if not root_exists and not isinstance(journal, state.RollbackTombstoneJournal):
+            if state._lstat_optional(metadata) is not None:
+                reopened = state.RollbackTombstoneJournal.open_cleanup_metadata(
+                    metadata,
+                    journal.deployment_identity_hash,
+                    journal.secret_companion_parent,
+                )
+                finalize_rollback_cleanup(reopened)
+                return
+            if state._lstat_optional(tombstone) is not None:
+                raise state.DeploymentStateError(
+                    f"rollback cleanup tombstone has no metadata: {tombstone}"
+                )
+            return
+        if not isinstance(journal, state.RollbackTombstoneJournal):
+            phase = journal.read_phase().phase
+            if phase not in {"rollback_complete", "rollback_cleanup_required"}:
+                raise state.DeploymentStateError(
+                    f"transaction rollback is not complete: {journal.root}"
+                )
+        if state._lstat_optional(metadata) is None:
+            _write_rollback_cleanup_metadata(journal)
+        else:
+            state.RollbackTombstoneJournal.open_cleanup_metadata(
+                metadata,
+                journal.deployment_identity_hash,
+                journal.secret_companion_parent,
+            )
+        if journal.secret_companion_root is not None:
+            state._remove_private_tree(journal.secret_companion_root)
+        if journal.root != tombstone:
+            if state._lstat_optional(tombstone) is not None:
+                raise state.DeploymentStateError(
+                    f"rollback cleanup tombstone already exists: {tombstone}"
+                )
+            os.replace(journal.root, tombstone)
+            state.fsync_directory(journal.root.parent)
+            state.fsync_directory(tombstone.parent)
+        state._remove_private_tree(tombstone)
+        metadata_state = state._lstat_optional(metadata)
+        if metadata_state is not None:
+            if state._is_symlink(metadata_state) or not stat.S_ISREG(
+                metadata_state.st_mode
+            ):
+                raise state.DeploymentStateError(
+                    f"unsafe rollback cleanup metadata: {metadata}"
+                )
+            metadata.unlink()
+            state.fsync_directory(metadata.parent)
+    except Exception as exc:
+        if (
+            original_root.parent.name in {"transactions", "control-transactions"}
+            and state._lstat_optional(original_root) is not None
+        ):
+            with contextlib.suppress(Exception):
+                journal.write_phase("rollback_cleanup_required")
+        if isinstance(exc, state.DeploymentStateError):
+            raise
+        raise state.DeploymentStateError(
+            f"rollback cleanup failed at transaction journal: {journal.root}"
+        ) from None
+
+
 def resume_transaction_rollback(
-    journal: state.TransactionJournal,
+    journal: state.TransactionJournal | state.RollbackTombstoneJournal,
     *,
     secret_validator: SecretValidator | None = None,
 ) -> None:
     """Resume a pre-commit rollback and remove all transaction material on success."""
+    if isinstance(journal, state.RollbackTombstoneJournal):
+        finalize_rollback_cleanup(journal)
+        return
     phase = journal.read_phase().phase
     if phase in {"committed", "committed_cleanup_required"}:
         raise state.DeploymentStateError(
@@ -512,6 +619,9 @@ def resume_transaction_rollback(
         raise state.DeploymentStateError(
             f"rollback requires manual recovery: {journal.root}"
         )
+    if phase in {"rollback_complete", "rollback_cleanup_required"}:
+        finalize_rollback_cleanup(journal)
+        return
     try:
         journal.write_phase("rollback_in_progress")
         completed = set(journal._read_rollback_done())
@@ -550,9 +660,7 @@ def resume_transaction_rollback(
                 raise _conflict(operation)
             journal.record_rollback_done(sequence)
             completed.add(sequence)
-        if journal.secret_companion_root is not None:
-            state._remove_private_tree(journal.secret_companion_root)
-        state._remove_private_tree(journal.root)
+        journal.write_phase("rollback_complete")
     except Exception as exc:
         with contextlib.suppress(Exception):
             journal.write_phase("rollback_failed")
@@ -561,6 +669,7 @@ def resume_transaction_rollback(
         raise state.DeploymentStateError(
             f"rollback failed at transaction journal: {journal.root}"
         ) from None
+    finalize_rollback_cleanup(journal)
 
 
 def _read_receipt(journal: state.TransactionJournal) -> Mapping[str, object] | None:

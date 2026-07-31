@@ -42,6 +42,8 @@ TRANSACTION_PHASES = (
     "committed",
     "committed_cleanup_required",
     "rollback_in_progress",
+    "rollback_complete",
+    "rollback_cleanup_required",
     "rollback_failed",
 )
 OPERATION_KINDS = (
@@ -62,6 +64,8 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SAFE_CATEGORY = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _CLEANUP_TOMBSTONE = re.compile(r"^\.([0-9a-f]{32})\.journal-cleanup$")
 _CLEANUP_TOMBSTONE_METADATA = re.compile(r"^\.([0-9a-f]{32})\.journal-cleanup\.json$")
+_ROLLBACK_TOMBSTONE = re.compile(r"^\.([0-9a-f]{32})\.rollback-cleanup$")
+_ROLLBACK_TOMBSTONE_METADATA = re.compile(r"^\.([0-9a-f]{32})\.rollback-cleanup\.json$")
 _HISTORY_RECEIPT = re.compile(r"^([0-9a-f]{32})\.json$")
 _ATOMIC_TEMP = re.compile(r"^\.(?P<target>.+)\.(?P<nonce>[a-z0-9_]{8})\.tmp$")
 _SAFE_METADATA_KEYS = frozenset(
@@ -635,6 +639,7 @@ def _history_temp_transaction_id(target: str) -> str | None:
     for pattern in (
         _HISTORY_RECEIPT,
         _CLEANUP_TOMBSTONE_METADATA,
+        _ROLLBACK_TOMBSTONE_METADATA,
     ):
         match = pattern.fullmatch(target)
         if match is not None:
@@ -1380,7 +1385,12 @@ class TransactionJournal:
             receipt is not None
             and receipt["cleanup_status"] in {"committed_cleanup_pending", "complete"}
         ) or (
-            phase.phase == "rollback_in_progress"
+            phase.phase
+            in {
+                "rollback_in_progress",
+                "rollback_complete",
+                "rollback_cleanup_required",
+            }
             and {operation["sequence"] for operation in operations}
             <= set(rollback_done)
         )
@@ -1706,6 +1716,8 @@ class TransactionJournal:
                 "committed",
                 "committed_cleanup_required",
                 "rollback_in_progress",
+                "rollback_complete",
+                "rollback_cleanup_required",
                 "rollback_failed",
             }
             or len(entries) != len(operations) + 1
@@ -2249,6 +2261,107 @@ class TombstoneJournal(TransactionJournal):
         return journal
 
 
+@dataclasses.dataclass
+class RollbackTombstoneJournal(TransactionJournal):
+    """Rollback cleanup reconstructed from authoritative external metadata."""
+
+    cleanup_metadata_path: Path = dataclasses.field(init=False)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.cleanup_metadata_path = self.root.parent / (
+            f".{self.transaction_id}.rollback-cleanup.json"
+        )
+
+    @classmethod
+    def open_cleanup_metadata(
+        cls,
+        metadata_path: str | Path,
+        expected_identity_hash: str,
+        authoritative_companion_parent: str | Path | None,
+    ) -> RollbackTombstoneJournal:
+        path = Path(metadata_path)
+        expected_hash = _validate_identity_hash(expected_identity_hash)
+        _verify_directory(path.parent, "history directory")
+        _verify_directory(path.parent.parent, "state root")
+        match = _ROLLBACK_TOMBSTONE_METADATA.fullmatch(path.name)
+        if match is None:
+            raise DeploymentStateError(f"invalid rollback cleanup metadata: {path}")
+        transaction_id = _validate_uuid4_hex(match.group(1))
+        payload = _read_json_value(path, "rollback cleanup metadata")
+        required = {
+            "schema_version",
+            "transaction_id",
+            "deployment_identity_hash",
+            "object_categories",
+            "cleanup_status",
+            "tombstone_path",
+            "secret_companion_root",
+            "control",
+        }
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != required
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != SCHEMA_VERSION
+            or payload["transaction_id"] != transaction_id
+            or payload["deployment_identity_hash"] != expected_hash
+            or not isinstance(payload["object_categories"], list)
+            or payload["cleanup_status"] != "rollback_complete"
+            or type(payload["control"]) is not bool
+        ):
+            raise DeploymentStateError(f"invalid rollback cleanup metadata: {path}")
+        tombstone = _validate_abs_path(
+            payload["tombstone_path"], "rollback cleanup tombstone"
+        )
+        expected_tombstone = path.parent / f".{transaction_id}.rollback-cleanup"
+        if tombstone != expected_tombstone:
+            raise DeploymentStateError(f"invalid rollback cleanup metadata: {path}")
+        control = payload["control"]
+        companion_value = payload["secret_companion_root"]
+        if control:
+            if companion_value is not None:
+                raise DeploymentStateError(f"invalid rollback cleanup metadata: {path}")
+            companion = None
+        else:
+            if authoritative_companion_parent is None:
+                raise DeploymentStateError("rollback companion authority is required")
+            companion_parent = _validate_abs_path(
+                authoritative_companion_parent, "rollback companion parent"
+            )
+            if companion_parent.name != ".dcagent-transactions":
+                raise DeploymentStateError("invalid rollback companion parent")
+            companion = _validate_abs_path(
+                companion_value, "rollback secret companion root"
+            )
+            if (
+                companion.name != transaction_id
+                or companion.parent.name != ".dcagent-transactions"
+                or companion != companion_parent / transaction_id
+            ):
+                raise DeploymentStateError(f"invalid rollback cleanup metadata: {path}")
+        journal = cls(
+            tombstone,
+            transaction_id,
+            expected_hash,
+            companion,
+            tuple(payload["object_categories"]),
+            control,
+        )
+        tombstone_state = _lstat_optional(tombstone)
+        if tombstone_state is not None:
+            if _is_symlink(tombstone_state) or not stat.S_ISDIR(
+                tombstone_state.st_mode
+            ):
+                raise DeploymentStateError(
+                    f"unsafe rollback cleanup tombstone: {tombstone}"
+                )
+            _require_owner_and_mode(
+                tombstone, tombstone_state, 0o700, "rollback cleanup tombstone"
+            )
+        return journal
+
+
 def utc_now() -> str:
     return (
         dt.datetime.now(dt.UTC)
@@ -2698,7 +2811,7 @@ def scan_transaction_journals(
     paths: StatePaths,
     secret_companion_root: str | Path,
     expected_identity_hash: str,
-) -> tuple[TransactionJournal | TombstoneJournal, ...]:
+) -> tuple[TransactionJournal | TombstoneJournal | RollbackTombstoneJournal, ...]:
     """Validate both journal namespaces and normal companion links fail-closed."""
     _verify_state_root(paths)
     expected_hash = _validate_identity_hash(expected_identity_hash)
@@ -2709,7 +2822,9 @@ def scan_transaction_journals(
         raise DeploymentStateError(
             "secret companion root must be .dcagent-transactions"
         )
-    journals: list[TransactionJournal | TombstoneJournal] = []
+    journals: list[
+        TransactionJournal | TombstoneJournal | RollbackTombstoneJournal
+    ] = []
     normal_ids: set[str] = set()
     seen_ids: set[str] = set()
     for directory, control in (
@@ -2756,6 +2871,8 @@ def scan_transaction_journals(
             _HISTORY_RECEIPT,
             _CLEANUP_TOMBSTONE,
             _CLEANUP_TOMBSTONE_METADATA,
+            _ROLLBACK_TOMBSTONE,
+            _ROLLBACK_TOMBSTONE_METADATA,
         ):
             match = pattern.fullmatch(entry.name)
             if match is not None:
@@ -2784,6 +2901,42 @@ def scan_transaction_journals(
             raise DeploymentStateError(
                 f"cannot inspect history directory: {paths.history}"
             ) from exc
+    rollback_metadata: dict[str, RollbackTombstoneJournal] = {}
+    for entry in sorted(history_entries, key=lambda item: item.name):
+        match = _ROLLBACK_TOMBSTONE_METADATA.fullmatch(entry.name)
+        if match is None:
+            continue
+        journal = RollbackTombstoneJournal.open_cleanup_metadata(
+            entry.path, expected_hash, companion_parent
+        )
+        transaction_id = journal.transaction_id
+        if transaction_id in rollback_metadata:
+            raise DeploymentStateError(
+                f"duplicate rollback cleanup metadata: {journal.root}"
+            )
+        rollback_metadata[transaction_id] = journal
+        if transaction_id in seen_ids:
+            active = next(
+                item for item in journals if item.transaction_id == transaction_id
+            )
+            if (
+                active.deployment_identity_hash != journal.deployment_identity_hash
+                or active.object_categories != journal.object_categories
+                or active.control != journal.control
+                or active.secret_companion_root != journal.secret_companion_root
+                or _lstat_optional(journal.root) is not None
+                or not isinstance(active, TransactionJournal)
+                or active.read_phase().phase
+                not in {"rollback_complete", "rollback_cleanup_required"}
+            ):
+                raise DeploymentStateError(
+                    f"duplicate rollback transaction state: {journal.root}"
+                )
+            continue
+        seen_ids.add(transaction_id)
+        if not journal.control:
+            normal_ids.add(transaction_id)
+        journals.append(journal)
     cleanup_metadata: dict[str, TombstoneJournal] = {}
     for entry in sorted(history_entries, key=lambda item: item.name):
         match = _CLEANUP_TOMBSTONE_METADATA.fullmatch(entry.name)
@@ -2793,6 +2946,8 @@ def scan_transaction_journals(
             entry.path, expected_hash, companion_parent
         )
         transaction_id = journal.transaction_id
+        if transaction_id in rollback_metadata:
+            raise DeploymentStateError(f"conflicting cleanup metadata: {journal.root}")
         if transaction_id in cleanup_metadata:
             raise DeploymentStateError(f"duplicate cleanup metadata: {journal.root}")
         cleanup_metadata[transaction_id] = journal
@@ -2817,12 +2972,24 @@ def scan_transaction_journals(
         journals.append(journal)
 
     for entry in sorted(history_entries, key=lambda item: item.name):
+        rollback_match = _ROLLBACK_TOMBSTONE.fullmatch(entry.name)
+        if rollback_match is not None:
+            transaction_id = _validate_uuid4_hex(rollback_match.group(1))
+            if transaction_id not in rollback_metadata:
+                raise DeploymentStateError(
+                    f"rollback cleanup tombstone has no metadata: {Path(entry.path)}"
+                )
+            continue
         match = _CLEANUP_TOMBSTONE.fullmatch(entry.name)
         if match is None:
             if (
                 entry.name.startswith(".")
-                and ".journal-cleanup" in entry.name
+                and (
+                    ".journal-cleanup" in entry.name
+                    or ".rollback-cleanup" in entry.name
+                )
                 and _CLEANUP_TOMBSTONE_METADATA.fullmatch(entry.name) is None
+                and _ROLLBACK_TOMBSTONE_METADATA.fullmatch(entry.name) is None
             ):
                 raise DeploymentStateError(
                     f"invalid cleanup tombstone: {Path(entry.path)}"
@@ -2906,6 +3073,8 @@ def assert_no_incomplete_transactions(
         if entry.name.startswith(".") and (
             entry.name.endswith(".journal-cleanup")
             or entry.name.endswith(".journal-cleanup.json")
+            or entry.name.endswith(".rollback-cleanup")
+            or entry.name.endswith(".rollback-cleanup.json")
             or entry.name.endswith(".tmp")
         ):
             raise DeploymentStateError(

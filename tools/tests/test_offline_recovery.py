@@ -1859,6 +1859,199 @@ class RecoveryExecutionTests(unittest.TestCase):
         recovery.resume_transaction_rollback(reopened)
         self.assertFalse(journal.root.exists())
 
+    def test_rollback_cleanup_uses_external_metadata_before_rename(self) -> None:
+        journal, _restore_before, validator = self.executed_rollback_case("mkdir")
+        assert journal.secret_companion_root is not None
+        original_remove = state._remove_private_tree
+
+        def interrupt_after_companion(root: Path) -> None:
+            if root == journal.secret_companion_root:
+                original_remove(root)
+                raise OSError("simulated rollback cleanup interruption")
+            original_remove(root)
+
+        with (
+            mock.patch.object(
+                state, "_remove_private_tree", side_effect=interrupt_after_companion
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.resume_transaction_rollback(journal, secret_validator=validator)
+
+        self.assertIn(
+            journal.read_phase().phase,
+            {"rollback_complete", "rollback_cleanup_required"},
+        )
+        metadata = self.paths.history / (
+            f".{journal.transaction_id}.rollback-cleanup.json"
+        )
+        self.assertTrue(metadata.exists())
+        found = state.scan_transaction_journals(
+            self.paths, self.secret_parent, self.identity_hash
+        )
+        reopened = next(
+            item for item in found if item.transaction_id == journal.transaction_id
+        )
+        recovery.resume_transaction_rollback(reopened, secret_validator=validator)
+        self.assertFalse(journal.root.exists())
+        self.assertFalse(metadata.exists())
+
+    def test_rollback_cleanup_resumes_after_renamed_tombstone_interrupt(self) -> None:
+        journal, _restore_before, validator = self.executed_rollback_case("mkdir")
+        original_remove = state._remove_private_tree
+        tombstone_name = f".{journal.transaction_id}.rollback-cleanup"
+
+        def interrupt_after_rename(root: Path) -> None:
+            if root.name == tombstone_name:
+                raise OSError("simulated rollback tombstone interruption")
+            original_remove(root)
+
+        with (
+            mock.patch.object(
+                state, "_remove_private_tree", side_effect=interrupt_after_rename
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.resume_transaction_rollback(journal, secret_validator=validator)
+
+        tombstone = self.paths.history / tombstone_name
+        metadata = self.paths.history / f"{tombstone_name}.json"
+        self.assertTrue(tombstone.exists())
+        self.assertTrue(metadata.exists())
+        found = state.scan_transaction_journals(
+            self.paths, self.secret_parent, self.identity_hash
+        )
+        reopened = next(
+            item for item in found if item.transaction_id == journal.transaction_id
+        )
+        recovery.resume_transaction_rollback(reopened, secret_validator=validator)
+        self.assertFalse(tombstone.exists())
+        self.assertFalse(metadata.exists())
+
+    def test_scan_rejects_conflicting_commit_and_rollback_cleanup_metadata(
+        self,
+    ) -> None:
+        journal = self.journal()
+        journal.write_phase("rollback_complete")
+        recovery._write_rollback_cleanup_metadata(journal)
+        state.atomic_write_json(
+            journal.history_receipt_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": journal.transaction_id,
+                "completed_at": state.utc_now(),
+                "final_phase": "committed",
+                "cleanup_status": "complete",
+                "deployment_identity_hash": journal.deployment_identity_hash,
+                "object_categories": list(journal.object_categories),
+            },
+        )
+        recovery._write_cleanup_metadata(journal, "complete")
+
+        with self.assertRaises(state.DeploymentStateError):
+            state.scan_transaction_journals(
+                self.paths, self.secret_parent, self.identity_hash
+            )
+
+    def test_partial_rollback_tombstone_cleanup_is_resumable(self) -> None:
+        journal, _restore_before, validator = self.executed_rollback_case("mkdir")
+        original_remove = state._remove_private_tree
+        tombstone_name = f".{journal.transaction_id}.rollback-cleanup"
+
+        def interrupt_partial_tombstone(root: Path) -> None:
+            if root.name == tombstone_name:
+                (root / "journal.json").unlink()
+                (root / "phase.json").unlink()
+                raise OSError("simulated partial rollback tombstone deletion")
+            original_remove(root)
+
+        with (
+            mock.patch.object(
+                state, "_remove_private_tree", side_effect=interrupt_partial_tombstone
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.resume_transaction_rollback(journal, secret_validator=validator)
+
+        tombstone = self.paths.history / tombstone_name
+        metadata = self.paths.history / f"{tombstone_name}.json"
+        self.assertTrue(tombstone.exists())
+        self.assertTrue(metadata.exists())
+        found = state.scan_transaction_journals(
+            self.paths, self.secret_parent, self.identity_hash
+        )
+        reopened = next(
+            item for item in found if item.transaction_id == journal.transaction_id
+        )
+        recovery.resume_transaction_rollback(reopened, secret_validator=validator)
+        self.assertFalse(tombstone.exists())
+        self.assertFalse(metadata.exists())
+
+    def test_metadata_only_rollback_cleanup_is_resumable(self) -> None:
+        journal, _restore_before, validator = self.executed_rollback_case("mkdir")
+        tombstone, metadata = recovery._rollback_cleanup_paths(journal)
+        original_unlink = Path.unlink
+
+        def interrupt_metadata_unlink(path: Path, missing_ok: bool = False) -> None:
+            if path == metadata:
+                raise OSError("simulated rollback metadata deletion interruption")
+            original_unlink(path, missing_ok=missing_ok)
+
+        with (
+            mock.patch.object(Path, "unlink", interrupt_metadata_unlink),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.resume_transaction_rollback(journal, secret_validator=validator)
+
+        self.assertFalse(journal.root.exists())
+        self.assertFalse(tombstone.exists())
+        self.assertTrue(metadata.exists())
+        found = state.scan_transaction_journals(
+            self.paths, self.secret_parent, self.identity_hash
+        )
+        reopened = next(
+            item for item in found if item.transaction_id == journal.transaction_id
+        )
+        recovery.resume_transaction_rollback(reopened, secret_validator=validator)
+        self.assertFalse(metadata.exists())
+
+    def test_rollback_cleanup_metadata_companion_is_bound_to_scan_authority(
+        self,
+    ) -> None:
+        journal, _restore_before, validator = self.executed_rollback_case("mkdir")
+        original_remove = state._remove_private_tree
+        tombstone_name = f".{journal.transaction_id}.rollback-cleanup"
+
+        def interrupt_after_rename(root: Path) -> None:
+            if root.name == tombstone_name:
+                raise OSError("simulated rollback cleanup interruption")
+            original_remove(root)
+
+        with (
+            mock.patch.object(
+                state, "_remove_private_tree", side_effect=interrupt_after_rename
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.resume_transaction_rollback(journal, secret_validator=validator)
+
+        outside_parent = self.base / "outside" / ".dcagent-transactions"
+        outside_companion = outside_parent / journal.transaction_id
+        (outside_companion / "backup").mkdir(parents=True, mode=0o700)
+        (outside_companion / "staging").mkdir(mode=0o700)
+        canary = outside_companion / "backup" / "CANARY"
+        canary.write_text("must survive", encoding="utf-8")
+        _tombstone, metadata = recovery._rollback_cleanup_paths(journal)
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        payload["secret_companion_root"] = outside_companion.as_posix()
+        state.atomic_write_json(metadata, payload)
+
+        with self.assertRaises(state.DeploymentStateError):
+            state.scan_transaction_journals(
+                self.paths, self.secret_parent, self.identity_hash
+            )
+        self.assertTrue(canary.exists())
+
     def test_rollback_intent_recovery_accepts_before_state_for_all_kinds(self) -> None:
         # mkdir: rollback completed before the process died.
         journal = self.journal()
