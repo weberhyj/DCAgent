@@ -52,6 +52,13 @@ class FilesystemMutationBackend(Protocol):
         expected_source: os.stat_result,
     ) -> None: ...
 
+    def unlink(
+        self,
+        path: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None: ...
+
     def restore_environment(
         self,
         journal: state.TransactionJournal,
@@ -221,6 +228,21 @@ class PosixFilesystemMutationBackend:
         finally:
             if fd is not None:
                 os.close(fd)
+            os.close(parent_fd)
+
+    def unlink(
+        self,
+        path: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        parent_fd = self._open_parent(path.parent)
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            self._verify_source(current, expected_source)
+            os.unlink(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
             os.close(parent_fd)
 
     def _after_env_rollback_step(self, step: str) -> None:
@@ -1127,6 +1149,21 @@ def _restore_environment(
         raise _conflict(operation) from None
 
 
+def _unlink(
+    backend: FilesystemMutationBackend | None,
+    path: Path,
+    expected_source: os.stat_result,
+    operation: Mapping[str, object],
+) -> None:
+    try:
+        _filesystem_mutations(backend).unlink(
+            path,
+            expected_source=expected_source,
+        )
+    except (OSError, AttributeError, state.DeploymentStateError):
+        raise _conflict(operation) from None
+
+
 def _operation_label(operation: Mapping[str, object]) -> str:
     kind = operation.get("kind", "unknown")
     sequence = operation.get("sequence", "unknown")
@@ -1229,6 +1266,179 @@ def _regular_digest(path: Path, operation: Mapping[str, object]) -> str:
         return digest.hexdigest()
     except OSError:
         raise _conflict(operation) from None
+
+
+def _forward_file_snapshot(
+    path: Path, operation: Mapping[str, object]
+) -> tuple[os.stat_result, str] | None:
+    before = _lstat(path, operation)
+    if before is None:
+        return None
+    if state._is_symlink(before) or not stat.S_ISREG(before.st_mode):
+        raise _conflict(operation)
+    digest = _regular_digest(path, operation)
+    after = _lstat(path, operation)
+    if after is None or not _same_identity(before, after):
+        raise _conflict(operation)
+    return after, digest
+
+
+def _forward_identity(
+    payload: Mapping[str, object], prefix: str
+) -> tuple[int, int] | None:
+    device = payload[f"{prefix}_device"]
+    inode = payload[f"{prefix}_inode"]
+    if device is None and inode is None:
+        return None
+    if type(device) is not int or type(inode) is not int:
+        raise state.DeploymentStateError("invalid forward environment identity")
+    return device, inode
+
+
+def _forward_snapshot_matches(
+    snapshot: tuple[os.stat_result, str] | None,
+    identity: tuple[int, int] | None,
+    digest: object,
+    operation: Mapping[str, object],
+    *,
+    mode_field: str,
+    uid_field: str,
+    gid_field: str,
+) -> bool:
+    if snapshot is None or identity is None or not isinstance(digest, str):
+        return False
+    observed, observed_digest = snapshot
+    return (
+        (observed.st_dev, observed.st_ino) == identity
+        and observed_digest == digest
+        and _authority_matches(
+            observed,
+            operation,
+            mode_field=mode_field,
+            uid_field=uid_field,
+            gid_field=gid_field,
+        )
+    )
+
+
+def _resume_forward_environment(
+    journal: state.TransactionJournal,
+    *,
+    mutation_backend: FilesystemMutationBackend | None,
+) -> None:
+    payload = journal.read_forward_environment_state()
+    if payload is None:
+        return
+    operations = {
+        operation["sequence"]: operation for operation in journal.read_operations()
+    }
+    operation = operations.get(payload["sequence"])
+    if operation is None or operation.get("kind") != "env_replace":
+        raise state.DeploymentStateError("invalid forward environment operation")
+    env_path = _path(operation, "env_path")
+    candidate_path = state._validate_abs_path(
+        payload["candidate_path"], "forward environment candidate"
+    )
+    env_snapshot = _forward_file_snapshot(env_path, operation)
+    candidate_snapshot = _forward_file_snapshot(candidate_path, operation)
+    source_identity = _forward_identity(payload, "source")
+    candidate_identity = _forward_identity(payload, "candidate")
+    before_absent = operation["before_absent"] is True
+    if before_absent:
+        env_before = env_snapshot is None
+    elif source_identity is None:
+        env_before = (
+            env_snapshot is not None
+            and env_snapshot[1] == operation["before_digest"]
+            and _authority_matches(
+                env_snapshot[0],
+                operation,
+                mode_field="before_mode",
+                uid_field="before_owner_uid",
+                gid_field="before_owner_gid",
+            )
+        )
+    else:
+        env_before = _forward_snapshot_matches(
+            env_snapshot,
+            source_identity,
+            operation["before_digest"],
+            operation,
+            mode_field="before_mode",
+            uid_field="before_owner_uid",
+            gid_field="before_owner_gid",
+        )
+    env_after = _forward_snapshot_matches(
+        env_snapshot,
+        candidate_identity,
+        operation["after_digest"],
+        operation,
+        mode_field="after_mode",
+        uid_field="after_owner_uid",
+        gid_field="after_owner_gid",
+    )
+    candidate_after = _forward_snapshot_matches(
+        candidate_snapshot,
+        candidate_identity,
+        operation["after_digest"],
+        operation,
+        mode_field="after_mode",
+        uid_field="after_owner_uid",
+        gid_field="after_owner_gid",
+    )
+    candidate_before = _forward_snapshot_matches(
+        candidate_snapshot,
+        source_identity,
+        operation["before_digest"],
+        operation,
+        mode_field="before_mode",
+        uid_field="before_owner_uid",
+        gid_field="before_owner_gid",
+    )
+    phase = payload["phase"]
+    candidate_to_remove: os.stat_result | None = None
+    if phase == "preparing":
+        if not env_before:
+            raise _conflict(operation)
+        if candidate_snapshot is not None:
+            observed, digest = candidate_snapshot
+            if digest != operation["after_digest"] or not _authority_matches(
+                observed,
+                operation,
+                mode_field="after_mode",
+                uid_field="after_owner_uid",
+                gid_field="after_owner_gid",
+            ):
+                raise _conflict(operation)
+            candidate_to_remove = observed
+    elif phase == "candidate_ready":
+        if not env_before or not (candidate_after or candidate_snapshot is None):
+            raise _conflict(operation)
+        if candidate_after:
+            assert candidate_snapshot is not None
+            candidate_to_remove = candidate_snapshot[0]
+    elif phase in {"publish_pending", "applied"}:
+        pre_state = env_before and (candidate_after or candidate_snapshot is None)
+        post_state = env_after and (
+            candidate_snapshot is None or (not before_absent and candidate_before)
+        )
+        if phase == "applied" and not post_state or not (pre_state or post_state):
+            raise _conflict(operation)
+        if candidate_snapshot is not None:
+            if pre_state and candidate_after or post_state and candidate_before:
+                candidate_to_remove = candidate_snapshot[0]
+            else:
+                raise _conflict(operation)
+    else:
+        raise _conflict(operation)
+    if candidate_to_remove is not None:
+        _unlink(
+            mutation_backend,
+            candidate_path,
+            candidate_to_remove,
+            operation,
+        )
+    journal.clear_forward_environment_state()
 
 
 def _classify_intent(
@@ -1841,6 +2051,7 @@ def resume_transaction_rollback(
         return
     try:
         journal.write_phase("rollback_in_progress")
+        _resume_forward_environment(journal, mutation_backend=mutation_backend)
         completed = set(journal._read_rollback_done())
         rollback_intents = set(journal._read_rollback_intents())
         operations = sorted(journal.read_operations(), key=_rollback_order)

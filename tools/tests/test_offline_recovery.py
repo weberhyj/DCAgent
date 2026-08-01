@@ -124,6 +124,15 @@ class PortableMutationBackend:
         self._assert_identity(path, expected_source)
         os.chmod(path, mode)
 
+    def unlink(
+        self,
+        path: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        self._assert_identity(path, expected_source)
+        path.unlink()
+
     def restore_environment(
         self,
         journal: state.TransactionJournal,
@@ -674,6 +683,83 @@ class TransactionJournalTests(unittest.TestCase):
         with self.assertRaises(state.DeploymentStateError):
             state.TransactionJournal.open(journal.root, self.identity_hash)
 
+    def test_forward_environment_wal_is_strict_and_transaction_bound(self) -> None:
+        journal = self.make_journal()
+        env = self.base / "forward.env"
+        before = b"A=before\n"
+        after = b"A=after\n"
+        env.write_bytes(before)
+        journal.persist_env_backup(env)
+        journal.record_intent(
+            1,
+            {
+                "kind": "env_replace",
+                "object_category": "env",
+                "env_path": str(env),
+                "before_digest": hashlib.sha256(before).hexdigest(),
+                "after_digest": hashlib.sha256(after).hexdigest(),
+                "before_absent": False,
+            },
+        )
+        operation = journal.read_operations()[0]
+        journal.write_forward_environment_state(
+            operation,
+            phase="preparing",
+            source_identity=os.lstat(env),
+            candidate_identity=None,
+        )
+
+        preparing = journal.read_forward_environment_state()
+        self.assertEqual(
+            set(preparing or {}),
+            {
+                "schema_version",
+                "transaction_id",
+                "sequence",
+                "env_path",
+                "candidate_path",
+                "branch",
+                "phase",
+                "before_digest",
+                "after_digest",
+                "source_device",
+                "source_inode",
+                "candidate_device",
+                "candidate_inode",
+            },
+        )
+        self.assertEqual("preparing", preparing["phase"])  # type: ignore[index]
+        with self.assertRaises(state.DeploymentStateError):
+            journal.record_done(1)
+
+        candidate = journal.forward_environment_candidate_path(operation)
+        candidate.write_bytes(after)
+        journal.write_forward_environment_state(
+            operation,
+            phase="candidate_ready",
+            source_identity=os.lstat(env),
+            candidate_identity=os.lstat(candidate),
+        )
+        ready = journal.read_forward_environment_state()
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+        self.assertEqual(ready, reopened.read_forward_environment_state())
+
+        assert ready is not None
+        tampered = dict(ready, candidate_path=str(self.base / "other"))
+        state.atomic_write_json(journal.forward_environment_state_path, tampered)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        tampered = dict(ready, unexpected="CANARY")
+        state.atomic_write_json(journal.forward_environment_state_path, tampered)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        tampered = dict(ready, source_inode=None)
+        state.atomic_write_json(journal.forward_environment_state_path, tampered)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
     def test_protocol_atomic_temps_are_cleaned_but_unsafe_temps_fail_closed(
         self,
     ) -> None:
@@ -1021,7 +1107,10 @@ class TransactionJournalTests(unittest.TestCase):
             real_mkdir(path, mode)
 
         with (
-            mock.patch("tools.offline_deployment_state.os.mkdir", side_effect=fail_companion_parent),
+            mock.patch(
+                "tools.offline_deployment_state.os.mkdir",
+                side_effect=fail_companion_parent,
+            ),
             self.assertRaisesRegex(OSError, "companion bootstrap failure"),
         ):
             state.TransactionJournal.create(
@@ -2156,6 +2245,149 @@ class RecoveryExecutionTests(unittest.TestCase):
             )
         )
 
+    def _forward_environment_case(
+        self, suffix: str
+    ) -> tuple[state.TransactionJournal, Path, Path, bytes, bytes]:
+        journal = self.journal()
+        env = self.base / f"forward-{suffix}.env"
+        before = b"A=before\n"
+        after = b"A=after\n"
+        env.write_bytes(before)
+        journal.persist_env_backup(env)
+        journal.record_intent(
+            1,
+            {
+                "kind": "env_replace",
+                "object_category": "env",
+                "env_path": str(env),
+                "before_digest": hashlib.sha256(before).hexdigest(),
+                "after_digest": hashlib.sha256(after).hexdigest(),
+                "before_absent": False,
+            },
+        )
+        operation = journal.read_operations()[0]
+        journal.write_forward_environment_state(
+            operation,
+            phase="preparing",
+            source_identity=os.lstat(env),
+            candidate_identity=None,
+        )
+        candidate = journal.forward_environment_candidate_path(operation)
+        candidate.write_bytes(after)
+        source_state = os.lstat(env)
+        candidate_state = os.lstat(candidate)
+        journal.write_forward_environment_state(
+            operation,
+            phase="candidate_ready",
+            source_identity=source_state,
+            candidate_identity=candidate_state,
+        )
+        journal.write_forward_environment_state(
+            operation,
+            phase="publish_pending",
+            source_identity=source_state,
+            candidate_identity=candidate_state,
+        )
+        return journal, env, candidate, before, after
+
+    def test_forward_environment_recovery_removes_unpublished_candidate(self) -> None:
+        journal, env, candidate, before, _after = self._forward_environment_case(
+            "unpublished"
+        )
+
+        recovery.resume_transaction_rollback(
+            journal, mutation_backend=PortableMutationBackend()
+        )
+
+        self.assertEqual(before, env.read_bytes())
+        self.assertFalse(candidate.exists())
+        self.assertFalse(journal.root.exists())
+
+    def test_forward_environment_recovery_removes_exchanged_source(self) -> None:
+        journal, env, candidate, before, after = self._forward_environment_case(
+            "published"
+        )
+        temporary = self.base / "forward-exchange"
+        os.replace(env, temporary)
+        os.replace(candidate, env)
+        os.replace(temporary, candidate)
+        self.assertEqual(after, env.read_bytes())
+        self.assertEqual(before, candidate.read_bytes())
+
+        recovery.resume_transaction_rollback(
+            journal, mutation_backend=PortableMutationBackend()
+        )
+
+        self.assertEqual(before, env.read_bytes())
+        self.assertFalse(candidate.exists())
+        self.assertFalse(journal.root.exists())
+
+    def test_forward_environment_recovery_resumes_all_durable_wal_phases(
+        self,
+    ) -> None:
+        for wal_phase in ("preparing", "candidate_ready", "applied"):
+            with self.subTest(phase=wal_phase):
+                journal, env, candidate, before, after = self._forward_environment_case(
+                    wal_phase
+                )
+                operation = journal.read_operations()[0]
+                if wal_phase == "preparing":
+                    journal.write_forward_environment_state(
+                        operation,
+                        phase="preparing",
+                        source_identity=os.lstat(env),
+                        candidate_identity=None,
+                    )
+                elif wal_phase == "candidate_ready":
+                    journal.write_forward_environment_state(
+                        operation,
+                        phase="candidate_ready",
+                        source_identity=os.lstat(env),
+                        candidate_identity=os.lstat(candidate),
+                    )
+                else:
+                    temporary = self.base / f"forward-{wal_phase}-exchange"
+                    os.replace(env, temporary)
+                    os.replace(candidate, env)
+                    os.replace(temporary, candidate)
+                    journal.write_forward_environment_state(
+                        operation,
+                        phase="applied",
+                        source_identity=os.lstat(candidate),
+                        candidate_identity=os.lstat(env),
+                    )
+                    self.assertEqual(after, env.read_bytes())
+
+                recovery.resume_transaction_rollback(
+                    journal, mutation_backend=PortableMutationBackend()
+                )
+
+                self.assertEqual(before, env.read_bytes())
+                self.assertFalse(candidate.exists())
+                self.assertFalse(journal.root.exists())
+
+    def test_forward_environment_recovery_preserves_tampered_candidate(self) -> None:
+        journal, env, candidate, before, _after = self._forward_environment_case(
+            "tampered"
+        )
+        operation = journal.read_operations()[0]
+        journal.write_forward_environment_state(
+            operation,
+            phase="candidate_ready",
+            source_identity=os.lstat(env),
+            candidate_identity=os.lstat(candidate),
+        )
+        candidate.write_bytes(b"A=tampered\n")
+
+        with self.assertRaises(recovery.RecoveryConflict):
+            recovery.resume_transaction_rollback(
+                journal, mutation_backend=PortableMutationBackend()
+            )
+
+        self.assertEqual(before, env.read_bytes())
+        self.assertEqual(b"A=tampered\n", candidate.read_bytes())
+        self.assertEqual("rollback_failed", journal.read_phase().phase)
+
     def test_all_operation_kinds_require_authoritative_owner_and_mode_fields(
         self,
     ) -> None:
@@ -3221,7 +3453,12 @@ class RecoveryExecutionTests(unittest.TestCase):
                 raise OSError("injected bootstrap cleanup interruption")
 
         with (
-            mock.patch.object(Path, "rmdir", autospec=True, side_effect=interrupt_after_companion_parent),
+            mock.patch.object(
+                Path,
+                "rmdir",
+                autospec=True,
+                side_effect=interrupt_after_companion_parent,
+            ),
             self.assertRaises(state.DeploymentStateError),
         ):
             recovery.resume_transaction_rollback(journal)

@@ -62,6 +62,12 @@ ENV_ROLLBACK_PHASES = (
     "removed",
 )
 ENV_ROLLBACK_BRANCHES = ("existing_before", "absent_before")
+FORWARD_ENVIRONMENT_PHASES = (
+    "preparing",
+    "candidate_ready",
+    "publish_pending",
+    "applied",
+)
 OBJECT_TYPES = ("file", "directory", "environment", "secret")
 BOOTSTRAP_PROTOCOL = "directory-undo-v1"
 BOOTSTRAP_STATES = (
@@ -1288,6 +1294,7 @@ class TransactionJournal:
     env_backup_path: Path = dataclasses.field(init=False)
     env_backup_meta_path: Path = dataclasses.field(init=False)
     env_rollback_state_path: Path = dataclasses.field(init=False)
+    forward_environment_state_path: Path = dataclasses.field(init=False)
     rollback_path: Path = dataclasses.field(init=False)
     rollback_intents_path: Path = dataclasses.field(init=False)
     history_receipt_path: Path = dataclasses.field(init=False)
@@ -1307,6 +1314,7 @@ class TransactionJournal:
         self.env_backup_path = self.root / "env-backup"
         self.env_backup_meta_path = self.root / "env-backup.json"
         self.env_rollback_state_path = self.root / "env-rollback.json"
+        self.forward_environment_state_path = self.root / "forward-environment.json"
         self.rollback_path = self.root / "rollback.json"
         self.rollback_intents_path = self.root / "rollback-intents.json"
         self.history_receipt_path = (
@@ -1551,6 +1559,18 @@ class TransactionJournal:
             or phase.phase in {"rollback_complete", "rollback_cleanup_required"}
         ):
             raise DeploymentStateError(f"invalid rollback state: {root}")
+        forward_environment_state = journal._read_forward_environment_state(operations)
+        if forward_environment_state is not None and (
+            forward_environment_state["sequence"] in rollback_done
+            or phase.phase
+            in {
+                "committed",
+                "committed_cleanup_required",
+                "rollback_complete",
+                "rollback_cleanup_required",
+            }
+        ):
+            raise DeploymentStateError(f"invalid forward environment state: {root}")
         receipt = journal.read_history_receipt()
         if tombstone and (
             phase.phase not in {"committed", "committed_cleanup_required"}
@@ -1633,7 +1653,11 @@ class TransactionJournal:
             "rollback-intents.json",
             "env-backup.json",
         }
-        optional = {"env-backup", "env-rollback.json"}
+        optional = {
+            "env-backup",
+            "env-rollback.json",
+            "forward-environment.json",
+        }
         if self.bootstrap_protocol is not None:
             expected.add("bootstrap-directories.json")
         allowed_temp_targets = expected | optional
@@ -1792,6 +1816,19 @@ class TransactionJournal:
         ):
             raise DeploymentStateError(
                 "environment rollback must finish before rollback completion"
+            )
+        if (
+            phase
+            in {
+                "committed",
+                "committed_cleanup_required",
+                "rollback_complete",
+                "rollback_cleanup_required",
+            }
+            and self.read_forward_environment_state() is not None
+        ):
+            raise DeploymentStateError(
+                "forward environment mutation must finish before terminal phase"
             )
         record = PhaseRecord(
             SCHEMA_VERSION,
@@ -2163,6 +2200,14 @@ class TransactionJournal:
             raise DeploymentStateError("invalid transaction operation sequence")
         records = self._read_operations_internal()
         self._validate_manifest_operations(self._read_undo_manifest(), records)
+        forward_environment_state = self._read_forward_environment_state(records)
+        if (
+            forward_environment_state is not None
+            and forward_environment_state["sequence"] == sequence
+        ):
+            raise DeploymentStateError(
+                "forward environment mutation must finish before recording completion"
+            )
         found = False
         for record in records:
             if record["sequence"] == sequence:
@@ -2473,6 +2518,203 @@ class TransactionJournal:
             return
         _verify_regular_file(self.env_rollback_state_path, "environment rollback state")
         self.env_rollback_state_path.unlink()
+        fsync_directory(self.root)
+
+    @staticmethod
+    def _forward_environment_candidate_path(
+        operation: Mapping[str, object], transaction_id: str
+    ) -> Path:
+        env_path = _validate_abs_path(operation.get("env_path"), "environment path")
+        sequence = operation.get("sequence")
+        if type(sequence) is not int or sequence <= 0:
+            raise DeploymentStateError("invalid forward environment sequence")
+        return env_path.with_name(
+            f".{env_path.name}.dcagent-forward-{transaction_id}-{sequence}"
+        )
+
+    def forward_environment_candidate_path(
+        self, operation: Mapping[str, object]
+    ) -> Path:
+        persisted = self._env_rollback_operation(
+            operation.get("sequence"), self._read_operations_internal()
+        )
+        if dict(operation) != dict(persisted):
+            raise DeploymentStateError(
+                "forward environment state must reference a persisted operation"
+            )
+        return self._forward_environment_candidate_path(persisted, self.transaction_id)
+
+    def write_forward_environment_state(
+        self,
+        operation: Mapping[str, object],
+        *,
+        phase: str,
+        source_identity: os.stat_result | tuple[int, int] | None,
+        candidate_identity: os.stat_result | tuple[int, int] | None,
+    ) -> None:
+        operations = self._read_operations_internal()
+        persisted = self._env_rollback_operation(operation.get("sequence"), operations)
+        if dict(operation) != dict(persisted):
+            raise DeploymentStateError(
+                "forward environment state must reference a persisted operation"
+            )
+        if phase not in FORWARD_ENVIRONMENT_PHASES:
+            raise DeploymentStateError("invalid forward environment phase")
+        source_device, source_inode = self._env_rollback_identity_fields(
+            source_identity
+        )
+        candidate_device, candidate_inode = self._env_rollback_identity_fields(
+            candidate_identity
+        )
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "transaction_id": self.transaction_id,
+            "sequence": persisted["sequence"],
+            "env_path": persisted["env_path"],
+            "candidate_path": self._forward_environment_candidate_path(
+                persisted, self.transaction_id
+            ).as_posix(),
+            "branch": self._env_rollback_branch(persisted),
+            "phase": phase,
+            "before_digest": persisted["before_digest"],
+            "after_digest": persisted["after_digest"],
+            "source_device": source_device,
+            "source_inode": source_inode,
+            "candidate_device": candidate_device,
+            "candidate_inode": candidate_inode,
+        }
+        self._validate_forward_environment_payload(payload, operations)
+        atomic_write_json(self.forward_environment_state_path, payload)
+
+    def _validate_forward_environment_payload(
+        self,
+        payload: object,
+        operations: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        required = {
+            "schema_version",
+            "transaction_id",
+            "sequence",
+            "env_path",
+            "candidate_path",
+            "branch",
+            "phase",
+            "before_digest",
+            "after_digest",
+            "source_device",
+            "source_inode",
+            "candidate_device",
+            "candidate_inode",
+        }
+        if not isinstance(payload, Mapping) or set(payload) != required:
+            raise DeploymentStateError(
+                f"invalid forward environment state: {self.forward_environment_state_path}"
+            )
+        invalid_identity = any(
+            (device is None) != (inode is None)
+            or (
+                device is not None
+                and (
+                    type(device) is not int
+                    or type(inode) is not int
+                    or device < 0
+                    or inode <= 0
+                )
+            )
+            for device, inode in (
+                (payload["source_device"], payload["source_inode"]),
+                (payload["candidate_device"], payload["candidate_inode"]),
+            )
+        )
+        source_present = payload["source_device"] is not None
+        candidate_present = payload["candidate_device"] is not None
+        preparing = payload["phase"] == "preparing"
+        invalid_phase_identity = (
+            preparing
+            and (
+                candidate_present
+                or (payload["branch"] == "existing_before") != source_present
+            )
+        ) or (
+            not preparing
+            and (
+                not candidate_present
+                or (payload["branch"] == "existing_before") != source_present
+            )
+        )
+        duplicate_identity = (
+            source_present
+            and candidate_present
+            and (
+                payload["source_device"],
+                payload["source_inode"],
+            )
+            == (payload["candidate_device"], payload["candidate_inode"])
+        )
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != SCHEMA_VERSION
+            or payload["transaction_id"] != self.transaction_id
+            or type(payload["sequence"]) is not int
+            or payload["sequence"] <= 0
+            or not isinstance(payload["env_path"], str)
+            or not isinstance(payload["candidate_path"], str)
+            or payload["branch"] not in ENV_ROLLBACK_BRANCHES
+            or payload["phase"] not in FORWARD_ENVIRONMENT_PHASES
+            or not isinstance(payload["after_digest"], str)
+            or not _HEX_64.fullmatch(payload["after_digest"])
+            or (
+                payload["before_digest"] is not None
+                and (
+                    not isinstance(payload["before_digest"], str)
+                    or not _HEX_64.fullmatch(payload["before_digest"])
+                )
+            )
+            or invalid_identity
+            or invalid_phase_identity
+            or duplicate_identity
+        ):
+            raise DeploymentStateError(
+                f"invalid forward environment state: {self.forward_environment_state_path}"
+            )
+        operation = self._env_rollback_operation(payload["sequence"], operations)
+        expected_candidate = self._forward_environment_candidate_path(
+            operation, self.transaction_id
+        ).as_posix()
+        if (
+            payload["env_path"] != operation["env_path"]
+            or payload["candidate_path"] != expected_candidate
+            or payload["branch"] != self._env_rollback_branch(operation)
+            or payload["before_digest"] != operation["before_digest"]
+            or payload["after_digest"] != operation["after_digest"]
+        ):
+            raise DeploymentStateError(
+                f"forward environment state mismatch: {self.forward_environment_state_path}"
+            )
+        return dict(payload)
+
+    def _read_forward_environment_state(
+        self, operations: Sequence[Mapping[str, object]]
+    ) -> dict[str, object] | None:
+        existing = _lstat_optional(self.forward_environment_state_path)
+        if existing is None:
+            return None
+        payload = _read_json_value(
+            self.forward_environment_state_path, "forward environment state"
+        )
+        return self._validate_forward_environment_payload(payload, operations)
+
+    def read_forward_environment_state(self) -> dict[str, object] | None:
+        return self._read_forward_environment_state(self._read_operations_internal())
+
+    def clear_forward_environment_state(self) -> None:
+        existing = _lstat_optional(self.forward_environment_state_path)
+        if existing is None:
+            return
+        _verify_regular_file(
+            self.forward_environment_state_path, "forward environment state"
+        )
+        self.forward_environment_state_path.unlink()
         fsync_directory(self.root)
 
     def persist_env_backup(self, env_path: Path | None) -> None:

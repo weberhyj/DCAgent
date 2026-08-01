@@ -120,6 +120,15 @@ class PreparationFilesystemMutationBackend(Protocol):
         expected_source: os.stat_result,
     ) -> os.stat_result: ...
 
+    def publish_environment(
+        self,
+        journal: deployment_state.TransactionJournal,
+        operation: Mapping[str, object],
+        data: bytes,
+        *,
+        expected_source: os.stat_result | None,
+    ) -> os.stat_result: ...
+
 
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
@@ -194,6 +203,17 @@ class _PortablePreparationFilesystemMutationBackend:
         self._verify_source(path, expected_source)
         os.chmod(path, mode)
         observed = self._verify_source(path, expected_source)
+        flags = os.O_RDONLY if stat.S_ISDIR(observed.st_mode) else os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if not _same_identity(opened, observed):
+                raise OSError("forward mutation source changed")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         deployment_state.fsync_directory(path.parent)
         return observed
 
@@ -208,6 +228,8 @@ class _PortablePreparationFilesystemMutationBackend:
     ) -> os.stat_result:
         _assert_directory_non_link(path.parent, "Forward mutation parent")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd: int | None = os.open(path, flags, mode)
@@ -221,7 +243,10 @@ class _PortablePreparationFilesystemMutationBackend:
                 os.close(fd)
                 fd = None
                 os.chmod(path, mode)
-                fd = os.open(path, os.O_RDWR)
+                reopen_flags = os.O_RDWR
+                if hasattr(os, "O_BINARY"):
+                    reopen_flags |= os.O_BINARY
+                fd = os.open(path, reopen_flags)
                 os.fsync(fd)
             observed = os.fstat(fd)
         finally:
@@ -253,6 +278,77 @@ class _PortablePreparationFilesystemMutationBackend:
         if source.parent != target.parent:
             deployment_state.fsync_directory(target.parent)
         observed = self._verify_source(target, expected_source)
+        return observed
+
+    def _after_forward_environment_step(self, step: str) -> None:
+        """Test seam for simulating process interruption at durable boundaries."""
+
+    def publish_environment(
+        self,
+        journal: deployment_state.TransactionJournal,
+        operation: Mapping[str, object],
+        data: bytes,
+        *,
+        expected_source: os.stat_result | None,
+    ) -> os.stat_result:
+        env_path = Path(str(operation["env_path"]))
+        before_absent = operation["before_absent"] is True
+        if before_absent:
+            if expected_source is not None or _path_exists(env_path):
+                raise OSError("forward environment source changed")
+        else:
+            if expected_source is None:
+                raise OSError("forward environment source is missing")
+            self._verify_source(env_path, expected_source)
+        journal.write_forward_environment_state(
+            operation,
+            phase="preparing",
+            source_identity=expected_source,
+            candidate_identity=None,
+        )
+        candidate_path = journal.forward_environment_candidate_path(operation)
+        candidate = self.create_file(
+            candidate_path,
+            data,
+            mode=int(operation["after_mode"]),
+            owner_uid=int(operation["after_owner_uid"]),
+            owner_gid=int(operation["after_owner_gid"]),
+        )
+        journal.write_forward_environment_state(
+            operation,
+            phase="candidate_ready",
+            source_identity=expected_source,
+            candidate_identity=candidate,
+        )
+        self._after_forward_environment_step("candidate_ready")
+        journal.write_forward_environment_state(
+            operation,
+            phase="publish_pending",
+            source_identity=expected_source,
+            candidate_identity=candidate,
+        )
+        if before_absent:
+            observed = self.rename_noreplace(
+                candidate_path,
+                env_path,
+                expected_source=candidate,
+            )
+        else:
+            assert expected_source is not None
+            self._verify_source(env_path, expected_source)
+            self._verify_source(candidate_path, candidate)
+            os.replace(candidate_path, env_path)
+            deployment_state.fsync_directory(env_path.parent)
+            observed = self._verify_source(env_path, candidate)
+        self._after_forward_environment_step("published")
+        journal.write_forward_environment_state(
+            operation,
+            phase="applied",
+            source_identity=expected_source,
+            candidate_identity=candidate,
+        )
+        journal.clear_forward_environment_state()
+        self._after_forward_environment_step("clean")
         return observed
 
 
@@ -352,6 +448,132 @@ class _PosixPreparationFilesystemMutationBackend:
             expected_source=expected_source,
         )
         return os.lstat(target)
+
+    def _after_forward_environment_step(self, step: str) -> None:
+        """Test seam for simulating process interruption at durable boundaries."""
+
+    def publish_environment(
+        self,
+        journal: deployment_state.TransactionJournal,
+        operation: Mapping[str, object],
+        data: bytes,
+        *,
+        expected_source: os.stat_result | None,
+    ) -> os.stat_result:
+        env_path = Path(str(operation["env_path"]))
+        before_absent = operation["before_absent"] is True
+        if before_absent:
+            if expected_source is not None or _path_exists(env_path):
+                raise OSError("forward environment source changed")
+        elif expected_source is None:
+            raise OSError("forward environment source is missing")
+        journal.write_forward_environment_state(
+            operation,
+            phase="preparing",
+            source_identity=expected_source,
+            candidate_identity=None,
+        )
+        candidate_path = journal.forward_environment_candidate_path(operation)
+        after_mode = int(operation["after_mode"])
+        after_uid = int(operation["after_owner_uid"])
+        after_gid = int(operation["after_owner_gid"])
+        candidate = self.create_file(
+            candidate_path,
+            data,
+            mode=after_mode,
+            owner_uid=after_uid,
+            owner_gid=after_gid,
+        )
+        journal.write_forward_environment_state(
+            operation,
+            phase="candidate_ready",
+            source_identity=expected_source,
+            candidate_identity=candidate,
+        )
+        self._after_forward_environment_step("candidate_ready")
+        journal.write_forward_environment_state(
+            operation,
+            phase="publish_pending",
+            source_identity=expected_source,
+            candidate_identity=candidate,
+        )
+        parent_fd = self._trusted._open_parent(env_path.parent)
+        try:
+            self._trusted._verify_regular_at(
+                parent_fd,
+                candidate_path.name,
+                expected_identity=self._trusted._identity(candidate),
+                expected_digest=str(operation["after_digest"]),
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            if before_absent:
+                if (
+                    self._trusted._stat_at_optional(parent_fd, env_path.name)
+                    is not None
+                ):
+                    raise OSError("forward environment target changed")
+                self._trusted._renameat2(
+                    parent_fd,
+                    candidate_path.name,
+                    parent_fd,
+                    env_path.name,
+                    offline_recovery._RENAME_NOREPLACE,
+                )
+                os.fsync(parent_fd)
+            else:
+                assert expected_source is not None
+                before_mode = int(operation["before_mode"])
+                before_uid = int(operation["before_owner_uid"])
+                before_gid = int(operation["before_owner_gid"])
+                self._trusted._verify_regular_at(
+                    parent_fd,
+                    env_path.name,
+                    expected_identity=self._trusted._identity(expected_source),
+                    expected_digest=str(operation["before_digest"]),
+                    mode=before_mode,
+                    owner_uid=before_uid,
+                    owner_gid=before_gid,
+                )
+                self._trusted._exchange(
+                    parent_fd,
+                    env_path.name,
+                    parent_fd,
+                    candidate_path.name,
+                )
+            observed = self._trusted._verify_regular_at(
+                parent_fd,
+                env_path.name,
+                expected_identity=self._trusted._identity(candidate),
+                expected_digest=str(operation["after_digest"]),
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            self._after_forward_environment_step("published")
+            journal.write_forward_environment_state(
+                operation,
+                phase="applied",
+                source_identity=expected_source,
+                candidate_identity=candidate,
+            )
+            if not before_absent:
+                assert expected_source is not None
+                self._trusted._unlink_private_regular(
+                    parent_fd,
+                    candidate_path.name,
+                    expected_identity=self._trusted._identity(expected_source),
+                    expected_digest=str(operation["before_digest"]),
+                    mode=int(operation["before_mode"]),
+                    owner_uid=int(operation["before_owner_uid"]),
+                    owner_gid=int(operation["before_owner_gid"]),
+                )
+            journal.clear_forward_environment_state()
+            self._after_forward_environment_step("clean")
+            return observed
+        finally:
+            os.close(parent_fd)
 
 
 def _preparation_filesystem_mutations(
@@ -1299,6 +1521,18 @@ class _PortableMutationBackend:
         del expected_source
         os.chmod(path, mode)
 
+    def unlink(
+        self,
+        path: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        current = os.lstat(path)
+        if not _same_identity(current, expected_source):
+            raise OSError("test unlink source changed")
+        path.unlink()
+        deployment_state.fsync_directory(path.parent)
+
     def restore_environment(
         self,
         journal: deployment_state.TransactionJournal,
@@ -1379,6 +1613,12 @@ def _write_env_candidate(path: Path, text: str, mode: int) -> Path:
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, mode)
+        fd = os.open(temporary, os.O_RDWR)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        deployment_state.fsync_directory(path.parent)
         return temporary
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -1597,9 +1837,12 @@ def execute_preparation_plan(
         journal.write_phase("verified")
 
         journal.write_phase("env_committing")
-        current_bytes = (
-            plan.env_path.read_bytes() if _path_exists(plan.env_path) else None
+        current_metadata = (
+            os.lstat(plan.env_path) if _path_exists(plan.env_path) else None
         )
+        if current_metadata is not None:
+            _assert_regular_non_link(plan.env_path, "Offline environment")
+        current_bytes = None if current_metadata is None else plan.env_path.read_bytes()
         after_bytes = plan.env_after.encode("utf-8")
         if current_bytes != after_bytes:
             before_path = plan.env_path if current_bytes is not None else None
@@ -1607,40 +1850,36 @@ def execute_preparation_plan(
             after_mode = (
                 before_mode if before_path is not None else _expected_mode(0o600)
             )
-            temporary = _write_env_candidate(plan.env_path, plan.env_after, after_mode)
-            try:
-                after_metadata = temporary.stat()
-                after_mode = stat.S_IMODE(after_metadata.st_mode)
-                journal.record_intent(
-                    sequence,
-                    {
-                        "kind": "env_replace",
-                        "object_category": "environment",
-                        "env_path": plan.env_path.as_posix(),
-                        "before_digest": None
-                        if current_bytes is None
-                        else hashlib.sha256(current_bytes).hexdigest(),
-                        "after_digest": hashlib.sha256(after_bytes).hexdigest(),
-                        "before_absent": current_bytes is None,
-                        "object_type": "environment",
-                        "before_mode": None if current_bytes is None else before_mode,
-                        "before_owner_uid": None
-                        if current_bytes is None
-                        else before_uid,
-                        "before_owner_gid": None
-                        if current_bytes is None
-                        else before_gid,
-                        "after_mode": after_mode,
-                        "after_owner_uid": after_metadata.st_uid,
-                        "after_owner_gid": after_metadata.st_gid,
-                    },
-                )
-                os.replace(temporary, plan.env_path)
-                deployment_state.fsync_directory(plan.env_path.parent)
-                journal.record_done(sequence)
-                sequence += 1
-            finally:
-                temporary.unlink(missing_ok=True)
+            owner_uid, owner_gid = _operation_authority(plan)
+            journal.record_intent(
+                sequence,
+                {
+                    "kind": "env_replace",
+                    "object_category": "environment",
+                    "env_path": plan.env_path.as_posix(),
+                    "before_digest": None
+                    if current_bytes is None
+                    else hashlib.sha256(current_bytes).hexdigest(),
+                    "after_digest": hashlib.sha256(after_bytes).hexdigest(),
+                    "before_absent": current_bytes is None,
+                    "object_type": "environment",
+                    "before_mode": None if current_bytes is None else before_mode,
+                    "before_owner_uid": None if current_bytes is None else before_uid,
+                    "before_owner_gid": None if current_bytes is None else before_gid,
+                    "after_mode": after_mode,
+                    "after_owner_uid": owner_uid,
+                    "after_owner_gid": owner_gid,
+                },
+            )
+            operation = journal.read_operations()[-1]
+            filesystem.publish_environment(
+                journal,
+                operation,
+                after_bytes,
+                expected_source=current_metadata,
+            )
+            journal.record_done(sequence)
+            sequence += 1
         if plan.env_path.read_text(encoding="utf-8") != plan.env_after:
             raise DeploymentError("Offline environment verification failed")
         committed_values = load_env(plan.env_path)

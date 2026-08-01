@@ -8,7 +8,7 @@ import stat
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -289,6 +289,151 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             self.assertGreaterEqual(backend.mkdir.call_count, 7)
             self.assertEqual(4, backend.create_file.call_count)
             self.assertEqual(4, backend.rename_noreplace.call_count)
+
+    def test_portable_chmod_fsyncs_inode_before_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "managed"
+            path.write_text("content", encoding="utf-8")
+            expected = os.lstat(path)
+            events: list[str] = []
+            real_chmod = os.chmod
+            real_fsync = os.fsync
+
+            def record_chmod(target: Path, mode: int) -> None:
+                events.append("chmod")
+                real_chmod(target, mode)
+
+            def record_fsync(fd: int) -> None:
+                events.append("inode_fsync")
+                real_fsync(fd)
+
+            with (
+                mock.patch("tools.offline_env.os.chmod", side_effect=record_chmod),
+                mock.patch("tools.offline_env.os.fsync", side_effect=record_fsync),
+                mock.patch(
+                    "tools.offline_env.deployment_state.fsync_directory",
+                    side_effect=lambda _path: events.append("parent_fsync"),
+                ),
+            ):
+                offline_env_module._PortablePreparationFilesystemMutationBackend().chmod(
+                    path,
+                    offline_env_module._expected_mode(0o600),
+                    expected_source=expected,
+                )
+
+            self.assertEqual(["chmod", "inode_fsync", "parent_fsync"], events)
+
+    def test_environment_candidate_is_durable_after_chmod_before_publish(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            events: list[str] = []
+            real_chmod = os.chmod
+            real_fsync = os.fsync
+
+            def record_chmod(target: Path, mode: int) -> None:
+                events.append("chmod")
+                real_chmod(target, mode)
+
+            def record_fsync(fd: int) -> None:
+                events.append("file_fsync")
+                real_fsync(fd)
+
+            with (
+                mock.patch("tools.offline_env.os.chmod", side_effect=record_chmod),
+                mock.patch("tools.offline_env.os.fsync", side_effect=record_fsync),
+                mock.patch(
+                    "tools.offline_env.deployment_state.fsync_directory",
+                    side_effect=lambda _path: events.append("directory_fsync"),
+                ),
+            ):
+                candidate = offline_env_module._write_env_candidate(
+                    env_path,
+                    "KEY=value\n",
+                    offline_env_module._expected_mode(0o600),
+                )
+            try:
+                self.assertEqual(
+                    ["file_fsync", "chmod", "file_fsync", "directory_fsync"],
+                    events,
+                )
+            finally:
+                candidate.unlink(missing_ok=True)
+
+    def test_environment_publish_uses_forward_wal_before_record_done(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            events: list[str] = []
+            real_write = offline_deployment_state.TransactionJournal.write_forward_environment_state
+            real_clear = offline_deployment_state.TransactionJournal.clear_forward_environment_state
+            real_done = offline_deployment_state.TransactionJournal.record_done
+
+            def record_forward(
+                journal: offline_deployment_state.TransactionJournal,
+                operation: Mapping[str, object],
+                *,
+                phase: str,
+                source_identity: os.stat_result | tuple[int, int] | None,
+                candidate_identity: os.stat_result | tuple[int, int] | None,
+            ) -> None:
+                events.append(phase)
+                real_write(
+                    journal,
+                    operation,
+                    phase=phase,
+                    source_identity=source_identity,
+                    candidate_identity=candidate_identity,
+                )
+
+            def record_clear(
+                journal: offline_deployment_state.TransactionJournal,
+            ) -> None:
+                events.append("clear")
+                real_clear(journal)
+
+            def record_done(
+                journal: offline_deployment_state.TransactionJournal, sequence: int
+            ) -> None:
+                if journal.read_forward_environment_state() is None:
+                    events.append("done_without_forward_wal")
+                real_done(journal, sequence)
+
+            with (
+                mock.patch.object(
+                    offline_deployment_state.TransactionJournal,
+                    "write_forward_environment_state",
+                    autospec=True,
+                    side_effect=record_forward,
+                ),
+                mock.patch.object(
+                    offline_deployment_state.TransactionJournal,
+                    "clear_forward_environment_state",
+                    autospec=True,
+                    side_effect=record_clear,
+                ),
+                mock.patch.object(
+                    offline_deployment_state.TransactionJournal,
+                    "record_done",
+                    autospec=True,
+                    side_effect=record_done,
+                ),
+            ):
+                self._prepare(root)
+
+            forward_start = events.index("preparing")
+            self.assertEqual(
+                [
+                    "preparing",
+                    "candidate_ready",
+                    "publish_pending",
+                    "applied",
+                    "clear",
+                    "done_without_forward_wal",
+                ],
+                events[forward_start:],
+            )
 
     def test_raw_symlink_swap_does_not_chmod_external_victim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1597,6 +1742,28 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                     before = self._snapshot_tree(root)
                     env_path = root / "deploy" / "offline" / ".env"
                     real_replace = os.replace
+                    real_create_file = offline_env_module._PortablePreparationFilesystemMutationBackend.create_file
+
+                    def fail_env_candidate(
+                        backend: object,
+                        path: Path,
+                        data: bytes,
+                        *,
+                        mode: int,
+                        owner_uid: int,
+                        owner_gid: int,
+                        create_file: Callable[..., os.stat_result] = real_create_file,
+                    ) -> os.stat_result:
+                        if ".dcagent-forward-" in path.name:
+                            raise OSError("injected env temp failure")
+                        return create_file(
+                            backend,
+                            path,
+                            data,
+                            mode=mode,
+                            owner_uid=owner_uid,
+                            owner_gid=owner_gid,
+                        )
 
                     def fail_env_replace(
                         source: Path,
@@ -1611,8 +1778,9 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
 
                     patcher = (
                         mock.patch(
-                            "tools.offline_env._write_env_candidate",
-                            side_effect=OSError("injected env temp failure"),
+                            "tools.offline_env._PortablePreparationFilesystemMutationBackend.create_file",
+                            autospec=True,
+                            side_effect=fail_env_candidate,
                         )
                         if boundary == "temp"
                         else mock.patch(
