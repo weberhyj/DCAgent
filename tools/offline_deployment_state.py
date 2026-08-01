@@ -1568,7 +1568,12 @@ class TransactionJournal:
             raise DeploymentStateError(
                 f"invalid undo manifest: {self.undo_manifest_path}"
             )
-        return [UndoEntry.from_mapping(entry) for entry in payload["entries"]]
+        entries = [UndoEntry.from_mapping(entry) for entry in payload["entries"]]
+        if [entry.sequence for entry in entries] != list(range(1, len(entries) + 1)):
+            raise DeploymentStateError(
+                f"invalid undo manifest sequence: {self.undo_manifest_path}"
+            )
+        return entries
 
     def _undo_entry_for_operation(self, operation: Mapping[str, object]) -> UndoEntry:
         sequence = operation["sequence"]
@@ -1715,6 +1720,11 @@ class TransactionJournal:
         entries: Sequence[UndoEntry],
         operations: Sequence[Mapping[str, object]],
     ) -> None:
+        expected_sequences = list(range(1, len(operations) + 1))
+        if [operation["sequence"] for operation in operations] != expected_sequences:
+            raise DeploymentStateError("invalid transaction operation sequence")
+        if [entry.sequence for entry in entries] != expected_sequences:
+            raise DeploymentStateError("invalid undo manifest sequence")
         entry_by_sequence = {entry.sequence: entry for entry in entries}
         if len(entry_by_sequence) != len(entries):
             raise DeploymentStateError("duplicate undo manifest sequence")
@@ -1751,7 +1761,7 @@ class TransactionJournal:
             self._validate_manifest_operations(prefix, operations)
         except DeploymentStateError:
             return False
-        expected_sequence = 1 if not operations else operations[-1]["sequence"] + 1
+        expected_sequence = len(operations) + 1
         if entries[-1].sequence != expected_sequence:
             return False
         self.write_undo_manifest(prefix)
@@ -1781,7 +1791,6 @@ class TransactionJournal:
                 f"invalid transaction operations: {self.operations_path}"
             )
         records: list[dict[str, object]] = []
-        previous = 0
         for record in payload["records"]:
             validated = _validate_operation_mapping(
                 record, self.transaction_id, self.deployment_identity_hash
@@ -1791,11 +1800,10 @@ class TransactionJournal:
             self._validate_operation_boundaries(validated)
             if validated["kind"] == "env_replace":
                 self.validate_env_backup_for_operation(validated)
-            if validated["sequence"] <= previous:
+            if validated["sequence"] != len(records) + 1:
                 raise DeploymentStateError(
                     f"invalid transaction operation sequence: {self.operations_path}"
                 )
-            previous = validated["sequence"]
             records.append(validated)
         return records
 
@@ -1864,8 +1872,10 @@ class TransactionJournal:
         records = self._read_operations_internal()
         entries = self._read_undo_manifest()
         self._validate_manifest_operations(entries, records)
-        if records and sequence <= records[-1]["sequence"]:
-            raise DeploymentStateError("transaction operation sequence must increase")
+        if sequence != len(records) + 1:
+            raise DeploymentStateError(
+                "transaction operation sequence must be contiguous"
+            )
         entries.append(self._undo_entry_for_operation(validated))
         self.write_undo_manifest(entries)
         records.append(validated)

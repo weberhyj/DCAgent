@@ -371,19 +371,32 @@ class PosixFilesystemMutationBackend:
     ) -> os.stat_result:
         expected_digest = hashlib.sha256(data).hexdigest()
         existing = cls._stat_at_optional(private_fd, name)
-        if existing is None:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
-            fd = os.open(name, flags, mode, dir_fd=private_fd)
-            try:
-                os.fchown(fd, owner_uid, owner_gid)
-                os.fchmod(fd, mode)
-                state._write_all(fd, data)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        if existing is not None:
+            observed, digest = cls._snapshot_regular_at(
+                private_fd,
+                name,
+                mode=mode,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+            if digest == expected_digest:
+                return observed
+            current = os.stat(name, dir_fd=private_fd, follow_symlinks=False)
+            cls._verify_source(current, observed)
+            os.unlink(name, dir_fd=private_fd)
             os.fsync(private_fd)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        fd = os.open(name, flags, mode, dir_fd=private_fd)
+        try:
+            os.fchown(fd, owner_uid, owner_gid)
+            os.fchmod(fd, mode)
+            state._write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(private_fd)
         return cls._verify_regular_at(
             private_fd,
             name,

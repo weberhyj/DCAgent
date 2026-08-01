@@ -294,6 +294,51 @@ class TransactionJournalTests(unittest.TestCase):
         with self.assertRaises(state.DeploymentStateError):
             state.TransactionJournal.open(journal.root, self.identity_hash)
 
+    def test_operation_and_manifest_sequences_are_contiguous_from_one(self) -> None:
+        def payload(name: str) -> dict[str, object]:
+            return {
+                "kind": "mkdir",
+                "object_category": "secret",
+                "path": str(self.base / name),
+                "existed": False,
+                "mode": 0o700,
+            }
+
+        first_gap = self.make_journal()
+        with self.assertRaises(state.DeploymentStateError):
+            first_gap.record_intent(2, payload("first-gap"))
+
+        later_gap = self.make_journal()
+        later_gap.record_intent(1, payload("one"))
+        with self.assertRaises(state.DeploymentStateError):
+            later_gap.record_intent(3, payload("three"))
+
+        tampered_operations = self.make_journal()
+        tampered_operations.record_intent(1, payload("operations-one"))
+        tampered_operations.record_intent(2, payload("operations-two"))
+        operations = json.loads(
+            tampered_operations.operations_path.read_text(encoding="utf-8")
+        )
+        operations["records"][1]["sequence"] = 3
+        state.atomic_write_json(tampered_operations.operations_path, operations)
+        with self.assertRaises(state.DeploymentStateError):
+            tampered_operations._read_operations_internal()
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(tampered_operations.root, self.identity_hash)
+
+        tampered_manifest = self.make_journal()
+        tampered_manifest.record_intent(1, payload("manifest-one"))
+        tampered_manifest.record_intent(2, payload("manifest-two"))
+        manifest = json.loads(
+            tampered_manifest.undo_manifest_path.read_text(encoding="utf-8")
+        )
+        manifest["entries"][1]["sequence"] = 3
+        state.atomic_write_json(tampered_manifest.undo_manifest_path, manifest)
+        with self.assertRaises(state.DeploymentStateError):
+            tampered_manifest._read_undo_manifest()
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(tampered_manifest.root, self.identity_hash)
+
     def test_record_intent_recovers_only_the_single_trailing_manifest_prefix(
         self,
     ) -> None:
@@ -321,6 +366,32 @@ class TransactionJournalTests(unittest.TestCase):
         )
         self.assertEqual(repaired.read_operations(), ())
         self.assertEqual(repaired.read_undo_manifest(), ())
+
+        after_prefix = self.make_journal()
+        after_prefix.record_intent(1, dict(payload, path=str(self.base / "prefix-one")))
+        with (
+            mock.patch.object(
+                after_prefix,
+                "_write_operations",
+                side_effect=SystemExit("simulated SIGKILL after second manifest"),
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            after_prefix.record_intent(
+                2, dict(payload, path=str(self.base / "prefix-two"))
+            )
+
+        repaired_prefix = state.TransactionJournal.open(
+            after_prefix.root, self.identity_hash
+        )
+        self.assertEqual(
+            [operation["sequence"] for operation in repaired_prefix.read_operations()],
+            [1],
+        )
+        self.assertEqual(
+            [entry.sequence for entry in repaired_prefix.read_undo_manifest()],
+            [1],
+        )
 
         after_operations = self.make_journal()
         original_publish = after_operations._write_operations
@@ -1488,6 +1559,137 @@ class PosixEnvironmentExchangeBackLogicTests(unittest.TestCase):
         self.assertEqual(backend.exchange_count, 0)
 
 
+class PosixEnvironmentCandidateRecoveryLogicTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "candidate"
+        self.path.write_bytes(b"partial")
+        self.observed = os.lstat(self.path)
+        self.mode = stat.S_IMODE(self.observed.st_mode)
+
+    def test_safe_stable_digest_mismatch_is_unlinked_before_exclusive_recreate(
+        self,
+    ) -> None:
+        rebuilt = SimpleNamespace(st_dev=7, st_ino=11)
+        events = mock.Mock()
+        events.open.return_value = 37
+        with (
+            mock.patch.object(
+                recovery.PosixFilesystemMutationBackend,
+                "_stat_at_optional",
+                return_value=self.observed,
+            ),
+            mock.patch.object(
+                recovery.PosixFilesystemMutationBackend,
+                "_snapshot_regular_at",
+                return_value=(
+                    self.observed,
+                    hashlib.sha256(b"partial").hexdigest(),
+                ),
+            ),
+            mock.patch.object(recovery.os, "stat", return_value=self.observed),
+            mock.patch.object(recovery.os, "unlink", new=events.unlink),
+            mock.patch.object(recovery.os, "O_NOFOLLOW", 0, create=True),
+            mock.patch.object(recovery.os, "open", new=events.open),
+            mock.patch.object(recovery.os, "fchown", create=True),
+            mock.patch.object(recovery.os, "fchmod", create=True),
+            mock.patch.object(recovery.state, "_write_all"),
+            mock.patch.object(recovery.os, "fsync", new=events.fsync),
+            mock.patch.object(recovery.os, "close"),
+            mock.patch.object(
+                recovery.PosixFilesystemMutationBackend,
+                "_verify_regular_at",
+                return_value=rebuilt,
+            ),
+        ):
+            result = (
+                recovery.PosixFilesystemMutationBackend._create_or_verify_private_file(
+                    23,
+                    "candidate",
+                    b"complete",
+                    mode=self.mode,
+                    owner_uid=self.observed.st_uid,
+                    owner_gid=self.observed.st_gid,
+                )
+            )
+
+        self.assertIs(result, rebuilt)
+        events.unlink.assert_called_once_with("candidate", dir_fd=23)
+        self.assertEqual(events.open.call_args.kwargs["dir_fd"], 23)
+        self.assertTrue(events.open.call_args.args[1] & os.O_EXCL)
+        unlink_index = events.mock_calls.index(mock.call.unlink("candidate", dir_fd=23))
+        directory_fsync_index = events.mock_calls.index(mock.call.fsync(23))
+        open_index = events.mock_calls.index(
+            mock.call.open(*events.open.call_args.args, **events.open.call_args.kwargs)
+        )
+        self.assertLess(unlink_index, directory_fsync_index)
+        self.assertLess(directory_fsync_index, open_index)
+
+    def test_candidate_identity_change_before_unlink_fails_closed(self) -> None:
+        changed = SimpleNamespace(
+            st_dev=self.observed.st_dev,
+            st_ino=self.observed.st_ino + 1,
+            st_mode=self.observed.st_mode,
+            st_uid=self.observed.st_uid,
+            st_gid=self.observed.st_gid,
+        )
+        with (
+            mock.patch.object(
+                recovery.PosixFilesystemMutationBackend,
+                "_stat_at_optional",
+                return_value=self.observed,
+            ),
+            mock.patch.object(
+                recovery.PosixFilesystemMutationBackend,
+                "_snapshot_regular_at",
+                return_value=(
+                    self.observed,
+                    hashlib.sha256(b"partial").hexdigest(),
+                ),
+            ),
+            mock.patch.object(recovery.os, "stat", return_value=changed),
+            mock.patch.object(recovery.os, "unlink") as unlink,
+            self.assertRaises(OSError),
+        ):
+            recovery.PosixFilesystemMutationBackend._create_or_verify_private_file(
+                23,
+                "candidate",
+                b"complete",
+                mode=self.mode,
+                owner_uid=self.observed.st_uid,
+                owner_gid=self.observed.st_gid,
+            )
+
+        unlink.assert_not_called()
+
+    def test_unsafe_candidate_is_never_unlinked(self) -> None:
+        with (
+            mock.patch.object(
+                recovery.PosixFilesystemMutationBackend,
+                "_stat_at_optional",
+                return_value=self.observed,
+            ),
+            mock.patch.object(
+                recovery.PosixFilesystemMutationBackend,
+                "_snapshot_regular_at",
+                side_effect=OSError("unsafe candidate"),
+            ),
+            mock.patch.object(recovery.os, "unlink") as unlink,
+            self.assertRaises(OSError),
+        ):
+            recovery.PosixFilesystemMutationBackend._create_or_verify_private_file(
+                23,
+                "candidate",
+                b"complete",
+                mode=self.mode,
+                owner_uid=self.observed.st_uid,
+                owner_gid=self.observed.st_gid,
+            )
+
+        unlink.assert_not_called()
+
+
 @unittest.skipUnless(
     os.name == "posix" and sys.platform.startswith("linux"),
     "Linux renameat2 and fd chmod primitives require Linux",
@@ -1547,6 +1749,27 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
     @staticmethod
     def private_environment_root(journal: state.TransactionJournal, env: Path) -> Path:
         return env.parent / (f".dcagent-env-rollback-{journal.transaction_id}-1")
+
+    def prepare_environment_candidate(
+        self,
+        journal: state.TransactionJournal,
+        env: Path,
+        content: bytes,
+    ) -> Path:
+        operation = journal.read_operations()[0]
+        journal.record_rollback_intent(1)
+        journal.write_env_rollback_state(
+            operation,
+            phase="preparing",
+            source_identity=None,
+            candidate_identity=None,
+        )
+        private_root = self.private_environment_root(journal, env)
+        private_root.mkdir(mode=0o700)
+        candidate = private_root / "candidate"
+        candidate.write_bytes(content)
+        os.chmod(candidate, 0o600)
+        return candidate
 
     def test_rename_noreplace_preserves_an_existing_target(self) -> None:
         source = self.base / "source"
@@ -1671,6 +1894,84 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
         self.assertFalse(env.exists())
         self.assertFalse(journal.root.exists())
         self.assertFalse(self.private_environment_root(journal, env).exists())
+
+    def test_preparing_environment_adopts_a_complete_unrecorded_candidate(self) -> None:
+        for before in (b"A=before\n", None):
+            with self.subTest(before_absent=before is None):
+                journal, env, _after = self.executed_environment(before)
+                expected = b"" if before is None else before
+                self.prepare_environment_candidate(journal, env, expected)
+
+                reopened = state.TransactionJournal.open(
+                    journal.root, self.identity_hash
+                )
+                recovery.resume_transaction_rollback(
+                    reopened, mutation_backend=self.backend
+                )
+
+                if before is None:
+                    self.assertFalse(env.exists())
+                else:
+                    self.assertEqual(env.read_bytes(), before)
+                self.assertFalse(journal.root.exists())
+                self.assertFalse(self.private_environment_root(journal, env).exists())
+
+    def test_preparing_environment_rebuilds_a_partial_unrecorded_candidate(
+        self,
+    ) -> None:
+        for before in (b"A=before\n", None):
+            with self.subTest(before_absent=before is None):
+                journal, env, _after = self.executed_environment(before)
+                partial = b"A=part" if before is not None else b"not-empty"
+                self.prepare_environment_candidate(journal, env, partial)
+
+                reopened = state.TransactionJournal.open(
+                    journal.root, self.identity_hash
+                )
+                recovery.resume_transaction_rollback(
+                    reopened, mutation_backend=self.backend
+                )
+
+                if before is None:
+                    self.assertFalse(env.exists())
+                else:
+                    self.assertEqual(env.read_bytes(), before)
+                self.assertFalse(journal.root.exists())
+                self.assertFalse(self.private_environment_root(journal, env).exists())
+
+    def test_preparing_environment_preserves_unsafe_unrecorded_candidate(self) -> None:
+        for before in (b"A=before\n", None):
+            for unsafe_kind in ("directory", "symlink", "mode"):
+                with self.subTest(
+                    before_absent=before is None, unsafe_kind=unsafe_kind
+                ):
+                    journal, env, _after = self.executed_environment(before)
+                    candidate = self.prepare_environment_candidate(
+                        journal, env, b"unsafe"
+                    )
+                    if unsafe_kind == "directory":
+                        candidate.unlink()
+                        candidate.mkdir(mode=0o700)
+                    elif unsafe_kind == "symlink":
+                        candidate.unlink()
+                        target = candidate.parent / "foreign"
+                        target.write_bytes(b"foreign")
+                        candidate.symlink_to(target)
+                    else:
+                        os.chmod(candidate, 0o640)
+
+                    reopened = state.TransactionJournal.open(
+                        journal.root, self.identity_hash
+                    )
+                    with self.assertRaises(state.DeploymentStateError):
+                        recovery.resume_transaction_rollback(
+                            reopened, mutation_backend=self.backend
+                        )
+
+                    self.assertTrue(candidate.exists() or candidate.is_symlink())
+                    if unsafe_kind == "symlink":
+                        self.assertEqual(target.read_bytes(), b"foreign")
+                    self.assertEqual(journal.read_phase().phase, "rollback_failed")
 
     def test_environment_exchange_mismatch_restores_and_preserves_third_state(
         self,
