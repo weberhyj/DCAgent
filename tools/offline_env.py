@@ -349,11 +349,20 @@ def _assert_posix_owner(
     )
 
 
+def _read_managed_secret_ascii(path: Path) -> str:
+    try:
+        return path.read_text(encoding="ascii")
+    except UnicodeError:
+        raise DeploymentError(
+            "Managed offline secret content is not valid ASCII"
+        ) from None
+
+
 def _validate_postgres_secret_pair(paths: Mapping[str, Path]) -> None:
-    postgres_password = paths["postgres-password"].read_text(encoding="ascii")
+    postgres_password = _read_managed_secret_ascii(paths["postgres-password"])
     if PASSWORD.fullmatch(postgres_password) is None:
         raise DeploymentError("Offline password has an invalid format")
-    database_url = paths["database-url"].read_text(encoding="ascii")
+    database_url = _read_managed_secret_ascii(paths["database-url"])
     expected_database_url = (
         f"postgresql+psycopg://dc_agent:{postgres_password}@postgres:5432/dc_agent"
     )
@@ -364,8 +373,8 @@ def _validate_postgres_secret_pair(paths: Mapping[str, Path]) -> None:
 
 
 def _validate_clickhouse_secret_pair(paths: Mapping[str, Path]) -> None:
-    query_password = paths["clickhouse-query-password"].read_text(encoding="ascii")
-    ingest_password = paths["clickhouse-ingest-password"].read_text(encoding="ascii")
+    query_password = _read_managed_secret_ascii(paths["clickhouse-query-password"])
+    ingest_password = _read_managed_secret_ascii(paths["clickhouse-ingest-password"])
     for password in (query_password, ingest_password):
         if PASSWORD.fullmatch(password) is None:
             raise DeploymentError("Offline password has an invalid format")
@@ -491,10 +500,7 @@ def _directory_plan(
                 context="Offline managed directory",
                 verify_posix_metadata=verify_posix_metadata,
             )
-            if original_mode != _expected_mode(0o700):
-                mutations.setdefault(
-                    target, DirectoryMutation(target, True, original_mode)
-                )
+            mutations.setdefault(target, DirectoryMutation(target, True, original_mode))
     return tuple(
         sorted(
             mutations.values(),
@@ -1201,12 +1207,19 @@ def execute_preparation_plan(
                     context="Offline secret",
                 )
         for mutation in plan.directory_mutations:
-            if _path_exists(mutation.path):
-                _assert_directory_non_link(mutation.path, "Offline managed directory")
-                if _mode(mutation.path) != _expected_mode(0o700):
-                    raise DeploymentError(
-                        f"Offline managed directory mode is unsafe: {mutation.path}"
-                    )
+            _assert_directory_non_link(mutation.path, "Offline managed directory")
+            if verify_posix_metadata and os.name == "posix":
+                _assert_posix_metadata(
+                    mutation.path,
+                    uid=plan.uid,
+                    gid=plan.gid,
+                    mode=0o700,
+                    context="Offline managed directory",
+                )
+            elif _mode(mutation.path) != _expected_mode(0o700):
+                raise DeploymentError(
+                    f"Offline managed directory mode is unsafe: {mutation.path}"
+                )
         journal.write_phase("verified")
 
         journal.write_phase("env_committing")
@@ -1500,8 +1513,9 @@ def prepare_environment(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rotate-secrets", action="store_true")
-    parser.add_argument("--initialize-state", action="store_true")
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument("--rotate-secrets", action="store_true")
+    operation.add_argument("--initialize-state", action="store_true")
     args = parser.parse_args(argv)
     prepare_environment(
         Path(__file__).resolve().parents[1],

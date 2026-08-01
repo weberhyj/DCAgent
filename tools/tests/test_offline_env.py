@@ -90,6 +90,14 @@ class OfflineEnvironmentCoreTests(unittest.TestCase):
                     environ=os.environ,
                 )
 
+    def test_cli_rejects_initialize_and_rotate_before_preparation(self) -> None:
+        with mock.patch("tools.offline_env.prepare_environment") as prepare:
+            with self.assertRaises(SystemExit) as raised:
+                offline_env_module.main(["--initialize-state", "--rotate-secrets"])
+
+        self.assertEqual(2, raised.exception.code)
+        prepare.assert_not_called()
+
 
 class OfflineEnvironmentPreparationTests(unittest.TestCase):
     def _repository(self, root: Path) -> None:
@@ -223,6 +231,41 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 },
                 set(plan.publish_secret_names),
             )
+
+    def test_plan_records_every_managed_directory_for_final_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+
+            with mock.patch(
+                "tools.offline_env._current_identity", return_value=("1000", "1000")
+            ):
+                plan = build_preparation_plan(
+                    root,
+                    initialize_state=True,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+
+            data_root = root / "artifacts" / "data"
+            self.assertEqual(
+                {
+                    data_root,
+                    root / "artifacts" / "models",
+                    data_root / "postgres",
+                    data_root / "clickhouse",
+                    data_root / "qdrant",
+                    data_root / "redis",
+                    data_root / "raw",
+                    data_root / "parquet",
+                    root / "artifacts" / "secrets",
+                },
+                {mutation.path for mutation in plan.directory_mutations},
+            )
+            mutations = {mutation.path: mutation for mutation in plan.directory_mutations}
+            self.assertTrue(mutations[data_root].existed)
+            self.assertEqual(offline_env_module._expected_mode(0o700), mutations[data_root].original_mode)
+            self.assertTrue(mutations[root / "artifacts" / "models"].existed)
 
     def test_env_rejects_host_root_keys_without_mutation(self) -> None:
         for forbidden in ("HOST_DATA_ROOT", "HOST_MODEL_ROOT"):
@@ -1034,7 +1077,9 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                         env_path.read_bytes(),
                     )
                     self.assertFalse((root / "artifacts" / "data" / "raw").exists())
-                    self.assertFalse((root / "artifacts" / "data" / "parquet").exists())
+                    self.assertFalse(
+                        (root / "artifacts" / "data" / "parquet").exists()
+                    )
                     if not include_clickhouse:
                         self.assertFalse(
                             (secret_dir / "clickhouse-query-password").exists()
@@ -1042,6 +1087,31 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                         self.assertFalse(
                             (secret_dir / "clickhouse-ingest-password").exists()
                         )
+
+    def test_non_ascii_secret_pair_is_rejected_with_one_sanitized_error(self) -> None:
+        for family, name in (
+            ("postgres", "postgres-password"),
+            ("clickhouse", "clickhouse-query-password"),
+        ):
+            with self.subTest(family=family):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._repository(root)
+                    self._prepare(root)
+                    canary = b"\xffCANARY-SENSITIVE-VALUE"
+                    (root / "artifacts" / "secrets" / name).write_bytes(canary)
+
+                    with self.assertRaises(DeploymentError) as raised:
+                        self._prepare(root)
+
+                    self.assertEqual(
+                        "Managed offline secret content is not valid ASCII",
+                        str(raised.exception),
+                    )
+                    self.assertNotIn("CANARY", str(raised.exception))
+                    self.assertNotIn("codec", str(raised.exception).casefold())
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertTrue(raised.exception.__suppress_context__)
 
     def test_valid_clickhouse_pair_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1132,6 +1202,33 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 self._prepare(root, rotate_secrets=True)
 
             self.assertEqual(before, self._managed_secret_bytes(root))
+
+    def test_secret_staging_write_failure_preserves_original_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            before = self._snapshot_tree(root)
+            real_write_secret = offline_env_module._write_secret
+            writes = 0
+
+            def fail_second_staging_write(path: Path, value: str) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise OSError("injected secret staging write failure")
+                real_write_secret(path, value)
+
+            with (
+                mock.patch(
+                    "tools.offline_env._write_secret",
+                    side_effect=fail_second_staging_write,
+                ),
+                self.assertRaisesRegex(OSError, "secret staging write failure"),
+            ):
+                self._prepare(root, rotate_secrets=True)
+
+            self.assertEqual(before, self._snapshot_tree(root))
 
     def test_post_publish_validation_failure_restores_active_secret_set(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1225,6 +1322,131 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             with mock.patch("tools.offline_env.os.chmod", side_effect=fail_raw_chmod):
                 with self.assertRaisesRegex(OSError, "injected chmod failure"):
                     self._prepare(root)
+
+            self.assertEqual(before, self._snapshot_tree(root))
+            self.assertEqual(0o750, stat.S_IMODE(raw.stat().st_mode))
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "getuid") and os.getuid() != 0,
+        "POSIX non-root ownership and chmod semantics are required",
+    )
+    def test_existing_managed_directory_mode_race_fails_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            uid = str(os.getuid())
+            gid = str(os.getgid())
+            example = root / "deploy" / "offline" / ".env.example"
+            example.write_text(
+                example.read_text(encoding="utf-8")
+                .replace("DCAGENT_UID=1000", f"DCAGENT_UID={uid}")
+                .replace("DCAGENT_GID=1000", f"DCAGENT_GID={gid}"),
+                encoding="utf-8",
+            )
+            self._prepare(root, identity=(uid, gid))
+            before_secrets = self._managed_secret_bytes(root)
+            env_path = root / "deploy" / "offline" / ".env"
+            before_env = env_path.read_bytes()
+            raw = root / "artifacts" / "data" / "raw"
+
+            def inject_mode_race(_plan: PreparationPlan) -> None:
+                os.chmod(raw, 0o777)
+
+            with (
+                mock.patch(
+                    "tools.offline_env._current_identity", return_value=(uid, gid)
+                ),
+                self.assertRaisesRegex(DeploymentError, "directory.*unsafe"),
+            ):
+                prepare_environment(
+                    root,
+                    environ={},
+                    verify_posix_metadata=True,
+                    before_mutation=inject_mode_race,
+                )
+
+            self.assertEqual(before_env, env_path.read_bytes())
+            self.assertEqual(before_secrets, self._managed_secret_bytes(root))
+            self.assertEqual(0o777, stat.S_IMODE(raw.stat().st_mode))
+            with (
+                mock.patch(
+                    "tools.offline_env._current_identity", return_value=(uid, gid)
+                ),
+                self.assertRaisesRegex(DeploymentError, "directory.*unsafe"),
+            ):
+                prepare_environment(
+                    root,
+                    environ={},
+                    verify_posix_metadata=True,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "getuid") and os.getuid() != 0,
+        "POSIX non-root ownership and chmod semantics are required",
+    )
+    def test_directory_owner_reverification_failure_rolls_back_chmod(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            uid = str(os.getuid())
+            gid = str(os.getgid())
+            example = root / "deploy" / "offline" / ".env.example"
+            example.write_text(
+                example.read_text(encoding="utf-8")
+                .replace("DCAGENT_UID=1000", f"DCAGENT_UID={uid}")
+                .replace("DCAGENT_GID=1000", f"DCAGENT_GID={gid}"),
+                encoding="utf-8",
+            )
+            self._prepare(root, identity=(uid, gid))
+            raw = root / "artifacts" / "data" / "raw"
+            os.chmod(raw, 0o750)
+            before = self._snapshot_tree(root)
+            real_chmod = os.chmod
+            real_assert_metadata = offline_env_module._assert_posix_metadata
+            chmod_completed = False
+
+            def track_chmod(path: Path, mode: int) -> None:
+                nonlocal chmod_completed
+                real_chmod(path, mode)
+                if Path(path) == raw and mode == 0o700:
+                    chmod_completed = True
+
+            def reject_owner_after_chmod(
+                path: Path,
+                *,
+                uid: int,
+                gid: int,
+                mode: int,
+                context: str,
+            ) -> None:
+                if Path(path) == raw and chmod_completed:
+                    raise DeploymentError(
+                        f"Offline managed directory owner or mode is unsafe: {path}"
+                    )
+                real_assert_metadata(
+                    path,
+                    uid=uid,
+                    gid=gid,
+                    mode=mode,
+                    context=context,
+                )
+
+            with (
+                mock.patch("tools.offline_env.os.chmod", side_effect=track_chmod),
+                mock.patch(
+                    "tools.offline_env._assert_posix_metadata",
+                    side_effect=reject_owner_after_chmod,
+                ),
+                mock.patch(
+                    "tools.offline_env._current_identity", return_value=(uid, gid)
+                ),
+                self.assertRaisesRegex(DeploymentError, "owner or mode is unsafe"),
+            ):
+                prepare_environment(
+                    root,
+                    environ={},
+                    verify_posix_metadata=True,
+                )
 
             self.assertEqual(before, self._snapshot_tree(root))
             self.assertEqual(0o750, stat.S_IMODE(raw.stat().st_mode))
