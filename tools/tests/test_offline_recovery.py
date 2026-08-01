@@ -578,6 +578,22 @@ class TransactionJournalTests(unittest.TestCase):
             state.TransactionJournal.open(journal.root, self.identity_hash)
 
         payload["phase"] = "preparing"
+        payload["source_device"] = os.lstat(source).st_dev
+        payload["source_inode"] = os.lstat(source).st_ino
+        payload["candidate_device"] = None
+        payload["candidate_inode"] = None
+        state.atomic_write_json(journal.env_rollback_state_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        payload["phase"] = "applied"
+        payload["candidate_device"] = os.lstat(candidate).st_dev
+        payload["candidate_inode"] = None
+        state.atomic_write_json(journal.env_rollback_state_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        payload["phase"] = "preparing"
         payload["source_device"] = None
         payload["source_inode"] = None
         payload["candidate_device"] = None
@@ -1319,6 +1335,159 @@ class RecoveryClassificationTests(unittest.TestCase):
                         self.assertNotEqual(result, classification)
 
 
+class PosixEnvironmentExchangeBackLogicTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def test_atomic_replacement_source_is_exchanged_back_to_environment(self) -> None:
+        class PortableExchangeBackend(recovery.PosixFilesystemMutationBackend):
+            def __init__(self, env: Path, private: Path) -> None:
+                self.paths = {(1, "env"): env, (2, "candidate"): private}
+                self.base = env.parent
+                self.exchange_count = 0
+
+            def _path(self, directory_fd: int, name: str) -> Path:
+                return self.paths[(directory_fd, name)]
+
+            def _verify_regular_at(
+                self,
+                directory_fd: int,
+                name: str,
+                *,
+                expected_identity: tuple[int, int] | None,
+                expected_digest: str,
+                mode: int,
+                owner_uid: int,
+                owner_gid: int,
+            ) -> os.stat_result:
+                path = self._path(directory_fd, name)
+                observed = os.lstat(path)
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or (
+                        expected_identity is not None
+                        and (observed.st_dev, observed.st_ino) != expected_identity
+                    )
+                    or stat.S_IMODE(observed.st_mode) != mode
+                    or observed.st_uid != owner_uid
+                    or observed.st_gid != owner_gid
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != expected_digest
+                ):
+                    raise OSError("portable exchange verification failed")
+                return observed
+
+            def _snapshot_regular_at(
+                self,
+                directory_fd: int,
+                name: str,
+                *,
+                mode: int,
+                owner_uid: int,
+                owner_gid: int,
+            ) -> tuple[os.stat_result, str]:
+                path = self._path(directory_fd, name)
+                before = os.lstat(path)
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                after = os.lstat(path)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                    or stat.S_IMODE(after.st_mode) != mode
+                    or after.st_uid != owner_uid
+                    or after.st_gid != owner_gid
+                ):
+                    raise OSError("portable exchange snapshot failed")
+                return after, digest
+
+            def _exchange(
+                self,
+                parent_fd: int,
+                env_name: str,
+                private_fd: int,
+                candidate_name: str,
+            ) -> None:
+                self.exchange_count += 1
+                env = self._path(parent_fd, env_name)
+                private = self._path(private_fd, candidate_name)
+                temporary = self.base / "portable-exchange"
+                os.replace(env, temporary)
+                os.replace(private, env)
+                os.replace(temporary, private)
+
+        for rollback_candidate in (b"A=before\n", b""):
+            with self.subTest(before_absent=not rollback_candidate):
+                env = self.base / f"env-{len(rollback_candidate)}"
+                private = self.base / f"private-{len(rollback_candidate)}"
+                env.write_bytes(rollback_candidate)
+                private.write_bytes(b"A=original-after\n")
+                original_source = os.lstat(private)
+                replacement = self.base / f"replacement-{len(rollback_candidate)}"
+                third = b"A=atomic-third\n"
+                replacement.write_bytes(third)
+                os.replace(replacement, private)
+                replaced_source = os.lstat(private)
+                self.assertNotEqual(
+                    (original_source.st_dev, original_source.st_ino),
+                    (replaced_source.st_dev, replaced_source.st_ino),
+                )
+                candidate_state = os.lstat(env)
+                source_state = os.lstat(private)
+                backend = PortableExchangeBackend(env, private)
+
+                backend._exchange_back_relocated_source(
+                    1,
+                    "env",
+                    2,
+                    "candidate",
+                    candidate_identity=(candidate_state.st_dev, candidate_state.st_ino),
+                    candidate_digest=hashlib.sha256(rollback_candidate).hexdigest(),
+                    candidate_mode=stat.S_IMODE(candidate_state.st_mode),
+                    candidate_uid=candidate_state.st_uid,
+                    candidate_gid=candidate_state.st_gid,
+                    source_mode=stat.S_IMODE(source_state.st_mode),
+                    source_uid=source_state.st_uid,
+                    source_gid=source_state.st_gid,
+                )
+
+                self.assertEqual(env.read_bytes(), third)
+                self.assertEqual(private.read_bytes(), rollback_candidate)
+                self.assertEqual(backend.exchange_count, 1)
+
+        env = self.base / "changed-authoritative-env"
+        private = self.base / "unchanged-private-third"
+        rollback_candidate = b"A=before\n"
+        env.write_bytes(rollback_candidate)
+        candidate_state = os.lstat(env)
+        replacement = self.base / "authoritative-replacement"
+        replacement.write_bytes(b"A=authoritative-third\n")
+        os.replace(replacement, env)
+        private.write_bytes(b"A=private-third\n")
+        source_state = os.lstat(private)
+        backend = PortableExchangeBackend(env, private)
+
+        with self.assertRaises(OSError):
+            backend._exchange_back_relocated_source(
+                1,
+                "env",
+                2,
+                "candidate",
+                candidate_identity=(candidate_state.st_dev, candidate_state.st_ino),
+                candidate_digest=hashlib.sha256(rollback_candidate).hexdigest(),
+                candidate_mode=stat.S_IMODE(candidate_state.st_mode),
+                candidate_uid=candidate_state.st_uid,
+                candidate_gid=candidate_state.st_gid,
+                source_mode=stat.S_IMODE(source_state.st_mode),
+                source_uid=source_state.st_uid,
+                source_gid=source_state.st_gid,
+            )
+
+        self.assertEqual(env.read_bytes(), b"A=authoritative-third\n")
+        self.assertEqual(private.read_bytes(), b"A=private-third\n")
+        self.assertEqual(backend.exchange_count, 0)
+
+
 @unittest.skipUnless(
     os.name == "posix" and sys.platform.startswith("linux"),
     "Linux renameat2 and fd chmod primitives require Linux",
@@ -1525,6 +1694,44 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
                         journal, mutation_backend=RacingBackend(env, third)
                     )
 
+                self.assertEqual(env.read_bytes(), third)
+                self.assertEqual(journal.read_phase().phase, "rollback_failed")
+                self.assertIsNotNone(journal.read_env_rollback_state())
+                self.assertTrue(self.private_environment_root(journal, env).exists())
+                if before is not None:
+                    self.assertTrue(journal.env_backup_path.exists())
+
+    def test_environment_atomic_replace_mismatch_restores_third_state(self) -> None:
+        third = b"A=atomic-third\n"
+        for before in (b"A=before\n", None):
+            with self.subTest(before_absent=before is None):
+                journal, env, _after = self.executed_environment(before)
+                source_identity = (os.lstat(env).st_dev, os.lstat(env).st_ino)
+
+                class AtomicReplacingBackend(recovery.PosixFilesystemMutationBackend):
+                    def __init__(self, target: Path, content: bytes) -> None:
+                        self.target = target
+                        self.content = content
+
+                    def _after_env_rollback_step(self, step: str) -> None:
+                        if step == "before_exchange":
+                            replacement = self.target.parent / (
+                                f".atomic-replacement-{uuid.uuid4().hex}"
+                            )
+                            replacement.write_bytes(self.content)
+                            os.chmod(replacement, 0o600)
+                            os.replace(replacement, self.target)
+
+                with self.assertRaises(recovery.RecoveryConflict):
+                    recovery.resume_transaction_rollback(
+                        journal,
+                        mutation_backend=AtomicReplacingBackend(env, third),
+                    )
+
+                self.assertNotEqual(
+                    source_identity,
+                    (os.lstat(env).st_dev, os.lstat(env).st_ino),
+                )
                 self.assertEqual(env.read_bytes(), third)
                 self.assertEqual(journal.read_phase().phase, "rollback_failed")
                 self.assertIsNotNone(journal.read_env_rollback_state())

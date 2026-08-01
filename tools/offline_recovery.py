@@ -63,7 +63,13 @@ class FilesystemMutationBackend(Protocol):
 
 
 class PosixFilesystemMutationBackend:
-    """Linux fd-based mutations for rollback object moves and mode changes."""
+    """Linux fd-based mutations for rollback object moves and mode changes.
+
+    The deployment lock is the coordination boundary. Linux has no pathname-plus-
+    inode compare-and-swap primitive, so environment exchanges use strict pre/post
+    identity validation and bounded exchange-back recovery. This is not a claim of
+    resistance to an unbounded malicious same-UID racer that ignores the lock.
+    """
 
     @staticmethod
     def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -289,14 +295,34 @@ class PosixFilesystemMutationBackend:
         owner_uid: int,
         owner_gid: int,
     ) -> os.stat_result:
+        observed, digest = cls._snapshot_regular_at(
+            directory_fd,
+            name,
+            mode=mode,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        if (
+            expected_identity is not None
+            and cls._identity(observed) != expected_identity
+        ) or digest != expected_digest:
+            raise OSError(errno.EAGAIN, "environment rollback file changed")
+        return observed
+
+    @classmethod
+    def _snapshot_regular_at(
+        cls,
+        directory_fd: int,
+        name: str,
+        *,
+        mode: int,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> tuple[os.stat_result, str]:
         path_state = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if (
             state._is_symlink(path_state)
             or not stat.S_ISREG(path_state.st_mode)
-            or (
-                expected_identity is not None
-                and cls._identity(path_state) != expected_identity
-            )
             or stat.S_IMODE(path_state.st_mode) != mode
             or path_state.st_uid != owner_uid
             or path_state.st_gid != owner_gid
@@ -321,12 +347,14 @@ class PosixFilesystemMutationBackend:
                 cls._identity(after_fd) != cls._identity(path_state)
                 or cls._identity(after_path) != cls._identity(path_state)
                 or stat.S_IMODE(after_fd.st_mode) != mode
+                or stat.S_IMODE(after_path.st_mode) != mode
                 or after_fd.st_uid != owner_uid
                 or after_fd.st_gid != owner_gid
-                or digest.hexdigest() != expected_digest
+                or after_path.st_uid != owner_uid
+                or after_path.st_gid != owner_gid
             ):
                 raise OSError(errno.EAGAIN, "environment rollback file changed")
-            return after_fd
+            return after_fd, digest.hexdigest()
         finally:
             os.close(fd)
 
@@ -404,26 +432,82 @@ class PosixFilesystemMutationBackend:
         os.fsync(private_fd)
         os.fsync(parent_fd)
 
-    @classmethod
-    def _exchange_back_if_unchanged(
-        cls,
+    def _exchange_back_relocated_source(
+        self,
         parent_fd: int,
         env_name: str,
         private_fd: int,
         candidate_name: str,
         *,
-        env_identity: tuple[int, int],
         candidate_identity: tuple[int, int],
+        candidate_digest: str,
+        candidate_mode: int,
+        candidate_uid: int,
+        candidate_gid: int,
+        source_mode: int,
+        source_uid: int,
+        source_gid: int,
     ) -> None:
-        if cls._exchange_pair_matches(
+        self._verify_regular_at(
             parent_fd,
             env_name,
+            expected_identity=candidate_identity,
+            expected_digest=candidate_digest,
+            mode=candidate_mode,
+            owner_uid=candidate_uid,
+            owner_gid=candidate_gid,
+        )
+        source, source_digest = self._snapshot_regular_at(
             private_fd,
             candidate_name,
-            env_identity,
-            candidate_identity,
-        ):
-            cls._exchange(parent_fd, env_name, private_fd, candidate_name)
+            mode=source_mode,
+            owner_uid=source_uid,
+            owner_gid=source_gid,
+        )
+        source_identity = self._identity(source)
+        if source_identity == candidate_identity:
+            raise OSError(errno.EAGAIN, "environment rollback exchange changed")
+
+        # renameat2 cannot condition the exchange on these inode identities. The
+        # deployment lock supplies coordination; the repeated checks bound normal
+        # races and the postchecks fail closed if either pathname changes again.
+        self._verify_regular_at(
+            parent_fd,
+            env_name,
+            expected_identity=candidate_identity,
+            expected_digest=candidate_digest,
+            mode=candidate_mode,
+            owner_uid=candidate_uid,
+            owner_gid=candidate_gid,
+        )
+        self._verify_regular_at(
+            private_fd,
+            candidate_name,
+            expected_identity=source_identity,
+            expected_digest=source_digest,
+            mode=source_mode,
+            owner_uid=source_uid,
+            owner_gid=source_gid,
+        )
+        self._exchange(parent_fd, env_name, private_fd, candidate_name)
+        self._verify_regular_at(
+            parent_fd,
+            env_name,
+            expected_identity=source_identity,
+            expected_digest=source_digest,
+            mode=source_mode,
+            owner_uid=source_uid,
+            owner_gid=source_gid,
+        )
+        self._verify_regular_at(
+            private_fd,
+            candidate_name,
+            expected_identity=candidate_identity,
+            expected_digest=candidate_digest,
+            mode=candidate_mode,
+            owner_uid=candidate_uid,
+            owner_gid=candidate_gid,
+        )
 
     @classmethod
     def _unlink_private_regular(
@@ -571,13 +655,19 @@ class PosixFilesystemMutationBackend:
                     owner_gid=after_gid,
                 )
             except OSError:
-                self._exchange_back_if_unchanged(
+                self._exchange_back_relocated_source(
                     parent_fd,
                     env_name,
                     private_fd,
                     _ENV_CANDIDATE_NAME,
-                    env_identity=candidate_identity,
-                    candidate_identity=source_identity,
+                    candidate_identity=candidate_identity,
+                    candidate_digest=before_digest,
+                    candidate_mode=before_mode,
+                    candidate_uid=before_uid,
+                    candidate_gid=before_gid,
+                    source_mode=after_mode,
+                    source_uid=after_uid,
+                    source_gid=after_gid,
                 )
                 raise
             self._verify_regular_at(
@@ -747,13 +837,19 @@ class PosixFilesystemMutationBackend:
                     owner_gid=after_gid,
                 )
             except OSError:
-                self._exchange_back_if_unchanged(
+                self._exchange_back_relocated_source(
                     parent_fd,
                     env_name,
                     private_fd,
                     _ENV_CANDIDATE_NAME,
-                    env_identity=candidate_identity,
-                    candidate_identity=source_identity,
+                    candidate_identity=candidate_identity,
+                    candidate_digest=placeholder_digest,
+                    candidate_mode=after_mode,
+                    candidate_uid=after_uid,
+                    candidate_gid=after_gid,
+                    source_mode=after_mode,
+                    source_uid=after_uid,
+                    source_gid=after_gid,
                 )
                 raise
             self._verify_regular_at(

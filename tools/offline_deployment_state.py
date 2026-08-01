@@ -2110,14 +2110,18 @@ class TransactionJournal:
                 (payload["candidate_device"], payload["candidate_inode"]),
             )
         )
-        identities_present = (
-            payload["source_device"] is not None
-            and payload["candidate_device"] is not None
+        identity_values = (
+            payload["source_device"],
+            payload["source_inode"],
+            payload["candidate_device"],
+            payload["candidate_inode"],
         )
+        any_identity_present = any(value is not None for value in identity_values)
+        all_identities_present = all(value is not None for value in identity_values)
         invalid_phase_identity = (
-            payload["phase"] == "preparing" and identities_present
-        ) or (payload["phase"] != "preparing" and not identities_present)
-        duplicate_identity = identities_present and (
+            payload["phase"] == "preparing" and any_identity_present
+        ) or (payload["phase"] != "preparing" and not all_identities_present)
+        duplicate_identity = all_identities_present and (
             payload["source_device"],
             payload["source_inode"],
         ) == (payload["candidate_device"], payload["candidate_inode"])
