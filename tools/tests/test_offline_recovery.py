@@ -124,6 +124,55 @@ class PortableMutationBackend:
         self._assert_identity(path, expected_source)
         os.chmod(path, mode)
 
+    def restore_environment(
+        self,
+        journal: state.TransactionJournal,
+        operation: Mapping[str, object],
+        backup: bytes | None,
+        *,
+        expected_source: os.stat_result | None,
+    ) -> None:
+        path = Path(operation["env_path"])
+        if expected_source is None:
+            raise OSError("test environment source is missing")
+        self._assert_identity(path, expected_source)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != operation["after_digest"]:
+            raise OSError("test environment source changed")
+        if operation["before_absent"] is True:
+            path.unlink()
+        elif backup is None:
+            raise OSError("test environment backup is missing")
+        else:
+            path.write_bytes(backup)
+
+
+class RacingEnvironmentBackend(PortableMutationBackend):
+    """Inject a third environment state at the final mutation boundary."""
+
+    def __init__(self, env_path: Path, third_state: bytes) -> None:
+        self.env_path = env_path
+        self.third_state = third_state
+
+    def restore_environment(
+        self,
+        journal: state.TransactionJournal,
+        operation: Mapping[str, object],
+        backup: bytes | None,
+        *,
+        expected_source: os.stat_result | None,
+    ) -> None:
+        if expected_source is None:
+            raise OSError("simulated environment source is missing")
+        self.env_path.write_bytes(self.third_state)
+        current = os.lstat(self.env_path)
+        digest = hashlib.sha256(self.env_path.read_bytes()).hexdigest()
+        if (current.st_dev, current.st_ino) != (
+            expected_source.st_dev,
+            expected_source.st_ino,
+        ) or digest != operation["after_digest"]:
+            raise OSError("simulated environment race")
+        raise AssertionError("environment race was not detected")
+
 
 class TransactionJournalTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -421,6 +470,122 @@ class TransactionJournalTests(unittest.TestCase):
         state.atomic_write_bytes(tampered_ready.env_backup_path, b"A=tampered\n")
         with self.assertRaises(state.DeploymentStateError):
             state.TransactionJournal.open(tampered_ready.root, self.identity_hash)
+
+    def test_env_rollback_wal_is_strict_and_transaction_bound(self) -> None:
+        journal = self.make_journal()
+        env = self.base / "rollback.env"
+        before = b"A=before\n"
+        after = b"A=after\n"
+        env.write_bytes(before)
+        journal.persist_env_backup(env)
+        journal.record_intent(
+            1,
+            {
+                "kind": "env_replace",
+                "object_category": "env",
+                "env_path": str(env),
+                "before_digest": hashlib.sha256(before).hexdigest(),
+                "after_digest": hashlib.sha256(after).hexdigest(),
+                "before_absent": False,
+            },
+        )
+        operation = journal.read_operations()[0]
+        journal.write_env_rollback_state(
+            operation,
+            phase="preparing",
+            source_identity=None,
+            candidate_identity=None,
+        )
+
+        payload = journal.read_env_rollback_state()
+        self.assertEqual(
+            set(payload or {}),
+            {
+                "schema_version",
+                "transaction_id",
+                "sequence",
+                "env_path",
+                "branch",
+                "phase",
+                "expected_after_digest",
+                "before_digest",
+                "source_device",
+                "source_inode",
+                "candidate_device",
+                "candidate_inode",
+            },
+        )
+        self.assertEqual(payload["phase"], "preparing")  # type: ignore[index]
+        with self.assertRaises(state.DeploymentStateError):
+            journal.record_rollback_done(1)
+        with self.assertRaises(state.DeploymentStateError):
+            journal.write_phase("rollback_complete")
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+        self.assertEqual(reopened.read_env_rollback_state(), payload)
+
+        state.atomic_write_json(
+            journal.rollback_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": journal.transaction_id,
+                "completed_sequences": [1],
+            },
+        )
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+        state.atomic_write_json(
+            journal.rollback_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": journal.transaction_id,
+                "completed_sequences": [],
+            },
+        )
+
+        assert payload is not None
+        payload["phase"] = "applied"
+        state.atomic_write_json(journal.env_rollback_state_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        source = self.base / "wal-source"
+        candidate = self.base / "wal-candidate"
+        source.write_bytes(after)
+        candidate.write_bytes(before)
+        payload.update(
+            {
+                "phase": "absence_pending",
+                "source_device": os.lstat(source).st_dev,
+                "source_inode": os.lstat(source).st_ino,
+                "candidate_device": os.lstat(candidate).st_dev,
+                "candidate_inode": os.lstat(candidate).st_ino,
+            }
+        )
+        state.atomic_write_json(journal.env_rollback_state_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        payload["phase"] = []
+        state.atomic_write_json(journal.env_rollback_state_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        payload["phase"] = "applied"
+        payload["candidate_device"] = payload["source_device"]
+        payload["candidate_inode"] = payload["source_inode"]
+        state.atomic_write_json(journal.env_rollback_state_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        payload["phase"] = "preparing"
+        payload["source_device"] = None
+        payload["source_inode"] = None
+        payload["candidate_device"] = None
+        payload["candidate_inode"] = None
+        payload["unexpected"] = "CANARY"
+        state.atomic_write_json(journal.env_rollback_state_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
 
     def test_protocol_atomic_temps_are_cleaned_but_unsafe_temps_fail_closed(
         self,
@@ -1165,6 +1330,54 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
         self.base = Path(self.tmp.name)
         os.chmod(self.base, 0o700)
         self.backend = recovery.PosixFilesystemMutationBackend()
+        self.data = self.base / "data"
+        self.data.mkdir(mode=0o700)
+        self.paths = state.StatePaths(state.derive_state_root(self.data))
+        self.paths.ensure_layout(os.getuid(), os.getgid())
+        self.secret_parent = self.base / "secrets" / ".dcagent-transactions"
+        self.identity_hash = "d" * 64
+
+    def journal(self) -> state.TransactionJournal:
+        return install_legacy_record_intent(
+            state.TransactionJournal.create(
+                self.paths, self.identity_hash, ["env"], self.secret_parent
+            )
+        )
+
+    def executed_environment(
+        self, before: bytes | None
+    ) -> tuple[state.TransactionJournal, Path, bytes]:
+        journal = self.journal()
+        env = self.base / f"rollback-{journal.transaction_id}.env"
+        after = b"A=after\n"
+        if before is None:
+            journal.persist_env_backup(None)
+        else:
+            env.write_bytes(before)
+            os.chmod(env, 0o600)
+            journal.persist_env_backup(env)
+        journal.record_intent(
+            1,
+            {
+                "kind": "env_replace",
+                "object_category": "env",
+                "env_path": str(env),
+                "before_digest": (
+                    None if before is None else hashlib.sha256(before).hexdigest()
+                ),
+                "after_digest": hashlib.sha256(after).hexdigest(),
+                "before_absent": before is None,
+            },
+        )
+        env.write_bytes(after)
+        os.chmod(env, 0o600)
+        journal.record_done(1)
+        journal.write_phase("env_committed")
+        return journal, env, after
+
+    @staticmethod
+    def private_environment_root(journal: state.TransactionJournal, env: Path) -> Path:
+        return env.parent / (f".dcagent-env-rollback-{journal.transaction_id}-1")
 
     def test_rename_noreplace_preserves_an_existing_target(self) -> None:
         source = self.base / "source"
@@ -1213,6 +1426,111 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
             self.backend.chmod(path, 0o700, expected_source=expected)
 
         self.assertEqual(stat.S_IMODE(os.lstat(victim).st_mode), 0o640)
+
+    def test_existing_environment_exchange_interruption_reopens_and_resumes(
+        self,
+    ) -> None:
+        journal, env, _after = self.executed_environment(b"A=before\n")
+
+        class InterruptingBackend(recovery.PosixFilesystemMutationBackend):
+            def _after_env_rollback_step(self, step: str) -> None:
+                if step == "existing_after_exchange":
+                    raise SystemExit("simulated interruption")
+
+        with self.assertRaises(SystemExit):
+            recovery.resume_transaction_rollback(
+                journal, mutation_backend=InterruptingBackend()
+            )
+
+        self.assertEqual(env.read_bytes(), b"A=before\n")
+        self.assertIsNotNone(journal.read_env_rollback_state())
+        self.assertTrue(self.private_environment_root(journal, env).exists())
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+        recovery.resume_transaction_rollback(reopened, mutation_backend=self.backend)
+
+        self.assertEqual(env.read_bytes(), b"A=before\n")
+        self.assertFalse(journal.root.exists())
+        self.assertFalse(self.private_environment_root(journal, env).exists())
+
+    def test_absent_environment_exchange_interruption_reopens_and_resumes(
+        self,
+    ) -> None:
+        journal, env, _after = self.executed_environment(None)
+
+        class InterruptingBackend(recovery.PosixFilesystemMutationBackend):
+            def _after_env_rollback_step(self, step: str) -> None:
+                if step == "absent_after_exchange":
+                    raise SystemExit("simulated interruption")
+
+        with self.assertRaises(SystemExit):
+            recovery.resume_transaction_rollback(
+                journal, mutation_backend=InterruptingBackend()
+            )
+
+        self.assertTrue(env.exists())
+        self.assertIsNotNone(journal.read_env_rollback_state())
+        self.assertTrue(self.private_environment_root(journal, env).exists())
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+        recovery.resume_transaction_rollback(reopened, mutation_backend=self.backend)
+
+        self.assertFalse(env.exists())
+        self.assertFalse(journal.root.exists())
+        self.assertFalse(self.private_environment_root(journal, env).exists())
+
+    def test_absent_environment_move_interruption_reopens_and_resumes(self) -> None:
+        journal, env, _after = self.executed_environment(None)
+
+        class InterruptingBackend(recovery.PosixFilesystemMutationBackend):
+            def _after_env_rollback_step(self, step: str) -> None:
+                if step == "absent_after_move":
+                    raise SystemExit("simulated interruption")
+
+        with self.assertRaises(SystemExit):
+            recovery.resume_transaction_rollback(
+                journal, mutation_backend=InterruptingBackend()
+            )
+
+        self.assertFalse(env.exists())
+        self.assertIsNotNone(journal.read_env_rollback_state())
+        self.assertTrue(self.private_environment_root(journal, env).exists())
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+        recovery.resume_transaction_rollback(reopened, mutation_backend=self.backend)
+
+        self.assertFalse(env.exists())
+        self.assertFalse(journal.root.exists())
+        self.assertFalse(self.private_environment_root(journal, env).exists())
+
+    def test_environment_exchange_mismatch_restores_and_preserves_third_state(
+        self,
+    ) -> None:
+        third = b"A=third\n"
+        for before in (b"A=before\n", None):
+            with self.subTest(before_absent=before is None):
+                journal, env, _after = self.executed_environment(before)
+
+                class RacingBackend(recovery.PosixFilesystemMutationBackend):
+                    def __init__(self, target: Path, content: bytes) -> None:
+                        self.target = target
+                        self.content = content
+
+                    def _after_env_rollback_step(self, step: str) -> None:
+                        if step == "before_exchange":
+                            self.target.write_bytes(self.content)
+
+                with self.assertRaises(recovery.RecoveryConflict):
+                    recovery.resume_transaction_rollback(
+                        journal, mutation_backend=RacingBackend(env, third)
+                    )
+
+                self.assertEqual(env.read_bytes(), third)
+                self.assertEqual(journal.read_phase().phase, "rollback_failed")
+                self.assertIsNotNone(journal.read_env_rollback_state())
+                self.assertTrue(self.private_environment_root(journal, env).exists())
+                if before is not None:
+                    self.assertTrue(journal.env_backup_path.exists())
 
 
 class RecoveryExecutionTests(unittest.TestCase):
@@ -1826,6 +2144,136 @@ class RecoveryExecutionTests(unittest.TestCase):
         self.assertFalse(
             journal.secret_companion_root and journal.secret_companion_root.exists()
         )
+
+    def test_env_rollback_wal_is_resumed_before_reverse_state_shortcut(self) -> None:
+        observed: list[tuple[int, os.stat_result | None]] = []
+
+        class CompletingWalBackend(PortableMutationBackend):
+            def restore_environment(
+                self,
+                journal: state.TransactionJournal,
+                operation: Mapping[str, object],
+                backup: bytes | None,
+                *,
+                expected_source: os.stat_result | None,
+            ) -> None:
+                observed.append((int(operation["sequence"]), expected_source))
+                journal.clear_env_rollback_state()
+
+        for before in (b"A=before\n", None):
+            with self.subTest(before_absent=before is None):
+                journal = self.journal()
+                env = self.base / f"wal-resume-{journal.transaction_id}.env"
+                after = b"A=after\n"
+                if before is not None:
+                    env.write_bytes(before)
+                    journal.persist_env_backup(env)
+                else:
+                    journal.persist_env_backup(None)
+                journal.record_intent(
+                    1,
+                    {
+                        "kind": "env_replace",
+                        "object_category": "env",
+                        "env_path": str(env),
+                        "before_digest": (
+                            None
+                            if before is None
+                            else hashlib.sha256(before).hexdigest()
+                        ),
+                        "after_digest": hashlib.sha256(after).hexdigest(),
+                        "before_absent": before is None,
+                    },
+                )
+                env.write_bytes(after)
+                source = os.lstat(env)
+                candidate_path = self.base / (f"wal-candidate-{journal.transaction_id}")
+                candidate_path.write_bytes(b"candidate")
+                candidate = os.lstat(candidate_path)
+                journal.record_done(1)
+                journal.record_rollback_intent(1)
+                if before is None:
+                    env.unlink()
+                    phase = "removed"
+                else:
+                    env.write_bytes(before)
+                    phase = "applied"
+                journal.write_env_rollback_state(
+                    journal.read_operations()[0],
+                    phase=phase,
+                    source_identity=source,
+                    candidate_identity=candidate,
+                )
+
+                recovery.resume_transaction_rollback(
+                    journal, mutation_backend=CompletingWalBackend()
+                )
+
+                self.assertEqual(observed[-1], (1, None))
+                self.assertFalse(journal.root.exists())
+
+    def test_existing_env_race_after_classification_preserves_third_state(self) -> None:
+        journal = self.journal()
+        env = self.base / "existing-race.env"
+        before = b"A=before\n"
+        after = b"A=after\n"
+        third = b"A=third\n"
+        env.write_bytes(before)
+        journal.persist_env_backup(env)
+        journal.record_intent(
+            1,
+            {
+                "kind": "env_replace",
+                "object_category": "env",
+                "env_path": str(env),
+                "before_digest": hashlib.sha256(before).hexdigest(),
+                "after_digest": hashlib.sha256(after).hexdigest(),
+                "before_absent": False,
+            },
+        )
+        env.write_bytes(after)
+        journal.record_done(1)
+
+        with self.assertRaises((recovery.RecoveryConflict, state.DeploymentStateError)):
+            recovery.resume_transaction_rollback(
+                journal,
+                mutation_backend=RacingEnvironmentBackend(env, third),
+            )
+
+        self.assertEqual(env.read_bytes(), third)
+        self.assertEqual(journal.read_phase().phase, "rollback_failed")
+        self.assertTrue(journal.root.exists())
+        self.assertTrue(journal.env_backup_path.exists())
+
+    def test_absent_env_race_after_classification_preserves_third_state(self) -> None:
+        journal = self.journal()
+        env = self.base / "absent-race.env"
+        after = b"A=created\n"
+        third = b"A=third\n"
+        journal.persist_env_backup(None)
+        journal.record_intent(
+            1,
+            {
+                "kind": "env_replace",
+                "object_category": "env",
+                "env_path": str(env),
+                "before_digest": None,
+                "after_digest": hashlib.sha256(after).hexdigest(),
+                "before_absent": True,
+            },
+        )
+        env.write_bytes(after)
+        journal.record_done(1)
+
+        with self.assertRaises((recovery.RecoveryConflict, state.DeploymentStateError)):
+            recovery.resume_transaction_rollback(
+                journal,
+                mutation_backend=RacingEnvironmentBackend(env, third),
+            )
+
+        self.assertEqual(env.read_bytes(), third)
+        self.assertEqual(journal.read_phase().phase, "rollback_failed")
+        self.assertTrue(journal.root.exists())
 
     def test_tampered_env_backup_never_replaces_active_env(self) -> None:
         journal = self.journal()

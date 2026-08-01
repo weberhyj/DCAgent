@@ -14,7 +14,6 @@ import hashlib
 import os
 import stat
 import sys
-import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Literal, Protocol
@@ -29,6 +28,9 @@ class RecoveryConflict(state.DeploymentStateError):
 SecretValidator = Callable[[Path, Mapping[str, object]], bool]
 Classification = Literal["not_executed", "executed"]
 _RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_ENV_CANDIDATE_NAME = "candidate"
+_ENV_REMOVED_NAME = "removed"
 
 
 class FilesystemMutationBackend(Protocol):
@@ -48,6 +50,15 @@ class FilesystemMutationBackend(Protocol):
         mode: int,
         *,
         expected_source: os.stat_result,
+    ) -> None: ...
+
+    def restore_environment(
+        self,
+        journal: state.TransactionJournal,
+        operation: Mapping[str, object],
+        backup: bytes | None,
+        *,
+        expected_source: os.stat_result | None,
     ) -> None: ...
 
 
@@ -101,7 +112,11 @@ class PosixFilesystemMutationBackend:
 
     @staticmethod
     def _renameat2(
-        source_fd: int, source_name: str, target_fd: int, target_name: str
+        source_fd: int,
+        source_name: str,
+        target_fd: int,
+        target_name: str,
+        flags: int,
     ) -> None:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = getattr(libc, "renameat2", None)
@@ -120,7 +135,7 @@ class PosixFilesystemMutationBackend:
             os.fsencode(source_name),
             target_fd,
             os.fsencode(target_name),
-            _RENAME_NOREPLACE,
+            flags,
         )
         if result != 0:
             error = ctypes.get_errno()
@@ -146,7 +161,13 @@ class PosixFilesystemMutationBackend:
                 pass
             else:
                 raise OSError(errno.EEXIST, "rollback target exists")
-            self._renameat2(source_fd, source.name, target_fd, target.name)
+            self._renameat2(
+                source_fd,
+                source.name,
+                target_fd,
+                target.name,
+                _RENAME_NOREPLACE,
+            )
             moved = os.stat(target.name, dir_fd=target_fd, follow_symlinks=False)
             self._verify_source(moved, expected_source)
             os.fsync(target_fd)
@@ -196,6 +217,746 @@ class PosixFilesystemMutationBackend:
                 os.close(fd)
             os.close(parent_fd)
 
+    def _after_env_rollback_step(self, step: str) -> None:
+        """Test seam for simulating process interruption at durable boundaries."""
+
+    @staticmethod
+    def _identity(st: os.stat_result) -> tuple[int, int]:
+        return st.st_dev, st.st_ino
+
+    @staticmethod
+    def _wal_identity(
+        payload: Mapping[str, object], prefix: str
+    ) -> tuple[int, int] | None:
+        device = payload[f"{prefix}_device"]
+        inode = payload[f"{prefix}_inode"]
+        if device is None and inode is None:
+            return None
+        if type(device) is not int or type(inode) is not int:
+            raise OSError(errno.EINVAL, "invalid environment rollback identity")
+        return device, inode
+
+    @staticmethod
+    def _stat_at_optional(directory_fd: int, name: str) -> os.stat_result | None:
+        try:
+            return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    @classmethod
+    def _open_private_directory(cls, parent_fd: int, name: str) -> int:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            state._is_symlink(observed)
+            or not stat.S_ISDIR(observed.st_mode)
+            or stat.S_IMODE(observed.st_mode) != 0o700
+            or observed.st_uid != os.getuid()
+            or observed.st_gid != os.getgid()
+        ):
+            raise OSError(errno.EPERM, "unsafe environment rollback directory")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        private_fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(private_fd)
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or cls._identity(opened) != cls._identity(observed)
+                or cls._identity(current) != cls._identity(observed)
+            ):
+                raise OSError(errno.EAGAIN, "environment rollback directory changed")
+            return private_fd
+        except Exception:
+            os.close(private_fd)
+            raise
+
+    @classmethod
+    def _verify_regular_at(
+        cls,
+        directory_fd: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int] | None,
+        expected_digest: str,
+        mode: int,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result:
+        path_state = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            state._is_symlink(path_state)
+            or not stat.S_ISREG(path_state.st_mode)
+            or (
+                expected_identity is not None
+                and cls._identity(path_state) != expected_identity
+            )
+            or stat.S_IMODE(path_state.st_mode) != mode
+            or path_state.st_uid != owner_uid
+            or path_state.st_gid != owner_gid
+        ):
+            raise OSError(errno.EAGAIN, "environment rollback file changed")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        fd = os.open(name, flags, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or cls._identity(
+                opened
+            ) != cls._identity(path_state):
+                raise OSError(errno.EAGAIN, "environment rollback file changed")
+            digest = hashlib.sha256()
+            while chunk := os.read(fd, 65536):
+                digest.update(chunk)
+            after_fd = os.fstat(fd)
+            after_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                cls._identity(after_fd) != cls._identity(path_state)
+                or cls._identity(after_path) != cls._identity(path_state)
+                or stat.S_IMODE(after_fd.st_mode) != mode
+                or after_fd.st_uid != owner_uid
+                or after_fd.st_gid != owner_gid
+                or digest.hexdigest() != expected_digest
+            ):
+                raise OSError(errno.EAGAIN, "environment rollback file changed")
+            return after_fd
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _create_or_verify_private_file(
+        cls,
+        private_fd: int,
+        name: str,
+        data: bytes,
+        *,
+        mode: int,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result:
+        expected_digest = hashlib.sha256(data).hexdigest()
+        existing = cls._stat_at_optional(private_fd, name)
+        if existing is None:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            fd = os.open(name, flags, mode, dir_fd=private_fd)
+            try:
+                os.fchown(fd, owner_uid, owner_gid)
+                os.fchmod(fd, mode)
+                state._write_all(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.fsync(private_fd)
+        return cls._verify_regular_at(
+            private_fd,
+            name,
+            expected_identity=None,
+            expected_digest=expected_digest,
+            mode=mode,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+
+    @staticmethod
+    def _require_private_entries(private_fd: int, allowed: set[str]) -> None:
+        if set(os.listdir(private_fd)) - allowed:
+            raise OSError(errno.EPERM, "unsafe environment rollback material")
+
+    @classmethod
+    def _exchange_pair_matches(
+        cls,
+        parent_fd: int,
+        env_name: str,
+        private_fd: int,
+        candidate_name: str,
+        env_identity: tuple[int, int],
+        candidate_identity: tuple[int, int],
+    ) -> bool:
+        env_state = cls._stat_at_optional(parent_fd, env_name)
+        candidate_state = cls._stat_at_optional(private_fd, candidate_name)
+        return (
+            env_state is not None
+            and candidate_state is not None
+            and cls._identity(env_state) == env_identity
+            and cls._identity(candidate_state) == candidate_identity
+        )
+
+    @classmethod
+    def _exchange(
+        cls, parent_fd: int, env_name: str, private_fd: int, candidate_name: str
+    ) -> None:
+        cls._renameat2(
+            parent_fd,
+            env_name,
+            private_fd,
+            candidate_name,
+            _RENAME_EXCHANGE,
+        )
+        os.fsync(private_fd)
+        os.fsync(parent_fd)
+
+    @classmethod
+    def _exchange_back_if_unchanged(
+        cls,
+        parent_fd: int,
+        env_name: str,
+        private_fd: int,
+        candidate_name: str,
+        *,
+        env_identity: tuple[int, int],
+        candidate_identity: tuple[int, int],
+    ) -> None:
+        if cls._exchange_pair_matches(
+            parent_fd,
+            env_name,
+            private_fd,
+            candidate_name,
+            env_identity,
+            candidate_identity,
+        ):
+            cls._exchange(parent_fd, env_name, private_fd, candidate_name)
+
+    @classmethod
+    def _unlink_private_regular(
+        cls,
+        private_fd: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int],
+        expected_digest: str,
+        mode: int,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> None:
+        if cls._stat_at_optional(private_fd, name) is None:
+            return
+        cls._verify_regular_at(
+            private_fd,
+            name,
+            expected_identity=expected_identity,
+            expected_digest=expected_digest,
+            mode=mode,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        os.unlink(name, dir_fd=private_fd)
+        os.fsync(private_fd)
+
+    @staticmethod
+    def _private_root_name(
+        journal: state.TransactionJournal, operation: Mapping[str, object]
+    ) -> str:
+        return f".dcagent-env-rollback-{journal.transaction_id}-{operation['sequence']}"
+
+    def _restore_existing_environment(
+        self,
+        journal: state.TransactionJournal,
+        operation: Mapping[str, object],
+        rollback_state: Mapping[str, object],
+        backup: bytes,
+        parent_fd: int,
+        private_fd: int,
+        env_name: str,
+        expected_source: os.stat_result | None,
+    ) -> None:
+        before_mode = int(operation["before_mode"])
+        before_uid = int(operation["before_owner_uid"])
+        before_gid = int(operation["before_owner_gid"])
+        after_mode = int(operation["after_mode"])
+        after_uid = int(operation["after_owner_uid"])
+        after_gid = int(operation["after_owner_gid"])
+        before_digest = str(operation["before_digest"])
+        after_digest = str(operation["after_digest"])
+        if rollback_state["phase"] == "preparing":
+            source = self._verify_regular_at(
+                parent_fd,
+                env_name,
+                expected_identity=(
+                    None if expected_source is None else self._identity(expected_source)
+                ),
+                expected_digest=after_digest,
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            if self._stat_at_optional(private_fd, _ENV_REMOVED_NAME) is not None:
+                raise OSError(errno.EPERM, "invalid environment rollback material")
+            candidate = self._create_or_verify_private_file(
+                private_fd,
+                _ENV_CANDIDATE_NAME,
+                backup,
+                mode=before_mode,
+                owner_uid=before_uid,
+                owner_gid=before_gid,
+            )
+            journal.write_env_rollback_state(
+                operation,
+                phase="exchange_pending",
+                source_identity=source,
+                candidate_identity=candidate,
+            )
+            rollback_state = journal.read_env_rollback_state()
+        if rollback_state is None:
+            raise OSError(errno.EIO, "missing environment rollback state")
+        source_identity = self._wal_identity(rollback_state, "source")
+        candidate_identity = self._wal_identity(rollback_state, "candidate")
+        if source_identity is None or candidate_identity is None:
+            raise OSError(errno.EINVAL, "missing environment rollback identity")
+        phase = rollback_state["phase"]
+        if phase == "exchange_pending":
+            if self._exchange_pair_matches(
+                parent_fd,
+                env_name,
+                private_fd,
+                _ENV_CANDIDATE_NAME,
+                source_identity,
+                candidate_identity,
+            ):
+                self._verify_regular_at(
+                    parent_fd,
+                    env_name,
+                    expected_identity=source_identity,
+                    expected_digest=after_digest,
+                    mode=after_mode,
+                    owner_uid=after_uid,
+                    owner_gid=after_gid,
+                )
+                self._verify_regular_at(
+                    private_fd,
+                    _ENV_CANDIDATE_NAME,
+                    expected_identity=candidate_identity,
+                    expected_digest=before_digest,
+                    mode=before_mode,
+                    owner_uid=before_uid,
+                    owner_gid=before_gid,
+                )
+                self._after_env_rollback_step("before_exchange")
+                self._exchange(parent_fd, env_name, private_fd, _ENV_CANDIDATE_NAME)
+                self._after_env_rollback_step("existing_after_exchange")
+            elif not self._exchange_pair_matches(
+                parent_fd,
+                env_name,
+                private_fd,
+                _ENV_CANDIDATE_NAME,
+                candidate_identity,
+                source_identity,
+            ):
+                raise OSError(errno.EAGAIN, "environment rollback exchange changed")
+            self._verify_regular_at(
+                parent_fd,
+                env_name,
+                expected_identity=candidate_identity,
+                expected_digest=before_digest,
+                mode=before_mode,
+                owner_uid=before_uid,
+                owner_gid=before_gid,
+            )
+            try:
+                self._verify_regular_at(
+                    private_fd,
+                    _ENV_CANDIDATE_NAME,
+                    expected_identity=source_identity,
+                    expected_digest=after_digest,
+                    mode=after_mode,
+                    owner_uid=after_uid,
+                    owner_gid=after_gid,
+                )
+            except OSError:
+                self._exchange_back_if_unchanged(
+                    parent_fd,
+                    env_name,
+                    private_fd,
+                    _ENV_CANDIDATE_NAME,
+                    env_identity=candidate_identity,
+                    candidate_identity=source_identity,
+                )
+                raise
+            self._verify_regular_at(
+                parent_fd,
+                env_name,
+                expected_identity=candidate_identity,
+                expected_digest=before_digest,
+                mode=before_mode,
+                owner_uid=before_uid,
+                owner_gid=before_gid,
+            )
+            journal.write_env_rollback_state(
+                operation,
+                phase="applied",
+                source_identity=source_identity,
+                candidate_identity=candidate_identity,
+            )
+            phase = "applied"
+        if phase != "applied":
+            raise OSError(errno.EINVAL, "invalid existing environment rollback phase")
+        self._verify_regular_at(
+            parent_fd,
+            env_name,
+            expected_identity=candidate_identity,
+            expected_digest=before_digest,
+            mode=before_mode,
+            owner_uid=before_uid,
+            owner_gid=before_gid,
+        )
+        self._unlink_private_regular(
+            private_fd,
+            _ENV_CANDIDATE_NAME,
+            expected_identity=source_identity,
+            expected_digest=after_digest,
+            mode=after_mode,
+            owner_uid=after_uid,
+            owner_gid=after_gid,
+        )
+        if self._stat_at_optional(private_fd, _ENV_REMOVED_NAME) is not None:
+            raise OSError(errno.EPERM, "invalid environment rollback material")
+
+    @classmethod
+    def _restore_removed_if_env_absent(
+        cls, parent_fd: int, env_name: str, private_fd: int
+    ) -> None:
+        if (
+            cls._stat_at_optional(parent_fd, env_name) is None
+            and cls._stat_at_optional(private_fd, _ENV_REMOVED_NAME) is not None
+        ):
+            cls._renameat2(
+                private_fd,
+                _ENV_REMOVED_NAME,
+                parent_fd,
+                env_name,
+                _RENAME_NOREPLACE,
+            )
+            os.fsync(private_fd)
+            os.fsync(parent_fd)
+
+    def _restore_absent_environment(
+        self,
+        journal: state.TransactionJournal,
+        operation: Mapping[str, object],
+        rollback_state: Mapping[str, object],
+        parent_fd: int,
+        private_fd: int,
+        env_name: str,
+        expected_source: os.stat_result | None,
+    ) -> None:
+        after_mode = int(operation["after_mode"])
+        after_uid = int(operation["after_owner_uid"])
+        after_gid = int(operation["after_owner_gid"])
+        after_digest = str(operation["after_digest"])
+        placeholder_digest = hashlib.sha256(b"").hexdigest()
+        if rollback_state["phase"] == "preparing":
+            source = self._verify_regular_at(
+                parent_fd,
+                env_name,
+                expected_identity=(
+                    None if expected_source is None else self._identity(expected_source)
+                ),
+                expected_digest=after_digest,
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            if self._stat_at_optional(private_fd, _ENV_REMOVED_NAME) is not None:
+                raise OSError(errno.EPERM, "invalid environment rollback material")
+            candidate = self._create_or_verify_private_file(
+                private_fd,
+                _ENV_CANDIDATE_NAME,
+                b"",
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            journal.write_env_rollback_state(
+                operation,
+                phase="exchange_pending",
+                source_identity=source,
+                candidate_identity=candidate,
+            )
+            rollback_state = journal.read_env_rollback_state()
+        if rollback_state is None:
+            raise OSError(errno.EIO, "missing environment rollback state")
+        source_identity = self._wal_identity(rollback_state, "source")
+        candidate_identity = self._wal_identity(rollback_state, "candidate")
+        if source_identity is None or candidate_identity is None:
+            raise OSError(errno.EINVAL, "missing environment rollback identity")
+        phase = rollback_state["phase"]
+        if phase == "exchange_pending":
+            if self._exchange_pair_matches(
+                parent_fd,
+                env_name,
+                private_fd,
+                _ENV_CANDIDATE_NAME,
+                source_identity,
+                candidate_identity,
+            ):
+                self._verify_regular_at(
+                    parent_fd,
+                    env_name,
+                    expected_identity=source_identity,
+                    expected_digest=after_digest,
+                    mode=after_mode,
+                    owner_uid=after_uid,
+                    owner_gid=after_gid,
+                )
+                self._verify_regular_at(
+                    private_fd,
+                    _ENV_CANDIDATE_NAME,
+                    expected_identity=candidate_identity,
+                    expected_digest=placeholder_digest,
+                    mode=after_mode,
+                    owner_uid=after_uid,
+                    owner_gid=after_gid,
+                )
+                self._after_env_rollback_step("before_exchange")
+                self._exchange(parent_fd, env_name, private_fd, _ENV_CANDIDATE_NAME)
+                self._after_env_rollback_step("absent_after_exchange")
+            elif not self._exchange_pair_matches(
+                parent_fd,
+                env_name,
+                private_fd,
+                _ENV_CANDIDATE_NAME,
+                candidate_identity,
+                source_identity,
+            ):
+                raise OSError(errno.EAGAIN, "environment rollback exchange changed")
+            self._verify_regular_at(
+                parent_fd,
+                env_name,
+                expected_identity=candidate_identity,
+                expected_digest=placeholder_digest,
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            try:
+                self._verify_regular_at(
+                    private_fd,
+                    _ENV_CANDIDATE_NAME,
+                    expected_identity=source_identity,
+                    expected_digest=after_digest,
+                    mode=after_mode,
+                    owner_uid=after_uid,
+                    owner_gid=after_gid,
+                )
+            except OSError:
+                self._exchange_back_if_unchanged(
+                    parent_fd,
+                    env_name,
+                    private_fd,
+                    _ENV_CANDIDATE_NAME,
+                    env_identity=candidate_identity,
+                    candidate_identity=source_identity,
+                )
+                raise
+            self._verify_regular_at(
+                parent_fd,
+                env_name,
+                expected_identity=candidate_identity,
+                expected_digest=placeholder_digest,
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            journal.write_env_rollback_state(
+                operation,
+                phase="applied",
+                source_identity=source_identity,
+                candidate_identity=candidate_identity,
+            )
+            phase = "applied"
+        if phase == "applied":
+            self._verify_regular_at(
+                parent_fd,
+                env_name,
+                expected_identity=candidate_identity,
+                expected_digest=placeholder_digest,
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            self._verify_regular_at(
+                private_fd,
+                _ENV_CANDIDATE_NAME,
+                expected_identity=source_identity,
+                expected_digest=after_digest,
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            if self._stat_at_optional(private_fd, _ENV_REMOVED_NAME) is not None:
+                raise OSError(errno.EPERM, "invalid environment rollback material")
+            journal.write_env_rollback_state(
+                operation,
+                phase="absence_pending",
+                source_identity=source_identity,
+                candidate_identity=candidate_identity,
+            )
+            phase = "absence_pending"
+        if phase == "absence_pending":
+            self._verify_regular_at(
+                private_fd,
+                _ENV_CANDIDATE_NAME,
+                expected_identity=source_identity,
+                expected_digest=after_digest,
+                mode=after_mode,
+                owner_uid=after_uid,
+                owner_gid=after_gid,
+            )
+            env_state = self._stat_at_optional(parent_fd, env_name)
+            removed_state = self._stat_at_optional(private_fd, _ENV_REMOVED_NAME)
+            if (
+                env_state is not None
+                and self._identity(env_state) == candidate_identity
+                and removed_state is None
+            ):
+                self._verify_regular_at(
+                    parent_fd,
+                    env_name,
+                    expected_identity=candidate_identity,
+                    expected_digest=placeholder_digest,
+                    mode=after_mode,
+                    owner_uid=after_uid,
+                    owner_gid=after_gid,
+                )
+                self._renameat2(
+                    parent_fd,
+                    env_name,
+                    private_fd,
+                    _ENV_REMOVED_NAME,
+                    _RENAME_NOREPLACE,
+                )
+                os.fsync(private_fd)
+                os.fsync(parent_fd)
+                self._after_env_rollback_step("absent_after_move")
+            elif not (
+                env_state is None
+                and removed_state is not None
+                and self._identity(removed_state) == candidate_identity
+            ):
+                if env_state is None and removed_state is not None:
+                    self._restore_removed_if_env_absent(parent_fd, env_name, private_fd)
+                raise OSError(errno.EAGAIN, "environment absence move changed")
+            try:
+                self._verify_regular_at(
+                    private_fd,
+                    _ENV_REMOVED_NAME,
+                    expected_identity=candidate_identity,
+                    expected_digest=placeholder_digest,
+                    mode=after_mode,
+                    owner_uid=after_uid,
+                    owner_gid=after_gid,
+                )
+            except OSError:
+                self._restore_removed_if_env_absent(parent_fd, env_name, private_fd)
+                raise
+            if self._stat_at_optional(parent_fd, env_name) is not None:
+                raise OSError(errno.EAGAIN, "environment path changed after removal")
+            journal.write_env_rollback_state(
+                operation,
+                phase="removed",
+                source_identity=source_identity,
+                candidate_identity=candidate_identity,
+            )
+            phase = "removed"
+        if phase != "removed":
+            raise OSError(errno.EINVAL, "invalid absent environment rollback phase")
+        if self._stat_at_optional(parent_fd, env_name) is not None:
+            raise OSError(errno.EAGAIN, "environment path changed after removal")
+        self._unlink_private_regular(
+            private_fd,
+            _ENV_CANDIDATE_NAME,
+            expected_identity=source_identity,
+            expected_digest=after_digest,
+            mode=after_mode,
+            owner_uid=after_uid,
+            owner_gid=after_gid,
+        )
+        self._unlink_private_regular(
+            private_fd,
+            _ENV_REMOVED_NAME,
+            expected_identity=candidate_identity,
+            expected_digest=placeholder_digest,
+            mode=after_mode,
+            owner_uid=after_uid,
+            owner_gid=after_gid,
+        )
+
+    def restore_environment(
+        self,
+        journal: state.TransactionJournal,
+        operation: Mapping[str, object],
+        backup: bytes | None,
+        *,
+        expected_source: os.stat_result | None,
+    ) -> None:
+        env_path = _path(operation, "env_path")
+        parent_fd = self._open_parent(env_path.parent)
+        private_fd: int | None = None
+        private_name = self._private_root_name(journal, operation)
+        try:
+            rollback_state = journal.read_env_rollback_state()
+            if rollback_state is None:
+                if expected_source is None:
+                    raise OSError(errno.EINVAL, "missing environment rollback source")
+                journal.write_env_rollback_state(
+                    operation,
+                    phase="preparing",
+                    source_identity=None,
+                    candidate_identity=None,
+                )
+                rollback_state = journal.read_env_rollback_state()
+            if rollback_state is None:
+                raise OSError(errno.EIO, "missing environment rollback state")
+            private_fd = self._open_private_directory(parent_fd, private_name)
+            self._require_private_entries(
+                private_fd, {_ENV_CANDIDATE_NAME, _ENV_REMOVED_NAME}
+            )
+            branch = rollback_state["branch"]
+            if branch == "existing_before":
+                if backup is None:
+                    raise OSError(errno.EINVAL, "missing environment rollback backup")
+                self._restore_existing_environment(
+                    journal,
+                    operation,
+                    rollback_state,
+                    backup,
+                    parent_fd,
+                    private_fd,
+                    env_path.name,
+                    expected_source,
+                )
+            elif branch == "absent_before":
+                self._restore_absent_environment(
+                    journal,
+                    operation,
+                    rollback_state,
+                    parent_fd,
+                    private_fd,
+                    env_path.name,
+                    expected_source,
+                )
+            else:
+                raise OSError(errno.EINVAL, "invalid environment rollback branch")
+            self._require_private_entries(private_fd, set())
+            os.fsync(private_fd)
+            os.close(private_fd)
+            private_fd = None
+            os.rmdir(private_name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            journal.clear_env_rollback_state()
+        finally:
+            if private_fd is not None:
+                os.close(private_fd)
+            os.close(parent_fd)
+
 
 def _filesystem_mutations(
     backend: FilesystemMutationBackend | None,
@@ -234,6 +995,24 @@ def _chmod(
     try:
         _filesystem_mutations(backend).chmod(
             path, mode, expected_source=expected_source
+        )
+    except (OSError, state.DeploymentStateError):
+        raise _conflict(operation) from None
+
+
+def _restore_environment(
+    backend: FilesystemMutationBackend | None,
+    journal: state.TransactionJournal,
+    operation: Mapping[str, object],
+    backup: bytes | None,
+    expected_source: os.stat_result | None,
+) -> None:
+    try:
+        _filesystem_mutations(backend).restore_environment(
+            journal,
+            operation,
+            backup,
+            expected_source=expected_source,
         )
     except (OSError, state.DeploymentStateError):
         raise _conflict(operation) from None
@@ -503,55 +1282,6 @@ def classify_operation(
     return classification
 
 
-def _atomic_replace_bytes(
-    path: Path, data: bytes, *, mode: int, owner_uid: int, owner_gid: int
-) -> None:
-    parent = path.parent
-    parent_st = state._lstat(parent, "environment parent directory")
-    if state._is_symlink(parent_st) or not stat.S_ISDIR(parent_st.st_mode):
-        raise state.DeploymentStateError(f"unsafe environment parent: {parent}")
-    fd: int | None = None
-    temporary: Path | None = None
-    try:
-        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=parent)
-        temporary = Path(name)
-        if os.name == "posix":
-            os.fchown(fd, owner_uid, owner_gid)
-            os.fchmod(fd, mode)
-        state._write_all(fd, data)
-        os.fsync(fd)
-        os.close(fd)
-        fd = None
-        os.replace(temporary, path)
-        temporary = None
-        state.fsync_directory(parent)
-    finally:
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        if temporary is not None:
-            with contextlib.suppress(OSError):
-                temporary.unlink()
-
-
-def _unlink_expected(path: Path, operation: Mapping[str, object]) -> None:
-    current = _lstat(path, operation)
-    if current is None:
-        return
-    if not _matches_type(
-        current, operation.get("object_type")
-    ) or not _authority_matches(current, operation):
-        raise _conflict(operation)
-    if stat.S_ISDIR(current.st_mode):
-        try:
-            path.rmdir()
-        except OSError:
-            raise _conflict(operation) from None
-    else:
-        path.unlink()
-    state.fsync_directory(path.parent)
-
-
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
@@ -564,6 +1294,8 @@ def _mutation_source_path(operation: Mapping[str, object]) -> Path | None:
         return _path(operation, "backup_path")
     if kind == "chmod":
         return _path(operation, "path")
+    if kind == "env_replace":
+        return _path(operation, "env_path")
     return None
 
 
@@ -634,31 +1366,21 @@ def reverse_operation(
     kind = operation["kind"]
     if kind == "env_replace":
         path = _path(operation, "env_path")
+        if source_snapshot is None:
+            raise _conflict(operation)
         try:
             backup = journal.validate_env_backup_for_operation(operation)
         except state.DeploymentStateError:
             raise _conflict(operation) from None
-        if operation.get("before_absent") is True:
-            _unlink_expected(
-                path,
-                {
-                    **operation,
-                    "object_type": "file",
-                    "mode": operation["after_mode"],
-                    "owner_uid": operation["after_owner_uid"],
-                    "owner_gid": operation["after_owner_gid"],
-                },
-            )
-        elif backup is None:
+        if operation.get("before_absent") is not True and backup is None:
             raise _conflict(operation)
-        else:
-            _atomic_replace_bytes(
-                path,
-                backup,
-                mode=operation["before_mode"],
-                owner_uid=operation["before_owner_uid"],
-                owner_gid=operation["before_owner_gid"],
-            )
+        _restore_environment(
+            mutation_backend,
+            journal,
+            operation,
+            backup,
+            source_snapshot,
+        )
         return
     if kind == "staging_to_active":
         staging = _path(operation, "staging_path")
@@ -922,6 +1644,7 @@ def resume_transaction_rollback(
         completed = set(journal._read_rollback_done())
         rollback_intents = set(journal._read_rollback_intents())
         operations = sorted(journal.read_operations(), key=_rollback_order)
+        env_rollback_state = journal.read_env_rollback_state()
         for operation in operations:
             sequence = operation["sequence"]
             if sequence in completed:
@@ -931,6 +1654,32 @@ def resume_transaction_rollback(
                     raise _conflict(operation)
                 continue
             has_rollback_intent = sequence in rollback_intents
+            if (
+                env_rollback_state is not None
+                and env_rollback_state["sequence"] == sequence
+            ):
+                if not has_rollback_intent:
+                    raise _conflict(operation)
+                try:
+                    backup = journal.validate_env_backup_for_operation(operation)
+                except state.DeploymentStateError:
+                    raise _conflict(operation) from None
+                _restore_environment(
+                    mutation_backend,
+                    journal,
+                    operation,
+                    backup,
+                    None,
+                )
+                if journal.read_env_rollback_state() is not None or not (
+                    _reverse_state_is_safe(operation, secret_validator=secret_validator)
+                ):
+                    raise _conflict(operation)
+                journal.record_rollback_done(sequence)
+                completed.add(sequence)
+                rollback_intents.discard(sequence)
+                env_rollback_state = None
+                continue
             if has_rollback_intent and _reverse_state_is_safe(
                 operation, secret_validator=secret_validator
             ):

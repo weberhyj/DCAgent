@@ -54,6 +54,14 @@ OPERATION_KINDS = (
     "env_replace",
     "unlink",
 )
+ENV_ROLLBACK_PHASES = (
+    "preparing",
+    "exchange_pending",
+    "applied",
+    "absence_pending",
+    "removed",
+)
+ENV_ROLLBACK_BRANCHES = ("existing_before", "absent_before")
 OBJECT_TYPES = ("file", "directory", "environment", "secret")
 
 _MARKER_OPERATIONS = frozenset({"up", "exec", "cp", "legacy_adoption"})
@@ -1169,6 +1177,7 @@ class TransactionJournal:
     operations_path: Path = dataclasses.field(init=False)
     env_backup_path: Path = dataclasses.field(init=False)
     env_backup_meta_path: Path = dataclasses.field(init=False)
+    env_rollback_state_path: Path = dataclasses.field(init=False)
     rollback_path: Path = dataclasses.field(init=False)
     rollback_intents_path: Path = dataclasses.field(init=False)
     history_receipt_path: Path = dataclasses.field(init=False)
@@ -1186,6 +1195,7 @@ class TransactionJournal:
         self.operations_path = self.root / "operations.json"
         self.env_backup_path = self.root / "env-backup"
         self.env_backup_meta_path = self.root / "env-backup.json"
+        self.env_rollback_state_path = self.root / "env-rollback.json"
         self.rollback_path = self.root / "rollback.json"
         self.rollback_intents_path = self.root / "rollback-intents.json"
         self.history_receipt_path = (
@@ -1373,6 +1383,12 @@ class TransactionJournal:
             raise DeploymentStateError(f"invalid rollback state: {root}")
         journal._read_env_backup_meta()
         journal._validate_root_entries()
+        env_rollback_state = journal._read_env_rollback_state(operations)
+        if env_rollback_state is not None and (
+            env_rollback_state["sequence"] in rollback_done
+            or phase.phase in {"rollback_complete", "rollback_cleanup_required"}
+        ):
+            raise DeploymentStateError(f"invalid rollback state: {root}")
         receipt = journal.read_history_receipt()
         if tombstone and (
             phase.phase not in {"committed", "committed_cleanup_required"}
@@ -1447,7 +1463,8 @@ class TransactionJournal:
             "rollback-intents.json",
             "env-backup.json",
         }
-        allowed_temp_targets = expected | {"env-backup"}
+        optional = {"env-backup", "env-rollback.json"}
+        allowed_temp_targets = expected | optional
         try:
             entries = list(os.scandir(self.root))
         except OSError as exc:
@@ -1470,7 +1487,7 @@ class TransactionJournal:
                 f"cannot inspect transaction journal: {self.root}"
             ) from exc
         actual = {entry.name for entry in entries}
-        if not expected <= actual or actual - expected - {"env-backup"}:
+        if not expected <= actual or actual - expected - optional:
             raise DeploymentStateError(f"invalid transaction journal: {self.root}")
         for entry in entries:
             _verify_regular_file(Path(entry.path), "transaction journal record")
@@ -1493,6 +1510,12 @@ class TransactionJournal:
     def write_phase(self, phase: str) -> None:
         if phase not in TRANSACTION_PHASES:
             raise DeploymentStateError("invalid transaction phase")
+        if phase in {"rollback_complete", "rollback_cleanup_required"} and (
+            self.read_env_rollback_state() is not None
+        ):
+            raise DeploymentStateError(
+                "environment rollback must finish before rollback completion"
+            )
         record = PhaseRecord(
             SCHEMA_VERSION,
             self.transaction_id,
@@ -1950,6 +1973,14 @@ class TransactionJournal:
         }
         if sequence not in operation_sequences:
             raise DeploymentStateError("unknown rollback operation sequence")
+        env_rollback_state = self.read_env_rollback_state()
+        if (
+            env_rollback_state is not None
+            and env_rollback_state["sequence"] == sequence
+        ):
+            raise DeploymentStateError(
+                "environment rollback must finish before recording completion"
+            )
         done = self._read_rollback_done()
         if sequence not in done:
             done.append(sequence)
@@ -1958,6 +1989,200 @@ class TransactionJournal:
         if sequence in intents:
             intents.remove(sequence)
             self._write_rollback_intents(intents)
+
+    @staticmethod
+    def _env_rollback_identity_fields(
+        identity: os.stat_result | tuple[int, int] | None,
+    ) -> tuple[int | None, int | None]:
+        if identity is None:
+            return None, None
+        if isinstance(identity, os.stat_result):
+            device, inode = identity.st_dev, identity.st_ino
+        elif (
+            isinstance(identity, tuple)
+            and len(identity) == 2
+            and all(type(value) is int for value in identity)
+        ):
+            device, inode = identity
+        else:
+            raise DeploymentStateError("invalid environment rollback identity")
+        if device < 0 or inode <= 0:
+            raise DeploymentStateError("invalid environment rollback identity")
+        return device, inode
+
+    @staticmethod
+    def _env_rollback_branch(operation: Mapping[str, object]) -> str:
+        return (
+            "absent_before" if operation["before_absent"] is True else "existing_before"
+        )
+
+    def _env_rollback_operation(
+        self,
+        sequence: object,
+        operations: Sequence[Mapping[str, object]],
+    ) -> Mapping[str, object]:
+        matches = [
+            operation
+            for operation in operations
+            if operation["kind"] == "env_replace" and operation["sequence"] == sequence
+        ]
+        if len(matches) != 1:
+            raise DeploymentStateError(
+                f"invalid environment rollback state: {self.env_rollback_state_path}"
+            )
+        return matches[0]
+
+    def write_env_rollback_state(
+        self,
+        operation: Mapping[str, object],
+        *,
+        phase: str,
+        source_identity: os.stat_result | tuple[int, int] | None,
+        candidate_identity: os.stat_result | tuple[int, int] | None,
+    ) -> None:
+        operations = self._read_operations_internal()
+        persisted = self._env_rollback_operation(operation.get("sequence"), operations)
+        if dict(operation) != dict(persisted):
+            raise DeploymentStateError(
+                "environment rollback state must reference a persisted operation"
+            )
+        if phase not in ENV_ROLLBACK_PHASES:
+            raise DeploymentStateError("invalid environment rollback phase")
+        source_device, source_inode = self._env_rollback_identity_fields(
+            source_identity
+        )
+        candidate_device, candidate_inode = self._env_rollback_identity_fields(
+            candidate_identity
+        )
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "transaction_id": self.transaction_id,
+            "sequence": persisted["sequence"],
+            "env_path": persisted["env_path"],
+            "branch": self._env_rollback_branch(persisted),
+            "phase": phase,
+            "expected_after_digest": persisted["after_digest"],
+            "before_digest": persisted["before_digest"],
+            "source_device": source_device,
+            "source_inode": source_inode,
+            "candidate_device": candidate_device,
+            "candidate_inode": candidate_inode,
+        }
+        self._validate_env_rollback_payload(payload, operations)
+        atomic_write_json(self.env_rollback_state_path, payload)
+
+    def _validate_env_rollback_payload(
+        self,
+        payload: object,
+        operations: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        required = {
+            "schema_version",
+            "transaction_id",
+            "sequence",
+            "env_path",
+            "branch",
+            "phase",
+            "expected_after_digest",
+            "before_digest",
+            "source_device",
+            "source_inode",
+            "candidate_device",
+            "candidate_inode",
+        }
+        if not isinstance(payload, Mapping) or set(payload) != required:
+            raise DeploymentStateError(
+                f"invalid environment rollback state: {self.env_rollback_state_path}"
+            )
+        invalid_identity = any(
+            (device is None) != (inode is None)
+            or (
+                device is not None
+                and (
+                    type(device) is not int
+                    or type(inode) is not int
+                    or device < 0
+                    or inode <= 0
+                )
+            )
+            for device, inode in (
+                (payload["source_device"], payload["source_inode"]),
+                (payload["candidate_device"], payload["candidate_inode"]),
+            )
+        )
+        identities_present = (
+            payload["source_device"] is not None
+            and payload["candidate_device"] is not None
+        )
+        invalid_phase_identity = (
+            payload["phase"] == "preparing" and identities_present
+        ) or (payload["phase"] != "preparing" and not identities_present)
+        duplicate_identity = identities_present and (
+            payload["source_device"],
+            payload["source_inode"],
+        ) == (payload["candidate_device"], payload["candidate_inode"])
+        invalid_branch_phase = payload["branch"] == "existing_before" and payload[
+            "phase"
+        ] not in ("preparing", "exchange_pending", "applied")
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != SCHEMA_VERSION
+            or payload["transaction_id"] != self.transaction_id
+            or type(payload["sequence"]) is not int
+            or payload["sequence"] <= 0
+            or not isinstance(payload["env_path"], str)
+            or payload["branch"] not in ENV_ROLLBACK_BRANCHES
+            or payload["phase"] not in ENV_ROLLBACK_PHASES
+            or not isinstance(payload["expected_after_digest"], str)
+            or not _HEX_64.fullmatch(payload["expected_after_digest"])
+            or (
+                payload["before_digest"] is not None
+                and (
+                    not isinstance(payload["before_digest"], str)
+                    or not _HEX_64.fullmatch(payload["before_digest"])
+                )
+            )
+            or invalid_identity
+            or invalid_phase_identity
+            or duplicate_identity
+            or invalid_branch_phase
+        ):
+            raise DeploymentStateError(
+                f"invalid environment rollback state: {self.env_rollback_state_path}"
+            )
+        operation = self._env_rollback_operation(payload["sequence"], operations)
+        if (
+            payload["env_path"] != operation["env_path"]
+            or payload["branch"] != self._env_rollback_branch(operation)
+            or payload["expected_after_digest"] != operation["after_digest"]
+            or payload["before_digest"] != operation["before_digest"]
+        ):
+            raise DeploymentStateError(
+                f"environment rollback state mismatch: {self.env_rollback_state_path}"
+            )
+        return dict(payload)
+
+    def _read_env_rollback_state(
+        self, operations: Sequence[Mapping[str, object]]
+    ) -> dict[str, object] | None:
+        existing = _lstat_optional(self.env_rollback_state_path)
+        if existing is None:
+            return None
+        payload = _read_json_value(
+            self.env_rollback_state_path, "environment rollback state"
+        )
+        return self._validate_env_rollback_payload(payload, operations)
+
+    def read_env_rollback_state(self) -> dict[str, object] | None:
+        return self._read_env_rollback_state(self._read_operations_internal())
+
+    def clear_env_rollback_state(self) -> None:
+        existing = _lstat_optional(self.env_rollback_state_path)
+        if existing is None:
+            return
+        _verify_regular_file(self.env_rollback_state_path, "environment rollback state")
+        self.env_rollback_state_path.unlink()
+        fsync_directory(self.root)
 
     def persist_env_backup(self, env_path: Path | None) -> None:
         if env_path is None:
