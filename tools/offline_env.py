@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+from typing import Protocol
 
 from tools import offline_deployment_state as deployment_state
 from tools import offline_recovery
@@ -81,6 +82,290 @@ class PreparationPlan:
     managed_secret_paths: Mapping[str, Path]
     publish_secret_names: tuple[str, ...]
     rotate_secrets: bool
+
+
+class PreparationFilesystemMutationBackend(Protocol):
+    def mkdir(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result: ...
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> os.stat_result: ...
+
+    def create_file(
+        self,
+        path: Path,
+        data: bytes,
+        *,
+        mode: int,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result: ...
+
+    def rename_noreplace(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> os.stat_result: ...
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _verify_forward_object(
+    path: Path,
+    observed: os.stat_result,
+    *,
+    object_type: str,
+    mode: int,
+    owner_uid: int,
+    owner_gid: int,
+) -> None:
+    current = os.lstat(path)
+    expected_type = stat.S_ISDIR if object_type == "directory" else stat.S_ISREG
+    if (
+        not _same_identity(current, observed)
+        or deployment_state._is_symlink(current)
+        or not expected_type(current.st_mode)
+    ):
+        raise OSError("forward mutation target changed")
+    if os.name == "posix" and (
+        stat.S_IMODE(current.st_mode) != mode
+        or current.st_uid != owner_uid
+        or current.st_gid != owner_gid
+    ):
+        raise OSError("forward mutation authority changed")
+
+
+class _PortablePreparationFilesystemMutationBackend:
+    """Test-only forward mutation backend for non-POSIX contract tests."""
+
+    @staticmethod
+    def _verify_source(path: Path, expected: os.stat_result) -> os.stat_result:
+        current = os.lstat(path)
+        if not _same_identity(current, expected) or deployment_state._is_symlink(
+            current
+        ):
+            raise OSError("forward mutation source changed")
+        return current
+
+    def mkdir(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result:
+        _assert_directory_non_link(path.parent, "Forward mutation parent")
+        os.mkdir(path, mode)
+        deployment_state.fsync_directory(path.parent)
+        observed = os.lstat(path)
+        _verify_forward_object(
+            path,
+            observed,
+            object_type="directory",
+            mode=mode,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        return observed
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> os.stat_result:
+        self._verify_source(path, expected_source)
+        os.chmod(path, mode)
+        observed = self._verify_source(path, expected_source)
+        deployment_state.fsync_directory(path.parent)
+        return observed
+
+    def create_file(
+        self,
+        path: Path,
+        data: bytes,
+        *,
+        mode: int,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result:
+        _assert_directory_non_link(path.parent, "Forward mutation parent")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd: int | None = os.open(path, flags, mode)
+        try:
+            deployment_state._write_all(fd, data)
+            os.fsync(fd)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, mode)
+                os.fsync(fd)
+            else:
+                os.close(fd)
+                fd = None
+                os.chmod(path, mode)
+                fd = os.open(path, os.O_RDWR)
+                os.fsync(fd)
+            observed = os.fstat(fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+        deployment_state.fsync_directory(path.parent)
+        _verify_forward_object(
+            path,
+            observed,
+            object_type="file",
+            mode=mode,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        return observed
+
+    def rename_noreplace(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> os.stat_result:
+        self._verify_source(source, expected_source)
+        if _path_exists(target):
+            raise FileExistsError(target)
+        os.rename(source, target)
+        deployment_state.fsync_directory(source.parent)
+        if source.parent != target.parent:
+            deployment_state.fsync_directory(target.parent)
+        observed = self._verify_source(target, expected_source)
+        return observed
+
+
+class _PosixPreparationFilesystemMutationBackend:
+    """Linux dirfd-based forward mutation backend."""
+
+    def __init__(self) -> None:
+        self._trusted = offline_recovery.PosixFilesystemMutationBackend()
+
+    def mkdir(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result:
+        parent_fd = self._trusted._open_parent(path.parent)
+        try:
+            try:
+                os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(path)
+            os.mkdir(path.name, mode, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            observed = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            _verify_forward_object(
+                path,
+                observed,
+                object_type="directory",
+                mode=mode,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+            return observed
+        finally:
+            os.close(parent_fd)
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> os.stat_result:
+        self._trusted.chmod(path, mode, expected_source=expected_source)
+        return os.lstat(path)
+
+    def create_file(
+        self,
+        path: Path,
+        data: bytes,
+        *,
+        mode: int,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result:
+        parent_fd = self._trusted._open_parent(path.parent)
+        fd: int | None = None
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            fd = os.open(path.name, flags, mode, dir_fd=parent_fd)
+            deployment_state._write_all(fd, data)
+            os.fsync(fd)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+            observed = os.fstat(fd)
+            os.fsync(parent_fd)
+            _verify_forward_object(
+                path,
+                observed,
+                object_type="file",
+                mode=mode,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+            return observed
+        finally:
+            if fd is not None:
+                os.close(fd)
+            os.close(parent_fd)
+
+    def rename_noreplace(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> os.stat_result:
+        self._trusted.rename_noreplace(
+            source,
+            target,
+            expected_source=expected_source,
+        )
+        return os.lstat(target)
+
+
+def _preparation_filesystem_mutations(
+    backend: PreparationFilesystemMutationBackend | None,
+    *,
+    verify_posix_metadata: bool,
+) -> PreparationFilesystemMutationBackend:
+    if backend is not None:
+        return backend
+    if os.name == "posix" and sys.platform.startswith("linux"):
+        return _PosixPreparationFilesystemMutationBackend()
+    if verify_posix_metadata:
+        raise DeploymentError("secure environment preparation requires Linux")
+    return _PortablePreparationFilesystemMutationBackend()
 
 
 def _load_env_text(text: str) -> OrderedDict[str, str]:
@@ -296,14 +581,48 @@ def _new_password() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
 
 
-def _write_secret(path: Path, value: str) -> None:
+def _write_secret(
+    path: Path,
+    value: str,
+    *,
+    mutation_backend: PreparationFilesystemMutationBackend | None = None,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+) -> os.stat_result:
     if path.exists() and (path.is_symlink() or not path.is_file()):
         raise DeploymentError(f"Offline secret must be a regular file: {path}")
-    _atomic_write_text(path, value, encoding="ascii", mode=0o600)
+    backend = _preparation_filesystem_mutations(
+        mutation_backend,
+        verify_posix_metadata=False,
+    )
+    uid = os.getuid() if owner_uid is None and hasattr(os, "getuid") else owner_uid or 0
+    gid = os.getgid() if owner_gid is None and hasattr(os, "getgid") else owner_gid or 0
+    return backend.create_file(
+        path,
+        value.encode("ascii"),
+        mode=_expected_mode(0o600),
+        owner_uid=uid,
+        owner_gid=gid,
+    )
 
 
-def _replace_secret(source: Path, target: Path) -> None:
-    os.replace(source, target)
+def _replace_secret(
+    source: Path,
+    target: Path,
+    *,
+    mutation_backend: PreparationFilesystemMutationBackend | None = None,
+    expected_source: os.stat_result | None = None,
+) -> os.stat_result:
+    backend = _preparation_filesystem_mutations(
+        mutation_backend,
+        verify_posix_metadata=False,
+    )
+    source_state = os.lstat(source) if expected_source is None else expected_source
+    return backend.rename_noreplace(
+        source,
+        target,
+        expected_source=source_state,
+    )
 
 
 def _assert_regular_non_link(path: Path, context: str) -> None:
@@ -314,6 +633,20 @@ def _assert_regular_non_link(path: Path, context: str) -> None:
 def _assert_directory_non_link(path: Path, context: str) -> None:
     if path.is_symlink() or not path.is_dir():
         raise DeploymentError(f"{context} must be one non-link directory: {path}")
+
+
+def _revalidate_forward_directory(path: Path) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise DeploymentError(
+            f"Offline managed directory changed after planning: {path}"
+        ) from exc
+    if deployment_state._is_symlink(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise DeploymentError(
+            f"Offline managed directory changed after planning: {path}"
+        )
+    return metadata
 
 
 def _assert_posix_metadata(
@@ -856,7 +1189,8 @@ def _record_mkdir(
     *,
     owner_uid: int,
     owner_gid: int,
-) -> int:
+    mutation_backend: PreparationFilesystemMutationBackend,
+) -> tuple[int, os.stat_result]:
     recorded_mode = _expected_mode(0o700)
     journal.record_intent(
         sequence,
@@ -871,10 +1205,14 @@ def _record_mkdir(
             "object_type": "directory",
         },
     )
-    os.mkdir(path, 0o700)
-    deployment_state.fsync_directory(path.parent)
+    observed = mutation_backend.mkdir(
+        path,
+        recorded_mode,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
     journal.record_done(sequence)
-    return sequence + 1
+    return sequence + 1, observed
 
 
 def _record_chmod(
@@ -888,7 +1226,9 @@ def _record_chmod(
     object_type: str,
     owner_uid: int,
     owner_gid: int,
-) -> int:
+    expected_source: os.stat_result,
+    mutation_backend: PreparationFilesystemMutationBackend,
+) -> tuple[int, os.stat_result]:
     journal.record_intent(
         sequence,
         {
@@ -902,9 +1242,13 @@ def _record_chmod(
             "owner_gid": owner_gid,
         },
     )
-    os.chmod(path, after_mode)
+    observed = mutation_backend.chmod(
+        path,
+        after_mode,
+        expected_source=expected_source,
+    )
     journal.record_done(sequence)
-    return sequence + 1
+    return sequence + 1, observed
 
 
 def _secret_validator(path: Path, operation: Mapping[str, object]) -> bool:
@@ -1065,7 +1409,12 @@ def execute_preparation_plan(
     *,
     verify_posix_metadata: bool = True,
     before_mutation: Callable[[PreparationPlan], None] | None = None,
+    mutation_backend: PreparationFilesystemMutationBackend | None = None,
 ) -> None:
+    filesystem = _preparation_filesystem_mutations(
+        mutation_backend,
+        verify_posix_metadata=verify_posix_metadata,
+    )
     try:
         deployment_state.assert_identity_matches(plan.state_paths, plan.identity)
     except deployment_state.DeploymentStateError as exc:
@@ -1082,6 +1431,7 @@ def execute_preparation_plan(
             identity_hash,
             ("directory", "secret", "environment"),
             companion_parent,
+            bootstrap_backend=filesystem,
         )
         journal.persist_env_backup(
             plan.env_path if plan.env_before is not None else None
@@ -1092,8 +1442,15 @@ def execute_preparation_plan(
             values = _secret_values(plan.publish_secret_names)
             assert journal.secret_companion_root is not None
             staging = journal.secret_companion_root / "staging"
+            owner_uid, owner_gid = _operation_authority(plan)
             for name in plan.publish_secret_names:
-                _write_secret(staging / name, values[name])
+                _write_secret(
+                    staging / name,
+                    values[name],
+                    mutation_backend=filesystem,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                )
             _validate_secret_set(
                 {name: staging / name for name in plan.publish_secret_names}
             )
@@ -1110,16 +1467,17 @@ def execute_preparation_plan(
             if not mutation.existed:
                 if mutation.path == plan.secret_root and _path_exists(mutation.path):
                     continue
-                sequence = _record_mkdir(
+                sequence, _ = _record_mkdir(
                     journal,
                     sequence,
                     mutation.path,
                     owner_uid=owner_uid,
                     owner_gid=owner_gid,
+                    mutation_backend=filesystem,
                 )
             elif mutation.original_mode != _expected_mode(0o700):
-                metadata = mutation.path.stat()
-                sequence = _record_chmod(
+                metadata = _revalidate_forward_directory(mutation.path)
+                sequence, _ = _record_chmod(
                     journal,
                     sequence,
                     mutation.path,
@@ -1129,6 +1487,8 @@ def execute_preparation_plan(
                     object_type="directory",
                     owner_uid=metadata.st_uid,
                     owner_gid=metadata.st_gid,
+                    expected_source=metadata,
+                    mutation_backend=filesystem,
                 )
 
         assert journal.secret_companion_root is not None
@@ -1137,7 +1497,8 @@ def execute_preparation_plan(
             active = plan.managed_secret_paths[name]
             if not _path_exists(active):
                 continue
-            metadata = active.stat()
+            metadata = os.lstat(active)
+            _assert_regular_non_link(active, "Offline secret")
             backup_path = backup / name
             journal.record_intent(
                 sequence,
@@ -1152,7 +1513,12 @@ def execute_preparation_plan(
                     "owner_gid": metadata.st_gid,
                 },
             )
-            _replace_secret(active, backup_path)
+            _replace_secret(
+                active,
+                backup_path,
+                mutation_backend=filesystem,
+                expected_source=metadata,
+            )
             journal.record_done(sequence)
             sequence += 1
         journal.write_phase("backup_complete")
@@ -1162,7 +1528,8 @@ def execute_preparation_plan(
         for name in plan.publish_secret_names:
             staged = staging / name
             active = plan.managed_secret_paths[name]
-            metadata = staged.stat()
+            metadata = os.lstat(staged)
+            _assert_regular_non_link(staged, "Offline staged secret")
             journal.record_intent(
                 sequence,
                 {
@@ -1176,7 +1543,12 @@ def execute_preparation_plan(
                     "owner_gid": metadata.st_gid,
                 },
             )
-            _replace_secret(staged, active)
+            _replace_secret(
+                staged,
+                active,
+                mutation_backend=filesystem,
+                expected_source=metadata,
+            )
             journal.record_done(sequence)
             sequence += 1
         journal.write_phase("published")
@@ -1187,7 +1559,7 @@ def execute_preparation_plan(
             metadata = path.stat()
             before_mode = stat.S_IMODE(metadata.st_mode)
             if before_mode != _expected_mode(0o600):
-                sequence = _record_chmod(
+                sequence, metadata = _record_chmod(
                     journal,
                     sequence,
                     path,
@@ -1197,6 +1569,8 @@ def execute_preparation_plan(
                     object_type="secret",
                     owner_uid=metadata.st_uid,
                     owner_gid=metadata.st_gid,
+                    expected_source=metadata,
+                    mutation_backend=filesystem,
                 )
             if verify_posix_metadata and os.name == "posix":
                 _assert_posix_metadata(
@@ -1462,6 +1836,7 @@ def prepare_environment(
     environ: Mapping[str, str] | None = None,
     verify_posix_metadata: bool = True,
     before_mutation: Callable[[PreparationPlan], None] | None = None,
+    mutation_backend: PreparationFilesystemMutationBackend | None = None,
 ) -> None:
     effective_environ = os.environ if environ is None else environ
     bootstrap = build_preparation_plan(
@@ -1506,6 +1881,7 @@ def prepare_environment(
                 plan,
                 verify_posix_metadata=verify_posix_metadata,
                 before_mutation=before_mutation,
+                mutation_backend=mutation_backend,
             )
     except deployment_state.DeploymentStateError as exc:
         raise DeploymentError(str(exc)) from exc

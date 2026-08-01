@@ -167,6 +167,17 @@ class DeploymentStateError(RuntimeError):
     """A deployment state object is missing, unsafe, or inconsistent."""
 
 
+class BootstrapFilesystemMutationBackend(Protocol):
+    def mkdir(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result: ...
+
+
 def _canonical_json_bytes(payload: object) -> bytes:
     return json.dumps(
         payload,
@@ -1242,7 +1253,10 @@ def _validate_bootstrap_entry(
         if _validate_optional_int(result[field], f"bootstrap {field}") is None:
             raise DeploymentStateError("invalid transaction bootstrap directory entry")
     if result["existed"]:
-        if _validate_optional_int(result["original_mode"], "bootstrap original mode") is None:
+        if (
+            _validate_optional_int(result["original_mode"], "bootstrap original mode")
+            is None
+        ):
             raise DeploymentStateError("invalid transaction bootstrap directory entry")
         _validate_mode(result["original_mode"], "bootstrap original mode")
         for field in ("owner_uid", "owner_gid"):
@@ -1319,6 +1333,7 @@ class TransactionJournal:
         secret_companion_root: str | Path,
         control: bool = False,
         transaction_id: str | None = None,
+        bootstrap_backend: BootstrapFilesystemMutationBackend | None = None,
     ) -> TransactionJournal:
         _verify_state_root(paths)
         _verify_directory(paths.transactions, "transaction directory")
@@ -1379,21 +1394,33 @@ class TransactionJournal:
             )
             bootstrap_durable = True
             if not control:
+                owner_uid, owner_gid = _bootstrap_owner()
+
+                def create_bootstrap_directory(path: Path, description: str) -> None:
+                    if bootstrap_backend is None:
+                        os.mkdir(path, 0o700)
+                        fsync_directory(path.parent)
+                    else:
+                        bootstrap_backend.mkdir(
+                            path,
+                            0o700,
+                            owner_uid=owner_uid,
+                            owner_gid=owner_gid,
+                        )
+                    _verify_directory(path, description)
+
                 for entry in bootstrap_entries:
                     path = Path(str(entry["path"]))
                     if entry["existed"] is False:
-                        os.mkdir(path, 0o700)
-                        fsync_directory(path.parent)
+                        create_bootstrap_directory(
+                            path, f"transaction bootstrap {entry['role']}"
+                        )
                     _verify_directory(path, f"transaction bootstrap {entry['role']}")
                 assert companion is not None
-                os.mkdir(companion, 0o700)
-                fsync_directory(companion.parent)
-                _verify_directory(companion, "secret transaction companion")
+                create_bootstrap_directory(companion, "secret transaction companion")
                 for name in ("staging", "backup"):
                     directory = companion / name
-                    os.mkdir(directory, 0o700)
-                    fsync_directory(companion)
-                    _verify_directory(directory, f"secret {name} directory")
+                    create_bootstrap_directory(directory, f"secret {name} directory")
                 journal._write_bootstrap_directories(
                     state="ready",
                     entries=bootstrap_entries,
@@ -1533,20 +1560,25 @@ class TransactionJournal:
         ):
             raise DeploymentStateError(f"invalid cleanup tombstone: {root}")
         allow_partial_companion = (
-            receipt is not None
-            and receipt["cleanup_status"] in {"committed_cleanup_pending", "complete"}
-        ) or (
-            phase.phase
-            in {
-                "rollback_in_progress",
-                "rollback_complete",
-                "rollback_cleanup_required",
-            }
-            and {operation["sequence"] for operation in operations}
-            <= set(rollback_done)
-        ) or (
-            bootstrap_record is not None
-            and bootstrap_record["state"] == "preparing"
+            (
+                receipt is not None
+                and receipt["cleanup_status"]
+                in {"committed_cleanup_pending", "complete"}
+            )
+            or (
+                phase.phase
+                in {
+                    "rollback_in_progress",
+                    "rollback_complete",
+                    "rollback_cleanup_required",
+                }
+                and {operation["sequence"] for operation in operations}
+                <= set(rollback_done)
+            )
+            or (
+                bootstrap_record is not None
+                and bootstrap_record["state"] == "preparing"
+            )
         )
         journal._validate_secret_companion(allow_partial=allow_partial_companion)
         return journal
@@ -1634,15 +1666,15 @@ class TransactionJournal:
 
     def _write_metadata(self) -> None:
         payload: dict[str, object] = {
-                "schema_version": SCHEMA_VERSION,
-                "transaction_id": self.transaction_id,
-                "deployment_identity_hash": self.deployment_identity_hash,
-                "object_categories": list(self.object_categories),
-                "control": self.control,
-                "secret_companion_root": None
-                if self.secret_companion_root is None
-                else self.secret_companion_root.as_posix(),
-            }
+            "schema_version": SCHEMA_VERSION,
+            "transaction_id": self.transaction_id,
+            "deployment_identity_hash": self.deployment_identity_hash,
+            "object_categories": list(self.object_categories),
+            "control": self.control,
+            "secret_companion_root": None
+            if self.secret_companion_root is None
+            else self.secret_companion_root.as_posix(),
+        }
         if self.bootstrap_protocol is not None:
             payload["bootstrap_protocol"] = self.bootstrap_protocol
         atomic_write_json(self.metadata_path, payload)
@@ -1651,7 +1683,9 @@ class TransactionJournal:
         if self.control:
             return ()
         if self.secret_companion_root is None:
-            raise DeploymentStateError("normal transaction is missing companion metadata")
+            raise DeploymentStateError(
+                "normal transaction is missing companion metadata"
+            )
         companion_parent = self.secret_companion_root.parent
         return (
             ("secret_root", companion_parent.parent),
@@ -1664,7 +1698,10 @@ class TransactionJournal:
         state: str,
         entries: Sequence[Mapping[str, object]],
     ) -> None:
-        if self.bootstrap_protocol != BOOTSTRAP_PROTOCOL or state not in BOOTSTRAP_STATES:
+        if (
+            self.bootstrap_protocol != BOOTSTRAP_PROTOCOL
+            or state not in BOOTSTRAP_STATES
+        ):
             raise DeploymentStateError("invalid transaction bootstrap record")
         expected = self._expected_bootstrap_directories()
         if len(entries) != len(expected):

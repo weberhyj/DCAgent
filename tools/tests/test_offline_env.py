@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -128,6 +130,7 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
         identity: tuple[str, str] = ("1000", "1000"),
         rotate_secrets: bool = False,
         environ: dict[str, str] | None = None,
+        mutation_backend: object | None = None,
     ) -> None:
         state_identity = (
             root
@@ -148,6 +151,7 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 initialize_state=not state_identity.exists(),
                 environ={} if environ is None else environ,
                 verify_posix_metadata=False,
+                mutation_backend=mutation_backend,
             )
 
     def _write_existing_env(self, root: Path, text: str) -> Path:
@@ -262,10 +266,104 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 },
                 {mutation.path for mutation in plan.directory_mutations},
             )
-            mutations = {mutation.path: mutation for mutation in plan.directory_mutations}
+            mutations = {
+                mutation.path: mutation for mutation in plan.directory_mutations
+            }
             self.assertTrue(mutations[data_root].existed)
-            self.assertEqual(offline_env_module._expected_mode(0o700), mutations[data_root].original_mode)
+            self.assertEqual(
+                offline_env_module._expected_mode(0o700),
+                mutations[data_root].original_mode,
+            )
             self.assertTrue(mutations[root / "artifacts" / "models"].existed)
+
+    def test_injected_preparation_backend_owns_forward_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            backend = mock.Mock(
+                wraps=offline_env_module._PortablePreparationFilesystemMutationBackend()
+            )
+
+            self._prepare(root, mutation_backend=backend)
+
+            self.assertGreaterEqual(backend.mkdir.call_count, 7)
+            self.assertEqual(4, backend.create_file.call_count)
+            self.assertEqual(4, backend.rename_noreplace.call_count)
+
+    def test_raw_symlink_swap_does_not_chmod_external_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "repository"
+            self._repository(root)
+            self._prepare(root)
+            raw = root / "artifacts" / "data" / "raw"
+            if os.name == "posix":
+                os.chmod(raw, 0o750)
+
+            with mock.patch(
+                "tools.offline_env._current_identity", return_value=("1000", "1000")
+            ):
+                plan = offline_env_module.build_preparation_plan(
+                    root,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+            if os.name != "posix":
+                plan = replace(
+                    plan,
+                    directory_mutations=tuple(
+                        replace(mutation, original_mode=0o600)
+                        if mutation.path == raw
+                        else mutation
+                        for mutation in plan.directory_mutations
+                    ),
+                )
+
+            victim = workspace / "victim.txt"
+            victim.write_text("do not modify", encoding="utf-8")
+            victim_before = victim.read_bytes(), victim.lstat().st_mode
+            secrets_before = self._managed_secret_bytes(root)
+            env_before = plan.env_path.read_bytes()
+
+            def replace_raw_with_symlink(_plan: PreparationPlan) -> None:
+                raw.rmdir()
+                try:
+                    raw.symlink_to(victim)
+                except OSError as exc:
+                    self.skipTest(f"symlink creation unavailable: {exc}")
+
+            with self.assertRaisesRegex(DeploymentError, "changed"):
+                offline_env_module.execute_preparation_plan(
+                    plan,
+                    verify_posix_metadata=False,
+                    before_mutation=replace_raw_with_symlink,
+                    mutation_backend=(
+                        offline_env_module._PortablePreparationFilesystemMutationBackend()
+                    ),
+                )
+
+            self.assertTrue(raw.is_symlink())
+            self.assertEqual(
+                victim_before, (victim.read_bytes(), victim.lstat().st_mode)
+            )
+            self.assertEqual(secrets_before, self._managed_secret_bytes(root))
+            self.assertEqual(env_before, plan.env_path.read_bytes())
+            self.assertEqual([], list(plan.state_paths.transactions.iterdir()))
+            self.assertEqual(
+                [],
+                list((plan.secret_root / ".dcagent-transactions").iterdir()),
+            )
+
+    @unittest.skipIf(
+        os.name == "posix" and sys.platform.startswith("linux"),
+        "non-Linux fail-closed behavior only",
+    )
+    def test_verified_preparation_requires_linux_or_injected_backend(self) -> None:
+        with self.assertRaisesRegex(DeploymentError, "requires Linux"):
+            offline_env_module._preparation_filesystem_mutations(
+                None,
+                verify_posix_metadata=True,
+            )
 
     def test_env_rejects_host_root_keys_without_mutation(self) -> None:
         for forbidden in ("HOST_DATA_ROOT", "HOST_MODEL_ROOT"):
@@ -726,15 +824,19 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 for path in secret_dir.iterdir()
                 if path.is_file()
             }
-            real_replace = os.replace
+            real_replace = offline_env_module._replace_secret
             calls = 0
 
-            def fail_during_publish(source: Path, target: Path) -> None:
+            def fail_during_publish(
+                source: Path,
+                target: Path,
+                **kwargs: object,
+            ) -> os.stat_result:
                 nonlocal calls
                 calls += 1
                 if calls == 6:
                     raise OSError("injected publish failure")
-                real_replace(source, target)
+                return real_replace(source, target, **kwargs)
 
             with (
                 mock.patch(
@@ -1077,9 +1179,7 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                         env_path.read_bytes(),
                     )
                     self.assertFalse((root / "artifacts" / "data" / "raw").exists())
-                    self.assertFalse(
-                        (root / "artifacts" / "data" / "parquet").exists()
-                    )
+                    self.assertFalse((root / "artifacts" / "data" / "parquet").exists())
                     if not include_clickhouse:
                         self.assertFalse(
                             (secret_dir / "clickhouse-query-password").exists()
@@ -1212,12 +1312,16 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             real_write_secret = offline_env_module._write_secret
             writes = 0
 
-            def fail_second_staging_write(path: Path, value: str) -> None:
+            def fail_second_staging_write(
+                path: Path,
+                value: str,
+                **kwargs: object,
+            ) -> os.stat_result:
                 nonlocal writes
                 writes += 1
                 if writes == 2:
                     raise OSError("injected secret staging write failure")
-                real_write_secret(path, value)
+                return real_write_secret(path, value, **kwargs)
 
             with (
                 mock.patch(
@@ -1273,10 +1377,14 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             self._repository(root)
             self._prepare(root)
             before = self._managed_secret_bytes(root)
-            real_replace = os.replace
+            real_replace = offline_env_module._replace_secret
             backup_moves = 0
 
-            def fail_second_backup(source: Path, target: Path) -> None:
+            def fail_second_backup(
+                source: Path,
+                target: Path,
+                **kwargs: object,
+            ) -> os.stat_result:
                 nonlocal backup_moves
                 source = Path(source)
                 target = Path(target)
@@ -1284,7 +1392,7 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                     backup_moves += 1
                     if backup_moves == 2:
                         raise OSError("injected backup failure")
-                real_replace(source, target)
+                return real_replace(source, target, **kwargs)
 
             with (
                 mock.patch(
@@ -1597,13 +1705,17 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             self._repository(root)
             self._prepare(root)
             before = self._managed_secret_bytes(root)
-            real_replace = os.replace
+            real_replace = offline_env_module._replace_secret
 
-            def fail_publish(source: Path, target: Path) -> None:
+            def fail_publish(
+                source: Path,
+                target: Path,
+                **kwargs: object,
+            ) -> os.stat_result:
                 source = Path(source)
                 if source.parent.name == "staging":
                     raise OSError("injected publish failure")
-                real_replace(source, target)
+                return real_replace(source, target, **kwargs)
 
             def fail_rollback(
                 _backend: object,
