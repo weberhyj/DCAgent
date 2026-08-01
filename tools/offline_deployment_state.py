@@ -176,9 +176,15 @@ class DeploymentStateError(RuntimeError):
 class TransactionJournalCreationError(DeploymentStateError):
     """A durable, openable transaction journal survived creation failure."""
 
-    def __init__(self, journal: TransactionJournal) -> None:
+    def __init__(
+        self,
+        journal: TransactionJournal,
+        *,
+        original_error: BaseException,
+    ) -> None:
         self.journal = journal
         self.transaction_id = journal.transaction_id
+        self.original_error = original_error
         super().__init__("transaction journal creation failed after durable bootstrap")
 
 
@@ -1512,6 +1518,7 @@ class TransactionJournal:
             BOOTSTRAP_PROTOCOL,
         )
         bootstrap_durable = False
+        original_error: BaseException | None = None
         try:
             journal._write_metadata()
             journal.write_phase("planned")
@@ -1598,7 +1605,12 @@ class TransactionJournal:
                 with contextlib.suppress(Exception):
                     _remove_private_tree(root)
                 raise
-            raise TransactionJournalCreationError(journal) from exc
+            original_error = exc
+        assert original_error is not None
+        raise TransactionJournalCreationError(
+            journal,
+            original_error=original_error,
+        ) from None
 
     @classmethod
     def open(cls, root: str | Path, expected_identity_hash: str) -> TransactionJournal:

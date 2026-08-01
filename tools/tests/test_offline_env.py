@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import tempfile
+import traceback
 import unittest
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -510,7 +511,11 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 verify_posix_metadata=True,
             )
 
-    def test_partial_journal_create_failure_rolls_back_and_reraises_cause(self) -> None:
+    def test_partial_journal_create_failure_rolls_back_and_reraises_original_error(
+        self,
+    ) -> None:
+        original_error = OSError("SENSITIVE-COMPANION-MKDIR-CANARY")
+
         class FailingCompanionBackend(
             offline_env_module._PortablePreparationFilesystemMutationBackend
         ):
@@ -523,7 +528,7 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 owner_gid: int,
             ) -> os.stat_result:
                 if path.name == ".dcagent-transactions":
-                    raise OSError("injected companion mkdir failure")
+                    raise original_error
                 return super().mkdir(
                     path,
                     mode,
@@ -535,8 +540,10 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             root = Path(directory)
             self._repository(root)
 
-            with self.assertRaisesRegex(OSError, "companion mkdir failure"):
+            with self.assertRaises(OSError) as raised:
                 self._prepare(root, mutation_backend=FailingCompanionBackend())
+
+            self.assertIs(original_error, raised.exception)
 
             state_root = root / "artifacts" / "data" / ".dcagent-deployment-state"
             self.assertEqual([], list((state_root / "transactions").iterdir()))
@@ -579,6 +586,9 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             self.assertIn("transaction retained at", message)
             self.assertIn("phase=rollback_failed", message)
             self.assertNotIn(canary, message)
+            self.assertNotIn(canary, repr(raised.exception))
+            formatted = "".join(traceback.format_exception(raised.exception))
+            self.assertNotIn(canary, formatted)
             state_root = root / "artifacts" / "data" / ".dcagent-deployment-state"
             journals = list((state_root / "transactions").iterdir())
             self.assertEqual(1, len(journals))

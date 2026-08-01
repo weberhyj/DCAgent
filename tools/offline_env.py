@@ -1929,9 +1929,7 @@ def execute_preparation_plan(
             if not secret_root_existed:
                 _cleanup_empty_secret_infrastructure(plan)
         if creation_error is not None:
-            cause = creation_error.__cause__
-            if isinstance(cause, BaseException):
-                raise cause.with_traceback(cause.__traceback__)
+            raise creation_error.original_error
         raise
 
 

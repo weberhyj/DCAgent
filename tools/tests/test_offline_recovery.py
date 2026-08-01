@@ -8,6 +8,7 @@ import os
 import stat
 import sys
 import tempfile
+import traceback
 import unittest
 import uuid
 from collections.abc import Callable, Mapping
@@ -1332,6 +1333,7 @@ class TransactionJournalTests(unittest.TestCase):
     def test_partial_bootstrap_creation_retains_openable_journal_for_rollback(
         self,
     ) -> None:
+        canary = "SENSITIVE-COMPANION-BOOTSTRAP-CANARY"
         transaction_id = "1234567812344234a2341234567890ab"
         journal_root = self.paths.transactions / transaction_id
         secret_root = self.secret_root.parent
@@ -1339,7 +1341,7 @@ class TransactionJournalTests(unittest.TestCase):
 
         def fail_companion_parent(path: Path, mode: int = 0o777) -> None:
             if Path(path) == self.secret_root:
-                raise OSError("injected companion bootstrap failure")
+                raise OSError(canary)
             real_mkdir(path, mode)
 
         with (
@@ -1359,7 +1361,15 @@ class TransactionJournalTests(unittest.TestCase):
 
         self.assertEqual(transaction_id, raised.exception.transaction_id)
         self.assertEqual(journal_root, raised.exception.journal.root)
-        self.assertNotIn("companion bootstrap failure", str(raised.exception))
+        self.assertIsInstance(raised.exception.original_error, OSError)
+        self.assertIn(canary, str(raised.exception.original_error))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertNotIn(canary, str(raised.exception))
+        self.assertNotIn(canary, repr(raised.exception))
+        formatted = "".join(traceback.format_exception(raised.exception))
+        self.assertNotIn(canary, formatted)
         self.assertTrue(journal_root.is_dir())
         self.assertTrue(secret_root.is_dir())
         self.assertFalse(self.secret_root.exists())
