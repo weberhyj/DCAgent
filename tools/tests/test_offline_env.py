@@ -1,13 +1,23 @@
+# ruff: noqa: ISC004, SIM117
+
 from __future__ import annotations
 
+import hashlib
 import os
+import stat
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
+from tools import offline_deployment_state
+from tools import offline_env as offline_env_module
 from tools.offline_env import (
+    CLICKHOUSE_SECRET_NAMES,
     DeploymentError,
+    PreparationPlan,
+    build_preparation_plan,
     canonical_numeric_identity,
     load_env,
     prepare_environment,
@@ -97,9 +107,11 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             encoding="utf-8",
         )
         data = root / "artifacts" / "data"
-        for name in ("postgres", "clickhouse", "qdrant", "redis"):
-            (data / name).mkdir(parents=True)
-        (root / "artifacts" / "models").mkdir(parents=True)
+        data.mkdir(parents=True, mode=0o700)
+        models = root / "artifacts" / "models"
+        models.mkdir(parents=True, mode=0o700)
+        os.chmod(data, 0o700)
+        os.chmod(models, 0o700)
 
     def _prepare(
         self,
@@ -109,17 +121,31 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
         rotate_secrets: bool = False,
         environ: dict[str, str] | None = None,
     ) -> None:
-        with mock.patch("tools.offline_env._current_identity", return_value=identity):
+        state_identity = (
+            root
+            / "artifacts"
+            / "data"
+            / ".dcagent-deployment-state"
+            / "deployment-identity.json"
+        )
+        with (
+            mock.patch("tools.offline_env._current_identity", return_value=identity),
+            mock.patch(
+                "tools.offline_env._dcagent_containers_exist", return_value=False
+            ),
+        ):
             prepare_environment(
                 root,
                 rotate_secrets=rotate_secrets,
+                initialize_state=not state_identity.exists(),
                 environ={} if environ is None else environ,
                 verify_posix_metadata=False,
             )
 
     def _write_existing_env(self, root: Path, text: str) -> Path:
         path = root / "deploy" / "offline" / ".env"
-        path.write_text(text, encoding="utf-8")
+        with path.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
         return path
 
     def _snapshot_tree(self, root: Path) -> dict[str, tuple[str, int, bytes | None]]:
@@ -136,7 +162,10 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             elif path.is_dir():
                 snapshot[relative] = ("directory", metadata.st_mode, None)
             else:
-                snapshot[relative] = ("file", metadata.st_mode, path.read_bytes())
+                content = path.read_bytes()
+                if "artifacts/secrets/" in f"{relative}/":
+                    content = hashlib.sha256(content).digest()
+                snapshot[relative] = ("file", metadata.st_mode, content)
         return snapshot
 
     def _managed_secret_bytes(self, root: Path) -> dict[str, bytes]:
@@ -150,6 +179,427 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 "clickhouse-ingest-password",
             )
         }
+
+    def _remove_clickhouse_configuration(self, root: Path) -> None:
+        env_path = root / "deploy" / "offline" / ".env"
+        self._write_existing_env(
+            root,
+            "\n".join(
+                line
+                for line in env_path.read_text(encoding="utf-8").splitlines()
+                if not line.startswith("CLICKHOUSE_")
+            )
+            + "\n",
+        )
+        for name in CLICKHOUSE_SECRET_NAMES:
+            (root / "artifacts" / "secrets" / name).unlink()
+
+    def test_plan_is_read_only_and_records_all_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            before = self._snapshot_tree(root)
+
+            with mock.patch(
+                "tools.offline_env._current_identity", return_value=("1000", "1000")
+            ):
+                plan = build_preparation_plan(
+                    root,
+                    initialize_state=True,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+
+            self.assertEqual(before, self._snapshot_tree(root))
+            self.assertEqual(root / "artifacts" / "data", plan.data_root)
+            self.assertEqual(root / "artifacts" / "models", plan.model_root)
+            self.assertIn("DEPLOYMENT_STATE_ROOT", plan.env_updates)
+            self.assertEqual(
+                {
+                    "postgres-password",
+                    "database-url",
+                    "clickhouse-query-password",
+                    "clickhouse-ingest-password",
+                },
+                set(plan.publish_secret_names),
+            )
+
+    def test_env_rejects_host_root_keys_without_mutation(self) -> None:
+        for forbidden in ("HOST_DATA_ROOT", "HOST_MODEL_ROOT"):
+            with self.subTest(key=forbidden):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._repository(root)
+                    example = root / "deploy" / "offline" / ".env.example"
+                    example.write_text(
+                        example.read_text(encoding="utf-8")
+                        + f"{forbidden}=C:/forbidden\n",
+                        encoding="utf-8",
+                    )
+                    before = self._snapshot_tree(root)
+                    with (
+                        mock.patch(
+                            "tools.offline_env._current_identity",
+                            return_value=("1000", "1000"),
+                        ),
+                        self.assertRaisesRegex(
+                            DeploymentError, "process-environment only"
+                        ),
+                    ):
+                        build_preparation_plan(
+                            root,
+                            initialize_state=True,
+                            environ={},
+                            verify_posix_metadata=False,
+                        )
+                    self.assertEqual(before, self._snapshot_tree(root))
+
+    def test_normal_prepare_requires_existing_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+
+            with (
+                self.assertRaisesRegex(
+                    DeploymentError, "--initialize-state|adopt-existing"
+                ),
+                mock.patch(
+                    "tools.offline_env._current_identity",
+                    return_value=("1000", "1000"),
+                ),
+                mock.patch(
+                    "tools.offline_env._dcagent_containers_exist",
+                    return_value=False,
+                ),
+            ):
+                prepare_environment(
+                    root,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+
+    def test_initialize_rejects_unsafe_existing_deployment_state(self) -> None:
+        for condition in ("pg_version", "nonempty_data", "compose_container"):
+            with self.subTest(condition=condition):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._repository(root)
+                    data_root = root / "artifacts" / "data"
+                    if condition == "pg_version":
+                        (data_root / "postgres").mkdir()
+                        (data_root / "postgres" / "PG_VERSION").write_text(
+                            "16\n", encoding="ascii"
+                        )
+                    elif condition == "nonempty_data":
+                        (data_root / "unexpected").write_text("old", encoding="ascii")
+
+                    with (
+                        mock.patch(
+                            "tools.offline_env._dcagent_containers_exist",
+                            return_value=condition == "compose_container",
+                        ),
+                        self.assertRaises(DeploymentError),
+                        mock.patch(
+                            "tools.offline_env._current_identity",
+                            return_value=("1000", "1000"),
+                        ),
+                    ):
+                        prepare_environment(
+                            root,
+                            initialize_state=True,
+                            environ={},
+                            verify_posix_metadata=False,
+                        )
+                    state_root = data_root / ".dcagent-deployment-state"
+                    self.assertEqual(
+                        {"deployment.lock"},
+                        {entry.name for entry in state_root.iterdir()},
+                    )
+
+    def test_initialize_control_rollback_failure_is_retained_and_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            with (
+                mock.patch(
+                    "tools.offline_env.deployment_state.write_identity_exclusive",
+                    side_effect=OSError("injected identity publish failure"),
+                ),
+                mock.patch(
+                    "tools.offline_env.offline_recovery.resume_transaction_rollback",
+                    side_effect=offline_deployment_state.DeploymentStateError(
+                        "injected control rollback failure"
+                    ),
+                ),
+                mock.patch(
+                    "tools.offline_env._current_identity",
+                    return_value=("1000", "1000"),
+                ),
+                mock.patch(
+                    "tools.offline_env._dcagent_containers_exist",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(
+                    DeploymentError, "rollback.*control transaction retained"
+                ),
+            ):
+                prepare_environment(
+                    root,
+                    initialize_state=True,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+
+            with self.assertRaisesRegex(DeploymentError, "incomplete transaction"):
+                self._prepare(root)
+
+    def test_initialize_control_rollback_success_preserves_error_and_is_reentrant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            with (
+                mock.patch(
+                    "tools.offline_env.deployment_state.write_identity_exclusive",
+                    side_effect=OSError("injected identity publish failure"),
+                ),
+                mock.patch(
+                    "tools.offline_env._current_identity",
+                    return_value=("1000", "1000"),
+                ),
+                mock.patch(
+                    "tools.offline_env._dcagent_containers_exist",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(OSError, "identity publish failure"),
+            ):
+                prepare_environment(
+                    root,
+                    initialize_state=True,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+
+            control = (
+                root
+                / "artifacts"
+                / "data"
+                / ".dcagent-deployment-state"
+                / "control-transactions"
+            )
+            self.assertEqual([], list(control.iterdir()))
+            self._prepare(root)
+            self.assertTrue(
+                (
+                    root
+                    / "artifacts"
+                    / "data"
+                    / ".dcagent-deployment-state"
+                    / "deployment-identity.json"
+                ).exists()
+            )
+
+    def test_initialize_postcommit_cleanup_failure_keeps_identity_and_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            real_finalize = (
+                offline_env_module.offline_recovery.finalize_committed_cleanup
+            )
+
+            def fail_control_cleanup(
+                journal: offline_deployment_state.TransactionJournal,
+            ) -> None:
+                if journal.control:
+                    raise OSError("injected control cleanup failure")
+                real_finalize(journal)
+
+            with (
+                mock.patch(
+                    "tools.offline_env.offline_recovery.finalize_committed_cleanup",
+                    side_effect=fail_control_cleanup,
+                ),
+                mock.patch(
+                    "tools.offline_env._current_identity",
+                    return_value=("1000", "1000"),
+                ),
+                mock.patch(
+                    "tools.offline_env._dcagent_containers_exist",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(
+                    DeploymentError, "control transaction requires cleanup"
+                ),
+            ):
+                prepare_environment(
+                    root,
+                    initialize_state=True,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+
+            identity = (
+                root
+                / "artifacts"
+                / "data"
+                / ".dcagent-deployment-state"
+                / "deployment-identity.json"
+            )
+            self.assertTrue(identity.exists())
+            with (
+                mock.patch(
+                    "tools.offline_env._current_identity",
+                    return_value=("1000", "1000"),
+                ),
+                mock.patch(
+                    "tools.offline_env._dcagent_containers_exist",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(DeploymentError, "incomplete transaction"),
+            ):
+                prepare_environment(
+                    root,
+                    initialize_state=True,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+
+    def test_rotate_rechecks_pg_version_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            before = self._managed_secret_bytes(root)
+            pg_version = root / "artifacts" / "data" / "postgres" / "PG_VERSION"
+
+            def inject_race(_plan: PreparationPlan) -> None:
+                pg_version.write_text("16\n", encoding="ascii")
+
+            with self.assertRaisesRegex(DeploymentError, "initialized PostgreSQL"):
+                with mock.patch(
+                    "tools.offline_env._current_identity",
+                    return_value=("1000", "1000"),
+                ):
+                    prepare_environment(
+                        root,
+                        rotate_secrets=True,
+                        environ={},
+                        verify_posix_metadata=False,
+                        before_mutation=inject_race,
+                    )
+
+            self.assertEqual(before, self._managed_secret_bytes(root))
+
+    def test_rotate_rechecks_start_marker_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            before = self._managed_secret_bytes(root)
+            marker = (
+                root
+                / "artifacts"
+                / "data"
+                / ".dcagent-deployment-state"
+                / "deployment-started.json"
+            )
+
+            def inject_race(_plan: PreparationPlan) -> None:
+                marker.write_text("raced", encoding="ascii")
+
+            with self.assertRaisesRegex(DeploymentError, "deployment has started"):
+                with mock.patch(
+                    "tools.offline_env._current_identity",
+                    return_value=("1000", "1000"),
+                ):
+                    prepare_environment(
+                        root,
+                        rotate_secrets=True,
+                        environ={},
+                        verify_posix_metadata=False,
+                        before_mutation=inject_race,
+                    )
+
+            self.assertEqual(before, self._managed_secret_bytes(root))
+            self.assertTrue(marker.exists())
+
+    def test_transaction_uses_fixed_phase_order_and_contiguous_done_operations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            phases: list[str] = []
+            real_write_phase = offline_deployment_state.TransactionJournal.write_phase
+            real_finalize = (
+                offline_env_module.offline_recovery.finalize_committed_cleanup
+            )
+
+            def record_phase(
+                journal: offline_deployment_state.TransactionJournal, phase: str
+            ) -> None:
+                if not journal.control:
+                    phases.append(phase)
+                real_write_phase(journal, phase)
+
+            def inspect_then_finalize(
+                journal: offline_deployment_state.TransactionJournal,
+            ) -> None:
+                operations = journal.read_operations()
+                self.assertEqual(
+                    list(range(1, len(operations) + 1)),
+                    [operation["sequence"] for operation in operations],
+                )
+                self.assertTrue(
+                    all(operation["status"] == "done" for operation in operations)
+                )
+                self.assertEqual(
+                    root
+                    / "artifacts"
+                    / "secrets"
+                    / ".dcagent-transactions"
+                    / journal.transaction_id,
+                    journal.secret_companion_root,
+                )
+                real_finalize(journal)
+
+            with (
+                mock.patch.object(
+                    offline_deployment_state.TransactionJournal,
+                    "write_phase",
+                    autospec=True,
+                    side_effect=record_phase,
+                ),
+                mock.patch(
+                    "tools.offline_env.offline_recovery.finalize_committed_cleanup",
+                    side_effect=inspect_then_finalize,
+                ),
+            ):
+                self._prepare(root, rotate_secrets=True)
+
+            self.assertEqual(
+                [
+                    "planned",
+                    "staging",
+                    "staged",
+                    "backing_up",
+                    "backup_complete",
+                    "publishing",
+                    "published",
+                    "verifying",
+                    "verified",
+                    "env_committing",
+                    "env_committed",
+                    "committed",
+                ],
+                phases,
+            )
 
     def test_prepare_creates_env_managed_secrets_and_writable_directories(
         self,
@@ -243,12 +693,14 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                     raise OSError("injected publish failure")
                 real_replace(source, target)
 
-            with mock.patch(
-                "tools.offline_env._replace_secret",
-                side_effect=fail_during_publish,
+            with (
+                mock.patch(
+                    "tools.offline_env._replace_secret",
+                    side_effect=fail_during_publish,
+                ),
+                self.assertRaisesRegex(OSError, "injected publish failure"),
             ):
-                with self.assertRaisesRegex(OSError, "injected publish failure"):
-                    self._prepare(root, rotate_secrets=True)
+                self._prepare(root, rotate_secrets=True)
 
             after = {
                 path.name: path.read_bytes()
@@ -265,14 +717,14 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             self._repository(root)
             self._prepare(root)
             env_path = root / "deploy" / "offline" / ".env"
-            env_path.write_text(
+            self._write_existing_env(
+                root,
                 "\n".join(
                     line
                     for line in env_path.read_text(encoding="utf-8").splitlines()
                     if not line.startswith("CLICKHOUSE_")
                 )
                 + "\n",
-                encoding="utf-8",
             )
             (root / "artifacts" / "secrets" / "clickhouse-query-password").unlink()
             (root / "artifacts" / "secrets" / "clickhouse-ingest-password").unlink()
@@ -450,14 +902,14 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             self._prepare(root)
             before = self._managed_secret_bytes(root)
             env_path = root / "deploy" / "offline" / ".env"
-            env_path.write_text(
+            self._write_existing_env(
+                root,
                 "\n".join(
                     line
                     for line in env_path.read_text(encoding="utf-8").splitlines()
                     if not line.startswith("CLICKHOUSE_")
                 )
                 + "\n",
-                encoding="utf-8",
             )
             (root / "artifacts" / "secrets" / "clickhouse-query-password").unlink()
             (root / "artifacts" / "secrets" / "clickhouse-ingest-password").unlink()
@@ -549,9 +1001,10 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                         gid: int,
                         mode: int,
                         context: str,
+                        expected_path: Path = mismatched_path,
                     ) -> None:
                         del uid, gid, mode, context
-                        if path == mismatched_path:
+                        if path == expected_path:
                             raise DeploymentError(
                                 f"Offline secret owner or mode is unsafe: {path}"
                             )
@@ -566,13 +1019,13 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                             "tools.offline_env._assert_posix_metadata",
                             side_effect=reject_mismatched_owner,
                         ),
+                        self.assertRaisesRegex(DeploymentError, "owner"),
                     ):
-                        with self.assertRaisesRegex(DeploymentError, "owner"):
-                            prepare_environment(
-                                root,
-                                environ={},
-                                verify_posix_metadata=True,
-                            )
+                        prepare_environment(
+                            root,
+                            environ={},
+                            verify_posix_metadata=True,
+                        )
 
                     fake_os.chmod.assert_not_called()
                     self.assertEqual(before, self._snapshot_tree(root))
@@ -640,18 +1093,18 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._repository(root)
-            real_mkdir = Path.mkdir
+            real_mkdir = os.mkdir
 
-            def fail_parquet(path: Path, *args: object, **kwargs: object) -> None:
-                if path.name == "parquet":
+            def fail_parquet(path: Path, mode: int = 0o777) -> None:
+                if Path(path).name == "parquet":
                     raise OSError("injected parquet failure")
-                real_mkdir(path, *args, **kwargs)
+                real_mkdir(path, mode)
 
-            with mock.patch(
-                "pathlib.Path.mkdir", autospec=True, side_effect=fail_parquet
+            with (
+                mock.patch("tools.offline_env.os.mkdir", side_effect=fail_parquet),
+                self.assertRaisesRegex(OSError, "injected parquet failure"),
             ):
-                with self.assertRaisesRegex(OSError, "injected parquet failure"):
-                    self._prepare(root)
+                self._prepare(root)
 
             self.assertFalse((root / "artifacts" / "data" / "raw").exists())
             self.assertFalse((root / "artifacts" / "data" / "parquet").exists())
@@ -665,16 +1118,18 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             before = self._managed_secret_bytes(root)
 
             def fail_staging(paths: dict[str, Path]) -> None:
-                if next(iter(paths.values())).parent.name.startswith(".secret-stage-"):
+                if next(iter(paths.values())).parent.name == "staging":
                     raise DeploymentError("injected staging validation failure")
 
-            with mock.patch(
-                "tools.offline_env._validate_secret_set", side_effect=fail_staging
-            ):
-                with self.assertRaisesRegex(
+            with (
+                mock.patch(
+                    "tools.offline_env._validate_secret_set", side_effect=fail_staging
+                ),
+                self.assertRaisesRegex(
                     DeploymentError, "injected staging validation failure"
-                ):
-                    self._prepare(root, rotate_secrets=True)
+                ),
+            ):
+                self._prepare(root, rotate_secrets=True)
 
             self.assertEqual(before, self._managed_secret_bytes(root))
 
@@ -690,23 +1145,25 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 if set(paths) != set(before):
                     return
                 parent = next(iter(paths.values())).parent
-                if parent.name.startswith(".secret-stage-"):
+                if parent.name == "staging":
                     transaction_validations.append("staging")
                     return
                 transaction_validations.append("published")
                 if transaction_validations.count("published") == 1:
                     raise DeploymentError("injected post-publish validation failure")
 
-            with mock.patch(
-                "tools.offline_env._validate_secret_set", side_effect=fail_published
-            ):
-                with self.assertRaisesRegex(
+            with (
+                mock.patch(
+                    "tools.offline_env._validate_secret_set", side_effect=fail_published
+                ),
+                self.assertRaisesRegex(
                     DeploymentError, "injected post-publish validation failure"
-                ):
-                    self._prepare(root, rotate_secrets=True)
+                ),
+            ):
+                self._prepare(root, rotate_secrets=True)
 
             self.assertEqual(
-                ["staging", "published", "published"],
+                ["staging", "published"],
                 transaction_validations,
             )
             self.assertEqual(before, self._managed_secret_bytes(root))
@@ -726,24 +1183,191 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 nonlocal backup_moves
                 source = Path(source)
                 target = Path(target)
-                if target.parent.name.startswith(".secret-backup-"):
+                if target.parent.name == "backup":
                     backup_moves += 1
                     if backup_moves == 2:
                         raise OSError("injected backup failure")
                 real_replace(source, target)
 
-            with mock.patch(
-                "tools.offline_env._replace_secret",
-                side_effect=fail_second_backup,
+            with (
+                mock.patch(
+                    "tools.offline_env._replace_secret",
+                    side_effect=fail_second_backup,
+                ),
+                self.assertRaisesRegex(OSError, "injected backup failure"),
             ):
-                with self.assertRaisesRegex(OSError, "injected backup failure"):
-                    self._prepare(root, rotate_secrets=True)
+                self._prepare(root, rotate_secrets=True)
 
             self.assertEqual(before, self._managed_secret_bytes(root))
             self.assertEqual(
                 [],
-                list((root / "artifacts" / "secrets").glob(".secret-backup-*")),
+                list(
+                    (root / "artifacts" / "secrets" / ".dcagent-transactions").iterdir()
+                ),
             )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX chmod semantics are required")
+    def test_chmod_failure_restores_original_tree_and_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            raw = root / "artifacts" / "data" / "raw"
+            os.chmod(raw, 0o750)
+            before = self._snapshot_tree(root)
+            real_chmod = os.chmod
+
+            def fail_raw_chmod(path: Path, mode: int) -> None:
+                if Path(path) == raw and mode == 0o700:
+                    raise OSError("injected chmod failure")
+                real_chmod(path, mode)
+
+            with mock.patch("tools.offline_env.os.chmod", side_effect=fail_raw_chmod):
+                with self.assertRaisesRegex(OSError, "injected chmod failure"):
+                    self._prepare(root)
+
+            self.assertEqual(before, self._snapshot_tree(root))
+            self.assertEqual(0o750, stat.S_IMODE(raw.stat().st_mode))
+
+    def test_rotation_recheck_failure_restores_original_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            before = self._snapshot_tree(root)
+            real_check = offline_env_module._assert_rotation_allowed
+            checks = 0
+
+            def fail_final_recheck(plan: PreparationPlan) -> None:
+                nonlocal checks
+                checks += 1
+                if checks == 3:
+                    raise OSError("injected final recheck failure")
+                real_check(plan)
+
+            with (
+                mock.patch(
+                    "tools.offline_env._assert_rotation_allowed",
+                    side_effect=fail_final_recheck,
+                ),
+                self.assertRaisesRegex(OSError, "final recheck"),
+            ):
+                self._prepare(root, rotate_secrets=True)
+
+            self.assertEqual(before, self._snapshot_tree(root))
+
+    def test_environment_commit_failures_restore_full_original_tree(self) -> None:
+        for boundary in ("temp", "replace"):
+            with self.subTest(boundary=boundary):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._repository(root)
+                    self._prepare(root)
+                    self._remove_clickhouse_configuration(root)
+                    before = self._snapshot_tree(root)
+                    env_path = root / "deploy" / "offline" / ".env"
+                    real_replace = os.replace
+
+                    def fail_env_replace(
+                        source: Path,
+                        target: Path,
+                        *,
+                        expected_env: Path = env_path,
+                        replace: Callable[[Path, Path], None] = real_replace,
+                    ) -> None:
+                        if Path(target) == expected_env:
+                            raise OSError("injected env replace failure")
+                        replace(source, target)
+
+                    patcher = (
+                        mock.patch(
+                            "tools.offline_env._write_env_candidate",
+                            side_effect=OSError("injected env temp failure"),
+                        )
+                        if boundary == "temp"
+                        else mock.patch(
+                            "tools.offline_env.os.replace",
+                            side_effect=fail_env_replace,
+                        )
+                    )
+                    with patcher:
+                        with self.assertRaisesRegex(OSError, f"env {boundary}"):
+                            self._prepare(root)
+
+                    self.assertEqual(before, self._snapshot_tree(root))
+
+    def test_commit_phase_failure_rolls_back_and_preserves_original_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            before = self._snapshot_tree(root)
+            real_write_phase = offline_deployment_state.TransactionJournal.write_phase
+
+            def fail_commit_phase(
+                journal: offline_deployment_state.TransactionJournal, phase: str
+            ) -> None:
+                if not journal.control and phase == "committed":
+                    raise OSError("injected commit phase failure")
+                real_write_phase(journal, phase)
+
+            with (
+                mock.patch.object(
+                    offline_deployment_state.TransactionJournal,
+                    "write_phase",
+                    autospec=True,
+                    side_effect=fail_commit_phase,
+                ),
+                self.assertRaisesRegex(OSError, "commit phase"),
+            ):
+                self._prepare(root, rotate_secrets=True)
+
+            self.assertEqual(before, self._snapshot_tree(root))
+
+    def test_postcommit_cleanup_failure_keeps_new_state_and_next_prepare_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            before = self._managed_secret_bytes(root)
+
+            with (
+                mock.patch(
+                    "tools.offline_env.offline_recovery.finalize_committed_cleanup",
+                    side_effect=OSError("injected postcommit cleanup failure"),
+                ),
+                self.assertRaisesRegex(
+                    DeploymentError, "Committed transaction requires cleanup"
+                ),
+            ):
+                self._prepare(root, rotate_secrets=True)
+
+            self.assertNotEqual(before, self._managed_secret_bytes(root))
+            transactions = list(
+                (
+                    root
+                    / "artifacts"
+                    / "data"
+                    / ".dcagent-deployment-state"
+                    / "transactions"
+                ).iterdir()
+            )
+            self.assertEqual(1, len(transactions))
+            journal = offline_deployment_state.TransactionJournal.open(
+                transactions[0],
+                offline_deployment_state.identity_digest(
+                    offline_deployment_state.load_identity(
+                        offline_deployment_state.StatePaths(
+                            root / "artifacts" / "data" / ".dcagent-deployment-state"
+                        )
+                    )
+                ),
+            )
+            self.assertEqual("committed_cleanup_required", journal.read_phase().phase)
+            with self.assertRaisesRegex(DeploymentError, "incomplete transaction"):
+                self._prepare(root)
 
     def test_rollback_failure_retains_backup_and_reports_its_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -753,33 +1377,49 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             before = self._managed_secret_bytes(root)
             real_replace = os.replace
 
-            def fail_publish_and_rollback(source: Path, target: Path) -> None:
+            def fail_publish(source: Path, target: Path) -> None:
                 source = Path(source)
-                target = Path(target)
-                if source.parent.name.startswith(".secret-stage-"):
+                if source.parent.name == "staging":
                     raise OSError("injected publish failure")
-                if source.parent.name.startswith(".secret-backup-"):
-                    raise OSError("injected rollback failure")
                 real_replace(source, target)
 
-            with mock.patch(
-                "tools.offline_env._replace_secret",
-                side_effect=fail_publish_and_rollback,
-            ):
-                with self.assertRaisesRegex(
-                    DeploymentError, r"backup.*\.secret-backup-"
-                ):
-                    self._prepare(root, rotate_secrets=True)
+            def fail_rollback(
+                _backend: object,
+                source: Path,
+                target: Path,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                del _backend, source, target, expected_source
+                raise OSError("injected rollback failure")
 
-            backup_directories = list(
-                (root / "artifacts" / "secrets").glob(".secret-backup-*")
+            with (
+                mock.patch(
+                    "tools.offline_env._replace_secret",
+                    side_effect=fail_publish,
+                ),
+                mock.patch(
+                    "tools.offline_env._PortableMutationBackend.rename_noreplace",
+                    autospec=True,
+                    side_effect=fail_rollback,
+                ),
+                self.assertRaisesRegex(
+                    DeploymentError, r"transaction retained.*phase=rollback_failed"
+                ),
+            ):
+                self._prepare(root, rotate_secrets=True)
+
+            transaction_directories = list(
+                (root / "artifacts" / "secrets" / ".dcagent-transactions").iterdir()
             )
-            self.assertEqual(1, len(backup_directories))
-            backup = backup_directories[0]
+            self.assertEqual(1, len(transaction_directories))
+            backup = transaction_directories[0] / "backup"
             self.assertEqual(
                 before,
                 {name: (backup / name).read_bytes() for name in before},
             )
+            with self.assertRaisesRegex(DeploymentError, "incomplete transaction"):
+                self._prepare(root)
 
 
 if __name__ == "__main__":
