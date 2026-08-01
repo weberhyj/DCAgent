@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -1599,9 +1600,10 @@ class TransactionJournalTests(unittest.TestCase):
                         *,
                         owner_uid: int,
                         owner_gid: int,
+                        failure: OSError = original_error,
                     ) -> os.stat_result:
                         if path.name == ".dcagent-transactions":
-                            raise original_error
+                            raise failure
                         return super().mkdir(
                             path,
                             mode,
@@ -4703,6 +4705,612 @@ class RecoveryExecutionTests(unittest.TestCase):
                 self.secret_parent,
                 self.identity_hash,
             )
+
+
+class RecoveryCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.data = self.base / "data"
+        self.model = self.base / "models"
+        self.secrets = self.base / "secrets"
+        for directory in (self.data, self.model, self.secrets):
+            directory.mkdir(mode=0o700)
+        self.paths = state.StatePaths(state.derive_state_root(self.data))
+        self.paths.ensure_layout(
+            os.getuid() if hasattr(os, "getuid") else 0,
+            os.getgid() if hasattr(os, "getgid") else 0,
+        )
+        self.identity = state.DeploymentIdentity.new(
+            state_root=self.paths.root,
+            data_root=self.data,
+            model_root=self.model,
+            secret_root=self.secrets,
+        )
+        state.write_identity_exclusive(self.paths, self.identity)
+        self.identity_hash = state.identity_digest(self.identity)
+        self.transaction_id = uuid.uuid4().hex
+
+    def test_cli_accepts_only_the_six_recovery_commands(self) -> None:
+        parser = recovery.build_parser()
+        commands = {
+            "inspect",
+            "resume-rollback",
+            "finalize-cleanup",
+            "clear-start-marker",
+            "adopt-existing",
+            "acknowledge-repaired",
+        }
+        self.assertEqual(set(parser._subparsers._group_actions[0].choices), commands)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["repair", "--state-root", str(self.paths.root)])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "inspect",
+                    "--state-root",
+                    "relative",
+                    "--transaction",
+                    self.transaction_id,
+                ]
+            )
+
+    def test_inspect_is_read_only_and_returns_only_sanitized_fields(self) -> None:
+        journal = state.TransactionJournal.create(
+            self.paths,
+            self.identity_hash,
+            ["env", "secret"],
+            self.secrets / ".dcagent-transactions",
+            transaction_id=self.transaction_id,
+            **(
+                {}
+                if os.name == "posix"
+                else {"bootstrap_backend": RecordingBootstrapBackend()}
+            ),
+        )
+        before = {
+            path.relative_to(self.paths.root).as_posix(): path.read_bytes()
+            for path in self.paths.root.rglob("*")
+            if path.is_file()
+        }
+        with mock.patch.object(
+            state,
+            "acquire_deployment_lock",
+            side_effect=AssertionError("inspect must not lock"),
+        ):
+            payload = recovery.inspect_transaction(self.paths, self.transaction_id)
+        self.assertEqual(
+            set(payload),
+            {
+                "transaction_id",
+                "phase",
+                "object_categories",
+                "recommended_action",
+                "deployment_identity_hash",
+            },
+        )
+        self.assertEqual(payload["phase"], "planned")
+        self.assertEqual(payload["recommended_action"], "resume-rollback")
+        self.assertNotIn(str(self.base), json.dumps(payload))
+        after = {
+            path.relative_to(self.paths.root).as_posix(): path.read_bytes()
+            for path in self.paths.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(any(self.paths.history.glob("recovery-*.json")))
+        self.assertTrue(journal.root.exists())
+
+    def test_control_wal_is_strict_identity_bound_and_tamper_evident(self) -> None:
+        journal = recovery.ControlJournal.create(
+            self.paths,
+            transaction_id=self.transaction_id,
+            command="clear-start-marker",
+            deployment_identity_hash=self.identity_hash,
+            phase="clear_planned",
+            details={"marker_digest": None},
+        )
+        reopened = recovery.ControlJournal.open(
+            self.paths,
+            self.transaction_id,
+            command="clear-start-marker",
+            deployment_identity_hash=self.identity_hash,
+        )
+        self.assertEqual(reopened.phase, "clear_planned")
+        payload = json.loads(journal.wal_path.read_text(encoding="utf-8"))
+        payload["unexpected"] = "secret"
+        state.atomic_write_json(journal.wal_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.ControlJournal.open(
+                self.paths,
+                self.transaction_id,
+                command="clear-start-marker",
+                deployment_identity_hash=self.identity_hash,
+            )
+
+    def test_adoption_wal_rejects_integer_as_boolean(self) -> None:
+        journal = recovery.ControlJournal.create(
+            self.paths,
+            transaction_id=self.transaction_id,
+            command="adopt-existing",
+            deployment_identity_hash=self.identity_hash,
+            phase="adoption_planned",
+            details={
+                "candidate_identity": self.identity.to_mapping(),
+                "runtime_initialized": None,
+            },
+        )
+        payload = json.loads(journal.wal_path.read_text(encoding="utf-8"))
+        payload["details"]["runtime_initialized"] = 1
+        state.atomic_write_json(journal.wal_path, payload)
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.ControlJournal.open(
+                self.paths, self.transaction_id, command="adopt-existing"
+            )
+
+    def test_evidence_metadata_never_records_content_or_full_path(self) -> None:
+        evidence = self.base / "operator-secret-report.txt"
+        evidence.write_text(
+            "DATABASE_URL=postgresql://dc_agent:top-secret@postgres/dc_agent\n",
+            encoding="utf-8",
+        )
+        metadata = recovery.evidence_metadata(evidence)
+        self.assertEqual(set(metadata), {"sha256", "size", "basename"})
+        self.assertEqual(metadata["basename"], evidence.name)
+        rendered = json.dumps(metadata)
+        self.assertNotIn("top-secret", rendered)
+        self.assertNotIn(str(self.base), rendered)
+        self.assertEqual(metadata["size"], evidence.stat().st_size)
+
+    def create_marker(self) -> None:
+        state.create_start_marker(
+            self.paths,
+            operation="up",
+            deployment_identity_hash=self.identity_hash,
+        )
+
+    def discard_control(self) -> None:
+        for child in self.paths.control_transactions.iterdir():
+            state._remove_private_tree(child)
+
+    def test_clear_start_marker_keeps_marker_when_any_gate_fails(self) -> None:
+        self.create_marker()
+        original = self.paths.start_marker.read_bytes()
+
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.clear_start_marker(
+                self.paths,
+                uuid.uuid4().hex,
+                containers_exist=lambda: True,
+            )
+        self.assertEqual(self.paths.start_marker.read_bytes(), original)
+        self.discard_control()
+
+        postgres = self.data / "postgres"
+        postgres.mkdir(mode=0o700)
+        (postgres / "PG_VERSION").write_text("16", encoding="ascii")
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.clear_start_marker(
+                self.paths,
+                uuid.uuid4().hex,
+                containers_exist=lambda: False,
+            )
+        self.assertEqual(self.paths.start_marker.read_bytes(), original)
+        (postgres / "PG_VERSION").unlink()
+        self.discard_control()
+
+        (postgres / "base").mkdir()
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.clear_start_marker(
+                self.paths,
+                uuid.uuid4().hex,
+                containers_exist=lambda: False,
+            )
+        self.assertEqual(self.paths.start_marker.read_bytes(), original)
+        (postgres / "base").rmdir()
+        self.discard_control()
+
+        unfinished = self.paths.transactions / uuid.uuid4().hex
+        unfinished.mkdir(mode=0o700)
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.clear_start_marker(
+                self.paths,
+                uuid.uuid4().hex,
+                containers_exist=lambda: False,
+            )
+        self.assertEqual(self.paths.start_marker.read_bytes(), original)
+
+    def test_clear_start_marker_resumes_each_durable_control_phase(self) -> None:
+        phases = (
+            "runtime_checked",
+            "marker_backed_up",
+            "receipt_written",
+            "clear_complete",
+        )
+        for interrupted_phase in phases:
+            with self.subTest(interrupted_phase=interrupted_phase):
+                self.discard_control()
+                for receipt in self.paths.history.glob("recovery-*.json"):
+                    receipt.unlink()
+                if not self.paths.start_marker.exists():
+                    self.create_marker()
+                transaction_id = uuid.uuid4().hex
+
+                def interrupt(
+                    _command: str,
+                    phase: str,
+                    target_phase: str = interrupted_phase,
+                ) -> None:
+                    if phase == target_phase:
+                        raise OSError("simulated hard exit")
+
+                with (
+                    mock.patch.object(
+                        recovery, "_after_control_step", side_effect=interrupt
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    recovery.clear_start_marker(
+                        self.paths,
+                        transaction_id,
+                        containers_exist=lambda: False,
+                    )
+                receipt = recovery.clear_start_marker(
+                    self.paths,
+                    transaction_id,
+                    containers_exist=lambda: False,
+                )
+                self.assertEqual(receipt["command"], "clear-start-marker")
+                self.assertFalse(self.paths.start_marker.exists())
+                self.assertFalse(
+                    (self.paths.control_transactions / transaction_id).exists()
+                )
+
+    def test_initialized_adoption_publishes_marker_before_identity(self) -> None:
+        self.paths.identity.unlink()
+        candidate = self.identity
+        transaction_id = uuid.uuid4().hex
+        original_write = state.write_identity_exclusive
+
+        def checked_write(
+            paths: state.StatePaths, identity: state.DeploymentIdentity
+        ) -> None:
+            self.assertTrue(paths.start_marker.is_file())
+            marker = json.loads(paths.start_marker.read_text(encoding="utf-8"))
+            self.assertEqual(
+                marker["deployment_identity_hash"], state.identity_digest(identity)
+            )
+            original_write(paths, identity)
+
+        with (
+            mock.patch.object(
+                recovery,
+                "_secure_env_candidate",
+                return_value=(candidate, self.base / ".env", {}, 0, 0),
+            ),
+            mock.patch.object(
+                state, "write_identity_exclusive", side_effect=checked_write
+            ),
+        ):
+            recovery.adopt_existing(
+                self.paths,
+                transaction_id,
+                containers_exist=lambda: True,
+            )
+        self.assertTrue(self.paths.identity.is_file())
+        self.assertTrue(self.paths.start_marker.is_file())
+
+    def test_adoption_resumes_each_durable_control_phase(self) -> None:
+        phases = (
+            "adoption_planned",
+            "identity_created",
+            "runtime_checked",
+            "marker_written_or_rotation_enabled",
+            "adoption_complete",
+        )
+        for interrupted_phase in phases:
+            with (
+                self.subTest(interrupted_phase=interrupted_phase),
+                tempfile.TemporaryDirectory() as raw,
+            ):
+                base = Path(raw)
+                data = base / "data"
+                model = base / "models"
+                secrets = base / "secrets"
+                for directory in (data, model, secrets):
+                    directory.mkdir(mode=0o700)
+                paths = state.StatePaths(state.derive_state_root(data))
+                paths.ensure_layout(*recovery._current_owner())
+                candidate = state.DeploymentIdentity.new(
+                    state_root=paths.root,
+                    data_root=data,
+                    model_root=model,
+                    secret_root=secrets,
+                )
+                transaction_id = uuid.uuid4().hex
+
+                def interrupt(
+                    _command: str,
+                    phase: str,
+                    target_phase: str = interrupted_phase,
+                ) -> None:
+                    if phase == target_phase:
+                        raise OSError("simulated hard exit")
+
+                candidate_result = (candidate, base / ".env", {}, 0, 0)
+                with (
+                    mock.patch.object(
+                        recovery,
+                        "_secure_env_candidate",
+                        return_value=candidate_result,
+                    ),
+                    mock.patch.object(
+                        recovery, "_after_control_step", side_effect=interrupt
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    recovery.adopt_existing(
+                        paths,
+                        transaction_id,
+                        containers_exist=lambda: True,
+                    )
+                with mock.patch.object(
+                    recovery,
+                    "_secure_env_candidate",
+                    return_value=candidate_result,
+                ):
+                    receipt = recovery.adopt_existing(
+                        paths,
+                        transaction_id,
+                        containers_exist=lambda: True,
+                    )
+                self.assertEqual(receipt["final_phase"], "adoption_complete")
+                state.assert_identity_matches(paths, candidate)
+                self.assertTrue(paths.start_marker.is_file())
+                self.assertFalse((paths.control_transactions / transaction_id).exists())
+
+    def test_acknowledge_repaired_quarantines_and_sanitizes_receipt(self) -> None:
+        damaged = self.paths.transactions / self.transaction_id
+        damaged.mkdir(mode=0o700)
+        (damaged / "corrupt.json").write_text(
+            'DATABASE_URL="postgresql://dc_agent:secret@postgres/db"',
+            encoding="utf-8",
+        )
+        evidence = self.base / "repair.txt"
+        evidence.write_text("operator secret narrative", encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(evidence, 0o644)
+        with mock.patch.object(recovery, "_active_state_revalidated"):
+            receipt = recovery.acknowledge_repaired(
+                self.paths, self.transaction_id, evidence
+            )
+        self.assertFalse(damaged.exists())
+        self.assertTrue((self.paths.quarantine / self.transaction_id).is_dir())
+        rendered = json.dumps(receipt)
+        self.assertNotIn("operator secret narrative", rendered)
+        self.assertNotIn(str(self.base), rendered)
+        self.assertNotIn("postgresql", rendered)
+
+        receipt_path = self.paths.history / f"recovery-{self.transaction_id}.json"
+        tampered = json.loads(receipt_path.read_text(encoding="utf-8"))
+        tampered["deployment_identity_hash"] = "f" * 64
+        state.atomic_write_json(receipt_path, tampered)
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.acknowledge_repaired(self.paths, self.transaction_id, evidence)
+
+    def test_acknowledge_repaired_resumes_each_durable_control_phase(self) -> None:
+        phases = (
+            "active_state_checked",
+            "transaction_quarantined",
+            "receipt_written",
+            "repair_acknowledgement_complete",
+        )
+        evidence = self.base / "evidence.txt"
+        evidence.write_text("repair complete", encoding="utf-8")
+        for interrupted_phase in phases:
+            with self.subTest(interrupted_phase=interrupted_phase):
+                transaction_id = uuid.uuid4().hex
+                damaged = self.paths.transactions / transaction_id
+                damaged.mkdir(mode=0o700)
+
+                def interrupt(
+                    _command: str,
+                    phase: str,
+                    target_phase: str = interrupted_phase,
+                ) -> None:
+                    if phase == target_phase:
+                        raise OSError("simulated hard exit")
+
+                with (
+                    mock.patch.object(recovery, "_active_state_revalidated"),
+                    mock.patch.object(
+                        recovery, "_after_control_step", side_effect=interrupt
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    recovery.acknowledge_repaired(self.paths, transaction_id, evidence)
+                with mock.patch.object(recovery, "_active_state_revalidated"):
+                    receipt = recovery.acknowledge_repaired(
+                        self.paths, transaction_id, evidence
+                    )
+                self.assertEqual(
+                    receipt["final_phase"], "repair_acknowledgement_complete"
+                )
+                self.assertTrue((self.paths.quarantine / transaction_id).is_dir())
+                self.assertFalse(
+                    (self.paths.control_transactions / transaction_id).exists()
+                )
+
+    def test_reacquired_lock_revalidates_clear_and_adoption_gates(self) -> None:
+        self.create_marker()
+        clear_id = uuid.uuid4().hex
+
+        def stop_at_runtime(_command: str, phase: str) -> None:
+            if phase == "runtime_checked":
+                raise OSError("hard exit")
+
+        with (
+            mock.patch.object(
+                recovery, "_after_control_step", side_effect=stop_at_runtime
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.clear_start_marker(
+                self.paths, clear_id, containers_exist=lambda: False
+            )
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.clear_start_marker(
+                self.paths, clear_id, containers_exist=lambda: True
+            )
+        self.assertTrue(self.paths.start_marker.is_file())
+        self.assertFalse((self.paths.control_transactions / clear_id).exists())
+
+        self.paths.start_marker.unlink()
+        self.paths.identity.unlink()
+        adopt_id = uuid.uuid4().hex
+        candidate_result = (self.identity, self.base / ".env", {}, 0, 0)
+
+        def stop_after_rotation_enabled(_command: str, phase: str) -> None:
+            if phase == "marker_written_or_rotation_enabled":
+                raise OSError("hard exit")
+
+        with (
+            mock.patch.object(
+                recovery, "_secure_env_candidate", return_value=candidate_result
+            ),
+            mock.patch.object(
+                recovery,
+                "_after_control_step",
+                side_effect=stop_after_rotation_enabled,
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.adopt_existing(
+                self.paths, adopt_id, containers_exist=lambda: False
+            )
+        with mock.patch.object(
+            recovery, "_secure_env_candidate", return_value=candidate_result
+        ):
+            recovery.adopt_existing(self.paths, adopt_id, containers_exist=lambda: True)
+        self.assertTrue(self.paths.start_marker.is_file())
+
+    def test_acknowledge_recovers_rename_before_phase_persist(self) -> None:
+        transaction_id = uuid.uuid4().hex
+        damaged = self.paths.transactions / transaction_id
+        damaged.mkdir(mode=0o700)
+        evidence = self.base / "rename-evidence.txt"
+        evidence.write_text("repaired", encoding="utf-8")
+        original_advance = recovery.ControlJournal.advance
+
+        def fail_quarantine_phase(
+            journal: recovery.ControlJournal,
+            phase: str,
+            *,
+            details: Mapping[str, object] | None = None,
+        ) -> None:
+            if phase == "transaction_quarantined":
+                raise OSError("rename persisted before WAL phase")
+            original_advance(journal, phase, details=details)
+
+        with (
+            mock.patch.object(recovery, "_active_state_revalidated"),
+            mock.patch.object(
+                recovery.ControlJournal, "advance", new=fail_quarantine_phase
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.acknowledge_repaired(self.paths, transaction_id, evidence)
+        self.assertFalse(damaged.exists())
+        with mock.patch.object(recovery, "_active_state_revalidated"):
+            receipt = recovery.acknowledge_repaired(
+                self.paths, transaction_id, evidence
+            )
+        self.assertEqual(receipt["final_phase"], "repair_acknowledgement_complete")
+
+    def test_inspect_tombstone_preserves_history_temp(self) -> None:
+        journal = state.TransactionJournal.create(
+            self.paths,
+            self.identity_hash,
+            ["env"],
+            self.secrets / ".dcagent-transactions",
+            transaction_id=self.transaction_id,
+            **(
+                {}
+                if os.name == "posix"
+                else {"bootstrap_backend": RecordingBootstrapBackend()}
+            ),
+        )
+        journal.write_phase("committed")
+        journal.write_history_receipt("complete")
+        tombstone = self.paths.history / f".{self.transaction_id}.journal-cleanup"
+        journal.root.replace(tombstone)
+        canary = self.paths.history / ".operator-canary.tmp"
+        canary.write_text("keep", encoding="utf-8")
+        payload = recovery.inspect_transaction(self.paths, self.transaction_id)
+        self.assertEqual(payload["recommended_action"], "finalize-cleanup")
+        self.assertTrue(canary.is_file())
+
+    def test_adoption_receipt_reentry_removes_completed_control_wal(self) -> None:
+        self.paths.identity.unlink()
+        transaction_id = uuid.uuid4().hex
+        candidate_result = (self.identity, self.base / ".env", {}, 0, 0)
+        with (
+            mock.patch.object(
+                recovery, "_secure_env_candidate", return_value=candidate_result
+            ),
+            mock.patch.object(
+                recovery.ControlJournal, "remove", side_effect=OSError("hard exit")
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.adopt_existing(
+                self.paths, transaction_id, containers_exist=lambda: True
+            )
+        self.assertTrue((self.paths.control_transactions / transaction_id).exists())
+        receipt = recovery.adopt_existing(
+            self.paths, transaction_id, containers_exist=lambda: True
+        )
+        self.assertEqual(receipt["final_phase"], "adoption_complete")
+        self.assertFalse((self.paths.control_transactions / transaction_id).exists())
+
+    def test_main_holds_one_lock_through_mutation_and_receipt(self) -> None:
+        locked = False
+
+        @contextlib.contextmanager
+        def lock(_paths: state.StatePaths):
+            nonlocal locked
+            self.assertFalse(locked)
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+
+        def checked_clear(
+            _paths: state.StatePaths, _transaction_id: str
+        ) -> dict[str, object]:
+            self.assertTrue(locked)
+            return {"command": "clear-start-marker"}
+
+        with (
+            mock.patch.object(state, "acquire_deployment_lock", side_effect=lock),
+            mock.patch.object(
+                recovery, "clear_start_marker", side_effect=checked_clear
+            ),
+            mock.patch("builtins.print"),
+        ):
+            result = recovery.main(
+                [
+                    "clear-start-marker",
+                    "--state-root",
+                    str(self.paths.root),
+                    "--transaction",
+                    self.transaction_id,
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertFalse(locked)
 
 
 if __name__ == "__main__":
