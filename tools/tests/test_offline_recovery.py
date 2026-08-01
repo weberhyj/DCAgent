@@ -155,6 +155,37 @@ class PortableMutationBackend:
             path.write_bytes(backup)
 
 
+class RecordingBootstrapBackend(PortableMutationBackend):
+    """Portable bootstrap backend that records mutation ordering."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, Path, int]] = []
+
+    def mkdir(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result:
+        del owner_uid, owner_gid
+        self.events.append(("mkdir", path, mode))
+        os.mkdir(path, mode)
+        return os.lstat(path)
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        self._assert_identity(path, expected_source)
+        self.events.append(("chmod", path, mode))
+        os.chmod(path, mode)
+
+
 class RacingEnvironmentBackend(PortableMutationBackend):
     """Inject a third environment state at the final mutation boundary."""
 
@@ -199,6 +230,8 @@ class TransactionJournalTests(unittest.TestCase):
         self.identity_hash = "a" * 64
 
     def make_journal(self, **kwargs: object) -> state.TransactionJournal:
+        if os.name != "posix" and "bootstrap_backend" not in kwargs:
+            kwargs["bootstrap_backend"] = RecordingBootstrapBackend()
         return install_legacy_record_intent(
             state.TransactionJournal.create(
                 self.paths,
@@ -1093,6 +1126,209 @@ class TransactionJournalTests(unittest.TestCase):
             all(entry["existed"] is False for entry in bootstrap["entries"])
         )
 
+    def test_existing_secret_root_is_hardened_before_companion_creation(self) -> None:
+        secret_root = self.secret_root.parent
+        secret_root.mkdir(mode=0o750)
+        if os.name == "posix":
+            os.chmod(secret_root, 0o750)
+        original_mode = stat.S_IMODE(os.lstat(secret_root).st_mode)
+        backend = RecordingBootstrapBackend()
+
+        journal = state.TransactionJournal.create(
+            self.paths,
+            self.identity_hash,
+            ["secret", "env"],
+            self.secret_root,
+            bootstrap_backend=backend,
+        )
+
+        bootstrap = journal.read_bootstrap_directories()
+        secret_entry = bootstrap["entries"][0]
+        self.assertEqual(original_mode, secret_entry["original_mode"])
+        self.assertTrue(all(entry["prepare_done"] for entry in bootstrap["entries"]))
+        self.assertEqual(("chmod", secret_root, 0o700), backend.events[0])
+        companion_index = next(
+            index
+            for index, event in enumerate(backend.events)
+            if event[:2] == ("mkdir", self.secret_root)
+        )
+        self.assertLess(0, companion_index)
+        journal.write_phase("staging")
+
+    def test_existing_secret_root_mode_is_restored_on_normal_rollback(self) -> None:
+        secret_root = self.secret_root.parent
+        secret_root.mkdir(mode=0o750)
+        if os.name == "posix":
+            os.chmod(secret_root, 0o750)
+        original_mode = stat.S_IMODE(os.lstat(secret_root).st_mode)
+        backend = RecordingBootstrapBackend()
+        journal = state.TransactionJournal.create(
+            self.paths,
+            self.identity_hash,
+            ["secret", "env"],
+            self.secret_root,
+            bootstrap_backend=backend,
+        )
+
+        recovery.resume_transaction_rollback(journal, mutation_backend=backend)
+
+        self.assertTrue(secret_root.is_dir())
+        if os.name == "posix":
+            self.assertEqual(original_mode, stat.S_IMODE(os.lstat(secret_root).st_mode))
+        self.assertEqual(("chmod", secret_root, original_mode), backend.events[-1])
+        self.assertFalse(journal.root.exists())
+
+    def test_bootstrap_chmod_symlink_race_does_not_touch_external_directory(
+        self,
+    ) -> None:
+        secret_root = self.secret_root.parent
+        secret_root.mkdir(mode=0o750)
+        if os.name == "posix":
+            os.chmod(secret_root, 0o750)
+        victim = self.base / "victim"
+        victim.mkdir()
+        victim_before = os.lstat(victim).st_mode
+
+        class SymlinkRaceBackend(RecordingBootstrapBackend):
+            def chmod(
+                self,
+                path: Path,
+                mode: int,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                self._assert_identity(path, expected_source)
+                moved = path.with_name("moved-secret-root")
+                path.rename(moved)
+                try:
+                    path.symlink_to(victim, target_is_directory=True)
+                except OSError as exc:
+                    self.skip_reason = str(exc)
+                    moved.rename(path)
+                    raise
+                self.events.append(("chmod", path, mode))
+
+        backend = SymlinkRaceBackend()
+        try:
+            with self.assertRaises(state.TransactionJournalCreationError):
+                state.TransactionJournal.create(
+                    self.paths,
+                    self.identity_hash,
+                    ["secret", "env"],
+                    self.secret_root,
+                    bootstrap_backend=backend,
+                )
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        if hasattr(backend, "skip_reason"):
+            self.skipTest(f"symlink creation unavailable: {backend.skip_reason}")
+
+        self.assertEqual(victim_before, os.lstat(victim).st_mode)
+        self.assertFalse(self.secret_root.exists())
+
+    def test_bootstrap_rejects_inode_replacement_after_initial_wal(self) -> None:
+        secret_root = self.secret_root.parent
+        secret_root.mkdir(mode=0o750)
+        if os.name == "posix":
+            os.chmod(secret_root, 0o750)
+        original = secret_root.with_name("original-secret-root")
+        backend = RecordingBootstrapBackend()
+        real_write = state.TransactionJournal._write_bootstrap_directories
+        swapped = False
+
+        def swap_after_initial_wal(
+            journal: state.TransactionJournal,
+            *,
+            state: str,
+            entries: list[Mapping[str, object]],
+        ) -> None:
+            nonlocal swapped
+            real_write(journal, state=state, entries=entries)
+            if state == "preparing" and not swapped:
+                swapped = True
+                secret_root.rename(original)
+                secret_root.mkdir(mode=0o750)
+                if os.name == "posix":
+                    os.chmod(secret_root, 0o750)
+
+        with (
+            mock.patch.object(
+                state.TransactionJournal,
+                "_write_bootstrap_directories",
+                autospec=True,
+                side_effect=swap_after_initial_wal,
+            ),
+            self.assertRaises(state.TransactionJournalCreationError),
+        ):
+            state.TransactionJournal.create(
+                self.paths,
+                self.identity_hash,
+                ["secret", "env"],
+                self.secret_root,
+                bootstrap_backend=backend,
+            )
+
+        self.assertEqual([], backend.events)
+        self.assertFalse(self.secret_root.exists())
+
+    def test_bootstrap_cleanup_rejects_existing_root_identity_change(self) -> None:
+        secret_root = self.secret_root.parent
+        secret_root.mkdir(mode=0o750)
+        if os.name == "posix":
+            os.chmod(secret_root, 0o750)
+        backend = RecordingBootstrapBackend()
+        journal = state.TransactionJournal.create(
+            self.paths,
+            self.identity_hash,
+            ["secret", "env"],
+            self.secret_root,
+            bootstrap_backend=backend,
+        )
+        original = secret_root.with_name("original-secret-root")
+        secret_root.rename(original)
+        secret_root.mkdir()
+        canary = secret_root / "CANARY"
+        canary.write_text("preserve", encoding="utf-8")
+
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.resume_transaction_rollback(
+                journal,
+                mutation_backend=backend,
+            )
+
+        self.assertEqual("preserve", canary.read_text(encoding="utf-8"))
+        self.assertTrue(original.is_dir())
+        self.assertEqual("rollback_failed", journal.read_phase().phase)
+
+    def test_bootstrap_progress_rejects_nonprefix_preparation(self) -> None:
+        journal = self.make_journal()
+        payload = json.loads(
+            journal.bootstrap_directories_path.read_text(encoding="utf-8")
+        )
+        payload["state"] = "preparing"
+        payload["entries"][0]["prepare_done"] = False
+        payload["entries"][1]["prepare_done"] = True
+        state.atomic_write_json(journal.bootstrap_directories_path, payload)
+
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX modes are required")
+    def test_existing_companion_parent_still_requires_mode_0700(self) -> None:
+        secret_root = self.secret_root.parent
+        secret_root.mkdir(mode=0o700)
+        self.secret_root.mkdir(mode=0o750)
+        os.chmod(secret_root, 0o700)
+        os.chmod(self.secret_root, 0o750)
+
+        with self.assertRaisesRegex(state.DeploymentStateError, "unsafe mode"):
+            state.TransactionJournal.create(
+                self.paths,
+                self.identity_hash,
+                ["secret", "env"],
+                self.secret_root,
+            )
+
     def test_partial_bootstrap_creation_retains_openable_journal_for_rollback(
         self,
     ) -> None:
@@ -1111,7 +1347,7 @@ class TransactionJournalTests(unittest.TestCase):
                 "tools.offline_deployment_state.os.mkdir",
                 side_effect=fail_companion_parent,
             ),
-            self.assertRaisesRegex(OSError, "companion bootstrap failure"),
+            self.assertRaises(state.TransactionJournalCreationError) as raised,
         ):
             state.TransactionJournal.create(
                 self.paths,
@@ -1121,6 +1357,9 @@ class TransactionJournalTests(unittest.TestCase):
                 transaction_id=transaction_id,
             )
 
+        self.assertEqual(transaction_id, raised.exception.transaction_id)
+        self.assertEqual(journal_root, raised.exception.journal.root)
+        self.assertNotIn("companion bootstrap failure", str(raised.exception))
         self.assertTrue(journal_root.is_dir())
         self.assertTrue(secret_root.is_dir())
         self.assertFalse(self.secret_root.exists())
@@ -2239,9 +2478,14 @@ class RecoveryExecutionTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def journal(self) -> state.TransactionJournal:
+        bootstrap_backend = RecordingBootstrapBackend() if os.name != "posix" else None
         return install_legacy_record_intent(
             state.TransactionJournal.create(
-                self.paths, self.identity_hash, ["secret", "env"], self.secret_parent
+                self.paths,
+                self.identity_hash,
+                ["secret", "env"],
+                self.secret_parent,
+                bootstrap_backend=bootstrap_backend,
             )
         )
 
@@ -2443,6 +2687,9 @@ class RecoveryExecutionTests(unittest.TestCase):
                     self.identity_hash,
                     ["secret", "env"],
                     self.secret_parent,
+                    bootstrap_backend=(
+                        RecordingBootstrapBackend() if os.name != "posix" else None
+                    ),
                 )
                 current = dict(payload)
                 if current["kind"] == "active_to_backup":

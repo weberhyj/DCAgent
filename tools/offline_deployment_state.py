@@ -173,6 +173,15 @@ class DeploymentStateError(RuntimeError):
     """A deployment state object is missing, unsafe, or inconsistent."""
 
 
+class TransactionJournalCreationError(DeploymentStateError):
+    """A durable, openable transaction journal survived creation failure."""
+
+    def __init__(self, journal: TransactionJournal) -> None:
+        self.journal = journal
+        self.transaction_id = journal.transaction_id
+        super().__init__("transaction journal creation failed after durable bootstrap")
+
+
 class BootstrapFilesystemMutationBackend(Protocol):
     def mkdir(
         self,
@@ -182,6 +191,14 @@ class BootstrapFilesystemMutationBackend(Protocol):
         owner_uid: int,
         owner_gid: int,
     ) -> os.stat_result: ...
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> object: ...
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
@@ -1195,6 +1212,88 @@ def _bootstrap_owner() -> tuple[int, int]:
     )
 
 
+def _same_filesystem_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _chmod_bootstrap_directory(
+    path: Path,
+    mode: int,
+    *,
+    expected_source: os.stat_result,
+    mutation_backend: BootstrapFilesystemMutationBackend | None,
+) -> os.stat_result:
+    if mutation_backend is not None:
+        try:
+            mutation_backend.chmod(
+                path,
+                mode,
+                expected_source=expected_source,
+            )
+        except OSError as exc:
+            raise DeploymentStateError(f"bootstrap chmod failed: {path}") from exc
+    else:
+        required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+        if not _is_posix() or any(not hasattr(os, name) for name in required_flags):
+            raise DeploymentStateError(
+                "secure bootstrap chmod requires POSIX fd primitives or an injected backend"
+            )
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY
+        target_flags = parent_flags | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            parent_flags |= os.O_CLOEXEC
+            target_flags |= os.O_CLOEXEC
+        parent_fd: int | None = None
+        target_fd: int | None = None
+        try:
+            parent_fd = os.open(path.parent, parent_flags)
+            target_fd = os.open(path.name, target_flags, dir_fd=parent_fd)
+            opened = os.fstat(target_fd)
+            if (
+                not _same_filesystem_identity(opened, expected_source)
+                or _is_symlink(opened)
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != expected_source.st_uid
+                or opened.st_gid != expected_source.st_gid
+            ):
+                raise DeploymentStateError(f"bootstrap chmod target changed: {path}")
+            os.fchmod(target_fd, mode)
+            changed = os.fstat(target_fd)
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not _same_filesystem_identity(changed, expected_source)
+                or not _same_filesystem_identity(current, changed)
+                or not stat.S_ISDIR(changed.st_mode)
+                or stat.S_IMODE(changed.st_mode) != mode
+                or changed.st_uid != expected_source.st_uid
+                or changed.st_gid != expected_source.st_gid
+            ):
+                raise DeploymentStateError(f"bootstrap chmod target changed: {path}")
+            os.fsync(target_fd)
+            os.fsync(parent_fd)
+        except DeploymentStateError:
+            raise
+        except OSError as exc:
+            raise DeploymentStateError(f"bootstrap chmod failed: {path}") from exc
+        finally:
+            if target_fd is not None:
+                os.close(target_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+    observed = _lstat(path, "transaction bootstrap directory")
+    if (
+        not _same_filesystem_identity(observed, expected_source)
+        or _is_symlink(observed)
+        or not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != expected_source.st_uid
+        or observed.st_gid != expected_source.st_gid
+        or _is_posix()
+        and stat.S_IMODE(observed.st_mode) != mode
+    ):
+        raise DeploymentStateError(f"bootstrap chmod target changed: {path}")
+    return observed
+
+
 def _plan_bootstrap_directory(role: str, path: Path) -> dict[str, object]:
     current = _lstat_optional(path)
     owner_uid, owner_gid = _bootstrap_owner()
@@ -1204,7 +1303,11 @@ def _plan_bootstrap_directory(role: str, path: Path) -> dict[str, object]:
         original_uid = None
         original_gid = None
     else:
-        _verify_directory(path, f"transaction bootstrap {role}")
+        current = _verify_directory(
+            path,
+            f"transaction bootstrap {role}",
+            exact_mode=role != "secret_root",
+        )
         existed = True
         original_mode = stat.S_IMODE(current.st_mode)
         original_uid = current.st_uid
@@ -1217,9 +1320,12 @@ def _plan_bootstrap_directory(role: str, path: Path) -> dict[str, object]:
         "original_mode": original_mode,
         "owner_uid": original_uid,
         "owner_gid": original_gid,
+        "device": None if current is None else current.st_dev,
+        "inode": None if current is None else current.st_ino,
         "after_mode": 0o700,
         "after_owner_uid": owner_uid,
         "after_owner_gid": owner_gid,
+        "prepare_done": False,
         "cleanup_done": False,
     }
 
@@ -1238,9 +1344,12 @@ def _validate_bootstrap_entry(
         "original_mode",
         "owner_uid",
         "owner_gid",
+        "device",
+        "inode",
         "after_mode",
         "after_owner_uid",
         "after_owner_gid",
+        "prepare_done",
         "cleanup_done",
     }
     if not isinstance(payload, Mapping) or set(payload) != required:
@@ -1251,6 +1360,7 @@ def _validate_bootstrap_entry(
         or result["path"] != expected_path.as_posix()
         or result["object_type"] != "directory"
         or type(result["existed"]) is not bool
+        or type(result["prepare_done"]) is not bool
         or type(result["cleanup_done"]) is not bool
         or _validate_mode(result["after_mode"], "bootstrap after mode") != 0o700
     ):
@@ -1270,11 +1380,25 @@ def _validate_bootstrap_entry(
                 raise DeploymentStateError(
                     "invalid transaction bootstrap directory entry"
                 )
+        for field in ("device", "inode"):
+            if _validate_optional_int(result[field], f"bootstrap {field}") is None:
+                raise DeploymentStateError(
+                    "invalid transaction bootstrap directory entry"
+                )
     elif any(
         result[field] is not None
         for field in ("original_mode", "owner_uid", "owner_gid")
     ):
         raise DeploymentStateError("invalid transaction bootstrap directory entry")
+    else:
+        identity = tuple(
+            _validate_optional_int(result[field], f"bootstrap {field}")
+            for field in ("device", "inode")
+        )
+        if (identity[0] is None) != (identity[1] is None) or (
+            result["prepare_done"] and identity[0] is None
+        ):
+            raise DeploymentStateError("invalid transaction bootstrap directory entry")
     return result
 
 
@@ -1417,13 +1541,48 @@ class TransactionJournal:
                         )
                     _verify_directory(path, description)
 
-                for entry in bootstrap_entries:
+                for index, entry in enumerate(bootstrap_entries):
                     path = Path(str(entry["path"]))
                     if entry["existed"] is False:
                         create_bootstrap_directory(
                             path, f"transaction bootstrap {entry['role']}"
                         )
-                    _verify_directory(path, f"transaction bootstrap {entry['role']}")
+                    repair_mode = (
+                        entry["role"] == "secret_root"
+                        and entry["existed"] is True
+                        and entry["original_mode"] != 0o700
+                    )
+                    current = _verify_directory(
+                        path,
+                        f"transaction bootstrap {entry['role']}",
+                        exact_mode=not repair_mode,
+                    )
+                    if entry["existed"] is True and (
+                        (current.st_dev, current.st_ino)
+                        != (entry["device"], entry["inode"])
+                        or current.st_uid != entry["owner_uid"]
+                        or current.st_gid != entry["owner_gid"]
+                        or stat.S_IMODE(current.st_mode) != entry["original_mode"]
+                    ):
+                        raise DeploymentStateError(
+                            f"transaction bootstrap target changed: {path}"
+                        )
+                    if repair_mode:
+                        current = _chmod_bootstrap_directory(
+                            path,
+                            0o700,
+                            expected_source=current,
+                            mutation_backend=bootstrap_backend,
+                        )
+                    if entry["existed"] is False:
+                        entry["device"] = current.st_dev
+                        entry["inode"] = current.st_ino
+                    entry["prepare_done"] = True
+                    bootstrap_entries[index] = entry
+                    journal._write_bootstrap_directories(
+                        state="preparing",
+                        entries=bootstrap_entries,
+                    )
                 assert companion is not None
                 create_bootstrap_directory(companion, "secret transaction companion")
                 for name in ("staging", "backup"):
@@ -1434,11 +1593,12 @@ class TransactionJournal:
                     entries=bootstrap_entries,
                 )
             return journal
-        except Exception:
+        except Exception as exc:
             if not bootstrap_durable:
                 with contextlib.suppress(Exception):
                     _remove_private_tree(root)
-            raise
+                raise
+            raise TransactionJournalCreationError(journal) from exc
 
     @classmethod
     def open(cls, root: str | Path, expected_identity_hash: str) -> TransactionJournal:
@@ -1597,7 +1757,7 @@ class TransactionJournal:
             )
             or (
                 bootstrap_record is not None
-                and bootstrap_record["state"] == "preparing"
+                and bootstrap_record["state"] in {"preparing", "cleanup_in_progress"}
             )
         )
         journal._validate_secret_companion(allow_partial=allow_partial_companion)
@@ -1739,8 +1899,14 @@ class TransactionJournal:
             for entry, (role, path) in zip(entries, expected, strict=True)
         ]
         completed = [entry["cleanup_done"] is True for entry in converted]
+        prepared = [entry["prepare_done"] is True for entry in converted]
+        prepared_prefix = prepared == sorted(prepared, reverse=True)
         if (
-            state in {"preparing", "ready"}
+            state == "preparing"
+            and not prepared_prefix
+            or state == "ready"
+            and not all(prepared)
+            or state in {"preparing", "ready"}
             and any(completed)
             or state == "cleanup_complete"
             and not all(completed)
@@ -1791,8 +1957,14 @@ class TransactionJournal:
         ]
         state_value = str(payload["state"])
         completed = [entry["cleanup_done"] is True for entry in entries]
+        prepared = [entry["prepare_done"] is True for entry in entries]
+        prepared_prefix = prepared == sorted(prepared, reverse=True)
         if (
-            state_value in {"preparing", "ready"}
+            state_value == "preparing"
+            and not prepared_prefix
+            or state_value == "ready"
+            and not all(prepared)
+            or state_value in {"preparing", "ready"}
             and any(completed)
             or state_value == "cleanup_complete"
             and not all(completed)

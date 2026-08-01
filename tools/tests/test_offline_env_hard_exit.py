@@ -114,6 +114,21 @@ class OfflineEnvironmentHardExitTests(unittest.TestCase):
         self.assertFalse(Path(str(descriptor["secret_root"])).exists())
         self.assertFalse(Path(str(descriptor["companion_parent"])).exists())
 
+    @unittest.skipUnless(
+        os.name == "posix" and sys.platform.startswith("linux"),
+        "Linux directory mode and fd durability semantics are required",
+    )
+    def test_hard_exit_after_bootstrap_chmod_restores_existing_mode(self) -> None:
+        descriptor = self.run_worker("bootstrap_existing_mode", "after_chmod")
+        secret_root = Path(str(descriptor["secret_root"]))
+        self.assertEqual(0o700, stat.S_IMODE(os.lstat(secret_root).st_mode))
+
+        self.recover(descriptor)
+
+        self.assertEqual(0o750, stat.S_IMODE(os.lstat(secret_root).st_mode))
+        self.assertFalse(Path(str(descriptor["journal_root"])).exists())
+        self.assertFalse(Path(str(descriptor["companion_parent"])).exists())
+
     def test_hard_exit_conflict_retains_journal_and_material(self) -> None:
         descriptor = self.run_worker("mkdir", "after_mutation")
         target = Path(str(descriptor["target"]))

@@ -203,6 +203,9 @@ class _PortablePreparationFilesystemMutationBackend:
         self._verify_source(path, expected_source)
         os.chmod(path, mode)
         observed = self._verify_source(path, expected_source)
+        if stat.S_ISDIR(observed.st_mode):
+            deployment_state.fsync_directory(path.parent)
+            return observed
         flags = os.O_RDONLY if stat.S_ISDIR(observed.st_mode) else os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -1664,15 +1667,21 @@ def execute_preparation_plan(
     companion_parent = plan.secret_root / ".dcagent-transactions"
     secret_root_existed = _path_exists(plan.secret_root)
     journal: deployment_state.TransactionJournal | None = None
+    creation_error: deployment_state.TransactionJournalCreationError | None = None
     committed = False
     try:
-        journal = deployment_state.TransactionJournal.create(
-            plan.state_paths,
-            identity_hash,
-            ("directory", "secret", "environment"),
-            companion_parent,
-            bootstrap_backend=filesystem,
-        )
+        try:
+            journal = deployment_state.TransactionJournal.create(
+                plan.state_paths,
+                identity_hash,
+                ("directory", "secret", "environment"),
+                companion_parent,
+                bootstrap_backend=filesystem,
+            )
+        except deployment_state.TransactionJournalCreationError as exc:
+            journal = exc.journal
+            creation_error = exc
+            raise
         journal.persist_env_backup(
             plan.env_path if plan.env_before is not None else None
         )
@@ -1919,6 +1928,10 @@ def execute_preparation_plan(
                 ) from rollback_error
             if not secret_root_existed:
                 _cleanup_empty_secret_infrastructure(plan)
+        if creation_error is not None:
+            cause = creation_error.__cause__
+            if isinstance(cause, BaseException):
+                raise cause.with_traceback(cause.__traceback__)
         raise
 
 

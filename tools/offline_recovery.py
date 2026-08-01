@@ -25,6 +25,10 @@ class RecoveryConflict(state.DeploymentStateError):
     """Observed filesystem state is not one of a recorded operation's two states."""
 
 
+class _BootstrapCleanupConflict(state.DeploymentStateError):
+    """Bootstrap authority or material no longer matches the durable record."""
+
+
 SecretValidator = Callable[[Path, Mapping[str, object]], bool]
 Classification = Literal["not_executed", "executed"]
 _RENAME_NOREPLACE = 1
@@ -1873,6 +1877,14 @@ def _bootstrap_entry_matches(
 ) -> bool:
     if state._is_symlink(current) or not stat.S_ISDIR(current.st_mode):
         return False
+    device = entry.get("device")
+    inode = entry.get("inode")
+    if (
+        type(device) is int
+        and type(inode) is int
+        and (current.st_dev, current.st_ino) != (device, inode)
+    ):
+        return False
     if os.name != "posix":
         return True
     prefix = "" if original else "after_"
@@ -1889,7 +1901,11 @@ def _bootstrap_entry_matches(
     )
 
 
-def _finalize_bootstrap_rollback_cleanup(journal: state.TransactionJournal) -> None:
+def _finalize_bootstrap_rollback_cleanup(
+    journal: state.TransactionJournal,
+    *,
+    mutation_backend: FilesystemMutationBackend | None,
+) -> None:
     if journal.bootstrap_protocol is None:
         return
     record = journal.read_bootstrap_directories()
@@ -1909,30 +1925,58 @@ def _finalize_bootstrap_rollback_cleanup(journal: state.TransactionJournal) -> N
                 if current is None or not _bootstrap_entry_matches(
                     entry, current, original=True
                 ):
-                    raise state.DeploymentStateError(
+                    raise _BootstrapCleanupConflict(
                         f"bootstrap cleanup conflict: {journal.root}"
                     )
             elif current is not None:
-                raise state.DeploymentStateError(
+                raise _BootstrapCleanupConflict(
                     f"bootstrap cleanup conflict: {journal.root}"
                 )
             continue
         if entry["existed"] is True:
-            if current is None or not _bootstrap_entry_matches(
-                entry, current, original=True
-            ):
-                raise state.DeploymentStateError(
+            if current is None:
+                raise _BootstrapCleanupConflict(
                     f"bootstrap cleanup conflict: {journal.root}"
                 )
+            portable_restore = (
+                os.name != "posix"
+                and entry["prepare_done"] is True
+                and entry["original_mode"] != entry["after_mode"]
+            )
+            if portable_restore or not _bootstrap_entry_matches(
+                entry, current, original=True
+            ):
+                if not _bootstrap_entry_matches(entry, current, original=False):
+                    raise _BootstrapCleanupConflict(
+                        f"bootstrap cleanup conflict: {journal.root}"
+                    )
+                try:
+                    state._chmod_bootstrap_directory(
+                        path,
+                        int(entry["original_mode"]),
+                        expected_source=current,
+                        mutation_backend=mutation_backend,
+                    )
+                except state.DeploymentStateError:
+                    raise _BootstrapCleanupConflict(
+                        f"bootstrap cleanup conflict: {journal.root}"
+                    ) from None
+                restored = state._lstat_optional(path)
+                if restored is None or not _bootstrap_entry_matches(
+                    entry, restored, original=True
+                ):
+                    raise _BootstrapCleanupConflict(
+                        f"bootstrap cleanup conflict: {journal.root}"
+                    )
         elif current is not None:
             if not _bootstrap_entry_matches(entry, current, original=False):
-                raise state.DeploymentStateError(
+                raise _BootstrapCleanupConflict(
                     f"bootstrap cleanup conflict: {journal.root}"
                 )
             try:
                 with os.scandir(path) as children:
                     if next(children, None) is not None:
-                        raise state.DeploymentStateError(
+                        raise _BootstrapCleanupConflict(
                             f"bootstrap cleanup conflict: {journal.root}"
                         )
                 path.rmdir()
@@ -1956,6 +2000,8 @@ def _finalize_bootstrap_rollback_cleanup(journal: state.TransactionJournal) -> N
 
 def finalize_rollback_cleanup(
     journal: state.TransactionJournal | state.RollbackTombstoneJournal,
+    *,
+    mutation_backend: FilesystemMutationBackend | None = None,
 ) -> None:
     """Idempotently remove a durably completed rollback journal."""
     original_root = journal.root
@@ -1969,7 +2015,10 @@ def finalize_rollback_cleanup(
                     journal.deployment_identity_hash,
                     journal.secret_companion_parent,
                 )
-                finalize_rollback_cleanup(reopened)
+                finalize_rollback_cleanup(
+                    reopened,
+                    mutation_backend=mutation_backend,
+                )
                 return
             if state._lstat_optional(tombstone) is not None:
                 raise state.DeploymentStateError(
@@ -1993,7 +2042,10 @@ def finalize_rollback_cleanup(
         if journal.secret_companion_root is not None:
             state._remove_private_tree(journal.secret_companion_root)
         if type(journal) is state.TransactionJournal:
-            _finalize_bootstrap_rollback_cleanup(journal)
+            _finalize_bootstrap_rollback_cleanup(
+                journal,
+                mutation_backend=mutation_backend,
+            )
         if journal.root != tombstone:
             if state._lstat_optional(tombstone) is not None:
                 raise state.DeploymentStateError(
@@ -2019,7 +2071,11 @@ def finalize_rollback_cleanup(
             and state._lstat_optional(original_root) is not None
         ):
             with contextlib.suppress(Exception):
-                journal.write_phase("rollback_cleanup_required")
+                journal.write_phase(
+                    "rollback_failed"
+                    if isinstance(exc, _BootstrapCleanupConflict)
+                    else "rollback_cleanup_required"
+                )
         if isinstance(exc, state.DeploymentStateError):
             raise
         raise state.DeploymentStateError(
@@ -2035,7 +2091,7 @@ def resume_transaction_rollback(
 ) -> None:
     """Resume a pre-commit rollback and remove all transaction material on success."""
     if isinstance(journal, state.RollbackTombstoneJournal):
-        finalize_rollback_cleanup(journal)
+        finalize_rollback_cleanup(journal, mutation_backend=mutation_backend)
         return
     phase = journal.read_phase().phase
     if phase in {"committed", "committed_cleanup_required"}:
@@ -2047,7 +2103,7 @@ def resume_transaction_rollback(
             f"rollback requires manual recovery: {journal.root}"
         )
     if phase in {"rollback_complete", "rollback_cleanup_required"}:
-        finalize_rollback_cleanup(journal)
+        finalize_rollback_cleanup(journal, mutation_backend=mutation_backend)
         return
     try:
         journal.write_phase("rollback_in_progress")
@@ -2129,7 +2185,7 @@ def resume_transaction_rollback(
         raise state.DeploymentStateError(
             f"rollback failed at transaction journal: {journal.root}"
         ) from None
-    finalize_rollback_cleanup(journal)
+    finalize_rollback_cleanup(journal, mutation_backend=mutation_backend)
 
 
 def _read_receipt(journal: state.TransactionJournal) -> Mapping[str, object] | None:

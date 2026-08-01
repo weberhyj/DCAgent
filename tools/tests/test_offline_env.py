@@ -510,6 +510,109 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 verify_posix_metadata=True,
             )
 
+    def test_partial_journal_create_failure_rolls_back_and_reraises_cause(self) -> None:
+        class FailingCompanionBackend(
+            offline_env_module._PortablePreparationFilesystemMutationBackend
+        ):
+            def mkdir(
+                self,
+                path: Path,
+                mode: int,
+                *,
+                owner_uid: int,
+                owner_gid: int,
+            ) -> os.stat_result:
+                if path.name == ".dcagent-transactions":
+                    raise OSError("injected companion mkdir failure")
+                return super().mkdir(
+                    path,
+                    mode,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+
+            with self.assertRaisesRegex(OSError, "companion mkdir failure"):
+                self._prepare(root, mutation_backend=FailingCompanionBackend())
+
+            state_root = root / "artifacts" / "data" / ".dcagent-deployment-state"
+            self.assertEqual([], list((state_root / "transactions").iterdir()))
+            self.assertFalse((root / "artifacts" / "secrets").exists())
+
+    def test_partial_journal_create_rollback_failure_is_retained_and_sanitized(
+        self,
+    ) -> None:
+        canary = "SENSITIVE-COMPANION-FAILURE-CANARY"
+
+        class ConflictingCompanionBackend(
+            offline_env_module._PortablePreparationFilesystemMutationBackend
+        ):
+            def mkdir(
+                self,
+                path: Path,
+                mode: int,
+                *,
+                owner_uid: int,
+                owner_gid: int,
+            ) -> os.stat_result:
+                if path.name == ".dcagent-transactions":
+                    (path.parent / "unexpected").write_text(canary, encoding="utf-8")
+                    raise OSError(canary)
+                return super().mkdir(
+                    path,
+                    mode,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+
+            with self.assertRaises(DeploymentError) as raised:
+                self._prepare(root, mutation_backend=ConflictingCompanionBackend())
+
+            message = str(raised.exception)
+            self.assertIn("transaction retained at", message)
+            self.assertIn("phase=rollback_failed", message)
+            self.assertNotIn(canary, message)
+            state_root = root / "artifacts" / "data" / ".dcagent-deployment-state"
+            journals = list((state_root / "transactions").iterdir())
+            self.assertEqual(1, len(journals))
+            journal = offline_deployment_state.TransactionJournal.open(
+                journals[0],
+                offline_deployment_state.identity_digest(
+                    offline_deployment_state.load_identity(
+                        offline_deployment_state.StatePaths(state_root)
+                    )
+                ),
+            )
+            self.assertEqual("rollback_failed", journal.read_phase().phase)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX modes are required")
+    def test_existing_0750_secret_root_can_complete_normal_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            secret_root = root / "artifacts" / "secrets"
+            os.chmod(secret_root, 0o750)
+
+            self._prepare(root)
+
+            self.assertEqual(0o700, stat.S_IMODE(os.lstat(secret_root).st_mode))
+            transactions = (
+                root
+                / "artifacts"
+                / "data"
+                / ".dcagent-deployment-state"
+                / "transactions"
+            )
+            self.assertEqual([], list(transactions.iterdir()))
+
     def test_env_rejects_host_root_keys_without_mutation(self) -> None:
         for forbidden in ("HOST_DATA_ROOT", "HOST_MODEL_ROOT"):
             with self.subTest(key=forbidden):

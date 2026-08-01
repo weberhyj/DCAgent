@@ -15,6 +15,42 @@ from tools import offline_env
 HARD_EXIT_CODE = 91
 
 
+class _HardExitAfterChmodBackend:
+    def __init__(
+        self, delegate: offline_env.PreparationFilesystemMutationBackend
+    ) -> None:
+        self.delegate = delegate
+
+    def mkdir(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        owner_uid: int,
+        owner_gid: int,
+    ) -> os.stat_result:
+        return self.delegate.mkdir(
+            path,
+            mode,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+
+    def chmod(
+        self,
+        path: Path,
+        mode: int,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        self.delegate.chmod(
+            path,
+            mode,
+            expected_source=expected_source,
+        )
+        os._exit(HARD_EXIT_CODE)
+
+
 def _owner() -> tuple[int, int]:
     return (
         os.getuid() if hasattr(os, "getuid") else 0,
@@ -110,6 +146,42 @@ def _bootstrap_case(
         },
     )
     os._exit(HARD_EXIT_CODE)
+
+
+def _bootstrap_existing_mode_case(
+    case_root: Path,
+    backend: offline_env.PreparationFilesystemMutationBackend,
+) -> None:
+    data_root = case_root / "data"
+    data_root.mkdir(mode=0o700)
+    paths = state.StatePaths(state.derive_state_root(data_root))
+    uid, gid = _owner()
+    paths.ensure_layout(uid, gid)
+    secret_root = case_root / "bootstrap-secrets"
+    secret_root.mkdir(mode=0o750)
+    os.chmod(secret_root, 0o750)
+    companion_parent = secret_root / ".dcagent-transactions"
+    identity_hash = "d" * 64
+    transaction_id = "1234567812344234a2341234567890ab"
+    _write_descriptor(
+        case_root,
+        {
+            "kind": "bootstrap_existing_mode",
+            "journal_root": (paths.transactions / transaction_id).as_posix(),
+            "identity_hash": identity_hash,
+            "secret_root": secret_root.as_posix(),
+            "companion_parent": companion_parent.as_posix(),
+        },
+    )
+    state.TransactionJournal.create(
+        paths,
+        identity_hash,
+        ("directory",),
+        companion_parent,
+        transaction_id=transaction_id,
+        bootstrap_backend=_HardExitAfterChmodBackend(backend),
+    )
+    raise AssertionError("bootstrap chmod hard exit did not run")
 
 
 def _operation_case(
@@ -291,6 +363,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     if kind == "bootstrap" and boundary == "after_create":
         _bootstrap_case(case_root, backend)
+    if kind == "bootstrap_existing_mode" and boundary == "after_chmod":
+        _bootstrap_existing_mode_case(case_root, backend)
     _operation_case(case_root, kind, boundary, backend)
 
 
