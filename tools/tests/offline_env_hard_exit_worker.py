@@ -219,7 +219,9 @@ def _operation_case(
                 "object_type": "directory",
             },
         )
-        mutate = lambda: backend.mkdir(target, mode, owner_uid=uid, owner_gid=gid)
+
+        def mutate() -> object:
+            return backend.mkdir(target, mode, owner_uid=uid, owner_gid=gid)
     elif kind == "chmod":
         target = case_root / "chmod-target"
         _create_file(backend, target, b"mode", 0o600)
@@ -244,7 +246,10 @@ def _operation_case(
                 "owner_gid": expected.st_gid,
             },
         )
-        mutate = lambda: backend.chmod(target, after_mode, expected_source=expected)
+
+        def mutate() -> object:
+            return backend.chmod(target, after_mode, expected_source=expected)
+
         descriptor["before_mode"] = before_mode
     elif kind == "active_to_backup":
         target = secret_root / "active"
@@ -261,9 +266,9 @@ def _operation_case(
                 **_authority(target),
             },
         )
-        mutate = lambda: backend.rename_noreplace(
-            target, backup, expected_source=expected
-        )
+
+        def mutate() -> object:
+            return backend.rename_noreplace(target, backup, expected_source=expected)
     elif kind == "staging_to_active":
         staging = companion / "staging" / "candidate"
         expected = _create_file(backend, staging, b"candidate", 0o600)
@@ -279,9 +284,9 @@ def _operation_case(
                 **_authority(staging),
             },
         )
-        mutate = lambda: backend.rename_noreplace(
-            staging, target, expected_source=expected
-        )
+
+        def mutate() -> object:
+            return backend.rename_noreplace(staging, target, expected_source=expected)
     elif kind == "env_replace":
         target = case_root / ".env"
         before = b"A=before\n"
@@ -308,12 +313,14 @@ def _operation_case(
             },
         )
         operation = journal.read_operations()[0]
-        mutate = lambda: backend.publish_environment(
-            journal,
-            operation,
-            after,
-            expected_source=expected,
-        )
+
+        def mutate() -> object:
+            return backend.publish_environment(
+                journal,
+                operation,
+                after,
+                expected_source=expected,
+            )
     elif kind == "unlink":
         target = secret_root / "removed"
         expected = _create_file(backend, target, b"old", 0o600)
@@ -330,9 +337,9 @@ def _operation_case(
                 **_authority(target),
             },
         )
-        mutate = lambda: backend.rename_noreplace(
-            target, backup, expected_source=expected
-        )
+
+        def mutate() -> object:
+            return backend.rename_noreplace(target, backup, expected_source=expected)
     else:
         raise AssertionError(f"unsupported hard-exit kind: {kind}")
 
