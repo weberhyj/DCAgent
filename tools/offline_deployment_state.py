@@ -69,7 +69,8 @@ FORWARD_ENVIRONMENT_PHASES = (
     "applied",
 )
 OBJECT_TYPES = ("file", "directory", "environment", "secret")
-BOOTSTRAP_PROTOCOL = "directory-undo-v1"
+BOOTSTRAP_PROTOCOL_V1 = "directory-undo-v1"
+BOOTSTRAP_PROTOCOL = "directory-undo-v2"
 BOOTSTRAP_STATES = (
     "preparing",
     "ready",
@@ -1408,6 +1409,67 @@ def _validate_bootstrap_entry(
     return result
 
 
+def _validate_bootstrap_entry_v1(
+    payload: object,
+    *,
+    expected_role: str,
+    expected_path: Path,
+) -> dict[str, object]:
+    required = {
+        "role",
+        "path",
+        "existed",
+        "object_type",
+        "original_mode",
+        "owner_uid",
+        "owner_gid",
+        "after_mode",
+        "after_owner_uid",
+        "after_owner_gid",
+        "cleanup_done",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != required:
+        raise DeploymentStateError("invalid v1 transaction bootstrap directory entry")
+    result = dict(payload)
+    if (
+        result["role"] != expected_role
+        or result["path"] != expected_path.as_posix()
+        or result["object_type"] != "directory"
+        or type(result["existed"]) is not bool
+        or type(result["cleanup_done"]) is not bool
+        or _validate_mode(result["after_mode"], "bootstrap after mode") != 0o700
+    ):
+        raise DeploymentStateError("invalid v1 transaction bootstrap directory entry")
+    after_owner = tuple(
+        _validate_optional_int(result[field], f"bootstrap {field}")
+        for field in ("after_owner_uid", "after_owner_gid")
+    )
+    if None in after_owner:
+        raise DeploymentStateError("invalid v1 transaction bootstrap directory entry")
+    if result["existed"]:
+        if (
+            _validate_optional_int(result["original_mode"], "bootstrap original mode")
+            != 0o700
+        ):
+            raise DeploymentStateError(
+                "invalid v1 transaction bootstrap directory entry"
+            )
+        original_owner = tuple(
+            _validate_optional_int(result[field], f"bootstrap {field}")
+            for field in ("owner_uid", "owner_gid")
+        )
+        if None in original_owner or original_owner != after_owner:
+            raise DeploymentStateError(
+                "invalid v1 transaction bootstrap directory entry"
+            )
+    elif any(
+        result[field] is not None
+        for field in ("original_mode", "owner_uid", "owner_gid")
+    ):
+        raise DeploymentStateError("invalid v1 transaction bootstrap directory entry")
+    return result
+
+
 @dataclasses.dataclass
 class TransactionJournal:
     root: Path
@@ -1451,7 +1513,11 @@ class TransactionJournal:
             self.root.parent.parent / "history" / f"{self.transaction_id}.json"
         )
         self.bootstrap_directories_path = self.root / "bootstrap-directories.json"
-        if self.bootstrap_protocol not in {None, BOOTSTRAP_PROTOCOL}:
+        if self.bootstrap_protocol not in {
+            None,
+            BOOTSTRAP_PROTOCOL_V1,
+            BOOTSTRAP_PROTOCOL,
+        }:
             raise DeploymentStateError("invalid transaction bootstrap protocol")
 
     @property
@@ -1665,7 +1731,11 @@ class TransactionJournal:
         ):
             raise DeploymentStateError(f"invalid transaction metadata: {metadata_path}")
         bootstrap_protocol = metadata.get("bootstrap_protocol")
-        if bootstrap_protocol not in {None, BOOTSTRAP_PROTOCOL}:
+        if bootstrap_protocol not in {
+            None,
+            BOOTSTRAP_PROTOCOL_V1,
+            BOOTSTRAP_PROTOCOL,
+        }:
             raise DeploymentStateError(f"invalid transaction metadata: {metadata_path}")
         control = metadata["control"]
         if not tombstone and control != (parent_name == "control-transactions"):
@@ -1722,6 +1792,8 @@ class TransactionJournal:
             raise DeploymentStateError(f"invalid rollback state: {root}")
         journal._read_env_backup_meta()
         bootstrap_record = None
+        if journal.bootstrap_protocol == BOOTSTRAP_PROTOCOL_V1:
+            journal._migrate_bootstrap_protocol_v1()
         if journal.bootstrap_protocol is not None:
             bootstrap_record = journal.read_bootstrap_directories()
         journal._validate_root_entries()
@@ -1887,6 +1959,165 @@ class TransactionJournal:
             ("secret_root", companion_parent.parent),
             ("companion_parent", companion_parent),
         )
+
+    def _read_bootstrap_directories_v1(self) -> dict[str, object]:
+        payload = _read_json_value(
+            self.bootstrap_directories_path, "v1 transaction bootstrap record"
+        )
+        required = {"schema_version", "transaction_id", "protocol", "state", "entries"}
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != required
+            or payload["schema_version"] != SCHEMA_VERSION
+            or payload["transaction_id"] != self.transaction_id
+            or payload["protocol"] != BOOTSTRAP_PROTOCOL_V1
+            or payload["state"] not in BOOTSTRAP_STATES
+            or not isinstance(payload["entries"], list)
+        ):
+            raise DeploymentStateError(
+                f"invalid v1 transaction bootstrap record: {self.bootstrap_directories_path}"
+            )
+        expected = self._expected_bootstrap_directories()
+        if len(payload["entries"]) != len(expected):
+            raise DeploymentStateError(
+                f"invalid v1 transaction bootstrap record: {self.bootstrap_directories_path}"
+            )
+        entries = [
+            _validate_bootstrap_entry_v1(
+                entry,
+                expected_role=role,
+                expected_path=path,
+            )
+            for entry, (role, path) in zip(payload["entries"], expected, strict=True)
+        ]
+        state_value = str(payload["state"])
+        completed = [entry["cleanup_done"] is True for entry in entries]
+        if (
+            state_value in {"preparing", "ready"}
+            and any(completed)
+            or state_value == "cleanup_complete"
+            and not all(completed)
+        ):
+            raise DeploymentStateError(
+                f"invalid v1 transaction bootstrap record: {self.bootstrap_directories_path}"
+            )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "transaction_id": self.transaction_id,
+            "protocol": BOOTSTRAP_PROTOCOL_V1,
+            "state": state_value,
+            "entries": entries,
+        }
+
+    def _snapshot_v1_bootstrap_directories(
+        self,
+        record: Mapping[str, object],
+    ) -> list[dict[str, object]]:
+        entries_value = record["entries"]
+        if not isinstance(entries_value, list):
+            raise DeploymentStateError("invalid v1 transaction bootstrap record")
+        converted: list[dict[str, object]] = []
+        for entry_value in entries_value:
+            if not isinstance(entry_value, Mapping):
+                raise DeploymentStateError("invalid v1 transaction bootstrap record")
+            entry = dict(entry_value)
+            path = Path(str(entry["path"]))
+            current = _lstat_optional(path)
+            if entry["existed"] is True:
+                if (
+                    current is None
+                    or _is_symlink(current)
+                    or not stat.S_ISDIR(current.st_mode)
+                ):
+                    raise DeploymentStateError(
+                        f"unsafe v1 transaction bootstrap target: {path}"
+                    )
+                if _is_posix() and (
+                    stat.S_IMODE(current.st_mode) != entry["original_mode"]
+                    or current.st_uid != entry["owner_uid"]
+                    or current.st_gid != entry["owner_gid"]
+                ):
+                    raise DeploymentStateError(
+                        f"unsafe v1 transaction bootstrap target: {path}"
+                    )
+                prepare_done = True
+            elif current is None:
+                prepare_done = False
+            else:
+                if (
+                    entry["cleanup_done"] is True
+                    or _is_symlink(current)
+                    or not stat.S_ISDIR(current.st_mode)
+                    or _is_posix()
+                    and (
+                        stat.S_IMODE(current.st_mode) != entry["after_mode"]
+                        or current.st_uid != entry["after_owner_uid"]
+                        or current.st_gid != entry["after_owner_gid"]
+                    )
+                ):
+                    raise DeploymentStateError(
+                        f"unsafe v1 transaction bootstrap target: {path}"
+                    )
+                prepare_done = True
+            entry["device"] = None if current is None else current.st_dev
+            entry["inode"] = None if current is None else current.st_ino
+            entry["prepare_done"] = prepare_done
+            converted.append(entry)
+        return converted
+
+    def _migrate_bootstrap_protocol_v1(self) -> None:
+        payload = _read_json_value(
+            self.bootstrap_directories_path, "transaction bootstrap record"
+        )
+        protocol = payload.get("protocol") if isinstance(payload, Mapping) else None
+        if protocol == BOOTSTRAP_PROTOCOL_V1:
+            v1_record = self._read_bootstrap_directories_v1()
+            migrated_entries = self._snapshot_v1_bootstrap_directories(v1_record)
+            state_value = str(v1_record["state"])
+            self.bootstrap_protocol = BOOTSTRAP_PROTOCOL
+            self._write_bootstrap_directories(
+                state=state_value,
+                entries=migrated_entries,
+            )
+        elif protocol == BOOTSTRAP_PROTOCOL:
+            self.bootstrap_protocol = BOOTSTRAP_PROTOCOL
+            migrated_record = self.read_bootstrap_directories()
+            v1_entries = []
+            for entry_value in migrated_record["entries"]:
+                entry = dict(entry_value)
+                stored_progress = (
+                    entry.pop("device"),
+                    entry.pop("inode"),
+                    entry.pop("prepare_done"),
+                )
+                v1_entry = _validate_bootstrap_entry_v1(
+                    entry,
+                    expected_role=str(entry["role"]),
+                    expected_path=Path(str(entry["path"])),
+                )
+                v1_entries.append((v1_entry, stored_progress))
+            snapshot = self._snapshot_v1_bootstrap_directories(
+                {
+                    "state": migrated_record["state"],
+                    "entries": [entry for entry, _progress in v1_entries],
+                }
+            )
+            for migrated, (_entry, stored_progress) in zip(
+                snapshot, v1_entries, strict=True
+            ):
+                if (
+                    migrated["device"],
+                    migrated["inode"],
+                    migrated["prepare_done"],
+                ) != stored_progress:
+                    raise DeploymentStateError(
+                        "invalid interrupted v1 bootstrap migration"
+                    )
+        else:
+            raise DeploymentStateError(
+                f"invalid v1 transaction bootstrap record: {self.bootstrap_directories_path}"
+            )
+        self._write_metadata()
 
     def _write_bootstrap_directories(
         self,

@@ -243,6 +243,28 @@ class TransactionJournalTests(unittest.TestCase):
             )
         )
 
+    def downgrade_bootstrap_to_v1(
+        self,
+        journal: state.TransactionJournal,
+        *,
+        bootstrap_state: str,
+    ) -> dict[str, object]:
+        metadata = json.loads(journal.metadata_path.read_text(encoding="utf-8"))
+        metadata["bootstrap_protocol"] = "directory-undo-v1"
+        state.atomic_write_json(journal.metadata_path, metadata)
+
+        bootstrap = json.loads(
+            journal.bootstrap_directories_path.read_text(encoding="utf-8")
+        )
+        bootstrap["protocol"] = "directory-undo-v1"
+        bootstrap["state"] = bootstrap_state
+        for entry in bootstrap["entries"]:
+            entry.pop("device")
+            entry.pop("inode")
+            entry.pop("prepare_done")
+        state.atomic_write_json(journal.bootstrap_directories_path, bootstrap)
+        return bootstrap
+
     def test_create_open_and_phase_manifest_operations_are_durable(self) -> None:
         journal = self.make_journal()
         self.assertRegex(journal.transaction_id, r"^[0-9a-f]{32}$")
@@ -1113,7 +1135,7 @@ class TransactionJournalTests(unittest.TestCase):
         journal = self.make_journal()
         bootstrap = journal.read_bootstrap_directories()
 
-        self.assertEqual("directory-undo-v1", bootstrap["protocol"])
+        self.assertEqual("directory-undo-v2", bootstrap["protocol"])
         self.assertEqual("ready", bootstrap["state"])
         self.assertEqual(
             ["secret_root", "companion_parent"],
@@ -1126,6 +1148,171 @@ class TransactionJournalTests(unittest.TestCase):
         self.assertTrue(
             all(entry["existed"] is False for entry in bootstrap["entries"])
         )
+
+    def test_v1_ready_bootstrap_is_strictly_migrated_to_v2(self) -> None:
+        journal = self.make_journal()
+        self.downgrade_bootstrap_to_v1(journal, bootstrap_state="ready")
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        self.assertEqual("directory-undo-v2", reopened.bootstrap_protocol)
+        bootstrap = reopened.read_bootstrap_directories()
+        self.assertEqual("directory-undo-v2", bootstrap["protocol"])
+        self.assertTrue(all(entry["prepare_done"] for entry in bootstrap["entries"]))
+        self.assertTrue(
+            all(type(entry["device"]) is int for entry in bootstrap["entries"])
+        )
+        metadata = json.loads(reopened.metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual("directory-undo-v2", metadata["bootstrap_protocol"])
+
+    def test_v1_partial_bootstrap_is_migrated_and_recovered(self) -> None:
+        journal = self.make_journal()
+        assert journal.secret_companion_root is not None
+        state._remove_private_tree(journal.secret_companion_root)
+        self.secret_root.rmdir()
+        self.downgrade_bootstrap_to_v1(journal, bootstrap_state="preparing")
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        bootstrap = reopened.read_bootstrap_directories()
+        self.assertEqual(
+            [True, False],
+            [entry["prepare_done"] for entry in bootstrap["entries"]],
+        )
+        self.assertIsInstance(bootstrap["entries"][0]["device"], int)
+        self.assertIsNone(bootstrap["entries"][1]["device"])
+        recovery.resume_transaction_rollback(
+            reopened,
+            mutation_backend=PortableMutationBackend(),
+        )
+        self.assertFalse(journal.root.exists())
+        self.assertFalse(self.secret_root.parent.exists())
+
+    def test_v1_cleanup_progress_is_migrated_and_recovered(self) -> None:
+        journal = self.make_journal()
+        assert journal.secret_companion_root is not None
+        state._remove_private_tree(journal.secret_companion_root)
+        self.secret_root.rmdir()
+        bootstrap = self.downgrade_bootstrap_to_v1(
+            journal,
+            bootstrap_state="cleanup_in_progress",
+        )
+        bootstrap["entries"][1]["cleanup_done"] = True
+        state.atomic_write_json(journal.bootstrap_directories_path, bootstrap)
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        migrated = reopened.read_bootstrap_directories()
+        self.assertEqual(
+            [False, True],
+            [entry["cleanup_done"] for entry in migrated["entries"]],
+        )
+        self.assertEqual(
+            [True, False],
+            [entry["prepare_done"] for entry in migrated["entries"]],
+        )
+        recovery.resume_transaction_rollback(
+            reopened,
+            mutation_backend=PortableMutationBackend(),
+        )
+        self.assertFalse(journal.root.exists())
+        self.assertFalse(self.secret_root.parent.exists())
+
+    def test_v1_migration_reconciles_record_first_interruption(self) -> None:
+        journal = self.make_journal()
+        metadata = json.loads(journal.metadata_path.read_text(encoding="utf-8"))
+        metadata["bootstrap_protocol"] = "directory-undo-v1"
+        state.atomic_write_json(journal.metadata_path, metadata)
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        self.assertEqual("directory-undo-v2", reopened.bootstrap_protocol)
+        migrated_metadata = json.loads(
+            reopened.metadata_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual("directory-undo-v2", migrated_metadata["bootstrap_protocol"])
+
+    def test_v1_bootstrap_migration_rejects_schema_authority_and_state_tampering(
+        self,
+    ) -> None:
+        journal = self.make_journal()
+        bootstrap = self.downgrade_bootstrap_to_v1(
+            journal,
+            bootstrap_state="ready",
+        )
+        original = json.loads(json.dumps(bootstrap))
+        tampered_payloads = {
+            "extra field": dict(original, unexpected="CANARY"),
+            "wrong owner": json.loads(json.dumps(original)),
+            "wrong original mode": json.loads(json.dumps(original)),
+            "ready cleanup progress": json.loads(json.dumps(original)),
+        }
+        tampered_payloads["wrong owner"]["entries"][0]["existed"] = True
+        tampered_payloads["wrong owner"]["entries"][0]["original_mode"] = 0o700
+        tampered_payloads["wrong owner"]["entries"][0]["owner_uid"] = 2**31
+        tampered_payloads["wrong owner"]["entries"][0]["owner_gid"] = 2**31
+        tampered_payloads["wrong original mode"]["entries"][0]["existed"] = True
+        tampered_payloads["wrong original mode"]["entries"][0]["original_mode"] = 0o750
+        tampered_payloads["wrong original mode"]["entries"][0]["owner_uid"] = os.lstat(
+            self.secret_root.parent
+        ).st_uid
+        tampered_payloads["wrong original mode"]["entries"][0]["owner_gid"] = os.lstat(
+            self.secret_root.parent
+        ).st_gid
+        tampered_payloads["ready cleanup progress"]["entries"][0]["cleanup_done"] = True
+
+        for description, payload in tampered_payloads.items():
+            with self.subTest(description=description):
+                state.atomic_write_json(journal.bootstrap_directories_path, payload)
+                with self.assertRaises(state.DeploymentStateError):
+                    state.TransactionJournal.open(journal.root, self.identity_hash)
+
+    def test_v1_bootstrap_migration_rejects_unsafe_filesystem_type(self) -> None:
+        journal = self.make_journal()
+        assert journal.secret_companion_root is not None
+        state._remove_private_tree(journal.secret_companion_root)
+        self.secret_root.rmdir()
+        self.secret_root.write_text("unsafe", encoding="utf-8")
+        self.downgrade_bootstrap_to_v1(journal, bootstrap_state="ready")
+
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+    def test_v1_bootstrap_migration_rejects_symlink(self) -> None:
+        journal = self.make_journal()
+        assert journal.secret_companion_root is not None
+        state._remove_private_tree(journal.secret_companion_root)
+        self.secret_root.rmdir()
+        victim = self.base / "bootstrap-victim"
+        victim.mkdir()
+        try:
+            self.secret_root.symlink_to(victim, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        self.downgrade_bootstrap_to_v1(journal, bootstrap_state="ready")
+
+        with self.assertRaises(state.DeploymentStateError):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
+
+    def test_v1_bootstrap_migration_rejects_nonprefix_snapshot(self) -> None:
+        journal = self.make_journal()
+        self.downgrade_bootstrap_to_v1(journal, bootstrap_state="preparing")
+        real_lstat_optional = state._lstat_optional
+
+        def nonprefix_snapshot(path: Path) -> os.stat_result | None:
+            if Path(path) == self.secret_root.parent:
+                return None
+            return real_lstat_optional(path)
+
+        with (
+            mock.patch.object(
+                state,
+                "_lstat_optional",
+                side_effect=nonprefix_snapshot,
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            state.TransactionJournal.open(journal.root, self.identity_hash)
 
     def test_existing_secret_root_is_hardened_before_companion_creation(self) -> None:
         secret_root = self.secret_root.parent
