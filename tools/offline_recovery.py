@@ -1655,6 +1655,95 @@ def _write_rollback_cleanup_metadata(
     )
 
 
+def _bootstrap_entry_matches(
+    entry: Mapping[str, object],
+    current: os.stat_result,
+    *,
+    original: bool,
+) -> bool:
+    if state._is_symlink(current) or not stat.S_ISDIR(current.st_mode):
+        return False
+    if os.name != "posix":
+        return True
+    prefix = "" if original else "after_"
+    mode = entry.get(f"{prefix}mode" if prefix else "original_mode")
+    uid = entry.get(f"{prefix}owner_uid" if prefix else "owner_uid")
+    gid = entry.get(f"{prefix}owner_gid" if prefix else "owner_gid")
+    return (
+        type(mode) is int
+        and type(uid) is int
+        and type(gid) is int
+        and stat.S_IMODE(current.st_mode) == mode
+        and current.st_uid == uid
+        and current.st_gid == gid
+    )
+
+
+def _finalize_bootstrap_rollback_cleanup(journal: state.TransactionJournal) -> None:
+    if journal.bootstrap_protocol is None:
+        return
+    record = journal.read_bootstrap_directories()
+    entries = [dict(entry) for entry in record["entries"]]
+    if record["state"] == "cleanup_complete":
+        return
+    journal._write_bootstrap_directories(
+        state="cleanup_in_progress",
+        entries=entries,
+    )
+    for index in range(len(entries) - 1, -1, -1):
+        entry = entries[index]
+        path = Path(str(entry["path"]))
+        current = state._lstat_optional(path)
+        if entry["cleanup_done"] is True:
+            if entry["existed"] is True:
+                if current is None or not _bootstrap_entry_matches(
+                    entry, current, original=True
+                ):
+                    raise state.DeploymentStateError(
+                        f"bootstrap cleanup conflict: {journal.root}"
+                    )
+            elif current is not None:
+                raise state.DeploymentStateError(
+                    f"bootstrap cleanup conflict: {journal.root}"
+                )
+            continue
+        if entry["existed"] is True:
+            if current is None or not _bootstrap_entry_matches(
+                entry, current, original=True
+            ):
+                raise state.DeploymentStateError(
+                    f"bootstrap cleanup conflict: {journal.root}"
+                )
+        elif current is not None:
+            if not _bootstrap_entry_matches(entry, current, original=False):
+                raise state.DeploymentStateError(
+                    f"bootstrap cleanup conflict: {journal.root}"
+                )
+            try:
+                with os.scandir(path) as children:
+                    if next(children, None) is not None:
+                        raise state.DeploymentStateError(
+                            f"bootstrap cleanup conflict: {journal.root}"
+                        )
+                path.rmdir()
+                state.fsync_directory(path.parent)
+            except state.DeploymentStateError:
+                raise
+            except OSError as exc:
+                raise state.DeploymentStateError(
+                    f"bootstrap cleanup failed: {journal.root}"
+                ) from exc
+        entries[index]["cleanup_done"] = True
+        journal._write_bootstrap_directories(
+            state="cleanup_in_progress",
+            entries=entries,
+        )
+    journal._write_bootstrap_directories(
+        state="cleanup_complete",
+        entries=entries,
+    )
+
+
 def finalize_rollback_cleanup(
     journal: state.TransactionJournal | state.RollbackTombstoneJournal,
 ) -> None:
@@ -1693,6 +1782,8 @@ def finalize_rollback_cleanup(
             )
         if journal.secret_companion_root is not None:
             state._remove_private_tree(journal.secret_companion_root)
+        if type(journal) is state.TransactionJournal:
+            _finalize_bootstrap_rollback_cleanup(journal)
         if journal.root != tombstone:
             if state._lstat_optional(tombstone) is not None:
                 raise state.DeploymentStateError(

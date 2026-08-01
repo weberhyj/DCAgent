@@ -981,10 +981,78 @@ class TransactionJournalTests(unittest.TestCase):
     def test_control_transaction_uses_nullable_companion(self) -> None:
         journal = self.make_journal(control=True)
         self.assertIsNone(journal.secret_companion_root)
+        bootstrap = journal.read_bootstrap_directories()
+        self.assertEqual("ready", bootstrap["state"])
+        self.assertEqual([], bootstrap["entries"])
         self.assertEqual(
             state.TransactionJournal.open(journal.root, self.identity_hash).control,
             True,
         )
+
+    def test_normal_journal_persists_strict_bootstrap_directory_undo(self) -> None:
+        journal = self.make_journal()
+        bootstrap = journal.read_bootstrap_directories()
+
+        self.assertEqual("directory-undo-v1", bootstrap["protocol"])
+        self.assertEqual("ready", bootstrap["state"])
+        self.assertEqual(
+            ["secret_root", "companion_parent"],
+            [entry["role"] for entry in bootstrap["entries"]],
+        )
+        self.assertEqual(
+            [self.secret_root.parent.as_posix(), self.secret_root.as_posix()],
+            [entry["path"] for entry in bootstrap["entries"]],
+        )
+        self.assertTrue(
+            all(entry["existed"] is False for entry in bootstrap["entries"])
+        )
+
+    def test_partial_bootstrap_creation_retains_openable_journal_for_rollback(
+        self,
+    ) -> None:
+        transaction_id = "1234567812344234a2341234567890ab"
+        journal_root = self.paths.transactions / transaction_id
+        secret_root = self.secret_root.parent
+        real_mkdir = os.mkdir
+
+        def fail_companion_parent(path: Path, mode: int = 0o777) -> None:
+            if Path(path) == self.secret_root:
+                raise OSError("injected companion bootstrap failure")
+            real_mkdir(path, mode)
+
+        with (
+            mock.patch("tools.offline_deployment_state.os.mkdir", side_effect=fail_companion_parent),
+            self.assertRaisesRegex(OSError, "companion bootstrap failure"),
+        ):
+            state.TransactionJournal.create(
+                self.paths,
+                self.identity_hash,
+                ["secret", "env"],
+                self.secret_root,
+                transaction_id=transaction_id,
+            )
+
+        self.assertTrue(journal_root.is_dir())
+        self.assertTrue(secret_root.is_dir())
+        self.assertFalse(self.secret_root.exists())
+        reopened = state.TransactionJournal.open(journal_root, self.identity_hash)
+        recovery.resume_transaction_rollback(
+            reopened,
+            mutation_backend=PortableMutationBackend(),
+        )
+        self.assertFalse(journal_root.exists())
+        self.assertFalse(secret_root.exists())
+
+    def test_legacy_journal_without_bootstrap_record_still_opens(self) -> None:
+        journal = self.make_journal()
+        metadata = json.loads(journal.metadata_path.read_text(encoding="utf-8"))
+        metadata.pop("bootstrap_protocol", None)
+        state.atomic_write_json(journal.metadata_path, metadata)
+        journal.bootstrap_directories_path.unlink(missing_ok=True)
+
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+
+        self.assertIsNone(reopened.bootstrap_protocol)
 
     @unittest.skipUnless(os.name == "posix", "POSIX owner and modes require POSIX")
     def test_journal_directories_and_records_are_private(self) -> None:
@@ -3137,6 +3205,33 @@ class RecoveryExecutionTests(unittest.TestCase):
         state._remove_private_tree(journal.secret_companion_root)
         reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
         recovery.resume_transaction_rollback(reopened)
+        self.assertFalse(journal.root.exists())
+
+    def test_bootstrap_directory_cleanup_interruption_is_reentrant(self) -> None:
+        journal = self.journal()
+        secret_root = self.secret_parent.parent
+        real_rmdir = Path.rmdir
+        interrupted = False
+
+        def interrupt_after_companion_parent(path: Path) -> None:
+            nonlocal interrupted
+            real_rmdir(path)
+            if path == self.secret_parent and not interrupted:
+                interrupted = True
+                raise OSError("injected bootstrap cleanup interruption")
+
+        with (
+            mock.patch.object(Path, "rmdir", autospec=True, side_effect=interrupt_after_companion_parent),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.resume_transaction_rollback(journal)
+
+        self.assertFalse(self.secret_parent.exists())
+        self.assertTrue(secret_root.exists())
+        self.assertTrue(journal.root.exists())
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+        recovery.resume_transaction_rollback(reopened)
+        self.assertFalse(secret_root.exists())
         self.assertFalse(journal.root.exists())
 
     def test_rollback_cleanup_uses_external_metadata_before_rename(self) -> None:

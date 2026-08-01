@@ -63,6 +63,14 @@ ENV_ROLLBACK_PHASES = (
 )
 ENV_ROLLBACK_BRANCHES = ("existing_before", "absent_before")
 OBJECT_TYPES = ("file", "directory", "environment", "secret")
+BOOTSTRAP_PROTOCOL = "directory-undo-v1"
+BOOTSTRAP_STATES = (
+    "preparing",
+    "ready",
+    "cleanup_in_progress",
+    "cleanup_complete",
+)
+BOOTSTRAP_ROLES = ("secret_root", "companion_parent")
 
 _MARKER_OPERATIONS = frozenset({"up", "exec", "cp", "legacy_adoption"})
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
@@ -1163,6 +1171,93 @@ def _validate_operation_mapping(
     return result
 
 
+def _bootstrap_owner() -> tuple[int, int]:
+    return (
+        os.getuid() if hasattr(os, "getuid") else 0,
+        os.getgid() if hasattr(os, "getgid") else 0,
+    )
+
+
+def _plan_bootstrap_directory(role: str, path: Path) -> dict[str, object]:
+    current = _lstat_optional(path)
+    owner_uid, owner_gid = _bootstrap_owner()
+    if current is None:
+        existed = False
+        original_mode = None
+        original_uid = None
+        original_gid = None
+    else:
+        _verify_directory(path, f"transaction bootstrap {role}")
+        existed = True
+        original_mode = stat.S_IMODE(current.st_mode)
+        original_uid = current.st_uid
+        original_gid = current.st_gid
+    return {
+        "role": role,
+        "path": path.as_posix(),
+        "existed": existed,
+        "object_type": "directory",
+        "original_mode": original_mode,
+        "owner_uid": original_uid,
+        "owner_gid": original_gid,
+        "after_mode": 0o700,
+        "after_owner_uid": owner_uid,
+        "after_owner_gid": owner_gid,
+        "cleanup_done": False,
+    }
+
+
+def _validate_bootstrap_entry(
+    payload: object,
+    *,
+    expected_role: str,
+    expected_path: Path,
+) -> dict[str, object]:
+    required = {
+        "role",
+        "path",
+        "existed",
+        "object_type",
+        "original_mode",
+        "owner_uid",
+        "owner_gid",
+        "after_mode",
+        "after_owner_uid",
+        "after_owner_gid",
+        "cleanup_done",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != required:
+        raise DeploymentStateError("invalid transaction bootstrap directory entry")
+    result = dict(payload)
+    if (
+        result["role"] != expected_role
+        or result["path"] != expected_path.as_posix()
+        or result["object_type"] != "directory"
+        or type(result["existed"]) is not bool
+        or type(result["cleanup_done"]) is not bool
+        or _validate_mode(result["after_mode"], "bootstrap after mode") != 0o700
+    ):
+        raise DeploymentStateError("invalid transaction bootstrap directory entry")
+    for field in ("after_owner_uid", "after_owner_gid"):
+        if _validate_optional_int(result[field], f"bootstrap {field}") is None:
+            raise DeploymentStateError("invalid transaction bootstrap directory entry")
+    if result["existed"]:
+        if _validate_optional_int(result["original_mode"], "bootstrap original mode") is None:
+            raise DeploymentStateError("invalid transaction bootstrap directory entry")
+        _validate_mode(result["original_mode"], "bootstrap original mode")
+        for field in ("owner_uid", "owner_gid"):
+            if _validate_optional_int(result[field], f"bootstrap {field}") is None:
+                raise DeploymentStateError(
+                    "invalid transaction bootstrap directory entry"
+                )
+    elif any(
+        result[field] is not None
+        for field in ("original_mode", "owner_uid", "owner_gid")
+    ):
+        raise DeploymentStateError("invalid transaction bootstrap directory entry")
+    return result
+
+
 @dataclasses.dataclass
 class TransactionJournal:
     root: Path
@@ -1171,6 +1266,7 @@ class TransactionJournal:
     secret_companion_root: Path | None
     object_categories: tuple[str, ...]
     control: bool = False
+    bootstrap_protocol: str | None = BOOTSTRAP_PROTOCOL
     metadata_path: Path = dataclasses.field(init=False)
     phase_path: Path = dataclasses.field(init=False)
     undo_manifest_path: Path = dataclasses.field(init=False)
@@ -1181,6 +1277,7 @@ class TransactionJournal:
     rollback_path: Path = dataclasses.field(init=False)
     rollback_intents_path: Path = dataclasses.field(init=False)
     history_receipt_path: Path = dataclasses.field(init=False)
+    bootstrap_directories_path: Path = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
@@ -1201,6 +1298,9 @@ class TransactionJournal:
         self.history_receipt_path = (
             self.root.parent.parent / "history" / f"{self.transaction_id}.json"
         )
+        self.bootstrap_directories_path = self.root / "bootstrap-directories.json"
+        if self.bootstrap_protocol not in {None, BOOTSTRAP_PROTOCOL}:
+            raise DeploymentStateError("invalid transaction bootstrap protocol")
 
     @property
     def secret_companion_parent(self) -> Path | None:
@@ -1232,39 +1332,40 @@ class TransactionJournal:
         root = parent / txid
         if _lstat_optional(root) is not None:
             raise DeploymentStateError(f"transaction already exists: {root}")
+        companion: Path | None = None
+        bootstrap_entries: list[dict[str, object]] = []
+        if not control:
+            companion_parent = _validate_abs_path(
+                secret_companion_root, "secret companion root"
+            )
+            if companion_parent.name != ".dcagent-transactions":
+                raise DeploymentStateError(
+                    "secret companion root must be .dcagent-transactions"
+                )
+            secret_root = companion_parent.parent
+            _verify_directory(
+                secret_root.parent,
+                "secret companion ancestor",
+                exact_mode=False,
+            )
+            bootstrap_entries = [
+                _plan_bootstrap_directory("secret_root", secret_root),
+                _plan_bootstrap_directory("companion_parent", companion_parent),
+            ]
+            companion = companion_parent / txid
         os.mkdir(root, 0o700)
         fsync_directory(parent)
-        companion: Path | None = None
+        journal = cls(
+            root,
+            txid,
+            identity_hash,
+            companion,
+            categories,
+            control,
+            BOOTSTRAP_PROTOCOL,
+        )
+        bootstrap_durable = False
         try:
-            if not control:
-                companion_parent = _validate_abs_path(
-                    secret_companion_root, "secret companion root"
-                )
-                if companion_parent.name != ".dcagent-transactions":
-                    raise DeploymentStateError(
-                        "secret companion root must be .dcagent-transactions"
-                    )
-                nearest = companion_parent
-                missing: list[Path] = []
-                while _lstat_optional(nearest) is None:
-                    missing.append(nearest)
-                    if nearest.parent == nearest:
-                        raise DeploymentStateError("invalid secret companion root")
-                    nearest = nearest.parent
-                _verify_directory(
-                    nearest, "secret companion ancestor", exact_mode=False
-                )
-                for directory in reversed(missing):
-                    os.mkdir(directory, 0o700)
-                    fsync_directory(directory.parent)
-                _verify_directory(companion_parent, "secret companion root")
-                companion = companion_parent / txid
-                os.mkdir(companion, 0o700)
-                os.mkdir(companion / "staging", 0o700)
-                os.mkdir(companion / "backup", 0o700)
-                fsync_directory(companion)
-                fsync_directory(companion_parent)
-            journal = cls(root, txid, identity_hash, companion, categories, control)
             journal._write_metadata()
             journal.write_phase("planned")
             journal.write_undo_manifest([])
@@ -1272,13 +1373,36 @@ class TransactionJournal:
             journal._write_rollback_done([])
             journal._write_rollback_intents([])
             journal._write_env_backup_meta(state="ready", absent=True, digest=None)
+            journal._write_bootstrap_directories(
+                state="ready" if control else "preparing",
+                entries=bootstrap_entries,
+            )
+            bootstrap_durable = True
+            if not control:
+                for entry in bootstrap_entries:
+                    path = Path(str(entry["path"]))
+                    if entry["existed"] is False:
+                        os.mkdir(path, 0o700)
+                        fsync_directory(path.parent)
+                    _verify_directory(path, f"transaction bootstrap {entry['role']}")
+                assert companion is not None
+                os.mkdir(companion, 0o700)
+                fsync_directory(companion.parent)
+                _verify_directory(companion, "secret transaction companion")
+                for name in ("staging", "backup"):
+                    directory = companion / name
+                    os.mkdir(directory, 0o700)
+                    fsync_directory(companion)
+                    _verify_directory(directory, f"secret {name} directory")
+                journal._write_bootstrap_directories(
+                    state="ready",
+                    entries=bootstrap_entries,
+                )
             return journal
         except Exception:
-            with contextlib.suppress(Exception):
-                if companion is not None:
-                    _remove_private_tree(companion)
-            with contextlib.suppress(Exception):
-                _remove_private_tree(root)
+            if not bootstrap_durable:
+                with contextlib.suppress(Exception):
+                    _remove_private_tree(root)
             raise
 
     @classmethod
@@ -1310,7 +1434,7 @@ class TransactionJournal:
             raise DeploymentStateError(f"unsafe transaction journal: {root}")
         metadata_path = root / "journal.json"
         metadata = _read_json_value(metadata_path, "transaction metadata")
-        required = {
+        legacy_required = {
             "schema_version",
             "transaction_id",
             "deployment_identity_hash",
@@ -1318,9 +1442,13 @@ class TransactionJournal:
             "control",
             "secret_companion_root",
         }
+        required = legacy_required | {"bootstrap_protocol"}
+        metadata_fields = (
+            frozenset(metadata) if isinstance(metadata, Mapping) else frozenset()
+        )
         if (
             not isinstance(metadata, Mapping)
-            or set(metadata) != required
+            or metadata_fields not in {frozenset(legacy_required), frozenset(required)}
             or type(metadata["schema_version"]) is not int
             or metadata["schema_version"] != SCHEMA_VERSION
             or metadata["transaction_id"] != transaction_id
@@ -1328,6 +1456,9 @@ class TransactionJournal:
             or type(metadata["control"]) is not bool
             or not isinstance(metadata["object_categories"], list)
         ):
+            raise DeploymentStateError(f"invalid transaction metadata: {metadata_path}")
+        bootstrap_protocol = metadata.get("bootstrap_protocol")
+        if bootstrap_protocol not in {None, BOOTSTRAP_PROTOCOL}:
             raise DeploymentStateError(f"invalid transaction metadata: {metadata_path}")
         control = metadata["control"]
         if not tombstone and control != (parent_name == "control-transactions"):
@@ -1355,6 +1486,7 @@ class TransactionJournal:
             companion,
             tuple(metadata["object_categories"]),
             control,
+            bootstrap_protocol,
         )
         phase = journal.read_phase()
         if phase.object_categories != journal.object_categories:
@@ -1382,6 +1514,9 @@ class TransactionJournal:
         ):
             raise DeploymentStateError(f"invalid rollback state: {root}")
         journal._read_env_backup_meta()
+        bootstrap_record = None
+        if journal.bootstrap_protocol is not None:
+            bootstrap_record = journal.read_bootstrap_directories()
         journal._validate_root_entries()
         env_rollback_state = journal._read_env_rollback_state(operations)
         if env_rollback_state is not None and (
@@ -1409,6 +1544,9 @@ class TransactionJournal:
             }
             and {operation["sequence"] for operation in operations}
             <= set(rollback_done)
+        ) or (
+            bootstrap_record is not None
+            and bootstrap_record["state"] == "preparing"
         )
         journal._validate_secret_companion(allow_partial=allow_partial_companion)
         return journal
@@ -1464,6 +1602,8 @@ class TransactionJournal:
             "env-backup.json",
         }
         optional = {"env-backup", "env-rollback.json"}
+        if self.bootstrap_protocol is not None:
+            expected.add("bootstrap-directories.json")
         allowed_temp_targets = expected | optional
         try:
             entries = list(os.scandir(self.root))
@@ -1493,9 +1633,7 @@ class TransactionJournal:
             _verify_regular_file(Path(entry.path), "transaction journal record")
 
     def _write_metadata(self) -> None:
-        atomic_write_json(
-            self.metadata_path,
-            {
+        payload: dict[str, object] = {
                 "schema_version": SCHEMA_VERSION,
                 "transaction_id": self.transaction_id,
                 "deployment_identity_hash": self.deployment_identity_hash,
@@ -1504,8 +1642,110 @@ class TransactionJournal:
                 "secret_companion_root": None
                 if self.secret_companion_root is None
                 else self.secret_companion_root.as_posix(),
+            }
+        if self.bootstrap_protocol is not None:
+            payload["bootstrap_protocol"] = self.bootstrap_protocol
+        atomic_write_json(self.metadata_path, payload)
+
+    def _expected_bootstrap_directories(self) -> tuple[tuple[str, Path], ...]:
+        if self.control:
+            return ()
+        if self.secret_companion_root is None:
+            raise DeploymentStateError("normal transaction is missing companion metadata")
+        companion_parent = self.secret_companion_root.parent
+        return (
+            ("secret_root", companion_parent.parent),
+            ("companion_parent", companion_parent),
+        )
+
+    def _write_bootstrap_directories(
+        self,
+        *,
+        state: str,
+        entries: Sequence[Mapping[str, object]],
+    ) -> None:
+        if self.bootstrap_protocol != BOOTSTRAP_PROTOCOL or state not in BOOTSTRAP_STATES:
+            raise DeploymentStateError("invalid transaction bootstrap record")
+        expected = self._expected_bootstrap_directories()
+        if len(entries) != len(expected):
+            raise DeploymentStateError("invalid transaction bootstrap record")
+        converted = [
+            _validate_bootstrap_entry(
+                entry,
+                expected_role=role,
+                expected_path=path,
+            )
+            for entry, (role, path) in zip(entries, expected, strict=True)
+        ]
+        completed = [entry["cleanup_done"] is True for entry in converted]
+        if (
+            state in {"preparing", "ready"}
+            and any(completed)
+            or state == "cleanup_complete"
+            and not all(completed)
+        ):
+            raise DeploymentStateError("invalid transaction bootstrap cleanup state")
+        atomic_write_json(
+            self.bootstrap_directories_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "transaction_id": self.transaction_id,
+                "protocol": BOOTSTRAP_PROTOCOL,
+                "state": state,
+                "entries": converted,
             },
         )
+
+    def read_bootstrap_directories(self) -> dict[str, object]:
+        if self.bootstrap_protocol is None:
+            raise DeploymentStateError("legacy transaction has no bootstrap record")
+        payload = _read_json_value(
+            self.bootstrap_directories_path, "transaction bootstrap record"
+        )
+        required = {"schema_version", "transaction_id", "protocol", "state", "entries"}
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != required
+            or payload["schema_version"] != SCHEMA_VERSION
+            or payload["transaction_id"] != self.transaction_id
+            or payload["protocol"] != BOOTSTRAP_PROTOCOL
+            or payload["state"] not in BOOTSTRAP_STATES
+            or not isinstance(payload["entries"], list)
+        ):
+            raise DeploymentStateError(
+                f"invalid transaction bootstrap record: {self.bootstrap_directories_path}"
+            )
+        expected = self._expected_bootstrap_directories()
+        if len(payload["entries"]) != len(expected):
+            raise DeploymentStateError(
+                f"invalid transaction bootstrap record: {self.bootstrap_directories_path}"
+            )
+        entries = [
+            _validate_bootstrap_entry(
+                entry,
+                expected_role=role,
+                expected_path=path,
+            )
+            for entry, (role, path) in zip(payload["entries"], expected, strict=True)
+        ]
+        state_value = str(payload["state"])
+        completed = [entry["cleanup_done"] is True for entry in entries]
+        if (
+            state_value in {"preparing", "ready"}
+            and any(completed)
+            or state_value == "cleanup_complete"
+            and not all(completed)
+        ):
+            raise DeploymentStateError(
+                f"invalid transaction bootstrap record: {self.bootstrap_directories_path}"
+            )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "transaction_id": self.transaction_id,
+            "protocol": BOOTSTRAP_PROTOCOL,
+            "state": state_value,
+            "entries": entries,
+        }
 
     def write_phase(self, phase: str) -> None:
         if phase not in TRANSACTION_PHASES:
