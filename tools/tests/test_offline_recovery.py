@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -97,7 +98,7 @@ class PortableMutationBackend:
     def _assert_identity(path: Path, expected: os.stat_result) -> None:
         current = os.lstat(path)
         if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
-            raise OSError("test mutation source changed")
+            raise OSError(errno.EAGAIN, "test mutation source changed")
 
     def rename_noreplace(
         self,
@@ -133,6 +134,19 @@ class PortableMutationBackend:
     ) -> None:
         self._assert_identity(path, expected_source)
         path.unlink()
+
+    def rmdir_empty(
+        self,
+        path: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        self._assert_identity(path, expected_source)
+        with os.scandir(path) as children:
+            if next(children, None) is not None:
+                raise OSError(errno.ENOTEMPTY, "test directory is not empty")
+        self._assert_identity(path, expected_source)
+        path.rmdir()
 
     def restore_environment(
         self,
@@ -1567,6 +1581,56 @@ class TransactionJournalTests(unittest.TestCase):
         )
         self.assertFalse(journal_root.exists())
         self.assertFalse(secret_root.exists())
+
+    def test_partial_bootstrap_baseexceptions_are_wrapped_with_openable_journal(
+        self,
+    ) -> None:
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exception_type=exception_type.__name__):
+                original_error = exception_type(
+                    f"SENSITIVE-{exception_type.__name__}-CANARY"
+                )
+
+                class FailingCompanionBackend(RecordingBootstrapBackend):
+                    def mkdir(
+                        self,
+                        path: Path,
+                        mode: int,
+                        *,
+                        owner_uid: int,
+                        owner_gid: int,
+                    ) -> os.stat_result:
+                        if path.name == ".dcagent-transactions":
+                            raise original_error
+                        return super().mkdir(
+                            path,
+                            mode,
+                            owner_uid=owner_uid,
+                            owner_gid=owner_gid,
+                        )
+
+                with self.assertRaises(state.TransactionJournalCreationError) as raised:
+                    state.TransactionJournal.create(
+                        self.paths,
+                        self.identity_hash,
+                        ["secret", "env"],
+                        self.secret_root,
+                        bootstrap_backend=FailingCompanionBackend(),
+                    )
+
+                self.assertIs(original_error, raised.exception.original_error)
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(raised.exception.__context__)
+                reopened = state.TransactionJournal.open(
+                    raised.exception.journal.root,
+                    self.identity_hash,
+                )
+                recovery.resume_transaction_rollback(
+                    reopened,
+                    mutation_backend=PortableMutationBackend(),
+                )
+                self.assertFalse(reopened.root.exists())
+                self.assertFalse(self.secret_root.parent.exists())
 
     def test_legacy_journal_without_bootstrap_record_still_opens(self) -> None:
         journal = self.make_journal()
@@ -3886,34 +3950,67 @@ class RecoveryExecutionTests(unittest.TestCase):
     def test_bootstrap_directory_cleanup_interruption_is_reentrant(self) -> None:
         journal = self.journal()
         secret_root = self.secret_parent.parent
-        real_rmdir = Path.rmdir
         interrupted = False
 
-        def interrupt_after_companion_parent(path: Path) -> None:
-            nonlocal interrupted
-            real_rmdir(path)
-            if path == self.secret_parent and not interrupted:
-                interrupted = True
-                raise OSError("injected bootstrap cleanup interruption")
+        class InterruptAfterRmdirBackend(PortableMutationBackend):
+            def rmdir_empty(
+                self,
+                path: Path,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                nonlocal interrupted
+                super().rmdir_empty(path, expected_source=expected_source)
+                if path == self.secret_parent and not interrupted:
+                    interrupted = True
+                    raise OSError(errno.EIO, "injected bootstrap cleanup interruption")
 
-        with (
-            mock.patch.object(
-                Path,
-                "rmdir",
-                autospec=True,
-                side_effect=interrupt_after_companion_parent,
-            ),
-            self.assertRaises(state.DeploymentStateError),
-        ):
-            recovery.resume_transaction_rollback(journal)
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.resume_transaction_rollback(
+                journal,
+                mutation_backend=InterruptAfterRmdirBackend(),
+            )
 
         self.assertFalse(self.secret_parent.exists())
         self.assertTrue(secret_root.exists())
         self.assertTrue(journal.root.exists())
         reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
-        recovery.resume_transaction_rollback(reopened)
+        recovery.resume_transaction_rollback(
+            reopened,
+            mutation_backend=PortableMutationBackend(),
+        )
         self.assertFalse(secret_root.exists())
         self.assertFalse(journal.root.exists())
+
+    def test_bootstrap_cleanup_inode_swap_fails_closed_and_retains_journal(
+        self,
+    ) -> None:
+        journal = self.journal()
+        original = self.secret_parent.with_name(".dcagent-transactions-original")
+
+        class SwapBeforeRmdirBackend(PortableMutationBackend):
+            def rmdir_empty(
+                self,
+                path: Path,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                path.rename(original)
+                path.mkdir(mode=stat.S_IMODE(expected_source.st_mode))
+                if os.name == "posix":
+                    os.chmod(path, stat.S_IMODE(expected_source.st_mode))
+                super().rmdir_empty(path, expected_source=expected_source)
+
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.resume_transaction_rollback(
+                journal,
+                mutation_backend=SwapBeforeRmdirBackend(),
+            )
+
+        self.assertTrue(journal.root.exists())
+        self.assertEqual("rollback_failed", journal.read_phase().phase)
+        self.assertTrue(original.is_dir())
+        self.assertTrue(self.secret_parent.is_dir())
 
     def test_rollback_cleanup_uses_external_metadata_before_rename(self) -> None:
         journal, _restore_before, validator = self.executed_rollback_case("mkdir")

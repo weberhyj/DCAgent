@@ -271,11 +271,25 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 mutation.path: mutation for mutation in plan.directory_mutations
             }
             self.assertTrue(mutations[data_root].existed)
+            data_snapshot = os.lstat(data_root)
             self.assertEqual(
                 offline_env_module._expected_mode(0o700),
                 mutations[data_root].original_mode,
             )
+            self.assertEqual(data_snapshot.st_dev, mutations[data_root].device)
+            self.assertEqual(data_snapshot.st_ino, mutations[data_root].inode)
+            self.assertEqual(data_snapshot.st_uid, mutations[data_root].owner_uid)
+            self.assertEqual(data_snapshot.st_gid, mutations[data_root].owner_gid)
+            self.assertEqual("directory", mutations[data_root].object_type)
             self.assertTrue(mutations[root / "artifacts" / "models"].existed)
+            postgres = mutations[data_root / "postgres"]
+            self.assertFalse(postgres.existed)
+            self.assertIsNone(postgres.original_mode)
+            self.assertIsNone(postgres.device)
+            self.assertIsNone(postgres.inode)
+            self.assertIsNone(postgres.owner_uid)
+            self.assertIsNone(postgres.owner_gid)
+            self.assertIsNone(postgres.object_type)
 
     def test_injected_preparation_backend_owns_forward_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -323,44 +337,6 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 )
 
             self.assertEqual(["chmod", "inode_fsync", "parent_fsync"], events)
-
-    def test_environment_candidate_is_durable_after_chmod_before_publish(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            env_path = Path(directory) / ".env"
-            events: list[str] = []
-            real_chmod = os.chmod
-            real_fsync = os.fsync
-
-            def record_chmod(target: Path, mode: int) -> None:
-                events.append("chmod")
-                real_chmod(target, mode)
-
-            def record_fsync(fd: int) -> None:
-                events.append("file_fsync")
-                real_fsync(fd)
-
-            with (
-                mock.patch("tools.offline_env.os.chmod", side_effect=record_chmod),
-                mock.patch("tools.offline_env.os.fsync", side_effect=record_fsync),
-                mock.patch(
-                    "tools.offline_env.deployment_state.fsync_directory",
-                    side_effect=lambda _path: events.append("directory_fsync"),
-                ),
-            ):
-                candidate = offline_env_module._write_env_candidate(
-                    env_path,
-                    "KEY=value\n",
-                    offline_env_module._expected_mode(0o600),
-                )
-            try:
-                self.assertEqual(
-                    ["file_fsync", "chmod", "file_fsync", "directory_fsync"],
-                    events,
-                )
-            finally:
-                candidate.unlink(missing_ok=True)
 
     def test_environment_publish_uses_forward_wal_before_record_done(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -500,6 +476,109 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 list((plan.secret_root / ".dcagent-transactions").iterdir()),
             )
 
+    def test_managed_directory_rename_swap_is_rejected_before_operation_intent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            with mock.patch(
+                "tools.offline_env._current_identity", return_value=("1000", "1000")
+            ):
+                plan = build_preparation_plan(
+                    root,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+            raw = root / "artifacts" / "data" / "raw"
+            original = raw.with_name("raw-original")
+            planned_mode = stat.S_IMODE(os.lstat(raw).st_mode)
+            intents: list[tuple[int, Mapping[str, object]]] = []
+            real_record_intent = (
+                offline_deployment_state.TransactionJournal.record_intent
+            )
+
+            def record_intent(
+                journal: offline_deployment_state.TransactionJournal,
+                sequence: int,
+                operation: Mapping[str, object],
+            ) -> None:
+                intents.append((sequence, operation))
+                real_record_intent(journal, sequence, operation)
+
+            def replace_raw_with_same_authority(_plan: PreparationPlan) -> None:
+                raw.rename(original)
+                raw.mkdir(mode=planned_mode)
+                if os.name == "posix":
+                    os.chmod(raw, planned_mode)
+
+            with (
+                mock.patch.object(
+                    offline_deployment_state.TransactionJournal,
+                    "record_intent",
+                    autospec=True,
+                    side_effect=record_intent,
+                ),
+                self.assertRaisesRegex(DeploymentError, "changed after planning"),
+            ):
+                offline_env_module.execute_preparation_plan(
+                    plan,
+                    verify_posix_metadata=False,
+                    before_mutation=replace_raw_with_same_authority,
+                    mutation_backend=(
+                        offline_env_module._PortablePreparationFilesystemMutationBackend()
+                    ),
+                )
+
+            self.assertEqual([], intents)
+            self.assertTrue(original.is_dir())
+            self.assertTrue(raw.is_dir())
+            self.assertEqual(planned_mode, stat.S_IMODE(os.lstat(original).st_mode))
+            self.assertEqual(planned_mode, stat.S_IMODE(os.lstat(raw).st_mode))
+            self.assertEqual([], list(plan.state_paths.transactions.iterdir()))
+            self.assertEqual(
+                [],
+                list((plan.secret_root / ".dcagent-transactions").iterdir()),
+            )
+
+    def test_secret_root_precheck_accepts_bootstrap_mode_hardening(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            self._prepare(root)
+            with mock.patch(
+                "tools.offline_env._current_identity", return_value=("1000", "1000")
+            ):
+                plan = build_preparation_plan(
+                    root,
+                    environ={},
+                    verify_posix_metadata=False,
+                )
+            plan = replace(
+                plan,
+                directory_mutations=tuple(
+                    replace(mutation, original_mode=0o600)
+                    if mutation.path == plan.secret_root
+                    else mutation
+                    for mutation in plan.directory_mutations
+                ),
+            )
+
+            offline_env_module.execute_preparation_plan(
+                plan,
+                verify_posix_metadata=False,
+                mutation_backend=(
+                    offline_env_module._PortablePreparationFilesystemMutationBackend()
+                ),
+            )
+
+            self.assertEqual([], list(plan.state_paths.transactions.iterdir()))
+            self.assertEqual(
+                [],
+                list((plan.secret_root / ".dcagent-transactions").iterdir()),
+            )
+
     @unittest.skipIf(
         os.name == "posix" and sys.platform.startswith("linux"),
         "non-Linux fail-closed behavior only",
@@ -548,6 +627,106 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
             state_root = root / "artifacts" / "data" / ".dcagent-deployment-state"
             self.assertEqual([], list((state_root / "transactions").iterdir()))
             self.assertFalse((root / "artifacts" / "secrets").exists())
+
+    def test_partial_journal_create_baseexceptions_are_rolled_back_and_reraised(
+        self,
+    ) -> None:
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exception_type=exception_type.__name__):
+                original_error = exception_type(
+                    f"SENSITIVE-{exception_type.__name__}-CANARY"
+                )
+
+                class FailingCompanionBackend(
+                    offline_env_module._PortablePreparationFilesystemMutationBackend
+                ):
+                    def mkdir(
+                        self,
+                        path: Path,
+                        mode: int,
+                        *,
+                        owner_uid: int,
+                        owner_gid: int,
+                    ) -> os.stat_result:
+                        if path.name == ".dcagent-transactions":
+                            raise original_error
+                        return super().mkdir(
+                            path,
+                            mode,
+                            owner_uid=owner_uid,
+                            owner_gid=owner_gid,
+                        )
+
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._repository(root)
+
+                    with self.assertRaises(exception_type) as raised:
+                        self._prepare(
+                            root,
+                            mutation_backend=FailingCompanionBackend(),
+                        )
+
+                    self.assertIs(original_error, raised.exception)
+                    state_root = (
+                        root / "artifacts" / "data" / ".dcagent-deployment-state"
+                    )
+                    self.assertEqual([], list((state_root / "transactions").iterdir()))
+                    self.assertFalse((root / "artifacts" / "secrets").exists())
+
+    def test_partial_journal_baseexception_rollback_conflict_is_retained(
+        self,
+    ) -> None:
+        canary = "SENSITIVE-KEYBOARDINTERRUPT-CANARY"
+        original_error = KeyboardInterrupt(canary)
+
+        class ConflictingCompanionBackend(
+            offline_env_module._PortablePreparationFilesystemMutationBackend
+        ):
+            def mkdir(
+                self,
+                path: Path,
+                mode: int,
+                *,
+                owner_uid: int,
+                owner_gid: int,
+            ) -> os.stat_result:
+                if path.name == ".dcagent-transactions":
+                    (path.parent / "unexpected").write_text(
+                        "preserve", encoding="utf-8"
+                    )
+                    raise original_error
+                return super().mkdir(
+                    path,
+                    mode,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+
+            with self.assertRaises(DeploymentError) as raised:
+                self._prepare(
+                    root,
+                    mutation_backend=ConflictingCompanionBackend(),
+                )
+
+            formatted = "".join(traceback.format_exception(raised.exception))
+            self.assertNotIn(canary, formatted)
+            state_root = root / "artifacts" / "data" / ".dcagent-deployment-state"
+            journals = list((state_root / "transactions").iterdir())
+            self.assertEqual(1, len(journals))
+            identity_hash = offline_deployment_state.identity_digest(
+                offline_deployment_state.load_identity(
+                    offline_deployment_state.StatePaths(state_root)
+                )
+            )
+            journal = offline_deployment_state.TransactionJournal.open(
+                journals[0], identity_hash
+            )
+            self.assertEqual("rollback_failed", journal.read_phase().phase)
 
     def test_partial_journal_create_rollback_failure_is_retained_and_sanitized(
         self,

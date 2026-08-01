@@ -1666,7 +1666,7 @@ class TransactionJournal:
                     entries=bootstrap_entries,
                 )
             return journal
-        except Exception as exc:
+        except BaseException as exc:
             if not bootstrap_durable:
                 with contextlib.suppress(Exception):
                     _remove_private_tree(root)

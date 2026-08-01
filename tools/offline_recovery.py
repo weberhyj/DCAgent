@@ -63,6 +63,13 @@ class FilesystemMutationBackend(Protocol):
         expected_source: os.stat_result,
     ) -> None: ...
 
+    def rmdir_empty(
+        self,
+        path: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None: ...
+
     def restore_environment(
         self,
         journal: state.TransactionJournal,
@@ -76,10 +83,11 @@ class FilesystemMutationBackend(Protocol):
 class PosixFilesystemMutationBackend:
     """Linux fd-based mutations for rollback object moves and mode changes.
 
-    The deployment lock is the coordination boundary. Linux has no pathname-plus-
-    inode compare-and-swap primitive, so environment exchanges use strict pre/post
-    identity validation and bounded exchange-back recovery. This is not a claim of
-    resistance to an unbounded malicious same-UID racer that ignores the lock.
+    The deployment lock is the coordination boundary for every mutation, including
+    bootstrap directory removal. Linux has no pathname-plus-inode compare-and-swap
+    primitive, so operations use trusted dirfds, bound target fds, and strict
+    pre/post identity validation. This is not a claim of resistance to an unbounded
+    malicious same-UID racer that ignores the lock.
     """
 
     @staticmethod
@@ -247,6 +255,51 @@ class PosixFilesystemMutationBackend:
             os.unlink(path.name, dir_fd=parent_fd)
             os.fsync(parent_fd)
         finally:
+            os.close(parent_fd)
+
+    def rmdir_empty(
+        self,
+        path: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        parent_fd = self._open_parent(path.parent)
+        target_fd: int | None = None
+        try:
+            path_state = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            self._verify_source(path_state, expected_source)
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            target_fd = os.open(path.name, flags, dir_fd=parent_fd)
+            opened = os.fstat(target_fd)
+            self._verify_source(opened, expected_source)
+            if not self._same_identity(opened, path_state):
+                raise OSError(errno.EAGAIN, "rollback directory changed")
+            if os.listdir(target_fd):
+                raise OSError(errno.ENOTEMPTY, "rollback directory is not empty")
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            self._verify_source(current, expected_source)
+            if not self._same_identity(current, opened):
+                raise OSError(errno.EAGAIN, "rollback directory changed")
+            os.rmdir(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            removed = os.fstat(target_fd)
+            if (
+                not self._same_identity(removed, opened)
+                or not stat.S_ISDIR(removed.st_mode)
+                or removed.st_nlink != 0
+            ):
+                raise OSError(errno.EAGAIN, "rollback directory removal changed")
+            try:
+                os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise OSError(errno.EAGAIN, "rollback directory path still exists")
+        finally:
+            if target_fd is not None:
+                os.close(target_fd)
             os.close(parent_fd)
 
     def _after_env_rollback_step(self, step: str) -> None:
@@ -1901,6 +1954,34 @@ def _bootstrap_entry_matches(
     )
 
 
+def _bootstrap_entry_expected_source(
+    entry: Mapping[str, object],
+) -> os.stat_result:
+    device = entry.get("device")
+    inode = entry.get("inode")
+    mode = entry.get("after_mode")
+    owner_uid = entry.get("after_owner_uid")
+    owner_gid = entry.get("after_owner_gid")
+    if not all(
+        type(value) is int for value in (device, inode, mode, owner_uid, owner_gid)
+    ):
+        raise _BootstrapCleanupConflict("bootstrap cleanup identity is incomplete")
+    return os.stat_result(
+        (
+            stat.S_IFDIR | int(mode),
+            int(inode),
+            int(device),
+            0,
+            int(owner_uid),
+            int(owner_gid),
+            0,
+            0,
+            0,
+            0,
+        )
+    )
+
+
 def _finalize_bootstrap_rollback_cleanup(
     journal: state.TransactionJournal,
     *,
@@ -1974,16 +2055,27 @@ def _finalize_bootstrap_rollback_cleanup(
                     f"bootstrap cleanup conflict: {journal.root}"
                 )
             try:
-                with os.scandir(path) as children:
-                    if next(children, None) is not None:
-                        raise _BootstrapCleanupConflict(
-                            f"bootstrap cleanup conflict: {journal.root}"
-                        )
-                path.rmdir()
-                state.fsync_directory(path.parent)
+                _filesystem_mutations(mutation_backend).rmdir_empty(
+                    path,
+                    expected_source=_bootstrap_entry_expected_source(entry),
+                )
             except state.DeploymentStateError:
                 raise
             except OSError as exc:
+                if exc.errno in {
+                    None,
+                    errno.EAGAIN,
+                    errno.ENOENT,
+                    errno.ENOTDIR,
+                    errno.ELOOP,
+                    errno.EPERM,
+                    errno.ESTALE,
+                    errno.ENOTEMPTY,
+                    errno.EEXIST,
+                }:
+                    raise _BootstrapCleanupConflict(
+                        f"bootstrap cleanup conflict: {journal.root}"
+                    ) from None
                 raise state.DeploymentStateError(
                     f"bootstrap cleanup failed: {journal.root}"
                 ) from exc

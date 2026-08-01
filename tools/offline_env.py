@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -61,6 +62,11 @@ class DirectoryMutation:
     path: Path
     existed: bool
     original_mode: int | None
+    device: int | None
+    inode: int | None
+    owner_uid: int | None
+    owner_gid: int | None
+    object_type: str | None
 
 
 @dataclass(frozen=True)
@@ -860,18 +866,59 @@ def _assert_directory_non_link(path: Path, context: str) -> None:
         raise DeploymentError(f"{context} must be one non-link directory: {path}")
 
 
-def _revalidate_forward_directory(path: Path) -> os.stat_result:
+def _planned_directory_source(mutation: DirectoryMutation) -> os.stat_result:
+    if (
+        not mutation.existed
+        or mutation.original_mode is None
+        or mutation.device is None
+        or mutation.inode is None
+        or mutation.owner_uid is None
+        or mutation.owner_gid is None
+        or mutation.object_type != "directory"
+    ):
+        raise DeploymentError(
+            f"Offline managed directory plan is incomplete: {mutation.path}"
+        )
+    return os.stat_result(
+        (
+            stat.S_IFDIR | mutation.original_mode,
+            mutation.inode,
+            mutation.device,
+            0,
+            mutation.owner_uid,
+            mutation.owner_gid,
+            0,
+            0,
+            0,
+            0,
+        )
+    )
+
+
+def _revalidate_planned_directory(
+    mutation: DirectoryMutation,
+    *,
+    expected_mode: int,
+) -> os.stat_result:
+    expected = _planned_directory_source(mutation)
     try:
-        metadata = os.lstat(path)
+        current = os.lstat(mutation.path)
     except OSError as exc:
         raise DeploymentError(
-            f"Offline managed directory changed after planning: {path}"
+            f"Offline managed directory changed after planning: {mutation.path}"
         ) from exc
-    if deployment_state._is_symlink(metadata) or not stat.S_ISDIR(metadata.st_mode):
+    if (
+        not _same_identity(current, expected)
+        or deployment_state._is_symlink(current)
+        or not stat.S_ISDIR(current.st_mode)
+        or stat.S_IMODE(current.st_mode) != expected_mode
+        or current.st_uid != expected.st_uid
+        or current.st_gid != expected.st_gid
+    ):
         raise DeploymentError(
-            f"Offline managed directory changed after planning: {path}"
+            f"Offline managed directory changed after planning: {mutation.path}"
         )
-    return metadata
+    return current
 
 
 def _assert_posix_metadata(
@@ -994,6 +1041,29 @@ def _assert_expected_owner(
         _assert_posix_owner(path, uid=uid, gid=gid, context=context)
 
 
+def _inspect_directory_snapshot(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    context: str,
+    verify_posix_metadata: bool,
+) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise DeploymentError(f"Cannot safely inspect {context}: {path}") from exc
+    if deployment_state._is_symlink(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise DeploymentError(f"{context} must be one non-link directory: {path}")
+    if (
+        verify_posix_metadata
+        and os.name == "posix"
+        and (metadata.st_uid != uid or metadata.st_gid != gid)
+    ):
+        raise DeploymentError(f"{context} owner or mode is unsafe: {path}")
+    return metadata
+
+
 def _inspect_directory(
     path: Path,
     *,
@@ -1002,15 +1072,15 @@ def _inspect_directory(
     context: str,
     verify_posix_metadata: bool,
 ) -> int:
-    _assert_directory_non_link(path, context)
-    _assert_expected_owner(
-        path,
-        uid=uid,
-        gid=gid,
-        context=context,
-        verify_posix_metadata=verify_posix_metadata,
+    return stat.S_IMODE(
+        _inspect_directory_snapshot(
+            path,
+            uid=uid,
+            gid=gid,
+            context=context,
+            verify_posix_metadata=verify_posix_metadata,
+        ).st_mode
     )
-    return _mode(path)
 
 
 def _directory_plan(
@@ -1049,16 +1119,40 @@ def _directory_plan(
                 f"Offline managed ancestor is group/other writable: {current}"
             )
         for path in reversed(missing):
-            mutations.setdefault(path, DirectoryMutation(path, False, None))
+            mutations.setdefault(
+                path,
+                DirectoryMutation(
+                    path=path,
+                    existed=False,
+                    original_mode=None,
+                    device=None,
+                    inode=None,
+                    owner_uid=None,
+                    owner_gid=None,
+                    object_type=None,
+                ),
+            )
         if not missing:
-            original_mode = _inspect_directory(
+            snapshot = _inspect_directory_snapshot(
                 target,
                 uid=uid,
                 gid=gid,
                 context="Offline managed directory",
                 verify_posix_metadata=verify_posix_metadata,
             )
-            mutations.setdefault(target, DirectoryMutation(target, True, original_mode))
+            mutations.setdefault(
+                target,
+                DirectoryMutation(
+                    path=target,
+                    existed=True,
+                    original_mode=stat.S_IMODE(snapshot.st_mode),
+                    device=snapshot.st_dev,
+                    inode=snapshot.st_ino,
+                    owner_uid=snapshot.st_uid,
+                    owner_gid=snapshot.st_gid,
+                    object_type="directory",
+                ),
+            )
     return tuple(
         sorted(
             mutations.values(),
@@ -1536,6 +1630,34 @@ class _PortableMutationBackend:
         path.unlink()
         deployment_state.fsync_directory(path.parent)
 
+    def rmdir_empty(
+        self,
+        path: Path,
+        *,
+        expected_source: os.stat_result,
+    ) -> None:
+        current = os.lstat(path)
+        if (
+            not _same_identity(current, expected_source)
+            or deployment_state._is_symlink(current)
+            or not stat.S_ISDIR(current.st_mode)
+            or os.name == "posix"
+            and (
+                stat.S_IMODE(current.st_mode) != stat.S_IMODE(expected_source.st_mode)
+                or current.st_uid != expected_source.st_uid
+                or current.st_gid != expected_source.st_gid
+            )
+        ):
+            raise OSError(errno.EAGAIN, "test rmdir source changed")
+        with os.scandir(path) as children:
+            if next(children, None) is not None:
+                raise OSError(errno.ENOTEMPTY, "test rmdir source is not empty")
+        current = os.lstat(path)
+        if not _same_identity(current, expected_source):
+            raise OSError(errno.EAGAIN, "test rmdir source changed")
+        os.rmdir(path)
+        deployment_state.fsync_directory(path.parent)
+
     def restore_environment(
         self,
         journal: deployment_state.TransactionJournal,
@@ -1605,29 +1727,6 @@ def _ensure_state_bootstrap(
     paths._create_or_verify_lock(uid, gid)
 
 
-def _write_env_candidate(path: Path, text: str, mode: int) -> Path:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary, mode)
-        fd = os.open(temporary, os.O_RDWR)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        deployment_state.fsync_directory(path.parent)
-        return temporary
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
 def _env_authority(path: Path | None, plan: PreparationPlan) -> tuple[int, int, int]:
     if path is not None:
         metadata = path.stat()
@@ -1638,13 +1737,6 @@ def _env_authority(path: Path | None, plan: PreparationPlan) -> tuple[int, int, 
         )
     owner_uid, owner_gid = _operation_authority(plan)
     return 0o600, owner_uid, owner_gid
-
-
-def _cleanup_empty_secret_infrastructure(plan: PreparationPlan) -> None:
-    companion_parent = plan.secret_root / ".dcagent-transactions"
-    for path in (companion_parent, plan.secret_root):
-        with contextlib.suppress(OSError):
-            path.rmdir()
 
 
 def execute_preparation_plan(
@@ -1665,7 +1757,6 @@ def execute_preparation_plan(
 
     identity_hash = deployment_state.identity_digest(plan.identity)
     companion_parent = plan.secret_root / ".dcagent-transactions"
-    secret_root_existed = _path_exists(plan.secret_root)
     journal: deployment_state.TransactionJournal | None = None
     creation_error: deployment_state.TransactionJournalCreationError | None = None
     committed = False
@@ -1709,6 +1800,18 @@ def execute_preparation_plan(
             before_mutation(plan)
         _assert_rotation_allowed(plan)
 
+        for mutation in plan.directory_mutations:
+            if mutation.existed:
+                assert mutation.original_mode is not None
+                _revalidate_planned_directory(
+                    mutation,
+                    expected_mode=(
+                        _expected_mode(0o700)
+                        if mutation.path == plan.secret_root
+                        else mutation.original_mode
+                    ),
+                )
+
         sequence = 1
         owner_uid, owner_gid = _operation_authority(plan)
         journal.write_phase("backing_up")
@@ -1724,8 +1827,15 @@ def execute_preparation_plan(
                     owner_gid=owner_gid,
                     mutation_backend=filesystem,
                 )
+            elif mutation.path == plan.secret_root:
+                continue
             elif mutation.original_mode != _expected_mode(0o700):
-                metadata = _revalidate_forward_directory(mutation.path)
+                assert mutation.original_mode is not None
+                _revalidate_planned_directory(
+                    mutation,
+                    expected_mode=mutation.original_mode,
+                )
+                expected_source = _planned_directory_source(mutation)
                 sequence, _ = _record_chmod(
                     journal,
                     sequence,
@@ -1734,9 +1844,9 @@ def execute_preparation_plan(
                     after_mode=_expected_mode(0o700),
                     object_category="directory",
                     object_type="directory",
-                    owner_uid=metadata.st_uid,
-                    owner_gid=metadata.st_gid,
-                    expected_source=metadata,
+                    owner_uid=expected_source.st_uid,
+                    owner_gid=expected_source.st_gid,
+                    expected_source=expected_source,
                     mutation_backend=filesystem,
                 )
 
@@ -1830,7 +1940,13 @@ def execute_preparation_plan(
                     context="Offline secret",
                 )
         for mutation in plan.directory_mutations:
-            _assert_directory_non_link(mutation.path, "Offline managed directory")
+            if mutation.existed:
+                _revalidate_planned_directory(
+                    mutation,
+                    expected_mode=_expected_mode(0o700),
+                )
+            else:
+                _assert_directory_non_link(mutation.path, "Offline managed directory")
             if verify_posix_metadata and os.name == "posix":
                 _assert_posix_metadata(
                     mutation.path,
@@ -1926,8 +2042,6 @@ def execute_preparation_plan(
                     "Environment preparation failed and rollback could not be "
                     f"completed; transaction retained at {journal.root} phase={phase}"
                 ) from rollback_error
-            if not secret_root_existed:
-                _cleanup_empty_secret_infrastructure(plan)
         if creation_error is not None:
             raise creation_error.original_error
         raise
