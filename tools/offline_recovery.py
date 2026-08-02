@@ -19,6 +19,7 @@ import re
 import stat
 import subprocess
 import sys
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Literal, Protocol
@@ -2487,6 +2488,50 @@ def _current_owner() -> tuple[int, int]:
     )
 
 
+def bootstrap_adoption_lock(paths: state.StatePaths, uid: int, gid: int) -> None:
+    """Create only the private state root and lock needed to serialize adoption."""
+    if type(uid) is not int or type(gid) is not int or uid < 0 or gid < 0:
+        raise state.DeploymentStateError("invalid adoption bootstrap owner")
+    root_state = state._lstat_optional(paths.root)
+    if root_state is None:
+        state._verify_directory(
+            paths.root.parent,
+            "adoption state-root parent",
+            uid,
+            gid,
+            exact_mode=False,
+        )
+        try:
+            os.mkdir(paths.root, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            raise state.DeploymentStateError(
+                "cannot create adoption state root"
+            ) from None
+        state.fsync_directory(paths.root.parent)
+    state._verify_directory(paths.root, "adoption state root", uid, gid)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(paths.lock, flags, 0o600)
+    except FileExistsError:
+        state._verify_regular_file(paths.lock, "deployment lock", uid=uid, gid=gid)
+        return
+    except OSError:
+        raise state.DeploymentStateError("cannot create deployment lock") from None
+    try:
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    state._verify_regular_file(paths.lock, "deployment lock", uid=uid, gid=gid)
+    state.fsync_directory(paths.root)
+
+
 def _absolute_state_root(value: str) -> Path:
     try:
         return state.normalize_absolute_root(value, "state_root")
@@ -2514,7 +2559,8 @@ def build_parser() -> argparse.ArgumentParser:
     for command in _CLI_COMMANDS:
         subparser = subparsers.add_parser(command, allow_abbrev=False)
         subparser.add_argument("--state-root", required=True, type=_absolute_state_root)
-        subparser.add_argument("--transaction", required=True, type=_transaction_id)
+        if command not in {"clear-start-marker", "adopt-existing"}:
+            subparser.add_argument("--transaction", required=True, type=_transaction_id)
         if command == "acknowledge-repaired":
             subparser.add_argument("--evidence", required=True, type=_absolute_evidence)
     return parser
@@ -2704,6 +2750,7 @@ class ControlJournal:
                 "deployment_identity_hash",
                 "details",
             }
+            or type(payload["schema_version"]) is not int
             or payload["schema_version"] != state.SCHEMA_VERSION
         ):
             raise state.DeploymentStateError("invalid control WAL")
@@ -2754,6 +2801,31 @@ class ControlJournal:
 
     def remove(self) -> None:
         state._remove_private_tree(self.root)
+
+
+def _select_control_transaction_id(paths: state.StatePaths, command: str) -> str:
+    """Resume the sole matching control WAL, or allocate a fresh recovery id."""
+    if command not in {"clear-start-marker", "adopt-existing"}:
+        raise state.DeploymentStateError("invalid implicit control command")
+    state._verify_directory(paths.control_transactions, "control transaction directory")
+    try:
+        entries = sorted(
+            os.scandir(paths.control_transactions), key=lambda item: item.name
+        )
+    except OSError:
+        raise state.DeploymentStateError(
+            "cannot inspect control transaction state"
+        ) from None
+    if not entries:
+        return uuid.uuid4().hex
+    if len(entries) != 1:
+        raise state.DeploymentStateError("multiple unfinished control transactions")
+    journal = ControlJournal.open(paths, entries[0].name)
+    if journal.command != command:
+        raise state.DeploymentStateError(
+            "unfinished control transaction command mismatch"
+        )
+    return journal.transaction_id
 
 
 def _after_control_step(command: str, phase: str) -> None:
@@ -2864,11 +2936,9 @@ def _recovery_receipt(
     path = _recovery_receipt_path(paths, transaction_id)
     existing = state._lstat_optional(path)
     if existing is not None:
-        current = state._parse_json_object(
-            state._read_secure_regular_file(path, "recovery receipt"),
-            "recovery receipt",
-            path,
-        )
+        current = _existing_recovery_receipt(paths, transaction_id, command)
+        if current is None:
+            raise state.DeploymentStateError("missing recovery receipt")
         comparable = dict(payload)
         comparable["completed_at"] = current.get("completed_at")
         if current != comparable:
@@ -2908,7 +2978,8 @@ def _existing_recovery_receipt(
     ):
         raise state.DeploymentStateError("invalid recovery receipt")
     if (
-        payload["schema_version"] != state.SCHEMA_VERSION
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != state.SCHEMA_VERSION
         or not isinstance(payload["deployment_identity_hash"], str)
         or _HEX_DIGEST.fullmatch(payload["deployment_identity_hash"]) is None
         or not isinstance(payload["completed_at"], str)
@@ -2940,15 +3011,57 @@ def _existing_recovery_receipt(
     return payload
 
 
+def _write_adoption_supplemental_receipt(
+    paths: state.StatePaths,
+    transaction_id: str,
+    deployment_identity_hash: str,
+) -> None:
+    path = paths.history / f"recovery-{transaction_id}-supplemental.json"
+    payload = {
+        "schema_version": state.SCHEMA_VERSION,
+        "recovery_id": state._validate_uuid4_hex(transaction_id),
+        "command": "adopt-existing-runtime-marker",
+        "completed_at": state.utc_now(),
+        "deployment_identity_hash": deployment_identity_hash,
+        "final_phase": "runtime_marker_recorded",
+        "object_categories": [],
+    }
+    if state._lstat_optional(path) is not None:
+        current = state._parse_json_object(
+            state._read_secure_regular_file(path, "supplemental recovery receipt"),
+            "supplemental recovery receipt",
+            path,
+        )
+        if (
+            set(current) != set(payload)
+            or type(current["schema_version"]) is not int
+            or current["schema_version"] != state.SCHEMA_VERSION
+            or not isinstance(current["completed_at"], str)
+            or state._RFC3339_MICROSECONDS_UTC.fullmatch(current["completed_at"])
+            is None
+        ):
+            raise state.DeploymentStateError("invalid supplemental recovery receipt")
+        comparable = dict(payload)
+        comparable["completed_at"] = current["completed_at"]
+        if current != comparable:
+            raise state.DeploymentStateError("supplemental recovery receipt mismatch")
+        return
+    state.atomic_write_json(path, payload)
+
+
 def _target_journal(
     paths: state.StatePaths,
     transaction_id: str,
     identity: state.DeploymentIdentity,
+    *,
+    read_only: bool = False,
 ) -> state.TransactionJournal | state.TombstoneJournal | state.RollbackTombstoneJournal:
     identity_hash = state.identity_digest(identity)
     root = paths.transactions / state._validate_uuid4_hex(transaction_id)
     if state._lstat_optional(root) is not None:
-        journal = state.TransactionJournal.open(root, identity_hash)
+        journal = state.TransactionJournal.open(
+            root, identity_hash, read_only=read_only
+        )
         expected_companion = identity.secret_root / ".dcagent-transactions"
         if journal.control or journal.secret_companion_parent != expected_companion:
             raise state.DeploymentStateError("transaction is outside this deployment")
@@ -2967,9 +3080,13 @@ def _target_journal(
             rollback_metadata, identity_hash, companion_parent
         )
     if state._lstat_optional(committed_tombstone) is not None:
-        journal = state.TransactionJournal.open(committed_tombstone, identity_hash)
+        journal = state.TransactionJournal.open(
+            committed_tombstone, identity_hash, read_only=read_only
+        )
     elif state._lstat_optional(rollback_tombstone) is not None:
-        journal = state.TransactionJournal.open(rollback_tombstone, identity_hash)
+        journal = state.TransactionJournal.open(
+            rollback_tombstone, identity_hash, read_only=read_only
+        )
     else:
         raise state.DeploymentStateError("recovery transaction was not found")
     if journal.secret_companion_parent != companion_parent:
@@ -2995,7 +3112,7 @@ def inspect_transaction(
 ) -> dict[str, object]:
     """Return the fixed, sanitized inspection projection without locking or writing."""
     identity = state.load_identity(paths)
-    journal = _target_journal(paths, transaction_id, identity)
+    journal = _target_journal(paths, transaction_id, identity, read_only=True)
     if isinstance(journal, state.TransactionJournal):
         phase = journal.read_phase().phase
     else:
@@ -3235,9 +3352,10 @@ def adopt_existing(
     )
     if existing_receipt is not None:
         identity = state.load_identity(paths)
+        identity_hash = state.identity_digest(identity)
         _assert_receipt_binding(
             existing_receipt,
-            identity_hash=state.identity_digest(identity),
+            identity_hash=identity_hash,
             final_phase="adoption_complete",
         )
         control_root = paths.control_transactions / transaction_id
@@ -3246,10 +3364,38 @@ def adopt_existing(
                 paths,
                 transaction_id,
                 command="adopt-existing",
-                deployment_identity_hash=state.identity_digest(identity),
+                deployment_identity_hash=identity_hash,
             )
             if completed.phase != "adoption_complete":
                 raise state.DeploymentStateError("adoption receipt precedes completion")
+            candidate = state.DeploymentIdentity(
+                **completed.details["candidate_identity"]  # type: ignore[arg-type]
+            )
+            if candidate != identity:
+                raise state.DeploymentStateError("completed adoption identity mismatch")
+            currently_initialized = (
+                containers_exist()
+                if containers_exist is not None
+                else _containers_exist(environ)
+            ) or _postgres_initialized(identity.data_root)
+            marker_became_required = (
+                completed.details["runtime_initialized"] is not True
+                and currently_initialized
+            )
+            if marker_became_required:
+                details = dict(completed.details)
+                details["runtime_initialized"] = True
+                completed.advance("adoption_complete", details=details)
+            if completed.details["runtime_initialized"] is True:
+                state.create_start_marker(
+                    paths,
+                    operation="legacy_adoption",
+                    deployment_identity_hash=identity_hash,
+                )
+            if marker_became_required:
+                _write_adoption_supplemental_receipt(
+                    paths, transaction_id, identity_hash
+                )
             completed.remove()
         return existing_receipt
     control_root = paths.control_transactions / transaction_id
@@ -3465,6 +3611,7 @@ def acknowledge_repaired(
     evidence_path: Path,
     *,
     environ: Mapping[str, str] | None = None,
+    mutation_backend: FilesystemMutationBackend | None = None,
 ) -> dict[str, object]:
     existing_receipt = _existing_recovery_receipt(
         paths, transaction_id, "acknowledge-repaired"
@@ -3543,9 +3690,16 @@ def acknowledge_repaired(
                 or (source_state.st_dev, source_state.st_ino) != expected_source
             ):
                 raise state.DeploymentStateError("damaged transaction changed")
-            os.replace(source, target)
-            state.fsync_directory(paths.transactions)
-            state.fsync_directory(paths.quarantine)
+            try:
+                _filesystem_mutations(mutation_backend).rename_noreplace(
+                    source,
+                    target,
+                    expected_source=source_state,
+                )
+            except OSError:
+                raise state.DeploymentStateError(
+                    "cannot safely quarantine damaged transaction"
+                ) from None
         elif source_state is None and target_state is not None:
             if (
                 state._is_symlink(target_state)
@@ -3668,17 +3822,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "inspect":
             result = inspect_transaction(paths, args.transaction)
         else:
+            uid, gid = _current_owner()
+            if args.command == "adopt-existing":
+                bootstrap_adoption_lock(paths, uid, gid)
             with state.acquire_deployment_lock(paths):
+                if args.command == "adopt-existing":
+                    paths.ensure_layout(uid, gid)
+                transaction_id = (
+                    _select_control_transaction_id(paths, args.command)
+                    if args.command in {"clear-start-marker", "adopt-existing"}
+                    else args.transaction
+                )
                 if args.command in {"resume-rollback", "finalize-cleanup"}:
-                    result = _repair_transaction(paths, args.transaction, args.command)
+                    result = _repair_transaction(paths, transaction_id, args.command)
                 elif args.command == "clear-start-marker":
-                    result = clear_start_marker(paths, args.transaction)
+                    result = clear_start_marker(paths, transaction_id)
                 elif args.command == "adopt-existing":
-                    result = adopt_existing(paths, args.transaction)
+                    result = adopt_existing(paths, transaction_id)
                 elif args.command == "acknowledge-repaired":
-                    result = acknowledge_repaired(
-                        paths, args.transaction, args.evidence
-                    )
+                    result = acknowledge_repaired(paths, transaction_id, args.evidence)
                 else:
                     raise state.DeploymentStateError("invalid recovery command")
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))

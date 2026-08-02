@@ -1180,6 +1180,102 @@ class TransactionJournalTests(unittest.TestCase):
         metadata = json.loads(reopened.metadata_path.read_text(encoding="utf-8"))
         self.assertEqual("directory-undo-v2", metadata["bootstrap_protocol"])
 
+    def test_read_only_open_validates_v1_without_migrating_bytes(self) -> None:
+        journal = self.make_journal()
+        self.downgrade_bootstrap_to_v1(journal, bootstrap_state="ready")
+        before = {
+            path.relative_to(self.paths.root).as_posix(): path.read_bytes()
+            for path in self.paths.root.rglob("*")
+            if path.is_file()
+        }
+
+        reopened = state.TransactionJournal.open(
+            journal.root, self.identity_hash, read_only=True
+        )
+
+        self.assertEqual(reopened.bootstrap_protocol, "directory-undo-v1")
+        after = {
+            path.relative_to(self.paths.root).as_posix(): path.read_bytes()
+            for path in self.paths.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_read_only_open_normalizes_trailing_manifest_only_in_memory(self) -> None:
+        journal = self.make_journal()
+        payload = {
+            "kind": "mkdir",
+            "object_category": "secret",
+            "path": str(self.base / "readonly-prefix"),
+            "existed": False,
+            "mode": 0o700,
+        }
+        with (
+            mock.patch.object(
+                journal,
+                "_write_operations",
+                side_effect=SystemExit("hard exit after manifest"),
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            journal.record_intent(1, payload)
+        before = {
+            path.relative_to(self.paths.root).as_posix(): path.read_bytes()
+            for path in self.paths.root.rglob("*")
+            if path.is_file()
+        }
+
+        reopened = state.TransactionJournal.open(
+            journal.root, self.identity_hash, read_only=True
+        )
+
+        self.assertEqual(reopened.read_operations(), ())
+        self.assertEqual(reopened.read_undo_manifest(), ())
+        after = {
+            path.relative_to(self.paths.root).as_posix(): path.read_bytes()
+            for path in self.paths.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_read_only_open_preserves_recoverable_atomic_temp(self) -> None:
+        journal = self.make_journal()
+        journal_temp = journal.root / ".phase.json.deadbeef.tmp"
+        journal_temp.write_bytes(b"partial")
+        if os.name == "posix":
+            os.chmod(journal_temp, 0o600)
+
+        reopened = state.TransactionJournal.open(
+            journal.root, self.identity_hash, read_only=True
+        )
+
+        self.assertEqual(reopened.read_phase().phase, "planned")
+        self.assertEqual(journal_temp.read_bytes(), b"partial")
+
+    def test_read_only_open_validates_preparing_env_backup_without_reconciliation(
+        self,
+    ) -> None:
+        journal = self.make_journal()
+        data = b"A=before\n"
+        state.atomic_write_json(
+            journal.env_backup_meta_path,
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "transaction_id": journal.transaction_id,
+                "state": "preparing",
+                "absent": False,
+                "digest": hashlib.sha256(data).hexdigest(),
+            },
+        )
+        state.atomic_write_bytes(journal.env_backup_path, data)
+        before_meta = journal.env_backup_meta_path.read_bytes()
+        before_backup = journal.env_backup_path.read_bytes()
+
+        state.TransactionJournal.open(journal.root, self.identity_hash, read_only=True)
+
+        self.assertEqual(journal.env_backup_meta_path.read_bytes(), before_meta)
+        self.assertEqual(journal.env_backup_path.read_bytes(), before_backup)
+
     def test_v1_partial_bootstrap_is_migrated_and_recovered(self) -> None:
         journal = self.make_journal()
         assert journal.secret_companion_root is not None
@@ -4755,6 +4851,149 @@ class RecoveryCliTests(unittest.TestCase):
                     self.transaction_id,
                 ]
             )
+        for command in ("clear-start-marker", "adopt-existing"):
+            with self.subTest(command=command):
+                parsed = parser.parse_args(
+                    [command, "--state-root", str(self.paths.root)]
+                )
+                self.assertEqual(parsed.command, command)
+                self.assertFalse(hasattr(parsed, "transaction"))
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(
+                        [
+                            command,
+                            "--state-root",
+                            str(self.paths.root),
+                            "--transaction",
+                            self.transaction_id,
+                        ]
+                    )
+
+    def test_control_command_selects_only_unique_matching_unfinished_wal(
+        self,
+    ) -> None:
+        matching = recovery.ControlJournal.create(
+            self.paths,
+            transaction_id=self.transaction_id,
+            command="clear-start-marker",
+            deployment_identity_hash=self.identity_hash,
+            phase="clear_planned",
+            details={"marker_digest": None},
+        )
+        self.assertEqual(
+            recovery._select_control_transaction_id(self.paths, "clear-start-marker"),
+            matching.transaction_id,
+        )
+
+        with self.assertRaises(state.DeploymentStateError):
+            recovery._select_control_transaction_id(self.paths, "adopt-existing")
+
+        second = uuid.uuid4().hex
+        recovery.ControlJournal.create(
+            self.paths,
+            transaction_id=second,
+            command="clear-start-marker",
+            deployment_identity_hash=self.identity_hash,
+            phase="clear_planned",
+            details={"marker_digest": None},
+        )
+        with self.assertRaises(state.DeploymentStateError):
+            recovery._select_control_transaction_id(self.paths, "clear-start-marker")
+
+    def test_adoption_minimal_bootstrap_creates_only_root_and_lock(self) -> None:
+        fresh_data = self.base / "fresh-data"
+        fresh_data.mkdir(mode=0o700)
+        paths = state.StatePaths(state.derive_state_root(fresh_data))
+        self.assertFalse(paths.root.exists())
+
+        recovery.bootstrap_adoption_lock(paths, *recovery._current_owner())
+
+        self.assertEqual(
+            {entry.name for entry in paths.root.iterdir()}, {paths.lock.name}
+        )
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(os.lstat(paths.root).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.lstat(paths.lock).st_mode), 0o600)
+
+    def test_adoption_minimal_bootstrap_rejects_wrong_mode_and_symlink(self) -> None:
+        fresh_data = self.base / "unsafe-data"
+        fresh_data.mkdir(mode=0o700)
+        paths = state.StatePaths(state.derive_state_root(fresh_data))
+        paths.root.mkdir(mode=0o755)
+        if os.name == "posix":
+            os.chmod(paths.root, 0o755)
+            with self.assertRaises(state.DeploymentStateError):
+                recovery.bootstrap_adoption_lock(paths, *recovery._current_owner())
+        paths.root.rmdir()
+        victim = self.base / "state-victim"
+        victim.mkdir()
+        try:
+            paths.root.symlink_to(victim, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.bootstrap_adoption_lock(paths, *recovery._current_owner())
+
+    def test_adoption_minimal_bootstrap_handles_create_race_fail_closed(self) -> None:
+        fresh_data = self.base / "race-data"
+        fresh_data.mkdir(mode=0o700)
+        paths = state.StatePaths(state.derive_state_root(fresh_data))
+        original_mkdir = os.mkdir
+
+        def raced_mkdir(path: str | Path, mode: int = 0o777) -> None:
+            if Path(path) == paths.root:
+                original_mkdir(path, mode)
+                raise FileExistsError(path)
+            original_mkdir(path, mode)
+
+        with mock.patch("os.mkdir", side_effect=raced_mkdir):
+            recovery.bootstrap_adoption_lock(paths, *recovery._current_owner())
+        self.assertTrue(paths.lock.is_file())
+
+    def test_main_adopts_new_state_root_and_expands_layout_only_under_lock(
+        self,
+    ) -> None:
+        fresh_data = self.base / "main-adopt-data"
+        fresh_data.mkdir(mode=0o700)
+        paths = state.StatePaths(state.derive_state_root(fresh_data))
+        locked = False
+
+        @contextlib.contextmanager
+        def lock(actual: state.StatePaths):
+            nonlocal locked
+            self.assertEqual(actual.root, paths.root)
+            self.assertEqual(
+                {entry.name for entry in paths.root.iterdir()}, {paths.lock.name}
+            )
+            locked = True
+            try:
+                yield
+            finally:
+                locked = False
+
+        def adopt(actual: state.StatePaths, transaction_id: str) -> dict[str, object]:
+            self.assertTrue(locked)
+            self.assertRegex(transaction_id, r"^[0-9a-f]{32}$")
+            self.assertEqual(uuid.UUID(hex=transaction_id).version, 4)
+            self.assertTrue(actual.control_transactions.is_dir())
+            self.assertTrue(actual.history.is_dir())
+            self.assertTrue(actual.quarantine.is_dir())
+            return {"command": "adopt-existing"}
+
+        with (
+            mock.patch.object(state, "acquire_deployment_lock", side_effect=lock),
+            mock.patch.object(recovery, "adopt_existing", side_effect=adopt),
+            mock.patch("builtins.print"),
+        ):
+            result = recovery.main(
+                [
+                    "adopt-existing",
+                    "--state-root",
+                    str(paths.root),
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertFalse(locked)
 
     def test_inspect_is_read_only_and_returns_only_sanitized_fields(self) -> None:
         journal = state.TransactionJournal.create(
@@ -4847,6 +5086,39 @@ class RecoveryCliTests(unittest.TestCase):
         with self.assertRaises(state.DeploymentStateError):
             recovery.ControlJournal.open(
                 self.paths, self.transaction_id, command="adopt-existing"
+            )
+
+    def test_control_wal_and_receipt_reject_boolean_schema_version(self) -> None:
+        journal = recovery.ControlJournal.create(
+            self.paths,
+            transaction_id=self.transaction_id,
+            command="clear-start-marker",
+            deployment_identity_hash=self.identity_hash,
+            phase="clear_planned",
+            details={"marker_digest": None},
+        )
+        wal = json.loads(journal.wal_path.read_text(encoding="utf-8"))
+        wal["schema_version"] = True
+        state.atomic_write_json(journal.wal_path, wal)
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.ControlJournal.open(
+                self.paths, self.transaction_id, command="clear-start-marker"
+            )
+        self.discard_control()
+        recovery._recovery_receipt(
+            self.paths,
+            transaction_id=self.transaction_id,
+            command="clear-start-marker",
+            deployment_identity_hash=self.identity_hash,
+            final_phase="clear_complete",
+        )
+        receipt_path = self.paths.history / f"recovery-{self.transaction_id}.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["schema_version"] = True
+        state.atomic_write_json(receipt_path, receipt)
+        with self.assertRaises(state.DeploymentStateError):
+            recovery._existing_recovery_receipt(
+                self.paths, self.transaction_id, "clear-start-marker"
             )
 
     def test_evidence_metadata_never_records_content_or_full_path(self) -> None:
@@ -5083,7 +5355,10 @@ class RecoveryCliTests(unittest.TestCase):
             os.chmod(evidence, 0o644)
         with mock.patch.object(recovery, "_active_state_revalidated"):
             receipt = recovery.acknowledge_repaired(
-                self.paths, self.transaction_id, evidence
+                self.paths,
+                self.transaction_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
             )
         self.assertFalse(damaged.exists())
         self.assertTrue((self.paths.quarantine / self.transaction_id).is_dir())
@@ -5129,10 +5404,18 @@ class RecoveryCliTests(unittest.TestCase):
                     ),
                     self.assertRaises(OSError),
                 ):
-                    recovery.acknowledge_repaired(self.paths, transaction_id, evidence)
+                    recovery.acknowledge_repaired(
+                        self.paths,
+                        transaction_id,
+                        evidence,
+                        mutation_backend=PortableMutationBackend(),
+                    )
                 with mock.patch.object(recovery, "_active_state_revalidated"):
                     receipt = recovery.acknowledge_repaired(
-                        self.paths, transaction_id, evidence
+                        self.paths,
+                        transaction_id,
+                        evidence,
+                        mutation_backend=PortableMutationBackend(),
                     )
                 self.assertEqual(
                     receipt["final_phase"], "repair_acknowledgement_complete"
@@ -5220,13 +5503,43 @@ class RecoveryCliTests(unittest.TestCase):
             ),
             self.assertRaises(OSError),
         ):
-            recovery.acknowledge_repaired(self.paths, transaction_id, evidence)
+            recovery.acknowledge_repaired(
+                self.paths,
+                transaction_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
         self.assertFalse(damaged.exists())
         with mock.patch.object(recovery, "_active_state_revalidated"):
             receipt = recovery.acknowledge_repaired(
-                self.paths, transaction_id, evidence
+                self.paths,
+                transaction_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
             )
         self.assertEqual(receipt["final_phase"], "repair_acknowledgement_complete")
+
+    def test_acknowledge_target_occupation_preserves_source_and_wal(self) -> None:
+        transaction_id = uuid.uuid4().hex
+        source = self.paths.transactions / transaction_id
+        source.mkdir(mode=0o700)
+        target = self.paths.quarantine / transaction_id
+        target.mkdir(mode=0o700)
+        evidence = self.base / "occupied-evidence.txt"
+        evidence.write_text("repaired", encoding="utf-8")
+        with (
+            mock.patch.object(recovery, "_active_state_revalidated"),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.acknowledge_repaired(
+                self.paths,
+                transaction_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
+        self.assertTrue(source.is_dir())
+        self.assertTrue(target.is_dir())
+        self.assertTrue((self.paths.control_transactions / transaction_id).is_dir())
 
     def test_inspect_tombstone_preserves_history_temp(self) -> None:
         journal = state.TransactionJournal.create(
@@ -5274,6 +5587,47 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(receipt["final_phase"], "adoption_complete")
         self.assertFalse((self.paths.control_transactions / transaction_id).exists())
 
+    def test_completed_adoption_revalidates_runtime_before_wal_cleanup(self) -> None:
+        self.paths.identity.unlink()
+        transaction_id = uuid.uuid4().hex
+        candidate_result = (self.identity, self.base / ".env", {}, 0, 0)
+        runtime_checks = 0
+
+        def stopped_runtime() -> bool:
+            nonlocal runtime_checks
+            runtime_checks += 1
+            return False
+
+        with (
+            mock.patch.object(
+                recovery, "_secure_env_candidate", return_value=candidate_result
+            ),
+            mock.patch.object(
+                recovery.ControlJournal, "remove", side_effect=OSError("hard exit")
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.adopt_existing(
+                self.paths, transaction_id, containers_exist=stopped_runtime
+            )
+        self.assertFalse(self.paths.start_marker.exists())
+
+        def started_runtime() -> bool:
+            nonlocal runtime_checks
+            runtime_checks += 1
+            return True
+
+        receipt = recovery.adopt_existing(
+            self.paths, transaction_id, containers_exist=started_runtime
+        )
+        self.assertGreaterEqual(runtime_checks, 2)
+        self.assertTrue(self.paths.start_marker.is_file())
+        self.assertEqual(receipt["final_phase"], "adoption_complete")
+        supplemental = (
+            self.paths.history / f"recovery-{transaction_id}-supplemental.json"
+        )
+        self.assertTrue(supplemental.is_file())
+
     def test_main_holds_one_lock_through_mutation_and_receipt(self) -> None:
         locked = False
 
@@ -5305,8 +5659,6 @@ class RecoveryCliTests(unittest.TestCase):
                     "clear-start-marker",
                     "--state-root",
                     str(self.paths.root),
-                    "--transaction",
-                    self.transaction_id,
                 ]
             )
         self.assertEqual(result, 0)

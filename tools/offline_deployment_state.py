@@ -1491,6 +1491,9 @@ class TransactionJournal:
     rollback_intents_path: Path = dataclasses.field(init=False)
     history_receipt_path: Path = dataclasses.field(init=False)
     bootstrap_directories_path: Path = dataclasses.field(init=False)
+    _read_only_undo_entries: tuple[UndoEntry, ...] | None = dataclasses.field(
+        init=False, default=None, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
@@ -1679,7 +1682,15 @@ class TransactionJournal:
         ) from None
 
     @classmethod
-    def open(cls, root: str | Path, expected_identity_hash: str) -> TransactionJournal:
+    def open(
+        cls,
+        root: str | Path,
+        expected_identity_hash: str,
+        *,
+        read_only: bool = False,
+    ) -> TransactionJournal:
+        if type(read_only) is not bool:
+            raise DeploymentStateError("read_only must be a boolean")
         root = Path(root)
         identity_hash = _validate_identity_hash(expected_identity_hash)
         _verify_directory(root.parent, "transaction directory")
@@ -1776,11 +1787,17 @@ class TransactionJournal:
         try:
             journal._validate_manifest_operations(undo_entries, operations)
         except DeploymentStateError:
-            if not journal._repair_trailing_manifest_prefix(
+            prefix = journal._trailing_manifest_prefix(
                 undo_entries, operations, phase.phase
-            ):
+            )
+            if prefix is None:
                 raise
-            undo_entries = journal._read_undo_manifest()
+            if read_only:
+                undo_entries = prefix
+                journal._read_only_undo_entries = tuple(prefix)
+            else:
+                journal.write_undo_manifest(prefix)
+                undo_entries = journal._read_undo_manifest()
             journal._validate_manifest_operations(undo_entries, operations)
         rollback_done = journal._read_rollback_done()
         rollback_intents = journal._read_rollback_intents()
@@ -1790,13 +1807,16 @@ class TransactionJournal:
             or not set(rollback_intents) <= operation_sequences
         ):
             raise DeploymentStateError(f"invalid rollback state: {root}")
-        journal._read_env_backup_meta()
+        journal._read_env_backup_meta(read_only=read_only)
         bootstrap_record = None
         if journal.bootstrap_protocol == BOOTSTRAP_PROTOCOL_V1:
-            journal._migrate_bootstrap_protocol_v1()
-        if journal.bootstrap_protocol is not None:
+            if read_only:
+                bootstrap_record = journal._read_bootstrap_directories_v1()
+            else:
+                journal._migrate_bootstrap_protocol_v1()
+        if journal.bootstrap_protocol is not None and bootstrap_record is None:
             bootstrap_record = journal.read_bootstrap_directories()
-        journal._validate_root_entries()
+        journal._validate_root_entries(read_only=read_only)
         env_rollback_state = journal._read_env_rollback_state(operations)
         if env_rollback_state is not None and (
             env_rollback_state["sequence"] in rollback_done
@@ -1887,7 +1907,7 @@ class TransactionJournal:
             _verify_directory(path, description)
             _verify_private_tree(path, description)
 
-    def _validate_root_entries(self) -> None:
+    def _validate_root_entries(self, *, read_only: bool = False) -> None:
         expected = {
             "journal.json",
             "phase.json",
@@ -1917,16 +1937,23 @@ class TransactionJournal:
                 continue
             if target not in allowed_temp_targets:
                 raise DeploymentStateError(f"invalid transaction journal: {self.root}")
-            _remove_verified_atomic_temp(
-                Path(entry.path), "transaction journal atomic temp"
-            )
+            if read_only:
+                _verify_regular_file(
+                    Path(entry.path), "transaction journal atomic temp"
+                )
+            else:
+                _remove_verified_atomic_temp(
+                    Path(entry.path), "transaction journal atomic temp"
+                )
         try:
             entries = list(os.scandir(self.root))
         except OSError as exc:
             raise DeploymentStateError(
                 f"cannot inspect transaction journal: {self.root}"
             ) from exc
-        actual = {entry.name for entry in entries}
+        actual = {
+            entry.name for entry in entries if _atomic_temp_target(entry.name) is None
+        }
         if not expected <= actual or actual - expected - optional:
             raise DeploymentStateError(f"invalid transaction journal: {self.root}")
         for entry in entries:
@@ -2282,6 +2309,8 @@ class TransactionJournal:
         )
 
     def read_undo_manifest(self) -> tuple[UndoEntry, ...]:
+        if self._read_only_undo_entries is not None:
+            return self._read_only_undo_entries
         return tuple(self._read_undo_manifest())
 
     def _read_undo_manifest(self) -> list[UndoEntry]:
@@ -2466,12 +2495,12 @@ class TransactionJournal:
             if actual.to_mapping() != expected.to_mapping():
                 raise DeploymentStateError("undo manifest operation mismatch")
 
-    def _repair_trailing_manifest_prefix(
+    def _trailing_manifest_prefix(
         self,
         entries: Sequence[UndoEntry],
         operations: Sequence[Mapping[str, object]],
         phase: str,
-    ) -> bool:
+    ) -> list[UndoEntry] | None:
         if (
             phase
             in {
@@ -2484,14 +2513,25 @@ class TransactionJournal:
             }
             or len(entries) != len(operations) + 1
         ):
-            return False
-        prefix = entries[:-1]
+            return None
+        prefix = list(entries[:-1])
         try:
             self._validate_manifest_operations(prefix, operations)
         except DeploymentStateError:
-            return False
+            return None
         expected_sequence = len(operations) + 1
         if entries[-1].sequence != expected_sequence:
+            return None
+        return prefix
+
+    def _repair_trailing_manifest_prefix(
+        self,
+        entries: Sequence[UndoEntry],
+        operations: Sequence[Mapping[str, object]],
+        phase: str,
+    ) -> bool:
+        prefix = self._trailing_manifest_prefix(entries, operations, phase)
+        if prefix is None:
             return False
         self.write_undo_manifest(prefix)
         return True
@@ -2557,7 +2597,12 @@ class TransactionJournal:
 
     def read_operations(self) -> tuple[dict[str, object], ...]:
         operations = self._read_operations_internal()
-        self._validate_manifest_operations(self._read_undo_manifest(), operations)
+        entries = (
+            list(self._read_only_undo_entries)
+            if self._read_only_undo_entries is not None
+            else self._read_undo_manifest()
+        )
+        self._validate_manifest_operations(entries, operations)
         return tuple(operations)
 
     @property
@@ -3187,7 +3232,7 @@ class TransactionJournal:
             },
         )
 
-    def _read_env_backup_meta(self) -> bool:
+    def _read_env_backup_meta(self, *, read_only: bool = False) -> bool:
         payload = _read_json_value(
             self.env_backup_meta_path, "environment backup metadata"
         )
@@ -3214,6 +3259,22 @@ class TransactionJournal:
             )
         backup = _lstat_optional(self.env_backup_path)
         if payload["state"] == "preparing":
+            if read_only:
+                if payload["absent"]:
+                    if backup is not None:
+                        _verify_regular_file(self.env_backup_path, "environment backup")
+                    return True
+                if backup is None:
+                    return True
+                data = _read_secure_regular_file(
+                    self.env_backup_path, "environment backup"
+                )
+                if hashlib.sha256(data).hexdigest() != payload["digest"]:
+                    raise DeploymentStateError(
+                        "environment backup digest mismatch: "
+                        f"{self.env_backup_meta_path}"
+                    )
+                return False
             if payload["absent"]:
                 if backup is not None:
                     _remove_verified_atomic_temp(
