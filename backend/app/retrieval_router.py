@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Protocol
 from uuid import uuid4
 
@@ -334,6 +334,7 @@ class ShadowQueue:
         self._closing = False
         self._closed = False
         self._dropped_count = 0
+        self._worker_stopping = Event()
         self.worker = Thread(
             target=self._run,
             name="retrieval-shadow-worker",
@@ -366,6 +367,8 @@ class ShadowQueue:
 
     def drain_for_test(self) -> None:
         self._queue.join()
+        if self._worker_stopping.is_set():
+            self.worker.join(self._close_timeout_seconds)
 
     def close(self) -> None:
         with self._lock:
@@ -403,7 +406,14 @@ class ShadowQueue:
                 if task is _STOP:
                     return
                 assert isinstance(task, _ShadowTask)
-                self._run_task(task)
+                try:
+                    self._run_task(task)
+                except (KeyboardInterrupt, SystemExit):
+                    with self._lock:
+                        self._closing = True
+                        self._dropped_count += self._discard_pending_locked()
+                        self._worker_stopping.set()
+                    return
             finally:
                 self._queue.task_done()
 

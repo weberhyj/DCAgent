@@ -22,26 +22,13 @@ DC-Agent 是一个公司内部只读知识 Agent。管理员把制度、合同�
 postgresql+psycopg://postgres:123456@127.0.0.1:5432/dc_agent
 ```
 
-手动创建数据库示例：
-
-```powershell
-$env:PGPASSWORD="123456"
-D:\PostgreSQL\18\bin\createdb.exe -h 127.0.0.1 -p 5432 -U postgres dc_agent
-Remove-Item Env:PGPASSWORD
-```
-
 也可以用 `DATABASE_URL` 覆盖默认连接串。管理员上传的文件默认保存在 `backend/uploads/knowledge`，该目录只用于本地运行数据，不进入版本管理。
 
 ## 环境变量
 
 后端启动时会自动读取项目根目录 `.env` 和 `backend/.env`。读取顺序为根目录 `.env` 后读取 `backend/.env`，但系统环境变量优先级最高，不会被文件覆盖。
 
-复制示例文件：
-
-```powershell
-Copy-Item .env.example .env
-Copy-Item backend\.env.example backend\.env
-```
+本地开发时，按所用开发环境为项目根目录和 `backend` 创建各自的 `.env` 文件。
 
 本地兜底模式：
 
@@ -99,15 +86,102 @@ LLM_MODEL=my_deepseek_r1_7b
 部署后必须从仓库根目录通过受支持的 Compose wrapper 在 API 容器内执行。probe 成功后再把
 脱敏报告复制到 host：
 
-```powershell
-& tools/invoke_offline_compose.ps1 exec -T api `
+```bash
+set -Eeuo pipefail
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh up -d
+if ! ./tools/invoke_offline_compose.sh exec -T api \
   python -m app.physoc_probe --report /tmp/physoc-probe.json
-if ($LASTEXITCODE -ne 0) { throw "Physoc probe failed; do not persist evidence." }
-New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null
-& tools/invoke_offline_compose.ps1 cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json
+then
+  echo "Physoc probe failed; do not persist evidence." >&2
+  exit 1
+fi
+mkdir -p artifacts/benchmarks
+./tools/invoke_offline_compose.sh cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json
 ```
 
 探针成功报告只记录 provider、model、streamPath、elapsedMs、answerChars 和 citationCount 等运行元数据，不会输出提示词、证据正文或模型回答正文。只有容器内 probe exit 0 后才创建 host 目录并执行 `cp`；将 `artifacts/benchmarks/physoc-probe.json` 作为切换门禁证据保存。探针失败时不得复制旧报告或启用该生产路由。
+
+## Ubuntu 20.04 公司内网事务部署
+
+生产主路径只支持 Ubuntu 20.04、Bash、rootful Docker Compose v2 和仓库根目录下的
+`prepare_offline_env.sh`、`invoke_offline_compose.sh`、`recover_offline_deployment.sh`。`DEPLOYMENT_STATE_ROOT`
+必须是 `DATA_ROOT/.dcagent-deployment-state`，由
+初始化或接管操作写入并与 data/model/secret roots 绑定。普通 prepare/Compose 不隐式创建 identity；
+更换 `DATA_ROOT` 视为新部署。
+
+新部署先由 Ubuntu 管理员预创建固定数据目录，并把 owner 设置为实际的非 root 部署账号。下面的
+`dcagent` 只是示例账号；部署前必须改成实际账号和组：
+
+```bash
+set -Eeuo pipefail
+deployment_user=dcagent
+deployment_group=dcagent
+sudo install -d -o "$deployment_user" -g "$deployment_group" -m 0700 \
+  /srv/dcagent/data /srv/dcagent/models
+```
+
+随后以该非 root 部署账号登录并进入仓库根目录。不要手工复制或改写 `.env.example`；首次不存在
+`deploy/offline/.env` 时，由 `--initialize-state` 自动创建 `.env`、写入当前 UID/GID，并把下面成对
+提供的 HOST roots 固化为绝对 `DATA_ROOT`/`MODEL_ROOT`。已有 `deploy/offline/.env` 不得覆盖，脚本会
+校验其 roots、UID/GID 和 deployment identity，不匹配时直接失败。
+
+公共前置完成后，手工路径与推荐 gate 路径二选一。
+
+### 手工路径
+
+固定核心顺序是 prepare → config → 单次 build → up：
+
+```bash
+set -Eeuo pipefail
+export HOST_DATA_ROOT=/srv/dcagent/data
+export HOST_MODEL_ROOT=/srv/dcagent/models
+./tools/prepare_offline_env.sh --initialize-state
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh up -d
+```
+
+### 推荐 gate 路径
+
+gate 自身执行上述 prepare/config/build/up 固定序列及验收；不要先运行手工路径，否则会重复 build/up。config 60 秒、build 1800 秒、up/readyz 300 秒、每个 probe 60 秒、recovery drill 120 秒。
+
+```bash
+set -Eeuo pipefail
+export HOST_DATA_ROOT=/srv/dcagent/data
+export HOST_MODEL_ROOT=/srv/dcagent/models
+python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
+```
+
+已有数据的旧部署必须先接管，不能跳过 state root：
+
+```bash
+set -Eeuo pipefail
+export HOST_DATA_ROOT=/absolute/data/root
+export HOST_MODEL_ROOT=/absolute/model/root
+./tools/recover_offline_deployment.sh adopt-existing --state-root /absolute/data/root/.dcagent-deployment-state
+./tools/prepare_offline_env.sh
+```
+
+部署锁等待上限为 30 秒。六个 Compose verb：config/build/up/down/exec/cp；只有
+`./tools/invoke_offline_compose.sh up`、`./tools/invoke_offline_compose.sh exec` 和
+`./tools/invoke_offline_compose.sh cp` 会在执行前 durable 写入 `deployment-started.json`，失败后保留它。
+`./tools/invoke_offline_compose.sh config`、`./tools/invoke_offline_compose.sh build` 和
+`./tools/invoke_offline_compose.sh down` 不写 marker。marker 存在时普通 `--rotate-secrets` 拒绝；只有经
+`recover_offline_deployment.sh clear-start-marker` 且确认无 `PG_VERSION`、无未完成事务后，才可能恢复
+pre-init rotation。任意形态 `PG_VERSION` 存在后永久拒绝；不提供在线 PostgreSQL role 密码修改，也不提供单行删除 marker 的命令。
+
+故障先运行 `./tools/recover_offline_deployment.sh inspect --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`。
+自动回滚成功后可继续；`rollback_failed` 使用
+`./tools/recover_offline_deployment.sh resume-rollback --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+`committed_cleanup_required` 使用
+`./tools/recover_offline_deployment.sh finalize-cleanup --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+损坏 journal/quarantine 经人工修复后使用
+`./tools/recover_offline_deployment.sh acknowledge-repaired --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id> --evidence /absolute/path/sanitized-repair-evidence.json`。
+人工执行 `./tools/recover_offline_deployment.sh clear-start-marker --state-root /absolute/data/root/.dcagent-deployment-state` 前，逐项确认无 DC-Agent 容器、无 `PG_VERSION`、PostgreSQL 目录不存在或未初始化、且无未完成事务。
+日志和 evidence receipt 不含 secret、数据库 URL、模型正文或原始 SSE。
+
+开发机本地测试不是Ubuntu live gate通过；没有真实 Ubuntu Docker、Physoc 和 Ollama 拓扑时，只能记录 live gate 未运行。
 
 ## Structured spreadsheet aggregation
 
@@ -293,6 +367,16 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 6. 在目标服务器完成 Compose smoke、Ollama/Physoc probe、新索引发布、Shadow/Canary、真实文档
    问答、模型故障 HTTP 502、Alias/Legacy 回滚、结构化统计和 15 用户并发验收。
 
+Ubuntu 20.04 新部署必须使用上文的事务部署固定顺序（包括 `--initialize-state`、五个服务的单次 build 和基础 `up`）；不得以普通 prepare 代替初始化。状态已初始化并且基础服务启动后，才可按需启动结构化 indexing worker：
+
+```bash
+set -Eeuo pipefail
+./tools/invoke_offline_compose.sh --profile indexing up -d
+```
+
+Windows 开发机兼容：本地开发者可以继续使用 `tools/prepare_offline_env.ps1` 和
+`tools/invoke_offline_compose.ps1`；这两个入口不是 Ubuntu 生产部署路径。
+
 ### Ollama Qwen2.5 部署准备与上线门禁
 
 如果目标环境已经部署过旧版 DC-Agent，本次升级不能只替换后端代码。DC-Agent 本身不再运行
@@ -312,7 +396,7 @@ Embedding/Reranker 权重；公司内网 Ollama 必须可达，且不依赖外�
 #### Linux (Bash)
 
 ```bash
-set -euo pipefail
+set -Eeuo pipefail
 ollama pull qwen2.5:0.5b
 ollama pull qwen2.5:3b
 ollama_url='http://127.0.0.1:11434'
@@ -342,48 +426,10 @@ for model in qwen2.5:0.5b qwen2.5:3b; do
 done
 ```
 
-#### Windows (PowerShell)
-
-```powershell
-ollama pull qwen2.5:0.5b
-ollama pull qwen2.5:3b
-$ollama = 'http://127.0.0.1:11434'
-$embedBody = @{ model = 'qwen2.5:0.5b'; input = @('dimension-probe'); truncate = $true; keep_alive = '30m' } | ConvertTo-Json -Compress
-$embedJson = curl.exe --fail-with-body --silent --show-error -H 'Content-Type: application/json' --data-binary $embedBody "$ollama/api/embed"
-$embedProbe = $embedJson | ConvertFrom-Json
-$dimensions = $embedProbe.embeddings[0].Count
-if ($dimensions -le 0) { throw 'Ollama returned no embedding dimensions' }
-```
-
-把 `$dimensions` 填入 `EMBEDDING_MODEL_DIMENSIONS`。老 Ollama 只提供 legacy endpoint 时，显式
+把 Bash 探针输出的 `EMBEDDING_MODEL_DIMENSIONS` 填入实际环境文件。老 Ollama 只提供 legacy endpoint 时，显式
 设置 `OLLAMA_EMBEDDING_PATH=/api/embeddings`，并把
 `EMBEDDING_ENCODING_PROFILE_SHA256` 改为 legacy profile hash
-`23e5b954b6099dcc4427a33745ad03b9ce7dc6fbf2d8fd4728f1d7e1ce7db34c`；不得在任意错误后自动切换路径。用原生生成接口
-确认 3B 模型能返回 JSON score shape：
-
-```powershell
-$prompt = 'Return only JSON: {"scores":[{"index":0,"score":0.0},{"index":1,"score":0.0}]}. Score relevance from 0 to 1. Query: leave policy. Passage 0: annual leave policy. Passage 1: cafeteria menu.'
-$generateBody = @{ model = 'qwen2.5:3b'; prompt = $prompt; stream = $false; format = 'json'; options = @{ temperature = 0; num_predict = 128 } } | ConvertTo-Json -Depth 5 -Compress
-$generateJson = curl.exe --fail-with-body --silent --show-error -H 'Content-Type: application/json' --data-binary $generateBody "$ollama/api/generate"
-$scoreProbe = (($generateJson | ConvertFrom-Json).response | ConvertFrom-Json)
-if ($scoreProbe.scores.Count -ne 2) { throw 'Ollama JSON score probe returned the wrong count' }
-```
-
-从 `/api/tags` 提取目标模型的真实 digest，去掉可选 `sha256:` 前缀后再写入配置。不要复制示例
-占位符：
-
-```powershell
-$tags = (curl.exe --fail-with-body --silent --show-error "$ollama/api/tags") | ConvertFrom-Json
-function Get-OllamaDigest([string]$model) {
-  $modelMatches = @($tags.models | Where-Object { $_.name -ceq $model -or $_.model -ceq $model })
-  if ($modelMatches.Count -ne 1) { throw "Expected exactly one Ollama model match: $model" }
-  $digest = ([string]$modelMatches[0].digest) -replace '^sha256:', ''
-  if ($digest -cnotmatch '^[0-9a-f]{64}$') { throw "Invalid Ollama digest for $model" }
-  $digest
-}
-$embeddingDigest = Get-OllamaDigest 'qwen2.5:0.5b'
-$rerankerDigest = Get-OllamaDigest 'qwen2.5:3b'
-```
+`23e5b954b6099dcc4427a33745ad03b9ce7dc6fbf2d8fd4728f1d7e1ce7db34c`；不得在任意错误后自动切换路径。上面的 Bash 命令还必须确认 3B 模型能返回 JSON score shape，并从 `/api/tags` 提取目标模型的真实 digest；去掉可选 `sha256:` 前缀后再写入配置，不要复制示例占位符。
 
 关键配置必须绑定实测值和固定 profile：
 
@@ -409,8 +455,8 @@ model digest、dimensions、protocol 和所选 endpoint profile 重新构建并�
 向量。保持 `knowledge_chunks_qwen3_vN` 和 `RETRIEVAL_MODE=qwen3` 兼容命名，先构建新的不可变
 collection 并验证模型元数据、实测 dimensions、归一化、profile/digest、点数和检索质量：
 
-```powershell
-& tools/invoke_offline_compose.ps1 exec -T api `
+```bash
+./tools/invoke_offline_compose.sh exec -T api \
   python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v1
 ```
 
@@ -419,9 +465,9 @@ collection 并验证模型元数据、实测 dimensions、归一化、profile/di
 回滚时先把 `RETRIEVAL_MODE=legacy`，恢复上一组模型 digest/profile/dimensions，再以新的版本号
 全量重建已知可用组合并执行受 fence 保护的 `--activate`，禁止直接修改 Qdrant Alias。
 
-```powershell
+```bash
 # 仅在目标 acceptance 全部通过后人工执行
-& tools/invoke_offline_compose.ps1 exec -T api `
+./tools/invoke_offline_compose.sh exec -T api \
   python -m app.retrieval_index_worker --collection knowledge_chunks_qwen3_v2 --activate
 ```
 
@@ -436,11 +482,12 @@ collection 并验证模型元数据、实测 dimensions、归一化、profile/di
 本机没有目标 wheelhouse。必须在真实离线构建环境中，用实际 artifacts/wheels 按 Dockerfile 的
 相同 `uv sync` flags 构建并验证镜像，以弥补本机限制：
 
-```powershell
-$env:UV_PYTHON_DOWNLOADS = 'never'
+```bash
+set -Eeuo pipefail
+export UV_PYTHON_DOWNLOADS=never
 uv sync --project backend --frozen --offline --no-install-project --no-dev --group offline --no-index --find-links artifacts/wheels
 uv sync --project backend --frozen --offline --no-install-project --no-dev --no-index --find-links artifacts/wheels
-& tools/invoke_offline_compose.ps1 build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
 ```
 
 真实 Ollama probe、镜像构建、全量索引、15 用户容量、目标服务器 acceptance 和 Alias activation
@@ -466,112 +513,34 @@ P95、错误率和 fallback rate；强制命令见离线部署手册。
 Redis/Celery 异步任务、ClamAV 上传扫描、细粒度引用和千万级整体验收。详细阶段和退出门禁见
 [`企业知识库升级路线`](docs/superpowers/plans/2026-07-24-enterprise-knowledge-base-qa-rollout.md)。
 
-## 启动
+## 本地开发补充
 
-后端：
+管理端提供概览、知识库维护、指定资料详情和 Agent 执行审计等独立路由。UI smoke 使用
+Playwright/Pillow 和独立 QA Python 环境，不由 backend UV dependency groups 管理；测试使用临时
+SQLite 数据和临时端口，结束后临时数据会销毁。
 
-```powershell
+安装后端开发依赖并启动本地 API：
+
+```bash
+set -Eeuo pipefail
 uv sync --project backend --group dev
-Set-Location backend
-uv run --project . --group dev python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-Set-Location ..
+(
+  cd backend
+  uv run --project . --group dev python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+)
 ```
 
-用户检索端：
+运行后端测试和 Ruff：
 
-```powershell
-cd frontend
-npm.cmd install
-npm.cmd run dev
+```bash
+set -Eeuo pipefail
+(
+  cd backend
+  uv run --project . --group dev python -m unittest discover -s tests -p "test_*.py" -v
+)
+uv run --project backend --group dev ruff check backend
+uv run --project backend --group dev ruff format backend
 ```
-
-默认访问地址：`http://127.0.0.1:5173`
-
-知识库管理端：
-
-```powershell
-cd admin-frontend
-npm.cmd install
-npm.cmd run dev
-```
-
-默认访问地址：`http://127.0.0.1:5174`
-
-管理端按功能拆分为独立路由：
-
-- `/overview`：管理概览与最近活动。
-- `/knowledge`：资料上传、筛选、重建索引和删除。
-- `/knowledge/{sourceId}`：指定资料的解析详情与片段预览。
-- `/agent-runs`：DCAgent 只读执行审计。
-
-## 本地验证
-
-后端测试：
-
-```powershell
-Set-Location backend
-uv run --project . --group dev python -m unittest discover -s tests -p "test_*.py" -v
-Set-Location ..
-```
-
-后端代码质量：
-
-> 历史文档曾写 `uv run --project backend --group dev ruff check backend` 和
-> `uv run --project backend --group dev ruff format backend`，但当前 `dev` group 不包含 Ruff；
-> 不要使用这些旧命令。以下 `uvx ruff` 调用已在本仓库实际验证。
-
-```powershell
-uvx ruff check backend tools
-uvx ruff format --check backend tools
-uvx ruff format backend tools
-```
-
-用户检索端：
-
-```powershell
-cd frontend
-npm.cmd run test:run
-npm.cmd run build
-```
-
-知识库管理端：
-
-```powershell
-cd admin-frontend
-npm.cmd run test:run
-npm.cmd run build
-```
-
-页面级冒烟（可选，需先确保已安装 Playwright Chromium）：
-
-UI smoke 使用独立、已安装 Playwright/Pillow 的 QA Python 环境，不由 backend UV dependency groups 管理。
-
-```powershell
-# 终端 1
-tools\start_smoke_backend.cmd
-
-# 终端 2
-tools\start_smoke_frontend.cmd
-
-# 终端 3
-tools\start_smoke_admin.cmd
-
-# 终端 4
-py tools\ui_smoke.py
-```
-
-冒烟脚本会使用临时后端 `8015`、用户端 `5177`、管理端 `5178`，截图输出到 `qa-screenshots`。
-
-冒烟流程还会在临时 SQLite 环境中验证质量评测工作台：导入预览不会提前落库，确认后可创建评测案例，两个不同阈值的批次能够完成，并可查看报告详情、批次比较以及桌面端和 390×844 移动端布局。临时服务退出后测试数据自动销毁。
-
-完整冒烟建议：
-
-1. 启动后端。
-2. 启动知识库管理端，上传一份 `.txt`、`.md`、`.docx`、`.xlsx`、`.csv`，或文本型、未加密且在已验收大小内的 `.pdf` 文档。
-3. 等待资料源状态从 `解析中` 变为 `已索引`。
-4. 启动用户检索端，询问文档中的制度、合同或业务问题。
-5. 确认 DCAgent 回答只基于知识库内容，不在用户侧暴露资料原文管理入口。
-6. 回到知识库管理端，确认“Agent 执行审计”中出现本次检索、资料检查、证据对比和回答生成步骤。
 
 ## 离线平台运行手册
 

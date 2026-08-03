@@ -121,6 +121,57 @@ def _reranker_metadata(*, model: str = QWEN25_RERANKER_MODEL) -> dict[str, objec
     }
 
 
+def _bash_blocks_after_heading(text: str, heading: str) -> list[str]:
+    heading_level = len(heading) - len(heading.lstrip("#"))
+    if heading_level == 0:
+        return []
+    heading_match = re.search(rf"(?m)^{re.escape(heading)}[ \t]*$", text)
+    if heading_match is None:
+        return []
+    section_start = heading_match.end()
+    next_heading = re.search(
+        rf"(?m)^#{{1,{heading_level}}}[ \t]+", text[section_start:]
+    )
+    section_end = (
+        section_start + next_heading.start() if next_heading is not None else len(text)
+    )
+    return re.findall(
+        r"(?ms)^[ \t]*```bash[ \t]*$\n(?P<body>.*?)^[ \t]*```[ \t]*$",
+        text[section_start:section_end],
+    )
+
+
+def _ollama_probe_blocks(blocks: list[str]) -> list[str]:
+    endpoints = ("/api/embed", "/api/generate", "/api/tags")
+    return [
+        block for block in blocks if all(endpoint in block for endpoint in endpoints)
+    ]
+
+
+def _windows_markers_in_bash(block: str) -> list[str]:
+    markers = []
+    lower_block = block.casefold()
+    for forbidden in (
+        "curl.exe",
+        "Invoke-RestMethod",
+        "Where-Object",
+        "$env:",
+        "$ErrorActionPreference",
+        "Set-Location",
+        "ConvertTo-Json",
+        "Select-Object",
+        "Out-File",
+        "Write-Host",
+    ):
+        if forbidden.casefold() in lower_block:
+            markers.append(forbidden)
+    if re.search(r"(?m)`[ \t]*$", block):
+        markers.append("PowerShell backtick continuation")
+    if re.search(r"(?m)^[ \t]*&[ \t]+tools/", block):
+        markers.append("& tools/")
+    return markers
+
+
 class _HelperResponse:
     def __init__(self, payload: dict[str, object] | bytes, status: int = 200) -> None:
         self.status = status
@@ -265,15 +316,17 @@ class FakeRunner:
 
     @staticmethod
     def _arguments(argv: list[str]) -> list[str]:
-        index = argv.index("-File")
-        return argv[index + 2 :]
+        if "-File" in argv:
+            index = argv.index("-File")
+            return argv[index + 2 :]
+        if argv and Path(argv[0]).suffix.casefold() == ".sh":
+            return argv[1:]
+        raise AssertionError(f"unexpected wrapper command: {argv!r}")
 
     @classmethod
     def _key(cls, argv: list[str]) -> str:
-        if "-File" not in argv:
-            if argv[0] == sys.executable and "/api/readyz" in " ".join(argv):
-                return "api"
-            raise AssertionError(f"unexpected host command: {argv!r}")
+        if argv[0] == sys.executable and "/api/readyz" in " ".join(argv):
+            return "api"
         arguments = cls._arguments(argv)
         action = arguments[0]
         if action != "exec":
@@ -852,6 +905,50 @@ class ComposeSmokeTest(unittest.TestCase):
                 compose_smoke.build_compose_command("up", wrapper_path=wrapper),
             )
 
+        bash_wrapper = Path("/repo/tools/invoke_offline_compose.sh")
+        self.assertEqual(
+            [str(bash_wrapper), "config", "--quiet"],
+            compose_smoke.build_compose_command("config", wrapper_path=bash_wrapper),
+        )
+
+    def test_default_wrapper_uses_bash_on_posix_and_powershell_on_windows(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        with mock.patch.object(compose_smoke.os, "name", "posix"):
+            self.assertEqual(
+                compose_smoke.REPO_ROOT / "tools" / "invoke_offline_compose.sh",
+                compose_smoke.default_wrapper_path(),
+            )
+        with mock.patch.object(compose_smoke.os, "name", "nt"):
+            self.assertEqual(
+                compose_smoke.REPO_ROOT / "tools" / "invoke_offline_compose.ps1",
+                compose_smoke.default_wrapper_path(),
+            )
+
+    def test_wrapper_prefix_supports_bash_and_powershell(self) -> None:
+        compose_smoke = _module()
+        bash = Path("/repo/tools/invoke_offline_compose.sh")
+        powershell = Path("/repo/tools/invoke_offline_compose.ps1")
+
+        self.assertEqual([str(bash)], compose_smoke._wrapper_prefix(bash))
+        self.assertEqual(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(powershell),
+            ],
+            compose_smoke._wrapper_prefix(powershell),
+        )
+
+    def test_wrapper_prefix_rejects_unsupported_script_extensions(self) -> None:
+        compose_smoke = _module()
+
+        with self.assertRaisesRegex(ValueError, r"\.sh or \.ps1"):
+            compose_smoke._wrapper_prefix(Path("/repo/tools/invoke_offline_compose.py"))
+
     def test_standard_stack_starts_models_without_consumer_health_dependencies(
         self,
     ) -> None:
@@ -884,13 +981,103 @@ class ComposeSmokeTest(unittest.TestCase):
     def test_production_runner_rejects_non_repository_wrapper(self) -> None:
         compose_smoke = _module()
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(ValueError):
-                compose_smoke.run_compose_smoke(
-                    wrapper_path=Path(directory) / "other.ps1",
+            for name in (
+                "invoke_offline_compose.sh",
+                "invoke_offline_compose.ps1",
+                "invoke_offline_compose.py",
+            ):
+                with self.subTest(name=name):
+                    wrapper = Path(directory) / name
+                    wrapper.touch()
+                    with self.assertRaises(ValueError):
+                        compose_smoke.run_compose_smoke(
+                            wrapper_path=wrapper,
+                            report_path=Path(directory) / "report.json",
+                            runner=FakeRunner(),
+                            hardware_collector=lambda: {},
+                            software_collector=lambda: {},
+                        )
+
+    def test_fake_runner_parses_bash_and_powershell_wrapper_arguments(self) -> None:
+        arguments = ["config", "--quiet"]
+        bash = [str(REPO_ROOT / "tools" / "invoke_offline_compose.sh"), *arguments]
+        powershell = [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(REPO_ROOT / "tools" / "invoke_offline_compose.ps1"),
+            *arguments,
+        ]
+
+        self.assertEqual(FakeRunner._arguments(bash), arguments)
+        self.assertEqual(FakeRunner._arguments(powershell), arguments)
+
+    def test_production_runner_supports_each_repository_wrapper_override(
+        self,
+    ) -> None:
+        compose_smoke = _module()
+        wrappers = {
+            "invoke_offline_compose.sh": [
+                str(REPO_ROOT / "tools" / "invoke_offline_compose.sh")
+            ],
+            "invoke_offline_compose.ps1": [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(REPO_ROOT / "tools" / "invoke_offline_compose.ps1"),
+            ],
+        }
+
+        for wrapper_name, prefix in wrappers.items():
+            with (
+                self.subTest(wrapper_name=wrapper_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner = FakeRunner()
+                report = compose_smoke.run_compose_smoke(
+                    wrapper_path=REPO_ROOT / "tools" / wrapper_name,
                     report_path=Path(directory) / "report.json",
-                    runner=FakeRunner(),
+                    runner=runner,
                     hardware_collector=lambda: {},
                     software_collector=lambda: {},
+                )
+
+                self.assertTrue(report["passed"])
+                wrapper_calls = [
+                    command
+                    for command, _ in runner.calls
+                    if command[0] != sys.executable
+                ]
+                self.assertTrue(wrapper_calls)
+                self.assertTrue(
+                    all(command[: len(prefix)] == prefix for command in wrapper_calls)
+                )
+                self.assertEqual(
+                    [runner._key(command) for command, _ in runner.calls],
+                    [
+                        "config",
+                        "up",
+                        "version",
+                        "postgres",
+                        "clickhouse_ping",
+                        "clickhouse_version",
+                        "qdrant_ready",
+                        "qdrant_version",
+                        "redis_ping",
+                        "redis_version",
+                        "clamav_ping",
+                        "clamav_version",
+                        "embedding.ready",
+                        "embedding.metadata",
+                        "embedding.embeddings",
+                        "reranker.ready",
+                        "reranker.metadata",
+                        "reranker.rerank",
+                        "api",
+                        "down",
+                    ],
                 )
 
     def test_runner_uses_argument_vectors_shell_false_and_never_direct_compose(
@@ -909,8 +1096,15 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertTrue(runner.calls)
         self.assertTrue(all(shell is False for _, shell in runner.calls))
         self.assertTrue(all(isinstance(command, list) for command, _ in runner.calls))
+        wrapper_commands = {
+            "pwsh",
+            str(REPO_ROOT / "tools" / "invoke_offline_compose.sh"),
+        }
         self.assertTrue(
-            all(command[0] in {"pwsh", sys.executable} for command, _ in runner.calls)
+            all(
+                command[0] in wrapper_commands | {sys.executable}
+                for command, _ in runner.calls
+            )
         )
         host_calls = [
             command for command, _ in runner.calls if command[0] == sys.executable
@@ -1520,47 +1714,75 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertIn("--remove-volumes", text)
         self.assertIn("preserves data volumes by default", text)
 
-    def test_readmes_separate_linux_curl_and_windows_powershell_ollama_probes(
+    def test_linux_bash_block_selector_returns_every_fence_after_prose(self) -> None:
+        text = """
+#### Linux (Bash)
+
+Run this only on the approved Ollama host.
+
+```bash
+set -Eeuo pipefail
+curl --fail-with-body http://127.0.0.1:11434/api/tags
+```
+
+```bash
+Write-Host 'This second fence must also be audited'
+```
+"""
+
+        self.assertEqual(
+            [
+                "set -Eeuo pipefail\n"
+                "curl --fail-with-body http://127.0.0.1:11434/api/tags\n",
+                "Write-Host 'This second fence must also be audited'\n",
+            ],
+            _bash_blocks_after_heading(text, "#### Linux (Bash)"),
+        )
+        blocks = _bash_blocks_after_heading(text, "#### Linux (Bash)")
+        self.assertEqual([], _windows_markers_in_bash(blocks[0]))
+        self.assertIn("Write-Host", _windows_markers_in_bash(blocks[1]))
+
+    def test_readme_linux_bash_ollama_probes_exclude_windows_commands(
         self,
     ) -> None:
         for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                linux_match = re.search(
-                    r"(?ms)^#### Linux \(Bash\)\s*$\n(?P<body>.*?)^#### Windows \(PowerShell\)\s*$",
-                    text,
+                linux_blocks = _bash_blocks_after_heading(text, "#### Linux (Bash)")
+                self.assertGreaterEqual(len(linux_blocks), 1)
+                for index, block in enumerate(linux_blocks):
+                    self.assertEqual(
+                        [],
+                        _windows_markers_in_bash(block),
+                        f"Windows command leaked into Bash block {index} in {path}",
+                    )
+                probe_blocks = _ollama_probe_blocks(linux_blocks)
+                self.assertEqual(1, len(probe_blocks))
+                linux = probe_blocks[0]
+                first_command = next(
+                    line.strip()
+                    for line in linux.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")
                 )
-                self.assertIsNotNone(linux_match)
-                assert linux_match is not None
-                linux = linux_match.group("body")
-                windows = text[linux_match.end() :]
+                self.assertEqual("set -Eeuo pipefail", first_command)
                 self.assertIn("curl --fail-with-body", linux)
-                self.assertNotIn("curl.exe", linux)
-                self.assertTrue("Invoke-RestMethod" in windows or "curl.exe" in windows)
                 for endpoint in ("/api/embed", "/api/generate", "/api/tags"):
                     self.assertIn(endpoint, linux)
-                    self.assertIn(endpoint, windows)
 
     def test_readme_digest_probes_require_one_exact_model_match(self) -> None:
         for path in (REPO_ROOT / "README.md", REPO_ROOT / "deploy/offline/README.md"):
             with self.subTest(path=path):
                 text = path.read_text(encoding="utf-8")
-                linux_match = re.search(
-                    r"(?ms)^#### Linux \(Bash\)\s*$\n(?P<body>.*?)^#### Windows \(PowerShell\)\s*$",
-                    text,
-                )
-                self.assertIsNotNone(linux_match)
-                assert linux_match is not None
-                linux = linux_match.group("body")
-                windows = text[linux_match.end() :]
+                linux_blocks = _bash_blocks_after_heading(text, "#### Linux (Bash)")
+                probe_blocks = _ollama_probe_blocks(linux_blocks)
+                self.assertEqual(1, len(probe_blocks))
+                linux = probe_blocks[0]
 
                 self.assertIn('matches=[item for item in body["models"]', linux)
                 self.assertIn("len(matches) == 1 or sys.exit", linux)
                 self.assertNotIn("entry=next(", linux)
-                self.assertIn("$modelMatches = @($tags.models | Where-Object", windows)
-                self.assertIn("$modelMatches.Count -ne 1", windows)
-                self.assertIn("-ceq $model", windows)
-                self.assertNotIn("Select-Object -First 1", windows)
+                self.assertNotIn("$modelMatches", linux)
+                self.assertNotIn("Select-Object -First 1", linux)
 
                 command_match = re.search(
                     r"python3 -c '(?P<code>[^']+)' \"\$model\"", linux
@@ -1572,6 +1794,22 @@ class ComposeSmokeTest(unittest.TestCase):
                 inventories = (
                     ({"models": []}, 1),
                     ({"models": [{"name": "qwen2.5:0.5b", "digest": digest}]}, 0),
+                    (
+                        {"models": [{"name": "qwen2.5:0.5b-extra", "digest": digest}]},
+                        1,
+                    ),
+                    (
+                        {"models": [{"model": "qwen2.5:0.5b-extra", "digest": digest}]},
+                        1,
+                    ),
+                    (
+                        {"models": [{"name": "QWEN2.5:0.5B", "digest": digest}]},
+                        1,
+                    ),
+                    (
+                        {"models": [{"model": " qwen2.5:0.5b", "digest": digest}]},
+                        1,
+                    ),
                     (
                         {
                             "models": [

@@ -23,7 +23,17 @@ from collections.abc import Callable, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_WRAPPER_PATH = REPO_ROOT / "tools" / "invoke_offline_compose.ps1"
+REPOSITORY_WRAPPER_PATHS = (
+    REPO_ROOT / "tools" / "invoke_offline_compose.sh",
+    REPO_ROOT / "tools" / "invoke_offline_compose.ps1",
+)
+
+
+def default_wrapper_path() -> Path:
+    return REPOSITORY_WRAPPER_PATHS[1 if os.name == "nt" else 0]
+
+
+DEFAULT_WRAPPER_PATH = default_wrapper_path()
 DEFAULT_REPORT_PATH = REPO_ROOT / "artifacts" / "benchmarks" / "compose-smoke.json"
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 APPROVED_EMBEDDING_MODEL = "qwen2.5:0.5b"
@@ -175,9 +185,12 @@ def _default_runner(
 
 def _wrapper_prefix(wrapper_path: Path) -> list[str]:
     path = Path(wrapper_path)
-    if not path.name or path.suffix.casefold() != ".ps1":
-        raise ValueError("wrapper_path must be a PowerShell script")
-    return ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(path)]
+    suffix = path.suffix.casefold()
+    if path.name and suffix == ".sh":
+        return [str(path)]
+    if path.name and suffix == ".ps1":
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(path)]
+    raise ValueError("wrapper_path must end with .sh or .ps1")
 
 
 def build_compose_command(
@@ -1010,10 +1023,12 @@ def run_compose_smoke(
     destination.unlink(missing_ok=True)
     try:
         wrapper = Path(wrapper_path).resolve(strict=True)
-        expected_wrapper = DEFAULT_WRAPPER_PATH.resolve(strict=True)
+        expected_wrappers = {
+            path.resolve(strict=True) for path in REPOSITORY_WRAPPER_PATHS
+        }
     except OSError as error:
         raise ValueError("offline smoke wrapper is unavailable") from error
-    if wrapper != expected_wrapper:
+    if wrapper not in expected_wrappers:
         raise ValueError("offline smoke must use the repository Compose wrapper")
     migration_head = _discover_migration_head()
     failures: list[str] = []

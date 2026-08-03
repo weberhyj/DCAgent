@@ -92,6 +92,10 @@ def active_assignments(text: str) -> dict[str, str]:
     return values
 
 
+def bash_fenced_blocks(text: str) -> list[str]:
+    return re.findall(r"(?ms)^[ \t]*```bash\s*$\n(.*?)^[ \t]*```\s*$", text)
+
+
 class PhysocLlmDocumentationContractTests(unittest.TestCase):
     def test_env_examples_document_the_keyless_physoc_configuration(self) -> None:
         for path in ENV_EXAMPLES:
@@ -246,11 +250,12 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "容器内不得把 `127.0.0.1` 当作宿主机 Physoc 地址",
             "核心 `offline` 网络仍为 `internal`",
             "只有 API 同时连接 `physoc-egress`",
-            "& tools/invoke_offline_compose.ps1 exec -T api `",
+            "./tools/invoke_offline_compose.sh exec -T api \\",
             "python -m app.physoc_probe --report /tmp/physoc-probe.json",
-            'if ($LASTEXITCODE -ne 0) { throw "Physoc probe failed; do not persist evidence." }',
-            "New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null",
-            "& tools/invoke_offline_compose.ps1 cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json",
+            "if ! ./tools/invoke_offline_compose.sh exec -T api \\",
+            'then\n  echo "Physoc probe failed; do not persist evidence." >&2',
+            "mkdir -p artifacts/benchmarks",
+            "./tools/invoke_offline_compose.sh cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json",
             "python -m app.physoc_probe",
             "artifacts/benchmarks/physoc-probe.json",
             "不会输出提示词、证据正文或模型回答正文",
@@ -274,20 +279,21 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "LLM_API_BASE=http://172.16.0.10:8090",
             "LLM_STREAM_PATH=/api/physoc/deepseeks/stream",
             "LLM_MODEL=my_deepseek_r1_7b",
-            "& tools/prepare_offline_env.ps1",
+            "./tools/prepare_offline_env.sh",
             "只在 `deploy/offline/.env` 不存在时创建",
             "已有 `deploy/offline/.env` 不得覆盖",
             "只编辑或审核以下 4 个 LLM 路由键",
             "其他 digest、UID/GID、path 和 secret settings 必须保持原批准值",
             "# Edit LLM_API_BASE to the approved private Physoc address.",
-            "& tools/invoke_offline_compose.ps1 config",
-            "& tools/invoke_offline_compose.ps1 up -d",
+            "./tools/invoke_offline_compose.sh config",
+            "./tools/invoke_offline_compose.sh up -d",
             "python -m app.physoc_probe --report /tmp/physoc-probe.json",
-            'if ($LASTEXITCODE -ne 0) { throw "Physoc probe failed; do not print or persist evidence." }',
+            "if ! ./tools/invoke_offline_compose.sh exec -T api \\",
+            'then\n  echo "Physoc probe failed; do not print or persist evidence." >&2',
             'python -c \'import json, pathlib; print(json.dumps(json.loads(pathlib.Path("/tmp/physoc-probe.json").read_text(encoding="utf-8")), indent=2, sort_keys=True))\'',
             "只有上一条 probe exit 0 才能执行打印和持久化步骤",
-            "New-Item -ItemType Directory -Force artifacts/benchmarks | Out-Null",
-            "& tools/invoke_offline_compose.ps1 cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json",
+            "mkdir -p artifacts/benchmarks",
+            "./tools/invoke_offline_compose.sh cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json",
             "host evidence 为 `artifacts/benchmarks/physoc-probe.json`",
             "physoc-probe.json",
             '"answerChars": 12',
@@ -314,7 +320,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             "纯 ClickHouse 结构化统计是确定性计算",
             "不属于 model-route rollback",
             "恢复为最后已知可用的 Physoc host/model",
-            "`& tools/invoke_offline_compose.ps1 up -d` 重启并重新执行 probe",
+            "`./tools/invoke_offline_compose.sh up -d` 重启并重新执行 probe",
             "禁止把生产环境回滚到",
             "核心 `offline` 网络保持 `internal`",
             "仅 API 连接 `physoc-egress`",
@@ -325,11 +331,41 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
                 self.assertIn(required_text, section)
 
         self.assertGreaterEqual(
-            section.count("& tools/invoke_offline_compose.ps1 exec -T api"), 2
+            section.count("./tools/invoke_offline_compose.sh exec -T api"), 2
         )
-        self.assertNotIn(
-            "Copy-Item deploy/offline/.env.example deploy/offline/.env", section
-        )
+        self.assertNotIn("cp deploy/offline/.env.example deploy/offline/.env", section)
+        for forbidden in (".ps1", "$LASTEXITCODE", "New-Item"):
+            self.assertNotIn(forbidden, section)
+
+    def test_physoc_evidence_blocks_fail_fast_in_safe_order(self) -> None:
+        for path in (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        ):
+            text = path.read_text(encoding="utf-8")
+            matching = [
+                block
+                for block in bash_fenced_blocks(text)
+                if "python -m app.physoc_probe --report /tmp/physoc-probe.json" in block
+                and "artifacts/benchmarks/physoc-probe.json" in block
+            ]
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertEqual(1, len(matching))
+                block = matching[0]
+                expected_order = (
+                    "set -Eeuo pipefail",
+                    "./tools/invoke_offline_compose.sh config",
+                    "./tools/invoke_offline_compose.sh up -d",
+                    "if ! ./tools/invoke_offline_compose.sh exec -T api",
+                    "then",
+                    "mkdir -p artifacts/benchmarks",
+                    "./tools/invoke_offline_compose.sh cp api:/tmp/physoc-probe.json artifacts/benchmarks/physoc-probe.json",
+                )
+                for token in expected_order:
+                    self.assertIn(token, block)
+                positions = [block.index(token) for token in expected_order]
+                self.assertEqual(sorted(positions), positions)
+                self.assertIn("exit 1\nfi", block)
 
     def test_design_documents_bounded_raw_sse_parsing(self) -> None:
         decoder_source = (REPO_ROOT / "backend" / "app" / "physoc_sse.py").read_text(

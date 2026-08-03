@@ -10,8 +10,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def bash_fenced_blocks(text: str) -> list[str]:
+    return re.findall(r"(?ms)^[ \t]*```bash\s*$\n(.*?)^[ \t]*```\s*$", text)
+
+
+def first_effective_bash_command(block: str) -> str:
+    return next(
+        line.strip()
+        for line in block.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
 
 
 def service_block(compose: str, service: str) -> str:
@@ -949,7 +960,7 @@ class ComposeContractTest(unittest.TestCase):
             identity_lines = [
                 line
                 for line in env_path.read_text(encoding="utf-8").splitlines()
-                if line.startswith("DCAGENT_UID=") or line.startswith("DCAGENT_GID=")
+                if line.startswith(("DCAGENT_UID=", "DCAGENT_GID="))
             ]
             custom_env = (
                 "DATA_ROOT=../../artifacts/data\n"
@@ -1105,6 +1116,9 @@ class ComposeContractTest(unittest.TestCase):
                 def run(
                     *arguments: str,
                     set_host_data_root: bool,
+                    host_data: Path = host_data,
+                    copied_script: Path = copied_script,
+                    root: Path = root,
                 ) -> subprocess.CompletedProcess[str]:
                     process_environment = os.environ.copy()
                     process_environment.pop("HOST_DATA_ROOT", None)
@@ -2016,7 +2030,7 @@ class ComposeContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("pre-initialization only", text)
-        self.assertIn("ALTER ROLE", text)
+        self.assertIn("不提供在线 PostgreSQL role 密码修改", text)
         self.assertIn("advisory lock", text)
         self.assertIn("PostgreSQL target host", text)
         self.assertIn("Docker build", text)
@@ -2033,6 +2047,306 @@ class ComposeContractTest(unittest.TestCase):
         self.assertIn("`${VAR:?message}`", text)
         self.assertIn("unsupported Compose expansion", text)
         self.assertIn("missing environment variable", text)
+
+    def test_ubuntu_production_docs_use_bash_compose_entrypoints(self) -> None:
+        documents = {
+            "root readme": REPO_ROOT / "README.md",
+            "intranet checklist": (
+                REPO_ROOT / "docs" / "intranet-deployment-configuration.md"
+            ),
+            "offline runbook": REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            "offline compose readme": REPO_ROOT / "deploy" / "offline" / "README.md",
+        }
+        required_commands = (
+            "./tools/prepare_offline_env.sh",
+            "./tools/invoke_offline_compose.sh config",
+            "./tools/invoke_offline_compose.sh up -d",
+        )
+        for label, path in documents.items():
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(document=label):
+                for command in required_commands:
+                    self.assertIn(command, text)
+
+        intranet = documents["intranet checklist"].read_text(encoding="utf-8")
+        for forbidden in (
+            ".ps1",
+            "Copy-Item",
+            "$LASTEXITCODE",
+            "New-Item",
+            "& tools/",
+            "pwsh",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, intranet)
+        self.assertNotRegex(intranet, r"(?m)[ \t]+`[ \t]*$")
+
+        for label in ("offline runbook", "offline compose readme"):
+            text = documents[label].read_text(encoding="utf-8")
+            with self.subTest(document=label):
+                self.assertNotIn(".ps1", text)
+                self.assertNotIn("$LASTEXITCODE", text)
+                self.assertNotIn("New-Item", text)
+                self.assertNotRegex(text, r"(?m)[ \t]+`[ \t]*$")
+
+        root_readme = documents["root readme"].read_text(encoding="utf-8")
+        self.assertEqual(1, root_readme.count("Windows 开发机兼容"))
+        self.assertEqual(1, root_readme.count("tools/prepare_offline_env.ps1"))
+        self.assertEqual(1, root_readme.count("tools/invoke_offline_compose.ps1"))
+
+    def test_ubuntu_prepare_docs_delegate_env_creation_and_identity_to_script(
+        self,
+    ) -> None:
+        for path in (
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+        ):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertNotIn(
+                    "cp deploy/offline/.env.example deploy/offline/.env", text
+                )
+                for phrase in (
+                    "首次运行",
+                    "./tools/prepare_offline_env.sh",
+                    "自动创建 `deploy/offline/.env`",
+                    "非 root 部署账号",
+                    "`id -u`",
+                    "`id -g`",
+                    "`DCAGENT_UID`",
+                    "`DCAGENT_GID`",
+                    "不匹配时拒绝继续",
+                ):
+                    self.assertIn(phrase, text)
+
+    def test_multi_step_production_bash_blocks_fail_fast(self) -> None:
+        paths = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        )
+        operation_tokens = (
+            "./tools/invoke_offline_compose.sh",
+            "curl --fail-with-body",
+            "python -m app.physoc_probe",
+            "mkdir -p ",
+            "ollama pull ",
+            "uv run ",
+            "uv sync ",
+        )
+        checked = 0
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            for index, block in enumerate(bash_fenced_blocks(text)):
+                operation_count = sum(block.count(token) for token in operation_tokens)
+                if operation_count < 2:
+                    continue
+                checked += 1
+                with self.subTest(path=path.relative_to(REPO_ROOT), block=index):
+                    self.assertRegex(
+                        first_effective_bash_command(block), r"^set -E?euo pipefail$"
+                    )
+        self.assertGreaterEqual(checked, 10)
+
+    def test_transactional_intranet_deployment_docs_share_recovery_contract(
+        self,
+    ) -> None:
+        documents = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        )
+        required = (
+            "./tools/prepare_offline_env.sh --initialize-state",
+            "./tools/recover_offline_deployment.sh adopt-existing",
+            "./tools/recover_offline_deployment.sh inspect",
+            "./tools/recover_offline_deployment.sh resume-rollback",
+            "./tools/recover_offline_deployment.sh finalize-cleanup",
+            "./tools/recover_offline_deployment.sh acknowledge-repaired",
+            "./tools/recover_offline_deployment.sh clear-start-marker",
+            "DEPLOYMENT_STATE_ROOT",
+            "deployment-started.json",
+            "30 秒",
+            'sudo install -d -o "$deployment_user" -g "$deployment_group" -m 0700',
+            "export HOST_DATA_ROOT=/srv/dcagent/data",
+            "export HOST_MODEL_ROOT=/srv/dcagent/models",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "config/build/up/down/exec/cp",
+            "rollback_failed",
+            "committed_cleanup_required",
+            "journal/quarantine",
+            "intranet_deployment_gate.py --mode fresh",
+            "config 60 秒",
+            "build 1800 秒",
+            "up/readyz 300 秒",
+            "probe 60 秒",
+            "recovery drill 120 秒",
+            "live gate",
+            "不提供在线",
+            "不隐式创建 identity",
+            "DATA_ROOT",
+            "evidence receipt",
+        )
+        marker_delete = re.compile(
+            r"(?im)^\s*"
+            r"(?:sudo(?:\s+-\S+(?:\s+\S+)?)?\s+)?"
+            r"(?:env(?:\s+(?:-\S+|\w+=\S+))*\s+)?"
+            r"(?:command\s+)?(?:/usr/bin/|/bin/)?rm\b"
+            r"[^\n]*deployment-started\.json"
+        )
+        for command in (
+            "rm deployment-started.json",
+            "/bin/rm deployment-started.json",
+            "command rm deployment-started.json",
+            "sudo rm deployment-started.json",
+            "env -i rm deployment-started.json",
+            "sudo -u deploy command /usr/bin/rm deployment-started.json",
+            "sudo env KEEP=1 /bin/rm deployment-started.json",
+        ):
+            with self.subTest(marker_delete_command=command):
+                self.assertRegex(command, marker_delete)
+        for non_command in (
+            "sudo echo rm deployment-started.json",
+            "env printf rm deployment-started.json",
+        ):
+            with self.subTest(marker_delete_non_command=non_command):
+                self.assertNotRegex(non_command, marker_delete)
+        for path in documents:
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(document=path.relative_to(REPO_ROOT)):
+                for token in required:
+                    self.assertIn(token, text)
+                self.assertNotRegex(text, marker_delete)
+                clear_paragraphs = [
+                    paragraph
+                    for paragraph in re.split(r"\n\s*\n", text)
+                    if "./tools/recover_offline_deployment.sh clear-start-marker"
+                    in paragraph
+                ]
+                self.assertEqual(1, len(clear_paragraphs))
+                for precondition in (
+                    "DC-Agent 容器",
+                    "PG_VERSION",
+                    "PostgreSQL 目录",
+                    "未完成事务",
+                ):
+                    self.assertIn(precondition, clear_paragraphs[0])
+                for verb in ("config", "build", "up", "down", "exec", "cp"):
+                    self.assertIn(f"./tools/invoke_offline_compose.sh {verb}", text)
+
+    def test_fresh_deployment_docs_bind_srv_roots_before_manual_or_gate(self) -> None:
+        documents = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        )
+        prerequisites = (
+            "deployment_user=dcagent",
+            "deployment_group=dcagent",
+            'sudo install -d -o "$deployment_user" -g "$deployment_group" -m 0700',
+            "export HOST_DATA_ROOT=/srv/dcagent/data",
+            "export HOST_MODEL_ROOT=/srv/dcagent/models",
+            "由 `--initialize-state` 自动创建",
+        )
+        manual_sequence = (
+            "./tools/prepare_offline_env.sh --initialize-state",
+            "./tools/invoke_offline_compose.sh config",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "./tools/invoke_offline_compose.sh up -d",
+        )
+        gate_command = (
+            "python3 tools/intranet_deployment_gate.py --mode fresh --report "
+            "artifacts/benchmarks/intranet-deployment-gate.json"
+        )
+        for path in documents:
+            text = path.read_text(encoding="utf-8")
+            section_match = re.search(r"(?ms)^## Ubuntu 20\.04 .*?(?=^## |\Z)", text)
+            with self.subTest(document=path.relative_to(REPO_ROOT)):
+                self.assertIsNotNone(section_match)
+                assert section_match is not None
+                section = section_match.group(0)
+                for token in prerequisites:
+                    self.assertIn(token, section)
+                self.assertIn("已有 `deploy/offline/.env`", section)
+                self.assertIn("不得覆盖", section)
+                self.assertNotIn(
+                    "install -m 0600 deploy/offline/.env.example deploy/offline/.env",
+                    section,
+                )
+                self.assertNotIn("sed -i", section)
+                self.assertIn("二选一", section)
+                self.assertIn("手工路径", section)
+                self.assertIn("推荐 gate 路径", section)
+                self.assertIn("gate 自身执行", section)
+                self.assertIn("不要先运行手工路径", section)
+
+                prerequisite_end = max(section.index(token) for token in prerequisites)
+                manual_start = section.index(manual_sequence[0])
+                gate_start = section.index(gate_command)
+                self.assertLess(prerequisite_end, manual_start)
+                self.assertLess(prerequisite_end, gate_start)
+
+                manual_blocks = [
+                    block
+                    for block in bash_fenced_blocks(section)
+                    if all(token in block for token in manual_sequence)
+                ]
+                self.assertEqual(1, len(manual_blocks))
+                manual_positions = [
+                    manual_blocks[0].index(token) for token in manual_sequence
+                ]
+                self.assertEqual(sorted(manual_positions), manual_positions)
+
+    def test_production_doc_command_order_and_windows_scope(self) -> None:
+        documents = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        )
+        sequence = (
+            "./tools/prepare_offline_env.sh --initialize-state",
+            "./tools/invoke_offline_compose.sh config",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "./tools/invoke_offline_compose.sh up -d",
+        )
+        for path in documents:
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(document=path.relative_to(REPO_ROOT)):
+                blocks = [
+                    block
+                    for block in bash_fenced_blocks(text)
+                    if all(token in block for token in sequence)
+                ]
+                self.assertTrue(blocks)
+                positions = [blocks[0].index(token) for token in sequence]
+                self.assertEqual(positions, sorted(positions))
+                if path != documents[0]:
+                    for forbidden in ("pwsh", "Copy-Item", "New-Item", "$LASTEXITCODE"):
+                        self.assertNotIn(forbidden, text)
+
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertEqual(1, readme.count("Windows 开发机兼容"))
+        compatibility = re.search(r"(?ms)^Windows 开发机兼容：.*?(?=^### |\Z)", readme)
+        self.assertIsNotNone(compatibility)
+        assert compatibility is not None
+        self.assertLess(len(compatibility.group(0)), 300)
+        outside = readme[: compatibility.start()] + readme[compatibility.end() :]
+        for forbidden in (
+            "```powershell",
+            "pwsh",
+            "Copy-Item",
+            "New-Item",
+            "$LASTEXITCODE",
+            ".ps1",
+        ):
+            self.assertNotIn(forbidden, outside)
+        self.assertEqual(2, compatibility.group(0).count(".ps1"))
+        for block in bash_fenced_blocks(readme):
+            self.assertNotRegex(block, r"(?m)`[ \t]*$")
 
 
 if __name__ == "__main__":

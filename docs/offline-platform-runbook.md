@@ -2,9 +2,83 @@
 
 本文是 Phase 1 离线单机部署和容量门禁的操作记录。它只描述本地、可审计的开源组件和内部镜像；运行时不得访问公共模型 API、公共镜像仓库或其他外部服务。
 
+## Ubuntu 20.04 事务部署与恢复
+
+生产入口只使用 Ubuntu 20.04 Bash 的 `prepare_offline_env.sh`、`invoke_offline_compose.sh` 和
+`recover_offline_deployment.sh`；PowerShell 仅用于 Windows 开发机。`DEPLOYMENT_STATE_ROOT` 是
+`DATA_ROOT/.dcagent-deployment-state`，与 data/model/secret roots 绑定。普通 prepare/Compose
+不隐式创建 identity；更换 `DATA_ROOT` 视为新部署。
+
+新部署先由 Ubuntu 管理员预创建固定数据目录，并把 owner 设置为实际的非 root 部署账号。下面的
+`dcagent` 只是示例账号；部署前必须改成实际账号和组：
+
+```bash
+set -Eeuo pipefail
+deployment_user=dcagent
+deployment_group=dcagent
+sudo install -d -o "$deployment_user" -g "$deployment_group" -m 0700 \
+  /srv/dcagent/data /srv/dcagent/models
+```
+
+随后以该非 root 部署账号登录并进入仓库根目录。不要手工复制或改写 `.env.example`；首次不存在
+`deploy/offline/.env` 时，由 `--initialize-state` 自动创建 `.env`、写入当前 UID/GID，并把下面成对
+提供的 HOST roots 固化为绝对 `DATA_ROOT`/`MODEL_ROOT`。已有 `deploy/offline/.env` 不得覆盖，脚本会
+校验其 roots、UID/GID 和 deployment identity，不匹配时直接失败。
+
+公共前置完成后，手工路径与推荐 gate 路径二选一。
+
+### 手工路径
+
+固定核心顺序是 prepare → config → 单次 build → up：
+
+```bash
+set -Eeuo pipefail
+export HOST_DATA_ROOT=/srv/dcagent/data
+export HOST_MODEL_ROOT=/srv/dcagent/models
+./tools/prepare_offline_env.sh --initialize-state
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh up -d
+```
+
+### 推荐 gate 路径
+
+gate 自身执行上述 prepare/config/build/up 固定序列及验收；不要先运行手工路径，否则会重复 build/up。config 60 秒、build 1800 秒、up/readyz 300 秒、每个 probe 60 秒、recovery drill 120 秒。
+
+```bash
+set -Eeuo pipefail
+export HOST_DATA_ROOT=/srv/dcagent/data
+export HOST_MODEL_ROOT=/srv/dcagent/models
+python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
+```
+
+旧部署必须先执行接管，再普通 prepare：
+
+```bash
+set -Eeuo pipefail
+export HOST_DATA_ROOT=/absolute/data/root
+export HOST_MODEL_ROOT=/absolute/model/root
+./tools/recover_offline_deployment.sh adopt-existing --state-root /absolute/data/root/.dcagent-deployment-state
+./tools/prepare_offline_env.sh
+```
+
+锁超时是 30 秒。六个 Compose verb：config/build/up/down/exec/cp。`./tools/invoke_offline_compose.sh up`、
+`./tools/invoke_offline_compose.sh exec`、`./tools/invoke_offline_compose.sh cp` 在执行前 durable 写入
+`deployment-started.json`，失败保留；`./tools/invoke_offline_compose.sh config`、
+`./tools/invoke_offline_compose.sh build`、`./tools/invoke_offline_compose.sh down` 不写 marker。marker 存在时普通
+`--rotate-secrets` 拒绝；只有经 `recover_offline_deployment.sh clear-start-marker` 且确认无 `PG_VERSION`、无未完成事务后，才可能恢复 pre-init rotation。任意形态 `PG_VERSION` 存在后永久拒绝；不提供在线 PostgreSQL role 密码修改，也不提供单行删除 marker 命令。
+
+运行 `./tools/recover_offline_deployment.sh inspect --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>` 后处理：自动回滚成功可继续；
+`rollback_failed` 用 `./tools/recover_offline_deployment.sh resume-rollback --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+`committed_cleanup_required` 用 `./tools/recover_offline_deployment.sh finalize-cleanup --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+损坏 journal/quarantine 修复后用 `./tools/recover_offline_deployment.sh acknowledge-repaired --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id> --evidence /absolute/path/sanitized-repair-evidence.json`。
+人工运行 `./tools/recover_offline_deployment.sh clear-start-marker --state-root /absolute/data/root/.dcagent-deployment-state` 前，逐项确认无 DC-Agent 容器、无 `PG_VERSION`、PostgreSQL 目录不存在或未初始化、无未完成事务。日志和 evidence receipt 不含 secret、数据库 URL、模型正文或原始 SSE。
+
+开发机本地测试不是Ubuntu live gate通过；未在真实 Ubuntu Docker、Physoc、Ollama 环境运行时，只能记录 live gate 未运行。
+
 ## 1. 当前状态与适用范围
 
-- 目标环境是 Linux、PowerShell 7（`pwsh`）、rootful Docker Engine、Docker Compose v2、本地 `default` Docker context。
+- 目标环境是 Ubuntu 20.04、Bash、rootful Docker Engine、Docker Compose v2、本地 `default` Docker context。
 - Python 3.12 是支持的基线；Node.js 20 用于两个前端的本地开发和 UI smoke。
 - 本阶段启动 API、PostgreSQL、schema migration、ClickHouse、Qdrant、Redis、ClamAV 和一个私有 Embedding 服务。`indexing` 与 `generation` profile 默认关闭。
 - 生产 Compose 的唯一宿主端口是 `127.0.0.1:8000:8000/tcp`。内部服务只能通过 Compose 网络和 `exec` 检查访问。
@@ -14,8 +88,9 @@
 
 `backend/uv.lock` 是仓库唯一的后端 Python/uv 依赖锁。Python 3.12 必须预先安装在目标主机上，禁止 uv 下载或自动安装 Python。先在可审核的解析环境中从仓库根目录更新该锁；再把仓库与锁文件带到目标 Linux 主机，只使用已审核的内部 wheelhouse 执行冻结同步：
 
-```powershell
-$env:UV_PYTHON_DOWNLOADS = "never"
+```bash
+set -Eeuo pipefail
+export UV_PYTHON_DOWNLOADS=never
 uv lock --project backend --python 3.12
 uv sync --project backend --frozen --offline --group offline --no-dev --no-index --find-links artifacts/wheels
 uv sync --project backend --frozen --offline --no-default-groups --group benchmark --no-index --find-links artifacts/wheels
@@ -50,7 +125,7 @@ uv sync --project backend --frozen --offline --no-default-groups --group benchma
 
 对文件或无符号链接目录使用仓库已有的确定性 artifact 哈希实现，禁止用下载 URL 代替本地路径：
 
-```powershell
+```bash
 uv run --project backend --frozen --offline --no-default-groups --group benchmark python -c "from pathlib import Path; from tools.benchmarks.model_probe import sha256_artifact; print(sha256_artifact(Path(r'artifacts/vendor/example-artifact')))"
 ```
 
@@ -63,18 +138,21 @@ uv run --project backend --frozen --offline --no-default-groups --group benchmar
 
 可用下面的只读检查验证清单形状（不会访问网络）：
 
-```powershell
-$env:PYTHONPATH = "backend"
+```bash
+export PYTHONPATH=backend
 uv run --project backend --frozen --offline --no-default-groups --group offline python -c "import json; from pathlib import Path; from app.offline_artifacts import validate_artifact_manifest; validate_artifact_manifest(json.loads(Path('deploy/offline/artifacts.lock.json').read_text(encoding='utf-8'))); print('artifact manifest valid')"
 ```
 
 ## 4. Compose profile、内存预算与准备
 
-先复制并填写 `deploy/offline/.env.example`：
+首次准备不要手工复制 `deploy/offline/.env.example`。首次运行
+`./tools/prepare_offline_env.sh --initialize-state` 会自动创建 `deploy/offline/.env`，读取当前非 root 部署账号的
+`id -u` 和 `id -g`，并写入 `DCAGENT_UID` 和 `DCAGENT_GID`。如果已有配置中的
+`DCAGENT_UID` 或 `DCAGENT_GID` 与当前账号不匹配，脚本会 fail closed，不匹配时拒绝继续：
 
-```powershell
-Copy-Item deploy/offline/.env.example deploy/offline/.env
-& tools/prepare_offline_env.ps1
+```bash
+set -Eeuo pipefail
+./tools/prepare_offline_env.sh --initialize-state
 ```
 
 必须替换全部占位 digest、Embedding checksum、模型文件和模型名。默认资源预算记录如下；它们是 Compose 配置值，不是已经测得的性能结果：
@@ -94,9 +172,10 @@ profile 约定：
 
 所有 Compose 操作必须经由受信 wrapper：
 
-```powershell
-& tools/invoke_offline_compose.ps1 config --quiet
-& tools/invoke_offline_compose.ps1 up -d
+```bash
+set -Eeuo pipefail
+./tools/invoke_offline_compose.sh config --quiet
+./tools/invoke_offline_compose.sh up -d
 ```
 
 不要直接运行 `docker compose`，不要使用远程 context、rootless Docker、userns remapping、NFS root-squash 或 Windows container UID 语义。wrapper 会在执行前清理环境覆盖、渲染所有 profile，并拒绝非内部 digest、异常 bind/secret、非 loopback API 端口和其他绕过参数。
@@ -107,17 +186,17 @@ profile 约定：
 
 在目标主机完成 artifact、`.env`、镜像和目录准备后，从仓库根目录运行：
 
-```powershell
-$HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
-uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py `
-  --report "artifacts/benchmarks/$HardwareClass/compose-smoke.json"
+```bash
+hardware_class=32gb # 64GB 主机必须改为 64gb
+uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py \
+  --report "artifacts/benchmarks/${hardware_class}/compose-smoke.json"
 ```
 
 命令会依次执行 wrapper `config`、仅启动 `api` 及其核心依赖、通过 `exec` 检查 PostgreSQL/Alembic、ClickHouse、Qdrant、Redis、ClamAV、Embedding，并请求宿主 `127.0.0.1:8000/api/readyz`。默认 `down` 保留 volume；只有明确传入 `--remove-volumes` 才删除 volume。该选项是破坏性清理，不属于常规验收命令，执行前必须确认 volume 可删除并继续写入独立报告：
 
-```powershell
-uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py `
-  --report "artifacts/benchmarks/$HardwareClass/compose-smoke-remove-volumes.json" `
+```bash
+uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py \
+  --report "artifacts/benchmarks/${hardware_class}/compose-smoke-remove-volumes.json" \
   --remove-volumes
 ```
 
@@ -129,16 +208,17 @@ uv run --project backend --frozen --offline --no-default-groups --group offline 
 
 命令形状如下（将最后的 benchmark command 替换为目标主机已审核的本地命令）：
 
-```powershell
-$HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
-uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark `
-  --manifest tools/benchmarks/manifests/smoke.json `
-  --metrics "artifacts/benchmarks/$HardwareClass/service-metrics.json" `
-  --report "artifacts/benchmarks/$HardwareClass/service-report.json" `
-  --profile service-round-trip `
-  --mode phase1-smoke `
-  --vector-dimension 32 `
-  --model-slots 1 `
+```bash
+set -Eeuo pipefail
+hardware_class=32gb # 64GB 主机必须改为 64gb
+uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark \
+  --manifest tools/benchmarks/manifests/smoke.json \
+  --metrics "artifacts/benchmarks/${hardware_class}/service-metrics.json" \
+  --report "artifacts/benchmarks/${hardware_class}/service-report.json" \
+  --profile service-round-trip \
+  --mode phase1-smoke \
+  --vector-dimension 32 \
+  --model-slots 1 \
   --benchmark-command <approved-local-service-round-trip-command>
 ```
 
@@ -150,17 +230,18 @@ uv run --project backend --frozen --offline --no-default-groups --group benchmar
 
 冷缓存示例（768 维、2 个模型槽位）如下。外层 capacity runner 会把绝对路径注入 `BENCHMARK_METRICS_PATH`，仓库的 `tools/benchmarks/locustfile.py` 在 Locust `test_stop` 事件中汇总请求并原子写出该 JSON；普通 stock Locust 单独运行不会生成 capacity metrics：
 
-```powershell
-$HardwareClass = "32gb" # 64GB 主机必须改为 "64gb"
-uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark `
-  --manifest tools/benchmarks/manifests/acceptance-30m-5m.json `
-  --metrics "artifacts/benchmarks/$HardwareClass/online-cold-metrics.json" `
-  --report "artifacts/benchmarks/$HardwareClass/online-cold-report.json" `
-  --profile online-cold `
-  --mode phase4-online `
-  --cache-label cold `
-  --vector-dimension 768 `
-  --model-slots 2 `
+```bash
+set -Eeuo pipefail
+hardware_class=32gb # 64GB 主机必须改为 64gb
+uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark \
+  --manifest tools/benchmarks/manifests/acceptance-30m-5m.json \
+  --metrics "artifacts/benchmarks/${hardware_class}/online-cold-metrics.json" \
+  --report "artifacts/benchmarks/${hardware_class}/online-cold-report.json" \
+  --profile online-cold \
+  --mode phase4-online \
+  --cache-label cold \
+  --vector-dimension 768 \
+  --model-slots 2 \
   --benchmark-command uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m locust -f tools/benchmarks/locustfile.py --headless -u 15 -r 1 --run-time 30m --host http://127.0.0.1:8000
 ```
 
@@ -204,10 +285,11 @@ artifacts/benchmarks/64gb/
 
 目标 Linux 主机本地、无需 Docker 的回归统一使用锁定的 uv 项目环境：
 
-```powershell
-Set-Location backend
+```bash
+set -Eeuo pipefail
+cd backend
 uv run --project . --frozen --offline --no-default-groups --group offline python -m unittest discover -s tests -p "test_*.py" -v
-Set-Location ..
+cd ..
 uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m unittest discover -s tools/tests -p "test_*.py" -v
 uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m compileall -q tools
 git diff --check
@@ -215,7 +297,8 @@ git diff --check
 
 目标主机 gate：
 
-```powershell
+```bash
+set -Eeuo pipefail
 uv run --project backend --frozen --offline --no-default-groups --group offline python tools/compose_smoke.py
 uv run --project backend --frozen --offline --no-default-groups --group benchmark python -m tools.benchmarks.run_capacity_benchmark --help
 ```
@@ -227,5 +310,5 @@ uv run --project backend --frozen --offline --no-default-groups --group benchmar
 - smoke 的任何 command、HTTP status、JSON、版本或 checksum 失败都按失败处理；不要手工编辑 report 把 `passed` 改成 true。
 - Compose 配置失败时不要删除数据目录；默认 cleanup 不移除 volume。
 - 第一次 PostgreSQL baseline stamp 之前必须有可恢复备份；baseline drift 应停止启动，不要用 downgrade 代替恢复。
-- secret rotation 仅适用于 PostgreSQL 初始化前；初始化后必须走受控 `ALTER ROLE`、双文件切换和连通性验证流程。
+- secret rotation 仅适用于 PostgreSQL 初始化前；初始化后不提供在线 PostgreSQL role 密码修改或双文件切换流程，必须保留现有 secret pair 并按恢复 runbook 处理。
 - 发现公共 endpoint、公共镜像、未审核 license、符号链接 bind source、远程 Docker context 或缺少 hash 时，立即停止并记录为 gate failure。
