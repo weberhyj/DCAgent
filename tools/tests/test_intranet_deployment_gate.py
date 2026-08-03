@@ -428,9 +428,14 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         from tools.intranet_deployment_gate import _run_recovery_drill
 
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "full-drill"
-            root.mkdir()
+            parent = Path(directory)
+            actual_drill_root = parent / "actual-drill-root"
             calls: list[list[str]] = []
+
+            def mkdtemp(*, prefix: str) -> str:
+                self.assertEqual("dcagent-recovery-drill-", prefix)
+                actual_drill_root.mkdir()
+                return str(actual_drill_root)
 
             def runner(
                 argv: list[str],
@@ -453,12 +458,31 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                     timeout=timeout,
                 )
 
-            _run_recovery_drill(
-                self.config(Path(__file__).resolve().parents[2]), runner=runner
-            )
+            with mock.patch(
+                "tools.intranet_deployment_gate.tempfile.mkdtemp", side_effect=mkdtemp
+            ) as mocked_mkdtemp:
+                _run_recovery_drill(
+                    self.config(Path(__file__).resolve().parents[2]), runner=runner
+                )
 
-        self.assertTrue(any(argv[:3] == ["docker", "ps", "-a"] for argv in calls))
-        self.assertFalse(root.exists())
+            mocked_mkdtemp.assert_called_once_with(prefix="dcagent-recovery-drill-")
+            self.assertTrue(any(argv[:3] == ["docker", "ps", "-a"] for argv in calls))
+            for path in (
+                actual_drill_root,
+                actual_drill_root / "data",
+                actual_drill_root / "models",
+                actual_drill_root / "secrets",
+                actual_drill_root / "repo",
+                actual_drill_root / "data" / ".dcagent-deployment-state",
+                actual_drill_root
+                / "data"
+                / ".dcagent-deployment-state"
+                / "deployment-identity.json",
+                actual_drill_root / "data" / ".dcagent-deployment-state" / "history",
+                actual_drill_root / "secrets" / ".dcagent-transactions",
+                actual_drill_root / "secrets" / "postgres-password",
+            ):
+                self.assertFalse(path.exists(), path)
 
     @unittest.skipUnless(
         os.name == "posix", "requires POSIX SIGKILL and ownership semantics"
