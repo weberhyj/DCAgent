@@ -261,6 +261,15 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(source["records"], 0)
         assert_display_timestamp(self, source["updatedAt"])
 
+    def test_adds_knowledge_source_with_public_default_classification(self) -> None:
+        response = self.client.post(
+            "/api/knowledge/sources",
+            json={"name": "公开制度.txt", "sourceType": "TXT"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()[0]["classification"], "公开")
+
     def test_assistant_reply_uses_indexed_knowledge_without_exposing_sources(self) -> None:
         self.repository.add_uploaded_knowledge_source(
             source_id="kb-cashflow",

@@ -500,7 +500,7 @@ def reindex_knowledge_source(
 async def upload_knowledge_file(
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
-    classification: str = Form(default="内部·机密"),
+    classification: str = Form(default="公开"),
     repository: ChatRepository = Depends(get_repository),
     storage: KnowledgeFileStorage = Depends(get_storage),
     ingestion_queue: KnowledgeIngestionQueue = Depends(get_ingestion_queue),

@@ -613,7 +613,7 @@ class StructuredStatusResponse(ApiModel):
 class KnowledgeSourceRequest(ApiModel):
     name: str = Field(min_length=1, max_length=200)
     source_type: str = Field(alias="sourceType", min_length=1, max_length=80)
-    classification: str = Field(default="内部·机密", min_length=1, max_length=80)
+    classification: str = Field(default="公开", min_length=1, max_length=80)
 
     @field_validator("name", "source_type", "classification")
     @classmethod
