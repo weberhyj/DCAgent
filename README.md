@@ -264,6 +264,14 @@ flowchart TD
   `RETRIEVAL_CANARY_PERCENT` 选择 Ollama-backed 混合检索；未命中 canary 或
   Embedding、Reranker、Qdrant、Alias、超时/熔断异常时安全回退 Legacy。
 
+新上传知识库文档的默认分类为“公开”，默认部署模板使用：
+
+```env
+RETRIEVAL_PERMISSION_TAGS=公开
+```
+
+显式提交的其他分类仍会保留。升级不会修改数据库中的历史分类，现有文档不会自动迁移；如需采用新默认值，请删除后重新导入并等待索引完成。
+
 DC-Agent 本身不再运行 Embedding/Reranker 权重；只有两个 adapter 服务调用公司内网可达的
 Ollama，不依赖外部 API。`qwen2.5:3b` 生成式 rerank 是兼容模式，不等价于专用 cross-encoder，
 必须在目标服务器完成 15 并发容量测试并观测 429/503、延迟和 controlled fallback。

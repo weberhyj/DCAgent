@@ -351,7 +351,10 @@ set -Eeuo pipefail
 RETRIEVAL_MODE=shadow
 RETRIEVAL_SHADOW_PERCENT=10
 RETRIEVAL_CANARY_PERCENT=0
+RETRIEVAL_PERMISSION_TAGS=公开
 ```
+
+后续未显式选择分类的新上传文档默认使用“公开”，该值必须与检索权限标签保持一致。显式分类不会被覆盖。升级不会批量修改数据库，现有文档不会自动迁移；管理员可以删除旧文档后重新导入。
 
 影子模式仍把 Legacy 结果返回给用户，混合检索主要用于后台对比。首次上线应先保持影子模式，重建全部文档向量：
 

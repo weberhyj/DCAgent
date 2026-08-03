@@ -163,6 +163,16 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         )
         self.assertEqual(offline_values["RERANKER_BATCH_MAX_ITEMS"], "32")
 
+    def test_public_classification_default_is_documented(self) -> None:
+        for path in (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+        ):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertIn("RETRIEVAL_PERMISSION_TAGS=公开", text)
+                self.assertIn("现有文档不会自动迁移", text)
+
     def test_api_receives_retrieval_rollout_and_pinned_metadata(self) -> None:
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
             encoding="utf-8"
