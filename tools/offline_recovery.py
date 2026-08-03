@@ -3254,25 +3254,20 @@ def _postgres_initialized(data_root: Path) -> bool:
         ) from None
 
 
-def _verify_control_state_directories(
-    paths: state.StatePaths, *, include_transactions: bool = False
-) -> None:
-    directories = [paths.control_transactions, paths.history]
-    if include_transactions:
-        directories.insert(0, paths.transactions)
+def _verify_control_state_directories(paths: state.StatePaths) -> None:
     for directory, description in (
         (paths.transactions, "transaction directory"),
         (paths.control_transactions, "control transaction directory"),
         (paths.history, "history directory"),
+        (paths.quarantine, "quarantine directory"),
     ):
-        if directory in directories:
-            state._verify_directory(directory, description)
+        state._verify_directory(directory, description)
 
 
 def _assert_only_control_transaction(
     paths: state.StatePaths, transaction_id: str
 ) -> None:
-    _verify_control_state_directories(paths, include_transactions=True)
+    _verify_control_state_directories(paths)
     for directory in (paths.transactions, paths.control_transactions):
         try:
             entries = list(os.scandir(directory))

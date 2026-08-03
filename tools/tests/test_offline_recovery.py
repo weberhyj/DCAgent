@@ -4925,7 +4925,12 @@ class RecoveryCliTests(unittest.TestCase):
     def test_control_wal_creation_rejects_unsafe_parent_before_writing_wal(
         self,
     ) -> None:
-        for name in ("control_transactions", "history"):
+        for name in (
+            "transactions",
+            "control_transactions",
+            "history",
+            "quarantine",
+        ):
             with self.subTest(name=name):
                 paths = state.StatePaths(
                     state.derive_state_root(self.base / f"unsafe-{name}-data")
@@ -4956,7 +4961,12 @@ class RecoveryCliTests(unittest.TestCase):
     def test_control_wal_creation_rejects_non_directory_parent_before_writing_wal(
         self,
     ) -> None:
-        for name in ("control_transactions", "history"):
+        for name in (
+            "transactions",
+            "control_transactions",
+            "history",
+            "quarantine",
+        ):
             with self.subTest(name=name):
                 paths = state.StatePaths(
                     state.derive_state_root(self.base / f"unsafe-type-{name}-data")
@@ -4983,7 +4993,12 @@ class RecoveryCliTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "POSIX modes and owners require POSIX")
     def test_control_wal_creation_rejects_unsafe_parent_mode_and_owner(self) -> None:
-        for name in ("control_transactions", "history"):
+        for name in (
+            "transactions",
+            "control_transactions",
+            "history",
+            "quarantine",
+        ):
             with self.subTest(name=name, defect="mode"):
                 paths = state.StatePaths(
                     state.derive_state_root(self.base / f"unsafe-mode-{name}-data")
