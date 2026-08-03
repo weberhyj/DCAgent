@@ -22,28 +22,13 @@ DC-Agent 是一个公司内部只读知识 Agent。管理员把制度、合同�
 postgresql+psycopg://postgres:123456@127.0.0.1:5432/dc_agent
 ```
 
-### Windows 开发机（仅限本地开发）
-
-手动创建数据库示例：
-
-```powershell
-$env:PGPASSWORD="123456"
-D:\PostgreSQL\18\bin\createdb.exe -h 127.0.0.1 -p 5432 -U postgres dc_agent
-Remove-Item Env:PGPASSWORD
-```
-
 也可以用 `DATABASE_URL` 覆盖默认连接串。管理员上传的文件默认保存在 `backend/uploads/knowledge`，该目录只用于本地运行数据，不进入版本管理。
 
 ## 环境变量
 
 后端启动时会自动读取项目根目录 `.env` 和 `backend/.env`。读取顺序为根目录 `.env` 后读取 `backend/.env`，但系统环境变量优先级最高，不会被文件覆盖。
 
-复制示例文件：
-
-```powershell
-Copy-Item .env.example .env
-Copy-Item backend\.env.example backend\.env
-```
+本地开发时，按所用开发环境为项目根目录和 `backend` 创建各自的 `.env` 文件。
 
 本地兜底模式：
 
@@ -120,8 +105,8 @@ mkdir -p artifacts/benchmarks
 ## Ubuntu 20.04 公司内网事务部署
 
 生产主路径只支持 Ubuntu 20.04、Bash、rootful Docker Compose v2 和仓库根目录下的
-`prepare_offline_env.sh`、`invoke_offline_compose.sh`、`recover_offline_deployment.sh`；PowerShell
-仅用于 Windows 开发机。`DEPLOYMENT_STATE_ROOT` 必须是 `DATA_ROOT/.dcagent-deployment-state`，由
+`prepare_offline_env.sh`、`invoke_offline_compose.sh`、`recover_offline_deployment.sh`。`DEPLOYMENT_STATE_ROOT`
+必须是 `DATA_ROOT/.dcagent-deployment-state`，由
 初始化或接管操作写入并与 data/model/secret roots 绑定。普通 prepare/Compose 不隐式创建 identity；
 更换 `DATA_ROOT` 视为新部署。
 
@@ -500,112 +485,9 @@ P95、错误率和 fallback rate；强制命令见离线部署手册。
 Redis/Celery 异步任务、ClamAV 上传扫描、细粒度引用和千万级整体验收。详细阶段和退出门禁见
 [`企业知识库升级路线`](docs/superpowers/plans/2026-07-24-enterprise-knowledge-base-qa-rollout.md)。
 
-## Windows 开发机启动（仅限本地开发）
+## 本地开发补充
 
-后端：
-
-```powershell
-uv sync --project backend --group dev
-Set-Location backend
-uv run --project . --group dev python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-Set-Location ..
-```
-
-用户检索端：
-
-```powershell
-cd frontend
-npm.cmd install
-npm.cmd run dev
-```
-
-默认访问地址：`http://127.0.0.1:5173`
-
-知识库管理端：
-
-```powershell
-cd admin-frontend
-npm.cmd install
-npm.cmd run dev
-```
-
-默认访问地址：`http://127.0.0.1:5174`
-
-管理端按功能拆分为独立路由：
-
-- `/overview`：管理概览与最近活动。
-- `/knowledge`：资料上传、筛选、重建索引和删除。
-- `/knowledge/{sourceId}`：指定资料的解析详情与片段预览。
-- `/agent-runs`：DCAgent 只读执行审计。
-
-## Windows 开发机本地验证（仅限本地开发）
-
-后端测试：
-
-```powershell
-Set-Location backend
-uv run --project . --group dev python -m unittest discover -s tests -p "test_*.py" -v
-Set-Location ..
-```
-
-后端代码质量：
-
-> 历史文档曾写 `uv run --project backend --group dev ruff check backend` 和
-> `uv run --project backend --group dev ruff format backend`，但当前 `dev` group 不包含 Ruff；
-> 不要使用这些旧命令。以下 `uvx ruff` 调用已在本仓库实际验证。
-
-```powershell
-uvx ruff check backend tools
-uvx ruff format --check backend tools
-uvx ruff format backend tools
-```
-
-用户检索端：
-
-```powershell
-cd frontend
-npm.cmd run test:run
-npm.cmd run build
-```
-
-知识库管理端：
-
-```powershell
-cd admin-frontend
-npm.cmd run test:run
-npm.cmd run build
-```
-
-页面级冒烟（可选，需先确保已安装 Playwright Chromium）：
-
-UI smoke 使用独立、已安装 Playwright/Pillow 的 QA Python 环境，不由 backend UV dependency groups 管理。
-
-```powershell
-# 终端 1
-tools\start_smoke_backend.cmd
-
-# 终端 2
-tools\start_smoke_frontend.cmd
-
-# 终端 3
-tools\start_smoke_admin.cmd
-
-# 终端 4
-py tools\ui_smoke.py
-```
-
-冒烟脚本会使用临时后端 `8015`、用户端 `5177`、管理端 `5178`，截图输出到 `qa-screenshots`。
-
-冒烟流程还会在临时 SQLite 环境中验证质量评测工作台：导入预览不会提前落库，确认后可创建评测案例，两个不同阈值的批次能够完成，并可查看报告详情、批次比较以及桌面端和 390×844 移动端布局。临时服务退出后测试数据自动销毁。
-
-完整冒烟建议：
-
-1. 启动后端。
-2. 启动知识库管理端，上传一份 `.txt`、`.md`、`.docx`、`.xlsx`、`.csv`，或文本型、未加密且在已验收大小内的 `.pdf` 文档。
-3. 等待资料源状态从 `解析中` 变为 `已索引`。
-4. 启动用户检索端，询问文档中的制度、合同或业务问题。
-5. 确认 DCAgent 回答只基于知识库内容，不在用户侧暴露资料原文管理入口。
-6. 回到知识库管理端，确认“Agent 执行审计”中出现本次检索、资料检查、证据对比和回答生成步骤。
+管理端提供概览、知识库维护、指定资料详情和 Agent 执行审计等独立路由。开发环境的 UI smoke 使用临时 SQLite 数据、临时端口和独立 QA Python 环境；测试结束后临时数据会销毁。
 
 ## 离线平台运行手册
 
