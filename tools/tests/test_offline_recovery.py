@@ -5396,17 +5396,143 @@ class RecoveryCliTests(unittest.TestCase):
                         self.paths,
                         transaction_id,
                         containers_exist=lambda: False,
+                        mutation_backend=PortableMutationBackend(),
                     )
                 receipt = recovery.clear_start_marker(
                     self.paths,
                     transaction_id,
                     containers_exist=lambda: False,
+                    mutation_backend=PortableMutationBackend(),
                 )
                 self.assertEqual(receipt["command"], "clear-start-marker")
                 self.assertFalse(self.paths.start_marker.exists())
                 self.assertFalse(
                     (self.paths.control_transactions / transaction_id).exists()
                 )
+
+    def test_clear_start_marker_backup_collision_preserves_both_files(self) -> None:
+        self.create_marker()
+        marker_before = self.paths.start_marker.read_bytes()
+        transaction_id = uuid.uuid4().hex
+        backup = (
+            self.paths.control_transactions / transaction_id / "start-marker.backup"
+        )
+        occupied = b"operator-owned-backup"
+
+        class OccupyBackupBackend(PortableMutationBackend):
+            def rename_noreplace(
+                self,
+                source: Path,
+                target: Path,
+                *,
+                expected_source: os.stat_result,
+            ) -> None:
+                target.write_bytes(occupied)
+                if os.name == "posix":
+                    target.chmod(0o600)
+                super().rename_noreplace(
+                    source,
+                    target,
+                    expected_source=expected_source,
+                )
+
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.clear_start_marker(
+                self.paths,
+                transaction_id,
+                containers_exist=lambda: False,
+                mutation_backend=OccupyBackupBackend(),
+            )
+        self.assertEqual(marker_before, self.paths.start_marker.read_bytes())
+        self.assertEqual(occupied, backup.read_bytes())
+        self.assertTrue((self.paths.control_transactions / transaction_id).is_dir())
+
+    def test_clear_start_marker_restore_collision_preserves_marker_and_backup(
+        self,
+    ) -> None:
+        self.create_marker()
+        transaction_id = uuid.uuid4().hex
+
+        def interrupt(_command: str, phase: str) -> None:
+            if phase == "marker_backed_up":
+                raise OSError("simulated hard exit")
+
+        with (
+            mock.patch.object(
+                recovery,
+                "_after_control_step",
+                side_effect=interrupt,
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.clear_start_marker(
+                self.paths,
+                transaction_id,
+                containers_exist=lambda: False,
+                mutation_backend=PortableMutationBackend(),
+            )
+        backup = (
+            self.paths.control_transactions / transaction_id / "start-marker.backup"
+        )
+        self.assertTrue(backup.is_file())
+        state.create_start_marker(
+            self.paths,
+            operation="exec",
+            deployment_identity_hash=self.identity_hash,
+        )
+        replacement = self.paths.start_marker.read_bytes()
+
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.clear_start_marker(
+                self.paths,
+                transaction_id,
+                containers_exist=lambda: True,
+                mutation_backend=PortableMutationBackend(),
+            )
+        self.assertEqual(replacement, self.paths.start_marker.read_bytes())
+        self.assertTrue(backup.is_file())
+        self.assertTrue((self.paths.control_transactions / transaction_id).is_dir())
+
+    def test_clear_start_marker_rejects_replaced_backup_identity(self) -> None:
+        self.create_marker()
+        transaction_id = uuid.uuid4().hex
+
+        def interrupt(_command: str, phase: str) -> None:
+            if phase == "marker_backed_up":
+                raise OSError("simulated hard exit")
+
+        with (
+            mock.patch.object(
+                recovery,
+                "_after_control_step",
+                side_effect=interrupt,
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.clear_start_marker(
+                self.paths,
+                transaction_id,
+                containers_exist=lambda: False,
+                mutation_backend=PortableMutationBackend(),
+            )
+        backup = (
+            self.paths.control_transactions / transaction_id / "start-marker.backup"
+        )
+        raw = backup.read_bytes()
+        backup.unlink()
+        backup.write_bytes(raw)
+        if os.name == "posix":
+            backup.chmod(0o600)
+
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.clear_start_marker(
+                self.paths,
+                transaction_id,
+                containers_exist=lambda: False,
+                mutation_backend=PortableMutationBackend(),
+            )
+        self.assertTrue(backup.is_file())
+        self.assertTrue((self.paths.control_transactions / transaction_id).is_dir())
 
     def test_initialized_adoption_publishes_marker_before_identity(self) -> None:
         self.paths.identity.unlink()
@@ -5542,6 +5668,165 @@ class RecoveryCliTests(unittest.TestCase):
         state.atomic_write_json(receipt_path, tampered)
         with self.assertRaises(state.DeploymentStateError):
             recovery.acknowledge_repaired(self.paths, self.transaction_id, evidence)
+
+    def test_acknowledge_repaired_uses_authoritative_directory_verification(
+        self,
+    ) -> None:
+        evidence = self.base / "repair-authority-evidence.txt"
+        evidence.write_text("repair complete", encoding="utf-8")
+        original_verify = state._verify_directory
+
+        source_id = uuid.uuid4().hex
+        source = self.paths.transactions / source_id
+        source.mkdir(mode=0o700)
+
+        def reject_source(path: Path, *args: object, **kwargs: object):
+            if path == source:
+                raise state.DeploymentStateError("unsafe damaged transaction")
+            return original_verify(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(recovery, "_active_state_revalidated"),
+            mock.patch.object(
+                state,
+                "_verify_directory",
+                side_effect=reject_source,
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.acknowledge_repaired(
+                self.paths,
+                source_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
+        self.assertTrue(source.is_dir())
+
+        target_id = uuid.uuid4().hex
+        target_source = self.paths.transactions / target_id
+        target_source.mkdir(mode=0o700)
+
+        def interrupt(_command: str, phase: str) -> None:
+            if phase == "transaction_quarantined":
+                raise OSError("simulated hard exit")
+
+        with (
+            mock.patch.object(recovery, "_active_state_revalidated"),
+            mock.patch.object(
+                recovery,
+                "_after_control_step",
+                side_effect=interrupt,
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.acknowledge_repaired(
+                self.paths,
+                target_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
+        target = self.paths.quarantine / target_id
+
+        def reject_target(path: Path, *args: object, **kwargs: object):
+            if path == target:
+                raise state.DeploymentStateError("unsafe quarantined transaction")
+            return original_verify(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(recovery, "_active_state_revalidated"),
+            mock.patch.object(
+                state,
+                "_verify_directory",
+                side_effect=reject_target,
+            ),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.acknowledge_repaired(
+                self.paths,
+                target_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
+        self.assertTrue(target.is_dir())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX modes require POSIX")
+    def test_acknowledge_repaired_rejects_unsafe_source_and_target_mode(self) -> None:
+        evidence = self.base / "repair-mode-evidence.txt"
+        evidence.write_text("repair complete", encoding="utf-8")
+
+        source_id = uuid.uuid4().hex
+        damaged = self.paths.transactions / source_id
+        damaged.mkdir(mode=0o700)
+        damaged.chmod(0o755)
+        with self.assertRaises(state.DeploymentStateError):
+            recovery.acknowledge_repaired(
+                self.paths,
+                source_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
+        self.assertTrue(damaged.is_dir())
+        self.assertFalse((self.paths.quarantine / source_id).exists())
+
+        target_id = uuid.uuid4().hex
+        target_source = self.paths.transactions / target_id
+        target_source.mkdir(mode=0o700)
+
+        def interrupt(_command: str, phase: str) -> None:
+            if phase == "transaction_quarantined":
+                raise OSError("simulated hard exit")
+
+        with (
+            mock.patch.object(recovery, "_active_state_revalidated"),
+            mock.patch.object(
+                recovery,
+                "_after_control_step",
+                side_effect=interrupt,
+            ),
+            self.assertRaises(OSError),
+        ):
+            recovery.acknowledge_repaired(
+                self.paths,
+                target_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
+        target = self.paths.quarantine / target_id
+        target.chmod(0o755)
+        with (
+            mock.patch.object(recovery, "_active_state_revalidated"),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery.acknowledge_repaired(
+                self.paths,
+                target_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
+        self.assertTrue(target.is_dir())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0,
+        "wrong-owner fixture requires POSIX root",
+    )
+    def test_acknowledge_repaired_rejects_wrong_owner_source(self) -> None:
+        evidence = self.base / "repair-owner-evidence.txt"
+        evidence.write_text("repair complete", encoding="utf-8")
+        transaction_id = uuid.uuid4().hex
+        damaged = self.paths.transactions / transaction_id
+        damaged.mkdir(mode=0o700)
+        uid, gid = recovery._current_owner()
+        os.chown(damaged, uid + 1, gid + 1)
+        try:
+            with self.assertRaises(state.DeploymentStateError):
+                recovery.acknowledge_repaired(
+                    self.paths,
+                    transaction_id,
+                    evidence,
+                    mutation_backend=PortableMutationBackend(),
+                )
+        finally:
+            os.chown(damaged, uid, gid)
 
     def test_acknowledge_repaired_resumes_each_durable_control_phase(self) -> None:
         phases = (

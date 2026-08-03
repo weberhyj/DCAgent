@@ -2569,12 +2569,25 @@ def build_parser() -> argparse.ArgumentParser:
 def _control_details(command: str, details: Mapping[str, object]) -> dict[str, object]:
     result = dict(details)
     if command == "clear-start-marker":
-        if set(result) != {"marker_digest"} or (
+        if set(result) == {"marker_digest"}:
+            result.update({"marker_device": None, "marker_inode": None})
+        if set(result) != {
+            "marker_digest",
+            "marker_device",
+            "marker_inode",
+        } or (
             result["marker_digest"] is not None
             and (
                 not isinstance(result["marker_digest"], str)
                 or _HEX_DIGEST.fullmatch(result["marker_digest"]) is None
             )
+        ):
+            raise state.DeploymentStateError("invalid clear-start-marker control WAL")
+        marker_device = result["marker_device"]
+        marker_inode = result["marker_inode"]
+        if (marker_device is None) != (marker_inode is None) or (
+            marker_device is not None
+            and (type(marker_device) is not int or type(marker_inode) is not int)
         ):
             raise state.DeploymentStateError("invalid clear-start-marker control WAL")
         return result
@@ -3518,6 +3531,7 @@ def clear_start_marker(
     *,
     environ: Mapping[str, str] | None = None,
     containers_exist: Callable[[], bool] | None = None,
+    mutation_backend: FilesystemMutationBackend | None = None,
 ) -> dict[str, object]:
     existing_receipt = _existing_recovery_receipt(
         paths, transaction_id, "clear-start-marker"
@@ -3539,11 +3553,19 @@ def clear_start_marker(
         command="clear-start-marker",
         deployment_identity_hash=identity_hash,
         phase="clear_planned",
-        details={"marker_digest": None},
+        details={
+            "marker_digest": None,
+            "marker_device": None,
+            "marker_inode": None,
+        },
     )
     backup = journal.root / "start-marker.backup"
     if journal.phase == "clear_planned":
+        marker_before = state._verify_regular_file(paths.start_marker, "start marker")
         raw = _read_valid_marker(paths, identity_hash)
+        marker_after = state._verify_regular_file(paths.start_marker, "start marker")
+        if not _same_identity(marker_before, marker_after):
+            raise state.DeploymentStateError("start marker changed")
         _assert_clear_gates(
             paths,
             transaction_id,
@@ -3551,7 +3573,11 @@ def clear_start_marker(
             environ=environ,
             containers_exist=containers_exist,
         )
-        details = {"marker_digest": hashlib.sha256(raw).hexdigest()}
+        details = {
+            "marker_digest": hashlib.sha256(raw).hexdigest(),
+            "marker_device": marker_after.st_dev,
+            "marker_inode": marker_after.st_ino,
+        }
         journal.advance("runtime_checked", details=details)
         _after_control_step("clear-start-marker", "runtime_checked")
     if existing_receipt is None and journal.phase in {
@@ -3569,22 +3595,59 @@ def clear_start_marker(
         except state.DeploymentStateError:
             if journal.phase == "marker_backed_up":
                 state.assert_start_marker_absent(paths)
-                state._verify_regular_file(backup, "start marker backup")
-                os.replace(backup, paths.start_marker)
-                state.fsync_directory(journal.root)
-                state.fsync_directory(paths.root)
+                backup_state = state._verify_regular_file(backup, "start marker backup")
+                expected_identity = (
+                    journal.details["marker_device"],
+                    journal.details["marker_inode"],
+                )
+                if (backup_state.st_dev, backup_state.st_ino) != expected_identity:
+                    raise state.DeploymentStateError(
+                        "start marker backup changed"
+                    ) from None
+                try:
+                    _filesystem_mutations(mutation_backend).rename_noreplace(
+                        backup,
+                        paths.start_marker,
+                        expected_source=backup_state,
+                    )
+                except OSError:
+                    raise state.DeploymentStateError(
+                        "cannot safely restore start marker"
+                    ) from None
             journal.remove()
             raise
     if journal.phase == "runtime_checked":
         if state._lstat_optional(backup) is None:
+            marker_state = state._verify_regular_file(
+                paths.start_marker, "start marker"
+            )
+            expected_identity = (
+                journal.details["marker_device"],
+                journal.details["marker_inode"],
+            )
+            if (marker_state.st_dev, marker_state.st_ino) != expected_identity:
+                raise state.DeploymentStateError("start marker changed")
             raw = _read_valid_marker(paths, identity_hash)
             if hashlib.sha256(raw).hexdigest() != journal.details["marker_digest"]:
                 raise state.DeploymentStateError("start marker changed")
-            os.replace(paths.start_marker, backup)
-            state.fsync_directory(paths.root)
-            state.fsync_directory(journal.root)
+            try:
+                _filesystem_mutations(mutation_backend).rename_noreplace(
+                    paths.start_marker,
+                    backup,
+                    expected_source=marker_state,
+                )
+            except OSError:
+                raise state.DeploymentStateError(
+                    "cannot safely back up start marker"
+                ) from None
         else:
-            state._verify_regular_file(backup, "start marker backup")
+            backup_state = state._verify_regular_file(backup, "start marker backup")
+            expected_identity = (
+                journal.details["marker_device"],
+                journal.details["marker_inode"],
+            )
+            if (backup_state.st_dev, backup_state.st_ino) != expected_identity:
+                raise state.DeploymentStateError("start marker backup changed")
             state.assert_start_marker_absent(paths)
         journal.advance("marker_backed_up")
         _after_control_step("clear-start-marker", "marker_backed_up")
@@ -3605,9 +3668,21 @@ def clear_start_marker(
         )
     if journal.phase == "receipt_written":
         if state._lstat_optional(backup) is not None:
-            state._verify_regular_file(backup, "start marker backup")
-            backup.unlink()
-            state.fsync_directory(journal.root)
+            backup_state = state._verify_regular_file(backup, "start marker backup")
+            expected_identity = (
+                journal.details["marker_device"],
+                journal.details["marker_inode"],
+            )
+            if (backup_state.st_dev, backup_state.st_ino) != expected_identity:
+                raise state.DeploymentStateError("start marker backup changed")
+            try:
+                _filesystem_mutations(mutation_backend).unlink(
+                    backup, expected_source=backup_state
+                )
+            except OSError:
+                raise state.DeploymentStateError(
+                    "cannot safely remove start marker backup"
+                ) from None
         journal.advance("clear_complete")
         _after_control_step("clear-start-marker", "clear_complete")
     journal.remove()
@@ -3640,12 +3715,9 @@ def acknowledge_repaired(
         if existing_receipt["evidence"] != evidence:
             raise state.DeploymentStateError("repair evidence changed")
         target = paths.quarantine / transaction_id
-        moved = state._lstat_optional(target)
+        moved = state._verify_directory(target, "quarantined transaction")
         if (
-            moved is None
-            or state._is_symlink(moved)
-            or not stat.S_ISDIR(moved.st_mode)
-            or moved.st_dev != existing_receipt["quarantine_device"]
+            moved.st_dev != existing_receipt["quarantine_device"]
             or moved.st_ino != existing_receipt["quarantine_inode"]
         ):
             raise state.DeploymentStateError("quarantined transaction changed")
@@ -3677,13 +3749,7 @@ def acknowledge_repaired(
     }:
         _active_state_revalidated(paths, identity, environ=environ)
     if journal.phase == "repair_acknowledgement_planned":
-        observed = state._lstat_optional(source)
-        if (
-            observed is None
-            or state._is_symlink(observed)
-            or not stat.S_ISDIR(observed.st_mode)
-        ):
-            raise state.DeploymentStateError("damaged transaction is not a directory")
+        observed = state._verify_directory(source, "damaged transaction")
         details = dict(journal.details)
         details["source_device"] = observed.st_dev
         details["source_inode"] = observed.st_ino
@@ -3697,11 +3763,8 @@ def acknowledge_repaired(
             journal.details["source_inode"],
         )
         if source_state is not None and target_state is None:
-            if (
-                state._is_symlink(source_state)
-                or not stat.S_ISDIR(source_state.st_mode)
-                or (source_state.st_dev, source_state.st_ino) != expected_source
-            ):
+            source_state = state._verify_directory(source, "damaged transaction")
+            if (source_state.st_dev, source_state.st_ino) != expected_source:
                 raise state.DeploymentStateError("damaged transaction changed")
             try:
                 _filesystem_mutations(mutation_backend).rename_noreplace(
@@ -3714,20 +3777,13 @@ def acknowledge_repaired(
                     "cannot safely quarantine damaged transaction"
                 ) from None
         elif source_state is None and target_state is not None:
-            if (
-                state._is_symlink(target_state)
-                or not stat.S_ISDIR(target_state.st_mode)
-                or (target_state.st_dev, target_state.st_ino) != expected_source
-            ):
+            target_state = state._verify_directory(target, "quarantined transaction")
+            if (target_state.st_dev, target_state.st_ino) != expected_source:
                 raise state.DeploymentStateError("quarantined transaction changed")
         else:
             raise state.DeploymentStateError("invalid quarantine move state")
-        moved = os.lstat(target)
-        if (
-            state._is_symlink(moved)
-            or not stat.S_ISDIR(moved.st_mode)
-            or (moved.st_dev, moved.st_ino) != expected_source
-        ):
+        moved = state._verify_directory(target, "quarantined transaction")
+        if (moved.st_dev, moved.st_ino) != expected_source:
             raise state.DeploymentStateError("quarantined transaction changed")
         details = dict(journal.details)
         details["quarantine_device"] = moved.st_dev
@@ -3735,11 +3791,9 @@ def acknowledge_repaired(
         journal.advance("transaction_quarantined", details=details)
         _after_control_step("acknowledge-repaired", "transaction_quarantined")
     if journal.phase in {"transaction_quarantined", "receipt_written"}:
-        moved = os.lstat(target)
+        moved = state._verify_directory(target, "quarantined transaction")
         if (
-            state._is_symlink(moved)
-            or not stat.S_ISDIR(moved.st_mode)
-            or moved.st_dev != journal.details["quarantine_device"]
+            moved.st_dev != journal.details["quarantine_device"]
             or moved.st_ino != journal.details["quarantine_inode"]
         ):
             raise state.DeploymentStateError("quarantined transaction changed")
