@@ -22,6 +22,15 @@ class KnowledgeUploadTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_upload_without_classification_defaults_to_public(self) -> None:
+        response = self.client.post(
+            "/api/knowledge/uploads",
+            files={"file": ("public-policy.txt", b"public policy" * 20, "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()[0]["classification"], "公开")
+
     def test_uploads_file_and_registers_pending_source_then_indexes_on_refresh(self) -> None:
         response = self.client.post(
             "/api/knowledge/uploads",
