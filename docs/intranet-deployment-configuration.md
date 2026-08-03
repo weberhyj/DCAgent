@@ -8,6 +8,55 @@
 
 除非内网拓扑与当前部署方式不兼容，一般不需要修改源代码。需要修改的是服务器上的实际环境文件、密码文件、镜像地址、服务地址和反向代理配置。
 
+## Ubuntu 20.04 事务部署与恢复
+
+生产主路径仅为 Ubuntu 20.04 Bash：`prepare_offline_env.sh`、`invoke_offline_compose.sh` 与
+`recover_offline_deployment.sh`。PowerShell 仅用于 Windows 开发机。`DEPLOYMENT_STATE_ROOT` 固定为
+`DATA_ROOT/.dcagent-deployment-state` 并与 data/model/secret roots 绑定；普通 prepare/Compose
+不隐式创建 identity，更换 `DATA_ROOT` 视为新部署。
+
+```bash
+set -Eeuo pipefail
+install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
+./tools/prepare_offline_env.sh --initialize-state
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh up -d
+```
+
+旧部署必须先接管，再普通 prepare：
+
+```bash
+set -Eeuo pipefail
+./tools/recover_offline_deployment.sh adopt-existing --state-root /absolute/data/root/.dcagent-deployment-state
+./tools/prepare_offline_env.sh
+```
+
+部署锁超时为 30 秒。六个 Compose verb：config/build/up/down/exec/cp；
+`./tools/invoke_offline_compose.sh up`、`./tools/invoke_offline_compose.sh exec`、
+`./tools/invoke_offline_compose.sh cp` 在执行前 durable 写入 `deployment-started.json`，失败保留；
+`./tools/invoke_offline_compose.sh config`、`./tools/invoke_offline_compose.sh build`、
+`./tools/invoke_offline_compose.sh down` 不写 marker。marker 或任意形态 `PG_VERSION` 存在后，普通
+`--rotate-secrets` 永久拒绝；不提供在线 PostgreSQL role 密码修改或单行删除 marker 命令。
+
+先用 `./tools/recover_offline_deployment.sh inspect --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>` 分类。
+自动回滚完成后可继续；`rollback_failed` 用
+`./tools/recover_offline_deployment.sh resume-rollback --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+`committed_cleanup_required` 用
+`./tools/recover_offline_deployment.sh finalize-cleanup --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+损坏 journal/quarantine 人工修复后用
+`./tools/recover_offline_deployment.sh acknowledge-repaired --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id> --evidence /absolute/path/sanitized-repair-evidence.json`。
+人工运行 `./tools/recover_offline_deployment.sh clear-start-marker --state-root /absolute/data/root/.dcagent-deployment-state` 前，确认无 DC-Agent 容器、无 `PG_VERSION`、PostgreSQL 目录不存在或未初始化、无未完成事务。日志和 evidence receipt 不含 secret、数据库 URL、模型正文或原始 SSE。
+
+目标 Ubuntu gate（config 60 秒、build 1800 秒、up/readyz 300 秒、每个 probe 60 秒、recovery drill 120 秒）：
+
+```bash
+set -Eeuo pipefail
+python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
+```
+
+开发机本地测试不是Ubuntu live gate通过；缺少真实 Docker、Physoc、Ollama 拓扑时只能记录未运行。
+
 ## 1. 部署前检查
 
 1. 从 GitHub `main` 分支拉取最新代码，并记录部署的 Commit SHA。
@@ -20,14 +69,14 @@
 
 ## 2. 创建实际环境文件
 
-Compose 部署首次准备时直接运行脚本；不要手工复制模板。首次运行
-`./tools/prepare_offline_env.sh` 会自动创建 `deploy/offline/.env`，读取当前非 root 部署账号的
+Compose 部署首次准备时直接运行 `./tools/prepare_offline_env.sh --initialize-state`；不要手工复制模板。首次运行
+该命令会自动创建 `deploy/offline/.env`，读取当前非 root 部署账号的
 `id -u` 和 `id -g`，并写入 `DCAGENT_UID` 和 `DCAGENT_GID`。如果已有配置中的
 `DCAGENT_UID` 或 `DCAGENT_GID` 与当前账号不匹配，脚本会 fail closed，不匹配时拒绝继续。
 
 ```bash
 set -Eeuo pipefail
-./tools/prepare_offline_env.sh
+./tools/prepare_offline_env.sh --initialize-state
 ```
 
 随后修改：
@@ -343,7 +392,8 @@ https://cdn.jsdelivr.net/npm/cn-fontsource-ding-talk-jin-bu-ti-regular@1.0.3/fon
 
 ```bash
 set -Eeuo pipefail
-./tools/prepare_offline_env.sh
+install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
+./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
 ./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d

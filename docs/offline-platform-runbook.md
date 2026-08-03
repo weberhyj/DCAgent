@@ -2,6 +2,51 @@
 
 本文是 Phase 1 离线单机部署和容量门禁的操作记录。它只描述本地、可审计的开源组件和内部镜像；运行时不得访问公共模型 API、公共镜像仓库或其他外部服务。
 
+## Ubuntu 20.04 事务部署与恢复
+
+生产入口只使用 Ubuntu 20.04 Bash 的 `prepare_offline_env.sh`、`invoke_offline_compose.sh` 和
+`recover_offline_deployment.sh`；PowerShell 仅用于 Windows 开发机。`DEPLOYMENT_STATE_ROOT` 是
+`DATA_ROOT/.dcagent-deployment-state`，与 data/model/secret roots 绑定。普通 prepare/Compose
+不隐式创建 identity；更换 `DATA_ROOT` 视为新部署。
+
+```bash
+set -Eeuo pipefail
+install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
+./tools/prepare_offline_env.sh --initialize-state
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh up -d
+```
+
+旧部署必须先执行接管，再普通 prepare：
+
+```bash
+set -Eeuo pipefail
+./tools/recover_offline_deployment.sh adopt-existing --state-root /absolute/data/root/.dcagent-deployment-state
+./tools/prepare_offline_env.sh
+```
+
+锁超时是 30 秒。六个 Compose verb：config/build/up/down/exec/cp。`./tools/invoke_offline_compose.sh up`、
+`./tools/invoke_offline_compose.sh exec`、`./tools/invoke_offline_compose.sh cp` 在执行前 durable 写入
+`deployment-started.json`，失败保留；`./tools/invoke_offline_compose.sh config`、
+`./tools/invoke_offline_compose.sh build`、`./tools/invoke_offline_compose.sh down` 不写 marker。marker 或任意
+形态 `PG_VERSION` 存在后普通 `--rotate-secrets` 永久拒绝；不提供在线 PostgreSQL role 密码修改，也不提供单行删除 marker 命令。
+
+运行 `./tools/recover_offline_deployment.sh inspect --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>` 后处理：自动回滚成功可继续；
+`rollback_failed` 用 `./tools/recover_offline_deployment.sh resume-rollback --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+`committed_cleanup_required` 用 `./tools/recover_offline_deployment.sh finalize-cleanup --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+损坏 journal/quarantine 修复后用 `./tools/recover_offline_deployment.sh acknowledge-repaired --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id> --evidence /absolute/path/sanitized-repair-evidence.json`。
+人工运行 `./tools/recover_offline_deployment.sh clear-start-marker --state-root /absolute/data/root/.dcagent-deployment-state` 前，逐项确认无 DC-Agent 容器、无 `PG_VERSION`、PostgreSQL 目录不存在或未初始化、无未完成事务。日志和 evidence receipt 不含 secret、数据库 URL、模型正文或原始 SSE。
+
+目标 Ubuntu gate 的时限为 config 60 秒、build 1800 秒、up/readyz 300 秒、每个 probe 60 秒、recovery drill 120 秒：
+
+```bash
+set -Eeuo pipefail
+python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
+```
+
+开发机本地测试不是Ubuntu live gate通过；未在真实 Ubuntu Docker、Physoc、Ollama 环境运行时，只能记录 live gate 未运行。
+
 ## 1. 当前状态与适用范围
 
 - 目标环境是 Ubuntu 20.04、Bash、rootful Docker Engine、Docker Compose v2、本地 `default` Docker context。
@@ -72,13 +117,13 @@ uv run --project backend --frozen --offline --no-default-groups --group offline 
 ## 4. Compose profile、内存预算与准备
 
 首次准备不要手工复制 `deploy/offline/.env.example`。首次运行
-`./tools/prepare_offline_env.sh` 会自动创建 `deploy/offline/.env`，读取当前非 root 部署账号的
+`./tools/prepare_offline_env.sh --initialize-state` 会自动创建 `deploy/offline/.env`，读取当前非 root 部署账号的
 `id -u` 和 `id -g`，并写入 `DCAGENT_UID` 和 `DCAGENT_GID`。如果已有配置中的
 `DCAGENT_UID` 或 `DCAGENT_GID` 与当前账号不匹配，脚本会 fail closed，不匹配时拒绝继续：
 
 ```bash
 set -Eeuo pipefail
-./tools/prepare_offline_env.sh
+./tools/prepare_offline_env.sh --initialize-state
 ```
 
 必须替换全部占位 digest、Embedding checksum、模型文件和模型名。默认资源预算记录如下；它们是 Compose 配置值，不是已经测得的性能结果：
@@ -236,5 +281,5 @@ uv run --project backend --frozen --offline --no-default-groups --group benchmar
 - smoke 的任何 command、HTTP status、JSON、版本或 checksum 失败都按失败处理；不要手工编辑 report 把 `passed` 改成 true。
 - Compose 配置失败时不要删除数据目录；默认 cleanup 不移除 volume。
 - 第一次 PostgreSQL baseline stamp 之前必须有可恢复备份；baseline drift 应停止启动，不要用 downgrade 代替恢复。
-- secret rotation 仅适用于 PostgreSQL 初始化前；初始化后必须走受控 `ALTER ROLE`、双文件切换和连通性验证流程。
+- secret rotation 仅适用于 PostgreSQL 初始化前；初始化后不提供在线 PostgreSQL role 密码修改或双文件切换流程，必须保留现有 secret pair 并按恢复 runbook 处理。
 - 发现公共 endpoint、公共镜像、未审核 license、符号链接 bind source、远程 Docker context 或缺少 hash 时，立即停止并记录为 gate failure。

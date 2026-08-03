@@ -2,9 +2,57 @@
 
 This Compose project is the private, single-server deployment contract for DC-Agent. It exposes only the API on `127.0.0.1:8000`; PostgreSQL, ClickHouse, Qdrant, Redis, ClamAV, the embedding service, the reranker service, and optional llama.cpp service remain on the internal Compose network.
 
+## Ubuntu 20.04 事务部署与恢复
+
+生产主路径是 Ubuntu 20.04 Bash 的 `prepare_offline_env.sh`、`invoke_offline_compose.sh` 与
+`recover_offline_deployment.sh`；PowerShell 仅用于 Windows 开发机。`DEPLOYMENT_STATE_ROOT` 固定为
+`DATA_ROOT/.dcagent-deployment-state` 并绑定 data/model/secret roots。普通 prepare/Compose
+不隐式创建 identity；更换 `DATA_ROOT` 视为新部署。
+
+```bash
+set -Eeuo pipefail
+install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
+./tools/prepare_offline_env.sh --initialize-state
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh up -d
+```
+
+旧部署必须先接管，再普通 prepare：
+
+```bash
+set -Eeuo pipefail
+./tools/recover_offline_deployment.sh adopt-existing --state-root /absolute/data/root/.dcagent-deployment-state
+./tools/prepare_offline_env.sh
+```
+
+部署锁超时为 30 秒。六个 Compose verb：config/build/up/down/exec/cp。`./tools/invoke_offline_compose.sh up`、
+`./tools/invoke_offline_compose.sh exec` 和 `./tools/invoke_offline_compose.sh cp` 在执行前 durable 写入
+`deployment-started.json`，失败保留；`./tools/invoke_offline_compose.sh config`、
+`./tools/invoke_offline_compose.sh build`、`./tools/invoke_offline_compose.sh down` 不写 marker。marker
+或任意 `PG_VERSION` 存在后普通 `--rotate-secrets` 永久拒绝；不提供在线 PostgreSQL role 密码修改，也不提供单行删除 marker 命令。
+
+先运行 `./tools/recover_offline_deployment.sh inspect --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`。
+自动回滚成功后可继续；`rollback_failed` 使用
+`./tools/recover_offline_deployment.sh resume-rollback --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+`committed_cleanup_required` 使用
+`./tools/recover_offline_deployment.sh finalize-cleanup --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+损坏 journal/quarantine 修复后使用
+`./tools/recover_offline_deployment.sh acknowledge-repaired --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id> --evidence /absolute/path/sanitized-repair-evidence.json`。
+人工运行 `./tools/recover_offline_deployment.sh clear-start-marker --state-root /absolute/data/root/.dcagent-deployment-state` 前，确认无 DC-Agent 容器、无 `PG_VERSION`、PostgreSQL 目录不存在或未初始化、无未完成事务。日志和 evidence receipt 不含 secret、数据库 URL、模型正文或原始 SSE。
+
+目标 Ubuntu gate 时限为 config 60 秒、build 1800 秒、up/readyz 300 秒、每个 probe 60 秒、recovery drill 120 秒：
+
+```bash
+set -Eeuo pipefail
+python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
+```
+
+开发机本地测试不是Ubuntu live gate通过；缺少真实 Ubuntu Docker、Physoc、Ollama 拓扑时，只能记录 live gate 未运行。
+
 ## Prepare local configuration
 
-Run `./tools/prepare_offline_env.sh` from the repository root on Ubuntu 20.04. The script copies `.env.example` only when `.env` is absent and creates the PostgreSQL password/database URL secret pair only when neither file exists. It also preserves valid existing ClickHouse role passwords or generates missing 43-character URL-safe passwords at the fixed repository-managed paths. It refuses partial path configuration and never prints secret values. Secret files are staged, validated, permission-restricted, and published without allowing `.env` to redirect them outside `artifacts/secrets`.
+For a new Ubuntu 20.04 deployment, run `./tools/prepare_offline_env.sh --initialize-state` from the repository root after creating the fixed data/model roots above. An adopted existing deployment runs ordinary `./tools/prepare_offline_env.sh` only after `adopt-existing`. The script copies `.env.example` only when `.env` is absent and creates the PostgreSQL password/database URL secret pair only when neither file exists. It also preserves valid existing ClickHouse role passwords or generates missing 43-character URL-safe passwords at the fixed repository-managed paths. It refuses partial path configuration and never prints secret values. Secret files are staged, validated, permission-restricted, and published without allowing `.env` to redirect them outside `artifacts/secrets`.
 
 An older `.env` with neither ClickHouse password-file key is upgraded in place with the two fixed relative paths while `STRUCTURED_QUERY_ENABLED` remains unchanged (and therefore remains `false` for legacy deployments). If exactly one key exists, preparation fails closed instead of guessing. Existing valid secret files are never overwritten.
 
@@ -14,7 +62,7 @@ Every host bind uses `create_host_path: false`, and every Compose interpolation 
 
 rootless Docker, Docker `userns` remapping, remote Docker engines/contexts, Windows container UID semantics, SELinux labels, and NFS ownership or root-squash behavior are not supported by this direct UID mapping contract. Treat each as a target-host fail-fast gate. Verify a local default rootful daemon, inspect `docker info`, and use `stat` to confirm owner/mode values before running `./tools/invoke_offline_compose.sh up -d`.
 
-`--rotate-secrets` is a **pre-initialization only** operation. `DATA_ROOT` and `MODEL_ROOT` must be unquoted explicit paths or the exact unquoted `${VAR}` form whose dedicated host variable exists; use names such as `${HOST_DATA_ROOT}` rather than a self-reference such as `${DATA_ROOT}`, because `.env` keys are deliberately removed before Compose starts. The script rejects single-quoted and double-quoted path values rather than interpreting them with semantics that differ from Compose. A missing environment variable, unresolved value, unsupported Compose expansion, invalid path, or mismatching shell override is rejected before any secret or data-directory mutation. The script refuses rotation when `${DATA_ROOT}/postgres/PG_VERSION` exists, because changing files alone cannot change the password stored in an initialized PostgreSQL role. Rotation after initialization requires a controlled maintenance procedure: stop dependent services, run a reviewed `ALTER ROLE`, update both secret files together, restart services, and verify connectivity. That coordinated workflow is intentionally outside this phase.
+`--rotate-secrets` is a **pre-initialization only** operation. `DATA_ROOT` and `MODEL_ROOT` must be unquoted explicit paths or the exact unquoted `${VAR}` form whose dedicated host variable exists; use names such as `${HOST_DATA_ROOT}` rather than a self-reference such as `${DATA_ROOT}`, because `.env` keys are deliberately removed before Compose starts. The script rejects single-quoted and double-quoted path values rather than interpreting them with semantics that differ from Compose. A missing environment variable, unresolved value, unsupported Compose expansion, invalid path, or mismatching shell override is rejected before any secret or data-directory mutation. The script refuses rotation when a start marker or `${DATA_ROOT}/postgres/PG_VERSION` exists. It does not provide online PostgreSQL role-password modification after initialization; preserve the secret pair and use the recovery runbook instead.
 
 Before deployment, replace every placeholder digest and model checksum in `deploy/offline/.env` with the approved values from the offline artifact lock and internal registry. Do not replace digest references with floating public tags. The digest-pinned PYTHON_BASE_IMAGE must use an approved Debian-family image whose reviewed `uv 0.11.29` binary is preinstalled on PATH. The Dockerfiles do not download uv: they run `uv --version` and then perform the frozen offline sync. On the target host, run `uv --version` from the internal reviewed image before building; all four real image builds remain target-host gates.
 
@@ -171,7 +219,8 @@ topology:
 
 ```bash
 set -Eeuo pipefail
-./tools/prepare_offline_env.sh
+install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
+./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
 ./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d

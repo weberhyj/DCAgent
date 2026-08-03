@@ -22,6 +22,8 @@ DC-Agent 是一个公司内部只读知识 Agent。管理员把制度、合同�
 postgresql+psycopg://postgres:123456@127.0.0.1:5432/dc_agent
 ```
 
+### Windows 开发机（仅限本地开发）
+
 手动创建数据库示例：
 
 ```powershell
@@ -114,6 +116,59 @@ mkdir -p artifacts/benchmarks
 ```
 
 探针成功报告只记录 provider、model、streamPath、elapsedMs、answerChars 和 citationCount 等运行元数据，不会输出提示词、证据正文或模型回答正文。只有容器内 probe exit 0 后才创建 host 目录并执行 `cp`；将 `artifacts/benchmarks/physoc-probe.json` 作为切换门禁证据保存。探针失败时不得复制旧报告或启用该生产路由。
+
+## Ubuntu 20.04 公司内网事务部署
+
+生产主路径只支持 Ubuntu 20.04、Bash、rootful Docker Compose v2 和仓库根目录下的
+`prepare_offline_env.sh`、`invoke_offline_compose.sh`、`recover_offline_deployment.sh`；PowerShell
+仅用于 Windows 开发机。`DEPLOYMENT_STATE_ROOT` 必须是 `DATA_ROOT/.dcagent-deployment-state`，由
+初始化或接管操作写入并与 data/model/secret roots 绑定。普通 prepare/Compose 不隐式创建 identity；
+更换 `DATA_ROOT` 视为新部署。
+
+新部署固定按以下顺序执行：
+
+```bash
+set -Eeuo pipefail
+install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
+./tools/prepare_offline_env.sh --initialize-state
+./tools/invoke_offline_compose.sh config
+./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh up -d
+```
+
+已有数据的旧部署必须先接管，不能跳过 state root：
+
+```bash
+set -Eeuo pipefail
+./tools/recover_offline_deployment.sh adopt-existing --state-root /absolute/data/root/.dcagent-deployment-state
+./tools/prepare_offline_env.sh
+```
+
+部署锁等待上限为 30 秒。六个 Compose verb：config/build/up/down/exec/cp；只有
+`./tools/invoke_offline_compose.sh up`、`./tools/invoke_offline_compose.sh exec` 和
+`./tools/invoke_offline_compose.sh cp` 会在执行前 durable 写入 `deployment-started.json`，失败后保留它。
+`./tools/invoke_offline_compose.sh config`、`./tools/invoke_offline_compose.sh build` 和
+`./tools/invoke_offline_compose.sh down` 不写 marker。marker 或任意形态 `PG_VERSION` 存在后，普通
+`--rotate-secrets` 永久拒绝；不提供在线 PostgreSQL role 密码修改，也不提供单行删除 marker 的命令。
+
+故障先运行 `./tools/recover_offline_deployment.sh inspect --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`。
+自动回滚成功后可继续；`rollback_failed` 使用
+`./tools/recover_offline_deployment.sh resume-rollback --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+`committed_cleanup_required` 使用
+`./tools/recover_offline_deployment.sh finalize-cleanup --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`；
+损坏 journal/quarantine 经人工修复后使用
+`./tools/recover_offline_deployment.sh acknowledge-repaired --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id> --evidence /absolute/path/sanitized-repair-evidence.json`。
+人工执行 `./tools/recover_offline_deployment.sh clear-start-marker --state-root /absolute/data/root/.dcagent-deployment-state` 前，逐项确认无 DC-Agent 容器、无 `PG_VERSION`、PostgreSQL 目录不存在或未初始化、且无未完成事务。
+日志和 evidence receipt 不含 secret、数据库 URL、模型正文或原始 SSE。
+
+目标 Ubuntu 主机使用以下 live gate；config 60 秒、build 1800 秒、up/readyz 300 秒、每个 probe 60 秒、recovery drill 120 秒。
+
+```bash
+set -Eeuo pipefail
+python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
+```
+
+开发机本地测试不是Ubuntu live gate通过；没有真实 Ubuntu Docker、Physoc 和 Ollama 拓扑时，只能记录 live gate 未运行。
 
 ## Structured spreadsheet aggregation
 
@@ -299,13 +354,10 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 6. 在目标服务器完成 Compose smoke、Ollama/Physoc probe、新索引发布、Shadow/Canary、真实文档
    问答、模型故障 HTTP 502、Alias/Legacy 回滚、结构化统计和 15 用户并发验收。
 
-Ubuntu 20.04 生产部署从仓库根目录统一使用 Bash 入口：
+Ubuntu 20.04 新部署必须使用上文的事务部署固定顺序（包括 `--initialize-state`、五个服务的单次 build 和基础 `up`）；不得以普通 prepare 代替初始化。状态已初始化并且基础服务启动后，才可按需启动结构化 indexing worker：
 
 ```bash
 set -Eeuo pipefail
-./tools/prepare_offline_env.sh
-./tools/invoke_offline_compose.sh config
-./tools/invoke_offline_compose.sh up -d
 ./tools/invoke_offline_compose.sh --profile indexing up -d
 ```
 
@@ -448,7 +500,7 @@ P95、错误率和 fallback rate；强制命令见离线部署手册。
 Redis/Celery 异步任务、ClamAV 上传扫描、细粒度引用和千万级整体验收。详细阶段和退出门禁见
 [`企业知识库升级路线`](docs/superpowers/plans/2026-07-24-enterprise-knowledge-base-qa-rollout.md)。
 
-## 启动
+## Windows 开发机启动（仅限本地开发）
 
 后端：
 
@@ -486,7 +538,7 @@ npm.cmd run dev
 - `/knowledge/{sourceId}`：指定资料的解析详情与片段预览。
 - `/agent-runs`：DCAgent 只读执行审计。
 
-## 本地验证
+## Windows 开发机本地验证（仅限本地开发）
 
 后端测试：
 

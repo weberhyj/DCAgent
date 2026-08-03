@@ -10,7 +10,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -961,7 +960,7 @@ class ComposeContractTest(unittest.TestCase):
             identity_lines = [
                 line
                 for line in env_path.read_text(encoding="utf-8").splitlines()
-                if line.startswith("DCAGENT_UID=") or line.startswith("DCAGENT_GID=")
+                if line.startswith(("DCAGENT_UID=", "DCAGENT_GID="))
             ]
             custom_env = (
                 "DATA_ROOT=../../artifacts/data\n"
@@ -1117,6 +1116,9 @@ class ComposeContractTest(unittest.TestCase):
                 def run(
                     *arguments: str,
                     set_host_data_root: bool,
+                    host_data: Path = host_data,
+                    copied_script: Path = copied_script,
+                    root: Path = root,
                 ) -> subprocess.CompletedProcess[str]:
                     process_environment = os.environ.copy()
                     process_environment.pop("HOST_DATA_ROOT", None)
@@ -2028,7 +2030,7 @@ class ComposeContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("pre-initialization only", text)
-        self.assertIn("ALTER ROLE", text)
+        self.assertIn("不提供在线 PostgreSQL role 密码修改", text)
         self.assertIn("advisory lock", text)
         self.assertIn("PostgreSQL target host", text)
         self.assertIn("Docker build", text)
@@ -2146,6 +2148,95 @@ class ComposeContractTest(unittest.TestCase):
                         first_effective_bash_command(block), r"^set -E?euo pipefail$"
                     )
         self.assertGreaterEqual(checked, 10)
+
+    def test_transactional_intranet_deployment_docs_share_recovery_contract(
+        self,
+    ) -> None:
+        documents = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        )
+        required = (
+            "./tools/prepare_offline_env.sh --initialize-state",
+            "./tools/recover_offline_deployment.sh adopt-existing",
+            "./tools/recover_offline_deployment.sh inspect",
+            "./tools/recover_offline_deployment.sh resume-rollback",
+            "./tools/recover_offline_deployment.sh finalize-cleanup",
+            "DEPLOYMENT_STATE_ROOT",
+            "deployment-started.json",
+            "30 秒",
+            "install -d -m 0700 /srv/dcagent/data /srv/dcagent/models",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "六个 Compose verb：config/build/up/down/exec/cp",
+            "rollback_failed",
+            "committed_cleanup_required",
+            "损坏 journal/quarantine",
+            "acknowledge-repaired",
+            "intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json",
+            "config 60 秒",
+            "build 1800 秒",
+            "up/readyz 300 秒",
+            "每个 probe 60 秒",
+            "recovery drill 120 秒",
+            "开发机本地测试不是Ubuntu live gate通过",
+            "不提供在线 PostgreSQL role 密码修改",
+            "不隐式创建 identity",
+            "更换 `DATA_ROOT` 视为新部署",
+            "evidence receipt 不含 secret、数据库 URL、模型正文或原始 SSE",
+        )
+        for path in documents:
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(document=path.relative_to(REPO_ROOT)):
+                for token in required:
+                    self.assertIn(token, text)
+                self.assertNotRegex(
+                    text,
+                    r"(?m)^\s*(?:rm|sudo\s+rm)\b[^\n]*deployment-started\.json",
+                )
+                for verb in ("config", "build", "up", "down", "exec", "cp"):
+                    self.assertIn(f"./tools/invoke_offline_compose.sh {verb}", text)
+
+    def test_production_doc_command_order_and_windows_scope(self) -> None:
+        documents = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        )
+        sequence = (
+            "install -d -m 0700 /srv/dcagent/data /srv/dcagent/models",
+            "./tools/prepare_offline_env.sh --initialize-state",
+            "./tools/invoke_offline_compose.sh config",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "./tools/invoke_offline_compose.sh up -d",
+        )
+        for path in documents:
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(document=path.relative_to(REPO_ROOT)):
+                blocks = [
+                    block
+                    for block in bash_fenced_blocks(text)
+                    if all(token in block for token in sequence)
+                ]
+                self.assertTrue(blocks)
+                positions = [blocks[0].index(token) for token in sequence]
+                self.assertEqual(positions, sorted(positions))
+                if path != documents[0]:
+                    for forbidden in ("pwsh", "Copy-Item", "New-Item", "$LASTEXITCODE"):
+                        self.assertNotIn(forbidden, text)
+
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertEqual(1, readme.count("Windows 开发机兼容"))
+        self.assertIn("Windows 开发机（仅限本地开发）", readme)
+        self.assertNotIn(
+            "set -Eeuo pipefail\n"
+            "./tools/prepare_offline_env.sh\n"
+            "./tools/invoke_offline_compose.sh config\n"
+            "./tools/invoke_offline_compose.sh up -d",
+            readme,
+        )
 
 
 if __name__ == "__main__":
