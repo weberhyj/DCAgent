@@ -140,6 +140,18 @@ class BlockingHybrid:
         return hybrid_outcome("qwen-probe")
 
 
+class BlockingSystemExitHybrid:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def retrieve(self, retrieval_request: RetrievalRequest) -> HybridRetrievalOutcome:
+        del retrieval_request
+        self.started.set()
+        self.release.wait(2.0)
+        raise SystemExit(3)
+
+
 class RetrievalRouterTest(unittest.TestCase):
     def build_router(
         self,
@@ -484,6 +496,33 @@ class RetrievalRouterTest(unittest.TestCase):
         dropped = router.shadow_queue.dropped_count
         self.assertFalse(router.shadow_queue.submit(request(), (), 0.0))
         self.assertEqual(router.shadow_queue.dropped_count, dropped + 1)
+
+    def test_shadow_system_exit_discards_pending_work_before_drain_returns(self) -> None:
+        hybrid = BlockingSystemExitHybrid()
+        router = self.build_router(
+            mode="shadow",
+            hybrid=hybrid,
+            audit=RecordingAudit(),
+            shadow_percent=100,
+            shadow_queue_size=2,
+        )
+
+        router.search(request("terminate after pending work"))
+        self.assertTrue(hybrid.started.wait(1.0))
+        self.assertTrue(router.shadow_queue.submit(request("pending work"), (), 0.0))
+        hybrid.release.set()
+        router.shadow_queue.worker.join(1.0)
+        self.assertFalse(router.shadow_queue.worker.is_alive())
+
+        drained = threading.Event()
+        drain_thread = threading.Thread(
+            target=lambda: (router.shadow_queue.drain_for_test(), drained.set()),
+            daemon=True,
+        )
+        drain_thread.start()
+
+        self.assertTrue(drained.wait(1.0), "pending shadow work was not discarded")
+        self.assertEqual(router.shadow_queue.dropped_count, 1)
 
     def test_ordinary_exception_still_uses_sanitized_fallback(self) -> None:
         router = self.build_router(

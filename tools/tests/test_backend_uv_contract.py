@@ -1,9 +1,10 @@
 import ast
 import re
-import tomllib
 import unittest
 from pathlib import Path
 from urllib.parse import urlsplit
+
+import tomllib
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 BACKEND_ROOT = REPOSITORY_ROOT / "backend"
@@ -214,14 +215,10 @@ export UV_PYTHON_DOWNLOADS=never
             "uv sync --project backend --frozen --offline --no-default-groups "
             "--group benchmark --no-index --find-links artifacts/wheels"
         )
-        valid_dependency_block = "\n".join(
-            (
-                "export UV_PYTHON_DOWNLOADS=never",
-                lock_command,
-                offline_sync,
-                benchmark_sync,
-            )
-        )
+        valid_dependency_block = f"""export UV_PYTHON_DOWNLOADS=never
+{lock_command}
+{offline_sync}
+{benchmark_sync}"""
         misleading_dependency_block = "\n".join(
             (
                 "# export UV_PYTHON_DOWNLOADS=never",
@@ -230,14 +227,10 @@ export UV_PYTHON_DOWNLOADS=never
                 f"# {benchmark_sync}",
             )
         )
-        out_of_order_dependency_block = "\n".join(
-            (
-                "export UV_PYTHON_DOWNLOADS=never",
-                benchmark_sync,
-                lock_command,
-                offline_sync,
-            )
-        )
+        out_of_order_dependency_block = f"""export UV_PYTHON_DOWNLOADS=never
+{benchmark_sync}
+{lock_command}
+{offline_sync}"""
 
         self.assert_offline_dependency_commands(
             valid_dependency_block, lock_command, offline_sync, benchmark_sync
@@ -740,24 +733,24 @@ export UV_PYTHON_DOWNLOADS=never
             "uv run --project . --group dev python -m uvicorn app.main:app "
             "--host 127.0.0.1 --port 8000"
         )
-        startup_block = self.powershell_block_containing(text, server_command)
+        startup_block = self.bash_block_under_heading_containing(
+            text, "## 本地开发补充", server_command
+        )
         normalized_startup = self.normalize_command_text(startup_block)
         sync_index = normalized_startup.index(sync_command)
-        backend_index = normalized_startup.index("Set-Location backend", sync_index)
+        backend_index = normalized_startup.index("cd backend", sync_index)
         run_index = normalized_startup.index(server_command, backend_index)
-        repository_index = normalized_startup.index("Set-Location ..", run_index)
         self.assertLess(sync_index, backend_index)
         self.assertLess(backend_index, run_index)
-        self.assertLess(run_index, repository_index)
 
         test_command = 'uv run --project . --group dev python -m unittest discover -s tests -p "test_*.py" -v'
-        test_block = self.powershell_block_containing(text, test_command)
+        test_block = self.bash_block_under_heading_containing(
+            text, "## 本地开发补充", test_command
+        )
         normalized_test = self.normalize_command_text(test_block)
-        backend_index = normalized_test.index("Set-Location backend")
+        backend_index = normalized_test.index("cd backend")
         test_index = normalized_test.index(test_command, backend_index)
-        repository_index = normalized_test.index("Set-Location ..", test_index)
         self.assertLess(backend_index, test_index)
-        self.assertLess(test_index, repository_index)
         self.assertIn(
             "uv run --project backend --group dev ruff check backend", normalized
         )
