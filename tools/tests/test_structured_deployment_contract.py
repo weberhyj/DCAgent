@@ -88,7 +88,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(values["RETRIEVAL_MODE"], "shadow")
                 self.assertEqual(values["RETRIEVAL_SHADOW_PERCENT"], "10")
                 self.assertEqual(values["RETRIEVAL_CANARY_PERCENT"], "0")
-                self.assertEqual(values["RETRIEVAL_PERMISSION_TAGS"], "internal")
+                self.assertEqual(values["RETRIEVAL_PERMISSION_TAGS"], "公开")
                 self.assertEqual(
                     values["QDRANT_COLLECTION_ALIAS"], "knowledge_chunks_current"
                 )

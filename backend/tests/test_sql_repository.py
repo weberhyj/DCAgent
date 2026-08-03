@@ -502,6 +502,35 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertEqual([hit.source.id for hit in hits], ["kb-allowed"])
         self.assertTrue(hasattr(scoped, "_search_legacy_knowledge_chunks"))
 
+    def test_default_public_scope_can_retrieve_public_source(self) -> None:
+        self.repository.add_uploaded_knowledge_source(
+            source_id="kb-public",
+            name="public-policy.txt",
+            source_type="TXT",
+            classification="公开",
+            records=0,
+            file_path="public-policy.txt",
+            file_size=64,
+            mime_type="text/plain",
+        )
+        self.repository.complete_knowledge_source_indexing(
+            "kb-public",
+            [
+                KnowledgeChunkModel(
+                    id="chunk-kb-public",
+                    source_id="kb-public",
+                    chunk_index=0,
+                    text="公开制度规定访客需要在前台登记。",
+                    token_count=18,
+                )
+            ],
+        )
+        scoped = SqlChatRepository(self.database, retrieval_permission_tags=("公开",))
+
+        hits = scoped.search_knowledge_chunks("访客前台登记", limit=5)
+
+        self.assertEqual([hit.source.id for hit in hits], ["kb-public"])
+
     def test_agent_uses_conversation_id_as_retrieval_routing_key(self) -> None:
         class RecordingRouter:
             def __init__(self) -> None:
