@@ -4,7 +4,8 @@ import argparse
 import contextlib
 import json
 import os
-import shutil
+import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -80,10 +81,11 @@ def _status(exit_code: int) -> str:
 
 
 def _write_report_atomically(path: Path, report: dict[str, object]) -> None:
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
+    published = False
     try:
+        path = path.resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
         )
@@ -97,6 +99,7 @@ def _write_report_atomically(path: Path, report: dict[str, object]) -> None:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         temporary = None
+        published = True
         if os.name == "posix":
             directory_fd = os.open(path.parent, os.O_RDONLY)
             try:
@@ -107,6 +110,9 @@ def _write_report_atomically(path: Path, report: dict[str, object]) -> None:
         if temporary is not None:
             with contextlib.suppress(OSError):
                 temporary.unlink()
+        if published and report.get("status") == "passed":
+            with contextlib.suppress(OSError):
+                path.unlink()
         raise GateError("deployment gate report could not be committed") from None
 
 
@@ -168,15 +174,18 @@ import sys, time, urllib.error, urllib.request
 
 deadline = time.monotonic() + 300
 while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SystemExit(1)
     try:
-        response = urllib.request.urlopen(sys.argv[1], timeout=min(10, max(1, deadline - time.monotonic())))
+        response = urllib.request.urlopen(sys.argv[1], timeout=min(10, remaining))
         try:
             response.read(65536)
             if 200 <= response.status < 300:
                 break
         finally:
             response.close()
-    except (OSError, urllib.error.HTTPError):
+    except (OSError, urllib.error.HTTPError, urllib.error.URLError):
         pass
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -343,74 +352,161 @@ assert not (root / "recovery-drill.marker").exists()
     ]
 
 
-def _audit_recovery_drill_artifacts(root: Path) -> tuple[Path, ...]:
-    state_root = root / "data" / ".dcagent-deployment-state"
-    secret_root = root / "secrets"
-    identity = state_root / "deployment-identity.json"
-    expected_roots = (root / "data", root / "models", secret_root, root / "repo")
-    if (
-        not state_root.is_dir()
-        or not identity.is_file()
-        or any(not path.is_dir() for path in expected_roots)
-    ):
-        raise GateError("recovery drill expected artifact is missing")
-    leftovers = [root / "recovery-drill.marker"]
-    for directory in (
-        state_root / "transactions",
-        state_root / "control-transactions",
-        state_root / "quarantine",
-    ):
-        if not directory.is_dir() or any(directory.iterdir()):
-            leftovers.append(directory)
-    companion = secret_root / ".dcagent-transactions"
-    if companion.exists():
-        leftovers.append(companion)
-    allowed_state = {
-        "deployment.lock",
-        "deployment-identity.json",
-        "transactions",
-        "control-transactions",
-        "history",
-        "quarantine",
-    }
-    leftovers.extend(
-        path for path in state_root.iterdir() if path.name not in allowed_state
-    )
-    leftovers.extend(path for path in (root / "data").iterdir() if path != state_root)
-    leftovers.extend((root / "models").iterdir())
-    allowed_secret_names = {
+_ACTIVE_SECRET_NAMES = frozenset(
+    {
         "postgres-password",
         "database-url",
         "clickhouse-query-password",
         "clickhouse-ingest-password",
     }
-    leftovers.extend(
-        path for path in secret_root.iterdir() if path.name not in allowed_secret_names
-    )
-    for candidate in root.rglob("*"):
-        if candidate.name in {"backup", "staging", ".dcagent-transactions"}:
-            leftovers.append(candidate)
-    leftovers = [path for path in leftovers if path.exists()]
-    if leftovers:
-        raise GateError("unexpected recovery drill artifact")
+)
+_HISTORY_RECEIPT_NAME = re.compile(r"^[0-9a-f]{32}\.json$")
 
-    active_secrets = tuple(
-        path
-        for path in secret_root.iterdir()
-        if path.is_file() and not path.name.startswith(".")
+
+def _safe_drill_lstat(root: Path, path: Path) -> os.stat_result:
+    """Return a no-follow stat result for a path confined below a drill root."""
+
+    root = Path(root)
+    path = Path(path)
+    try:
+        relative = path.relative_to(root)
+        root_stat = root.lstat()
+    except (OSError, ValueError):
+        raise GateError("unsafe recovery drill path") from None
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise GateError("unsafe recovery drill path")
+
+    current = root
+    try:
+        for component in relative.parts:
+            current_stat = current.lstat()
+            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(
+                current_stat.st_mode
+            ):
+                raise GateError("unsafe recovery drill path")
+            current = current / component
+        result = current.lstat()
+        resolved_root = root.resolve(strict=True)
+        resolved_path = current.resolve(strict=False)
+    except OSError:
+        raise GateError("unsafe recovery drill path") from None
+    if stat.S_ISLNK(result.st_mode) or not resolved_path.is_relative_to(resolved_root):
+        raise GateError("unsafe recovery drill path")
+    return result
+
+
+def _require_drill_directory(root: Path, path: Path) -> None:
+    if not stat.S_ISDIR(_safe_drill_lstat(root, path).st_mode):
+        raise GateError("recovery drill expected artifact is missing")
+
+
+def _require_drill_regular_file(root: Path, path: Path) -> None:
+    if not stat.S_ISREG(_safe_drill_lstat(root, path).st_mode):
+        raise GateError("recovery drill expected artifact is missing")
+
+
+def _drill_children(root: Path, directory: Path) -> tuple[Path, ...]:
+    _require_drill_directory(root, directory)
+    try:
+        children = tuple(sorted(directory / name for name in os.listdir(directory)))
+    except OSError:
+        raise GateError("unsafe recovery drill path") from None
+    for child in children:
+        _safe_drill_lstat(root, child)
+    return children
+
+
+def _require_drill_children(
+    root: Path, directory: Path, expected_names: frozenset[str]
+) -> tuple[Path, ...]:
+    children = _drill_children(root, directory)
+    names = {path.name for path in children}
+    if names - expected_names:
+        raise GateError("unexpected recovery drill artifact")
+    if expected_names - names:
+        raise GateError("recovery drill expected artifact is missing")
+    return children
+
+
+def _audit_recovery_drill_artifacts(root: Path) -> tuple[Path, ...]:
+    root = Path(root)
+    _require_drill_children(
+        root, root, frozenset({"data", "models", "secrets", "repo"})
     )
-    if not active_secrets:
-        raise GateError("recovery drill expected artifact is missing")
-    history = state_root / "history"
-    if not history.is_dir():
-        raise GateError("recovery drill expected artifact is missing")
-    history_entries = tuple(history.rglob("*"))
+
+    data = root / "data"
+    models = root / "models"
+    secrets = root / "secrets"
+    repo = root / "repo"
+    state = data / ".dcagent-deployment-state"
+    _require_drill_children(root, data, frozenset({state.name}))
+    _require_drill_children(root, models, frozenset())
+
+    secret_paths = _require_drill_children(root, secrets, _ACTIVE_SECRET_NAMES)
+    for secret in secret_paths:
+        _require_drill_regular_file(root, secret)
+
+    deployment_lock = state / "deployment.lock"
+    identity = state / "deployment-identity.json"
+    transactions = state / "transactions"
+    control_transactions = state / "control-transactions"
+    history = state / "history"
+    quarantine = state / "quarantine"
+    _require_drill_children(
+        root,
+        state,
+        frozenset(
+            {
+                deployment_lock.name,
+                identity.name,
+                transactions.name,
+                control_transactions.name,
+                history.name,
+                quarantine.name,
+            }
+        ),
+    )
+    for file_path in (deployment_lock, identity):
+        _require_drill_regular_file(root, file_path)
+    for directory in (transactions, control_transactions, history, quarantine):
+        _require_drill_directory(root, directory)
+    for directory in (transactions, control_transactions, quarantine):
+        if _drill_children(root, directory):
+            raise GateError("unexpected recovery drill artifact")
+
+    history_entries = _drill_children(root, history)
+    for entry in history_entries:
+        if not _HISTORY_RECEIPT_NAME.fullmatch(entry.name):
+            raise GateError("unexpected recovery drill artifact")
+        _require_drill_regular_file(root, entry)
+
+    deploy = repo / "deploy"
+    offline = deploy / "offline"
+    _require_drill_children(root, repo, frozenset({deploy.name}))
+    _require_drill_children(root, deploy, frozenset({offline.name}))
+    environment_files = _require_drill_children(
+        root, offline, frozenset({".env", ".env.example"})
+    )
+    for environment_file in environment_files:
+        _require_drill_regular_file(root, environment_file)
+
     return (
-        *active_secrets,
+        *secret_paths,
+        *environment_files,
         *history_entries,
+        deployment_lock,
         identity,
-        state_root,
-        *expected_roots,
+        transactions,
+        control_transactions,
+        history,
+        quarantine,
+        state,
+        data,
+        models,
+        secrets,
+        offline,
+        deploy,
+        repo,
         root,
     )
 
@@ -422,33 +518,43 @@ def _assert_recovery_drill_clean(root: Path) -> tuple[Path, ...]:
 def _cleanup_recovery_drill(
     root: Path, audited_cleanup: tuple[Path, ...] = ()
 ) -> GateError | None:
-    state_root = root / "data" / ".dcagent-deployment-state"
-    targets = (
-        *audited_cleanup,
-        root / "recovery-drill.marker",
-        root / "secrets" / ".dcagent-transactions",
-        root / "secrets",
-        state_root / "transactions",
-        state_root / "control-transactions",
-        state_root / "history",
-        state_root / "quarantine",
-        state_root,
-        root / "data",
-        root / "models",
-        root / "repo",
-        root,
-    )
-    for path in targets:
+    del audited_cleanup
+    try:
+        targets = _audit_recovery_drill_artifacts(root)
+    except GateError as exc:
+        if str(exc) == "recovery drill expected artifact is missing":
+            return None
+        return GateError("recovery drill cleanup failed")
+    for path in sorted(
+        targets,
+        key=lambda candidate: len(candidate.relative_to(root).parts),
+        reverse=True,
+    ):
         try:
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            elif path.exists() or path.is_symlink():
+            path_stat = _safe_drill_lstat(root, path)
+            if stat.S_ISDIR(path_stat.st_mode):
+                path.rmdir()
+            elif stat.S_ISREG(path_stat.st_mode):
                 path.unlink()
+            else:
+                return GateError("recovery drill cleanup failed")
         except OSError:
             return GateError("recovery drill cleanup failed")
-        if path.exists() or path.is_symlink():
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return GateError("recovery drill cleanup failed")
+        else:
             return GateError("recovery drill cleanup failed")
     return None
+
+
+def _persist_failed_report(path: Path, report: dict[str, object]) -> None:
+    report["status"] = "failed"
+    with contextlib.suppress(GateError):
+        _write_report_atomically(path, report)
 
 
 def _run_recovery_drill(config: GateConfig, runner: Runner) -> None:
@@ -691,10 +797,10 @@ def run_gate(
     except (KeyboardInterrupt, SystemExit):
         raise
     except GateError:
-        _write_report_atomically(config.report_path, report)
+        _persist_failed_report(config.report_path, report)
         raise
     except Exception:  # noqa: BLE001 - no arbitrary error may bypass the failed report
-        _write_report_atomically(config.report_path, report)
+        _persist_failed_report(config.report_path, report)
         raise GateError("deployment gate failed") from None
 
 

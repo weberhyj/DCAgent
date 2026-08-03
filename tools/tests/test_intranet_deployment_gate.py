@@ -39,16 +39,25 @@ class RecordingRunner:
                 state / "history",
                 state / "quarantine",
                 root / "models",
-                root / "repo",
                 root / "secrets",
+                root / "repo" / "deploy" / "offline",
             ):
                 directory.mkdir(parents=True, exist_ok=True)
             (state / "deployment-identity.json").write_text(
                 "identity", encoding="ascii"
             )
-            (root / "secrets" / "postgres-password").write_text(
-                "test-secret", encoding="ascii"
-            )
+            (state / "deployment.lock").write_text("lock", encoding="ascii")
+            for name in (
+                "postgres-password",
+                "database-url",
+                "clickhouse-query-password",
+                "clickhouse-ingest-password",
+            ):
+                (root / "secrets" / name).write_text("test-secret", encoding="ascii")
+            for name in (".env", ".env.example"):
+                (root / "repo" / "deploy" / "offline" / name).write_text(
+                    "fixture", encoding="ascii"
+                )
         exit_code = -9 if is_drill and "KillAfterIntent" in " ".join(argv) else 0
         return subprocess.CompletedProcess(
             argv,
@@ -78,6 +87,33 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             deployment_mode=mode,  # type: ignore[arg-type]
             state_root=directory / "state" if mode == "adopt" else None,
         )
+
+    def _drill_artifact_fixture(self, root: Path) -> Path:
+        state = root / "data" / ".dcagent-deployment-state"
+        for directory in (
+            state / "transactions",
+            state / "control-transactions",
+            state / "history",
+            state / "quarantine",
+            root / "models",
+            root / "secrets",
+            root / "repo" / "deploy" / "offline",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        (state / "deployment-identity.json").write_text("identity", encoding="ascii")
+        (state / "deployment.lock").write_text("lock", encoding="ascii")
+        for name in (
+            "postgres-password",
+            "database-url",
+            "clickhouse-query-password",
+            "clickhouse-ingest-password",
+        ):
+            (root / "secrets" / name).write_text("secret", encoding="ascii")
+        for name in (".env", ".env.example"):
+            (root / "repo" / "deploy" / "offline" / name).write_text(
+                "fixture", encoding="ascii"
+            )
+        return root
 
     def test_fresh_runs_fixed_categories_and_timeouts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -264,6 +300,65 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 _write_report_atomically(report_path, {"status": "failed"})
             self.assertEqual("old", report_path.read_text(encoding="utf-8"))
 
+    def test_report_parent_creation_failure_is_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "reports" / "report.json"
+            with (
+                mock.patch.object(Path, "mkdir", side_effect=OSError("TOP-SECRET")),
+                self.assertRaisesRegex(
+                    GateError, "report could not be committed"
+                ) as raised,
+            ):
+                _write_report_atomically(report_path, {"status": "failed"})
+
+        self.assertNotIn("TOP-SECRET", str(raised.exception))
+
+    def test_post_replace_directory_fsync_failure_never_leaves_passed_report(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = RecordingRunner()
+            original_open = os.open
+            original_close = os.close
+
+            def open_directory(
+                path: str | bytes | os.PathLike[str], flags: int, *args: object
+            ) -> int:
+                if (
+                    os.fspath(path) == os.fspath(root / "reports")
+                    and flags == os.O_RDONLY
+                ):
+                    return 7
+                return original_open(path, flags, *args)
+
+            def close_directory(fd: int) -> None:
+                if fd != 7:
+                    original_close(fd)
+
+            with (
+                mock.patch("tools.intranet_deployment_gate._run_recovery_drill"),
+                mock.patch("tools.intranet_deployment_gate.os.name", "posix"),
+                mock.patch(
+                    "tools.intranet_deployment_gate.os.open", side_effect=open_directory
+                ),
+                mock.patch(
+                    "tools.intranet_deployment_gate.os.close",
+                    side_effect=close_directory,
+                ),
+                mock.patch(
+                    "tools.intranet_deployment_gate.os.fsync",
+                    side_effect=(None, OSError("directory fsync"), None, None),
+                ),
+                self.assertRaises(GateError),
+            ):
+                run_gate(self.config(root), runner=runner)
+            report = json.loads(
+                (root / "reports" / "gate.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual("failed", report["status"])
+
     def test_residual_cleanup_failure_raises_without_down_volumes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -382,27 +477,56 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         self.assertEqual(0, result.returncode)
         self.assertGreaterEqual(attempts, 3)
 
+    def test_readyz_probe_exits_before_a_request_when_deadline_is_expired(self) -> None:
+        from tools.intranet_deployment_gate import _HTTP_PROBE
+
+        wrapper = """
+import itertools, time, urllib.request
+values = iter((0.0, 300.0))
+time.monotonic = lambda: next(values)
+urllib.request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError())
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", wrapper + _HTTP_PROBE, "http://127.0.0.1:1"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(1, result.returncode)
+        self.assertNotIn("AssertionError", result.stderr)
+
+    def test_readyz_probe_retries_transient_network_errors(self) -> None:
+        from tools.intranet_deployment_gate import _HTTP_PROBE
+
+        wrapper = """
+import time, urllib.error, urllib.request
+values = iter((0.0, 0.0, 300.0))
+time.monotonic = lambda: next(values)
+urllib.request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(urllib.error.URLError('transient'))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", wrapper + _HTTP_PROBE, "http://127.0.0.1:1"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(1, result.returncode)
+
     def test_recovery_audit_rejects_unexpected_backup_and_lists_cleanup_objects(
         self,
     ) -> None:
         from tools.intranet_deployment_gate import _audit_recovery_drill_artifacts
 
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = self._drill_artifact_fixture(Path(directory))
             state = root / "data" / ".dcagent-deployment-state"
-            (state / "transactions").mkdir(parents=True)
-            (state / "control-transactions").mkdir()
-            (state / "history").mkdir()
-            (state / "quarantine").mkdir()
-            (state / "deployment-identity.json").write_text(
-                "identity", encoding="ascii"
-            )
-            (root / "models").mkdir()
-            (root / "repo").mkdir()
             secrets = root / "secrets"
-            secrets.mkdir()
-            (secrets / "postgres-password").write_text("secret", encoding="ascii")
-            (state / "history" / "receipt.json").write_text("history", encoding="ascii")
+            receipt = state / "history" / ("a" * 32 + ".json")
+            receipt.write_text("history", encoding="ascii")
             (state / "transactions" / "unexpected-backup").write_text(
                 "x", encoding="ascii"
             )
@@ -417,7 +541,51 @@ class IntranetDeploymentGateTests(unittest.TestCase):
 
         self.assertIn(secrets / "postgres-password", cleanup)
         self.assertIn(state / "deployment-identity.json", cleanup)
-        self.assertIn(state / "history" / "receipt.json", cleanup)
+        self.assertIn(receipt, cleanup)
+
+    def test_recovery_audit_rejects_unknown_root_and_repo_entries(self) -> None:
+        from tools.intranet_deployment_gate import _audit_recovery_drill_artifacts
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._drill_artifact_fixture(Path(directory))
+            (root / "rogue-root").write_text("rogue", encoding="ascii")
+            with self.assertRaisesRegex(
+                GateError, "unexpected recovery drill artifact"
+            ):
+                _audit_recovery_drill_artifacts(root)
+            (root / "rogue-root").unlink()
+            (root / "repo" / "rogue-repo").write_text("rogue", encoding="ascii")
+            with self.assertRaisesRegex(
+                GateError, "unexpected recovery drill artifact"
+            ):
+                _audit_recovery_drill_artifacts(root)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX symlink semantics")
+    def test_recovery_audit_and_cleanup_reject_symlinked_data_without_touching_external(
+        self,
+    ) -> None:
+        from tools.intranet_deployment_gate import (
+            _audit_recovery_drill_artifacts,
+            _cleanup_recovery_drill,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "drill"
+            root.mkdir()
+            external = Path(directory) / "external-data"
+            external.mkdir()
+            sentinel = external / "sentinel"
+            sentinel.write_text("keep", encoding="ascii")
+            (root / "data").symlink_to(external, target_is_directory=True)
+            for name in ("models", "secrets", "repo"):
+                (root / name).mkdir()
+
+            with self.assertRaisesRegex(GateError, "unsafe recovery drill path"):
+                _audit_recovery_drill_artifacts(root)
+            cleanup_error = _cleanup_recovery_drill(root)
+
+        self.assertIsNotNone(cleanup_error)
+        self.assertTrue(sentinel.exists())
 
     @unittest.skipUnless(
         os.name == "posix", "requires POSIX SIGKILL and ownership semantics"
