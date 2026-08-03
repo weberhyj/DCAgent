@@ -1343,6 +1343,28 @@ class TransactionJournalTests(unittest.TestCase):
         )
         self.assertEqual("directory-undo-v2", migrated_metadata["bootstrap_protocol"])
 
+    def test_v2_bootstrap_directory_reader_rejects_boolean_schema_version(
+        self,
+    ) -> None:
+        v2 = self.make_journal()
+        v2_payload = json.loads(
+            v2.bootstrap_directories_path.read_text(encoding="utf-8")
+        )
+        v2_payload["schema_version"] = True
+        state.atomic_write_json(v2.bootstrap_directories_path, v2_payload)
+        with self.assertRaises(state.DeploymentStateError):
+            v2.read_bootstrap_directories()
+
+    def test_v1_bootstrap_directory_reader_rejects_boolean_schema_version(
+        self,
+    ) -> None:
+        v1 = self.make_journal()
+        v1_payload = self.downgrade_bootstrap_to_v1(v1, bootstrap_state="ready")
+        v1_payload["schema_version"] = True
+        state.atomic_write_json(v1.bootstrap_directories_path, v1_payload)
+        with self.assertRaises(state.DeploymentStateError):
+            v1._read_bootstrap_directories_v1()
+
     def test_v1_bootstrap_migration_rejects_schema_authority_and_state_tampering(
         self,
     ) -> None:
@@ -4900,6 +4922,138 @@ class RecoveryCliTests(unittest.TestCase):
         with self.assertRaises(state.DeploymentStateError):
             recovery._select_control_transaction_id(self.paths, "clear-start-marker")
 
+    def test_control_wal_creation_rejects_unsafe_parent_before_writing_wal(
+        self,
+    ) -> None:
+        for name in ("control_transactions", "history"):
+            with self.subTest(name=name):
+                paths = state.StatePaths(
+                    state.derive_state_root(self.base / f"unsafe-{name}-data")
+                )
+                paths.root.parent.mkdir(mode=0o700)
+                paths.ensure_layout(*recovery._current_owner())
+                parent = getattr(paths, name)
+                victim = self.base / f"{name}-victim"
+                victim.mkdir(mode=0o700)
+                parent.rmdir()
+                try:
+                    parent.symlink_to(victim, target_is_directory=True)
+                except OSError as exc:
+                    self.skipTest(f"symlink creation unavailable: {exc}")
+
+                with self.assertRaises(state.DeploymentStateError):
+                    recovery.ControlJournal.create(
+                        paths,
+                        transaction_id=self.transaction_id,
+                        command="clear-start-marker",
+                        deployment_identity_hash=self.identity_hash,
+                        phase="clear_planned",
+                        details={"marker_digest": None},
+                    )
+
+                self.assertFalse((victim / self.transaction_id).exists())
+
+    def test_control_wal_creation_rejects_non_directory_parent_before_writing_wal(
+        self,
+    ) -> None:
+        for name in ("control_transactions", "history"):
+            with self.subTest(name=name):
+                paths = state.StatePaths(
+                    state.derive_state_root(self.base / f"unsafe-type-{name}-data")
+                )
+                paths.root.parent.mkdir(mode=0o700)
+                paths.ensure_layout(*recovery._current_owner())
+                parent = getattr(paths, name)
+                parent.rmdir()
+                parent.write_text("unsafe", encoding="utf-8")
+
+                with self.assertRaises(state.DeploymentStateError):
+                    recovery.ControlJournal.create(
+                        paths,
+                        transaction_id=self.transaction_id,
+                        command="clear-start-marker",
+                        deployment_identity_hash=self.identity_hash,
+                        phase="clear_planned",
+                        details={"marker_digest": None},
+                    )
+
+                self.assertFalse(
+                    (paths.control_transactions / self.transaction_id).exists()
+                )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX modes and owners require POSIX")
+    def test_control_wal_creation_rejects_unsafe_parent_mode_and_owner(self) -> None:
+        for name in ("control_transactions", "history"):
+            with self.subTest(name=name, defect="mode"):
+                paths = state.StatePaths(
+                    state.derive_state_root(self.base / f"unsafe-mode-{name}-data")
+                )
+                paths.root.parent.mkdir(mode=0o700)
+                paths.ensure_layout(*recovery._current_owner())
+                parent = getattr(paths, name)
+                os.chmod(parent, 0o755)
+                with self.assertRaises(state.DeploymentStateError):
+                    recovery.ControlJournal.create(
+                        paths,
+                        transaction_id=self.transaction_id,
+                        command="clear-start-marker",
+                        deployment_identity_hash=self.identity_hash,
+                        phase="clear_planned",
+                        details={"marker_digest": None},
+                    )
+                self.assertFalse(
+                    (paths.control_transactions / self.transaction_id).exists()
+                )
+
+            with self.subTest(name=name, defect="owner"):
+                paths = state.StatePaths(
+                    state.derive_state_root(self.base / f"unsafe-owner-{name}-data")
+                )
+                paths.root.parent.mkdir(mode=0o700)
+                paths.ensure_layout(*recovery._current_owner())
+                parent = getattr(paths, name)
+                uid, gid = recovery._current_owner()
+                try:
+                    os.chown(parent, uid + 1, gid + 1)
+                except PermissionError as exc:
+                    self.skipTest(f"cannot create wrong-owner fixture: {exc}")
+                try:
+                    with self.assertRaises(state.DeploymentStateError):
+                        recovery.ControlJournal.create(
+                            paths,
+                            transaction_id=self.transaction_id,
+                            command="clear-start-marker",
+                            deployment_identity_hash=self.identity_hash,
+                            phase="clear_planned",
+                            details={"marker_digest": None},
+                        )
+                    self.assertFalse(
+                        (paths.control_transactions / self.transaction_id).exists()
+                    )
+                finally:
+                    os.chown(parent, uid, gid)
+
+    def test_clear_control_gate_validates_history_before_scanning_it(self) -> None:
+        victim = self.base / "history-scan-victim"
+        victim.mkdir(mode=0o700)
+        self.paths.history.rmdir()
+        try:
+            self.paths.history.symlink_to(victim, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        original_scandir = recovery.os.scandir
+
+        def no_history_scan(path: str | Path):
+            if Path(path) == self.paths.history:
+                raise AssertionError("history was scanned before validation")
+            return original_scandir(path)
+
+        with (
+            mock.patch.object(recovery.os, "scandir", side_effect=no_history_scan),
+            self.assertRaises(state.DeploymentStateError),
+        ):
+            recovery._assert_only_control_transaction(self.paths, self.transaction_id)
+
     def test_adoption_minimal_bootstrap_creates_only_root_and_lock(self) -> None:
         fresh_data = self.base / "fresh-data"
         fresh_data.mkdir(mode=0o700)
@@ -5424,6 +5578,92 @@ class RecoveryCliTests(unittest.TestCase):
                 self.assertFalse(
                     (self.paths.control_transactions / transaction_id).exists()
                 )
+
+    def test_acknowledge_repaired_revalidates_active_state_before_receipt_wal_cleanup(
+        self,
+    ) -> None:
+        active_tampering = (
+            "environment",
+            "identity",
+            "postgres secret pair",
+            "clickhouse secret pair",
+            "secret ownership",
+            "secret mode",
+        )
+        for tampering in active_tampering:
+            with self.subTest(tampering=tampering):
+                transaction_id = uuid.uuid4().hex
+                damaged = self.paths.transactions / transaction_id
+                damaged.mkdir(mode=0o700)
+                evidence = self.base / f"{transaction_id}-evidence.txt"
+                evidence.write_text("repair complete", encoding="utf-8")
+
+                def stop_after_receipt(_command: str, phase: str) -> None:
+                    if phase == "receipt_written":
+                        raise OSError("simulated hard exit")
+
+                with (
+                    mock.patch.object(recovery, "_active_state_revalidated"),
+                    mock.patch.object(
+                        recovery,
+                        "_after_control_step",
+                        side_effect=stop_after_receipt,
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    recovery.acknowledge_repaired(
+                        self.paths,
+                        transaction_id,
+                        evidence,
+                        mutation_backend=PortableMutationBackend(),
+                    )
+
+                with (
+                    mock.patch.object(
+                        recovery,
+                        "_active_state_revalidated",
+                        side_effect=state.DeploymentStateError(
+                            f"unsafe active {tampering}"
+                        ),
+                    ),
+                    self.assertRaises(state.DeploymentStateError),
+                ):
+                    recovery.acknowledge_repaired(
+                        self.paths,
+                        transaction_id,
+                        evidence,
+                        mutation_backend=PortableMutationBackend(),
+                    )
+                self.assertTrue(
+                    (self.paths.control_transactions / transaction_id).is_dir()
+                )
+
+    def test_completed_acknowledgement_receipt_does_not_revalidate_without_wal(
+        self,
+    ) -> None:
+        damaged = self.paths.transactions / self.transaction_id
+        damaged.mkdir(mode=0o700)
+        evidence = self.base / "completed-repair-evidence.txt"
+        evidence.write_text("repair complete", encoding="utf-8")
+        with mock.patch.object(recovery, "_active_state_revalidated"):
+            receipt = recovery.acknowledge_repaired(
+                self.paths,
+                self.transaction_id,
+                evidence,
+                mutation_backend=PortableMutationBackend(),
+            )
+
+        with mock.patch.object(recovery, "_active_state_revalidated") as revalidated:
+            self.assertEqual(
+                receipt,
+                recovery.acknowledge_repaired(
+                    self.paths,
+                    self.transaction_id,
+                    evidence,
+                    mutation_backend=PortableMutationBackend(),
+                ),
+            )
+        revalidated.assert_not_called()
 
     def test_reacquired_lock_revalidates_clear_and_adoption_gates(self) -> None:
         self.create_marker()

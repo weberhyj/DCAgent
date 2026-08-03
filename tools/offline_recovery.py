@@ -2687,6 +2687,7 @@ class ControlJournal:
         phase: str,
         details: Mapping[str, object],
     ) -> ControlJournal:
+        _verify_control_state_directories(paths)
         journal = cls(
             paths,
             transaction_id,
@@ -2731,6 +2732,7 @@ class ControlJournal:
         command: str | None = None,
         deployment_identity_hash: str | None = None,
     ) -> ControlJournal:
+        _verify_control_state_directories(paths)
         txid = state._validate_uuid4_hex(transaction_id)
         root = paths.control_transactions / txid
         state._verify_directory(root, "control transaction")
@@ -2807,7 +2809,7 @@ def _select_control_transaction_id(paths: state.StatePaths, command: str) -> str
     """Resume the sole matching control WAL, or allocate a fresh recovery id."""
     if command not in {"clear-start-marker", "adopt-existing"}:
         raise state.DeploymentStateError("invalid implicit control command")
-    state._verify_directory(paths.control_transactions, "control transaction directory")
+    _verify_control_state_directories(paths)
     try:
         entries = sorted(
             os.scandir(paths.control_transactions), key=lambda item: item.name
@@ -3252,11 +3254,25 @@ def _postgres_initialized(data_root: Path) -> bool:
         ) from None
 
 
+def _verify_control_state_directories(
+    paths: state.StatePaths, *, include_transactions: bool = False
+) -> None:
+    directories = [paths.control_transactions, paths.history]
+    if include_transactions:
+        directories.insert(0, paths.transactions)
+    for directory, description in (
+        (paths.transactions, "transaction directory"),
+        (paths.control_transactions, "control transaction directory"),
+        (paths.history, "history directory"),
+    ):
+        if directory in directories:
+            state._verify_directory(directory, description)
+
+
 def _assert_only_control_transaction(
     paths: state.StatePaths, transaction_id: str
 ) -> None:
-    state._verify_directory(paths.transactions, "transaction directory")
-    state._verify_directory(paths.control_transactions, "control transaction directory")
+    _verify_control_state_directories(paths, include_transactions=True)
     for directory in (paths.transactions, paths.control_transactions):
         try:
             entries = list(os.scandir(directory))
@@ -3657,10 +3673,12 @@ def acknowledge_repaired(
         raise state.DeploymentStateError("repair evidence changed")
     source = paths.transactions / transaction_id
     target = paths.quarantine / transaction_id
-    if existing_receipt is None and journal.phase in {
+    if journal.phase in {
         "repair_acknowledgement_planned",
         "active_state_checked",
         "transaction_quarantined",
+        "receipt_written",
+        "repair_acknowledgement_complete",
     }:
         _active_state_revalidated(paths, identity, environ=environ)
     if journal.phase == "repair_acknowledgement_planned":

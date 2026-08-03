@@ -1995,6 +1995,7 @@ class TransactionJournal:
         if (
             not isinstance(payload, Mapping)
             or set(payload) != required
+            or type(payload["schema_version"]) is not int
             or payload["schema_version"] != SCHEMA_VERSION
             or payload["transaction_id"] != self.transaction_id
             or payload["protocol"] != BOOTSTRAP_PROTOCOL_V1
@@ -2203,6 +2204,7 @@ class TransactionJournal:
         if (
             not isinstance(payload, Mapping)
             or set(payload) != required
+            or type(payload["schema_version"]) is not int
             or payload["schema_version"] != SCHEMA_VERSION
             or payload["transaction_id"] != self.transaction_id
             or payload["protocol"] != BOOTSTRAP_PROTOCOL
