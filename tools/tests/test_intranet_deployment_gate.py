@@ -58,6 +58,9 @@ class RecordingRunner:
                 (root / "repo" / "deploy" / "offline" / name).write_text(
                     "fixture", encoding="ascii"
                 )
+            (state / "history" / ("recovery-" + "a" * 32 + ".json")).write_text(
+                "receipt", encoding="ascii"
+            )
         exit_code = -9 if is_drill and "KillAfterIntent" in " ".join(argv) else 0
         return subprocess.CompletedProcess(
             argv,
@@ -113,6 +116,9 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             (root / "repo" / "deploy" / "offline" / name).write_text(
                 "fixture", encoding="ascii"
             )
+        (state / "history" / ("recovery-" + "a" * 32 + ".json")).write_text(
+            "receipt", encoding="ascii"
+        )
         return root
 
     def test_fresh_runs_fixed_categories_and_timeouts(self) -> None:
@@ -248,6 +254,81 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 self.assertRaisesRegex(GateError, "recovery drill timed out"),
             ):
                 run_gate(self.config(root), runner=runner)
+
+    def test_recovery_drill_cleans_known_partial_root_after_first_command_failure(
+        self,
+    ) -> None:
+        from tools.intranet_deployment_gate import _run_recovery_drill
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "fixed-drill-root"
+
+            def mkdtemp(*, prefix: str) -> str:
+                self.assertEqual("dcagent-recovery-drill-", prefix)
+                root.mkdir()
+                return str(root)
+
+            def runner(
+                argv: list[str], **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess(
+                    argv, 0 if argv[:3] == ["docker", "ps", "-a"] else 1
+                )
+
+            with (
+                mock.patch(
+                    "tools.intranet_deployment_gate.tempfile.mkdtemp",
+                    side_effect=mkdtemp,
+                ),
+                self.assertRaises(GateError),
+            ):
+                _run_recovery_drill(self.config(Path(directory)), runner=runner)
+
+            self.assertFalse(root.exists())
+
+    def test_partial_cleanup_failure_is_combined_and_leaves_root(self) -> None:
+        from tools.intranet_deployment_gate import _run_recovery_drill
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "fixed-drill-root"
+            original_rmdir = os.rmdir
+
+            def mkdtemp(*, prefix: str) -> str:
+                self.assertEqual("dcagent-recovery-drill-", prefix)
+                root.mkdir()
+                return str(root)
+
+            def runner(
+                argv: list[str], **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess(
+                    argv, 0 if argv[:3] == ["docker", "ps", "-a"] else 1
+                )
+
+            def rmdir(
+                path: str | bytes | os.PathLike[str], *args: object, **kwargs: object
+            ) -> None:
+                if os.fspath(path) == os.fspath(root) or (
+                    os.fspath(path) == root.name and kwargs.get("dir_fd") is not None
+                ):
+                    raise OSError("cleanup blocked")
+                original_rmdir(path, *args, **kwargs)
+
+            with (
+                mock.patch(
+                    "tools.intranet_deployment_gate.tempfile.mkdtemp",
+                    side_effect=mkdtemp,
+                ),
+                mock.patch(
+                    "tools.intranet_deployment_gate.os.rmdir", side_effect=rmdir
+                ),
+                self.assertRaisesRegex(
+                    GateError, "recovery drill failed and cleanup failed"
+                ),
+            ):
+                _run_recovery_drill(self.config(Path(directory)), runner=runner)
+
+            self.assertTrue(root.exists())
 
     def test_recovery_drill_uses_independent_roots_and_never_down_volumes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -516,6 +597,41 @@ urllib.request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(urllib.er
 
         self.assertEqual(1, result.returncode)
 
+    def test_readyz_probe_retries_transient_http_protocol_errors(self) -> None:
+        from tools.intranet_deployment_gate import _HTTP_PROBE
+
+        wrapper = """
+import http.client, time, urllib.request
+attempts = 0
+time.monotonic = lambda: 0.0
+class Response:
+    status = 204
+    def read(self, _): return b"ok"
+    def close(self): pass
+def urlopen(*args, **kwargs):
+    global attempts
+    attempts += 1
+    if attempts < 3:
+        raise http.client.HTTPException("transient")
+    return Response()
+urllib.request.urlopen = urlopen
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                wrapper + _HTTP_PROBE + "\nprint(attempts)",
+                "http://127.0.0.1:1",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("3", result.stdout.strip())
+
     def test_recovery_audit_rejects_unexpected_backup_and_lists_cleanup_objects(
         self,
     ) -> None:
@@ -525,7 +641,7 @@ urllib.request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(urllib.er
             root = self._drill_artifact_fixture(Path(directory))
             state = root / "data" / ".dcagent-deployment-state"
             secrets = root / "secrets"
-            receipt = state / "history" / ("a" * 32 + ".json")
+            receipt = state / "history" / ("b" * 32 + ".json")
             receipt.write_text("history", encoding="ascii")
             (state / "transactions" / "unexpected-backup").write_text(
                 "x", encoding="ascii"
@@ -542,6 +658,23 @@ urllib.request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(urllib.er
         self.assertIn(secrets / "postgres-password", cleanup)
         self.assertIn(state / "deployment-identity.json", cleanup)
         self.assertIn(receipt, cleanup)
+
+    def test_recovery_audit_accepts_only_real_history_receipt_names(self) -> None:
+        from tools.intranet_deployment_gate import _audit_recovery_drill_artifacts
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._drill_artifact_fixture(Path(directory))
+            history = root / "data" / ".dcagent-deployment-state" / "history"
+            normal_receipt = history / ("b" * 32 + ".json")
+            normal_receipt.write_text("receipt", encoding="ascii")
+
+            cleanup = _audit_recovery_drill_artifacts(root)
+            self.assertIn(normal_receipt, cleanup)
+            (history / "receipt.json").write_text("rogue", encoding="ascii")
+            with self.assertRaisesRegex(
+                GateError, "unexpected recovery drill artifact"
+            ):
+                _audit_recovery_drill_artifacts(root)
 
     def test_recovery_audit_rejects_unknown_root_and_repo_entries(self) -> None:
         from tools.intranet_deployment_gate import _audit_recovery_drill_artifacts
@@ -584,6 +717,42 @@ urllib.request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(urllib.er
                 _audit_recovery_drill_artifacts(root)
             cleanup_error = _cleanup_recovery_drill(root)
 
+        self.assertIsNotNone(cleanup_error)
+        self.assertTrue(sentinel.exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX directory descriptors")
+    def test_posix_cleanup_keeps_external_file_when_parent_is_swapped(self) -> None:
+        from tools.intranet_deployment_gate import _cleanup_recovery_drill
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._drill_artifact_fixture(Path(directory) / "drill")
+            external = Path(directory) / "external"
+            external.mkdir()
+            sentinel = external / "postgres-password"
+            sentinel.write_text("keep", encoding="ascii")
+            secret = root / "secrets" / "postgres-password"
+            original_unlink = os.unlink
+            swapped = False
+
+            def swap_parent(
+                path: str | bytes | os.PathLike[str], *args: object, **kwargs: object
+            ) -> None:
+                nonlocal swapped
+                if not swapped and (
+                    os.fspath(path) == "postgres-password"
+                    or os.fspath(path) == os.fspath(secret)
+                ):
+                    (root / "secrets").rename(root / "secrets-held")
+                    (root / "secrets").symlink_to(external, target_is_directory=True)
+                    swapped = True
+                original_unlink(path, *args, **kwargs)
+
+            with mock.patch(
+                "tools.intranet_deployment_gate.os.unlink", side_effect=swap_parent
+            ):
+                cleanup_error = _cleanup_recovery_drill(root)
+
+        self.assertTrue(swapped)
         self.assertIsNotNone(cleanup_error)
         self.assertTrue(sentinel.exists())
 
