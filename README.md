@@ -110,15 +110,64 @@ mkdir -p artifacts/benchmarks
 初始化或接管操作写入并与 data/model/secret roots 绑定。普通 prepare/Compose 不隐式创建 identity；
 更换 `DATA_ROOT` 视为新部署。
 
-新部署固定按以下顺序执行：
+新部署先完成公共前置。以下创建块只适用于首次不存在 `deploy/offline/.env` 的情况；若文件已存在会直接退出，已有 `deploy/offline/.env` 不得覆盖，必须人工审阅并把两个 root 改为同样的 `/srv` 路径后再执行后续核验。
 
 ```bash
 set -Eeuo pipefail
 install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
+if [[ -e deploy/offline/.env ]]; then
+  printf '%s\n' 'deploy/offline/.env already exists; review it instead of overwriting.' >&2
+  exit 1
+fi
+install -m 0600 deploy/offline/.env.example deploy/offline/.env
+deployment_uid="$(id -u)"
+deployment_gid="$(id -g)"
+sed -i \
+  -e 's|^DATA_ROOT=.*$|DATA_ROOT=/srv/dcagent/data|' \
+  -e 's|^MODEL_ROOT=.*$|MODEL_ROOT=/srv/dcagent/models|' \
+  -e "s|^DCAGENT_UID=.*$|DCAGENT_UID=$deployment_uid|" \
+  -e "s|^DCAGENT_GID=.*$|DCAGENT_GID=$deployment_gid|" \
+  deploy/offline/.env
+grep -Fx 'DATA_ROOT=/srv/dcagent/data' deploy/offline/.env
+grep -Fx 'MODEL_ROOT=/srv/dcagent/models' deploy/offline/.env
+grep -Fx "DCAGENT_UID=$deployment_uid" deploy/offline/.env
+grep -Fx "DCAGENT_GID=$deployment_gid" deploy/offline/.env
+```
+
+已有 `.env` 经人工审阅两个 root 和 UID/GID 后必须单独核验，不能用模板覆盖：
+
+```bash
+set -Eeuo pipefail
+install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
+deployment_uid="$(id -u)"
+deployment_gid="$(id -g)"
+grep -Fx 'DATA_ROOT=/srv/dcagent/data' deploy/offline/.env
+grep -Fx 'MODEL_ROOT=/srv/dcagent/models' deploy/offline/.env
+grep -Fx "DCAGENT_UID=$deployment_uid" deploy/offline/.env
+grep -Fx "DCAGENT_GID=$deployment_gid" deploy/offline/.env
+```
+
+公共前置完成后，手工路径与推荐 gate 路径二选一。
+
+### 手工路径
+
+固定核心顺序是 prepare → config → 单次 build → up：
+
+```bash
+set -Eeuo pipefail
 ./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
 ./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d
+```
+
+### 推荐 gate 路径
+
+gate 自身执行上述 prepare/config/build/up 固定序列及验收；不要先运行手工路径，否则会重复 build/up。config 60 秒、build 1800 秒、up/readyz 300 秒、每个 probe 60 秒、recovery drill 120 秒。
+
+```bash
+set -Eeuo pipefail
+python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
 ```
 
 已有数据的旧部署必须先接管，不能跳过 state root：
@@ -133,8 +182,9 @@ set -Eeuo pipefail
 `./tools/invoke_offline_compose.sh up`、`./tools/invoke_offline_compose.sh exec` 和
 `./tools/invoke_offline_compose.sh cp` 会在执行前 durable 写入 `deployment-started.json`，失败后保留它。
 `./tools/invoke_offline_compose.sh config`、`./tools/invoke_offline_compose.sh build` 和
-`./tools/invoke_offline_compose.sh down` 不写 marker。marker 或任意形态 `PG_VERSION` 存在后，普通
-`--rotate-secrets` 永久拒绝；不提供在线 PostgreSQL role 密码修改，也不提供单行删除 marker 的命令。
+`./tools/invoke_offline_compose.sh down` 不写 marker。marker 存在时普通 `--rotate-secrets` 拒绝；只有经
+`recover_offline_deployment.sh clear-start-marker` 且确认无 `PG_VERSION`、无未完成事务后，才可能恢复
+pre-init rotation。任意形态 `PG_VERSION` 存在后永久拒绝；不提供在线 PostgreSQL role 密码修改，也不提供单行删除 marker 的命令。
 
 故障先运行 `./tools/recover_offline_deployment.sh inspect --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id>`。
 自动回滚成功后可继续；`rollback_failed` 使用
@@ -145,13 +195,6 @@ set -Eeuo pipefail
 `./tools/recover_offline_deployment.sh acknowledge-repaired --state-root /absolute/data/root/.dcagent-deployment-state --transaction <transaction-id> --evidence /absolute/path/sanitized-repair-evidence.json`。
 人工执行 `./tools/recover_offline_deployment.sh clear-start-marker --state-root /absolute/data/root/.dcagent-deployment-state` 前，逐项确认无 DC-Agent 容器、无 `PG_VERSION`、PostgreSQL 目录不存在或未初始化、且无未完成事务。
 日志和 evidence receipt 不含 secret、数据库 URL、模型正文或原始 SSE。
-
-目标 Ubuntu 主机使用以下 live gate；config 60 秒、build 1800 秒、up/readyz 300 秒、每个 probe 60 秒、recovery drill 120 秒。
-
-```bash
-set -Eeuo pipefail
-python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
-```
 
 开发机本地测试不是Ubuntu live gate通过；没有真实 Ubuntu Docker、Physoc 和 Ollama 拓扑时，只能记录 live gate 未运行。
 

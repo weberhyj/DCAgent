@@ -2188,8 +2188,11 @@ class ComposeContractTest(unittest.TestCase):
             "evidence receipt",
         )
         marker_delete = re.compile(
-            r"(?im)^\s*(?:(?:sudo|env)(?:\s+(?:-\S+|\w+=\S+|\w+))*\s+)*"
-            r"(?:/bin/rm|rm|command\s+rm)\b[^\n]*deployment-started\.json"
+            r"(?im)^\s*"
+            r"(?:sudo(?:\s+-\S+(?:\s+\S+)?)?\s+)?"
+            r"(?:env(?:\s+(?:-\S+|\w+=\S+))*\s+)?"
+            r"(?:command\s+)?(?:/usr/bin/|/bin/)?rm\b"
+            r"[^\n]*deployment-started\.json"
         )
         for command in (
             "rm deployment-started.json",
@@ -2197,25 +2200,98 @@ class ComposeContractTest(unittest.TestCase):
             "command rm deployment-started.json",
             "sudo rm deployment-started.json",
             "env -i rm deployment-started.json",
+            "sudo -u deploy command /usr/bin/rm deployment-started.json",
             "sudo env KEEP=1 /bin/rm deployment-started.json",
         ):
             with self.subTest(marker_delete_command=command):
                 self.assertRegex(command, marker_delete)
+        for non_command in (
+            "sudo echo rm deployment-started.json",
+            "env printf rm deployment-started.json",
+        ):
+            with self.subTest(marker_delete_non_command=non_command):
+                self.assertNotRegex(non_command, marker_delete)
         for path in documents:
             text = path.read_text(encoding="utf-8")
             with self.subTest(document=path.relative_to(REPO_ROOT)):
                 for token in required:
                     self.assertIn(token, text)
                 self.assertNotRegex(text, marker_delete)
+                clear_paragraphs = [
+                    paragraph
+                    for paragraph in re.split(r"\n\s*\n", text)
+                    if "./tools/recover_offline_deployment.sh clear-start-marker"
+                    in paragraph
+                ]
+                self.assertEqual(1, len(clear_paragraphs))
                 for precondition in (
-                    r"clear-start-marker.*?DC-Agent 容器",
-                    r"clear-start-marker.*?PG_VERSION",
-                    r"clear-start-marker.*?PostgreSQL 目录",
-                    r"clear-start-marker.*?未完成事务",
+                    "DC-Agent 容器",
+                    "PG_VERSION",
+                    "PostgreSQL 目录",
+                    "未完成事务",
                 ):
-                    self.assertRegex(text, re.compile(precondition, re.DOTALL))
+                    self.assertIn(precondition, clear_paragraphs[0])
                 for verb in ("config", "build", "up", "down", "exec", "cp"):
                     self.assertIn(f"./tools/invoke_offline_compose.sh {verb}", text)
+
+    def test_fresh_deployment_docs_bind_srv_roots_before_manual_or_gate(self) -> None:
+        documents = (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+            REPO_ROOT / "docs" / "offline-platform-runbook.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+        )
+        prerequisites = (
+            "install -d -m 0700 /srv/dcagent/data /srv/dcagent/models",
+            "install -m 0600 deploy/offline/.env.example deploy/offline/.env",
+            "DATA_ROOT=/srv/dcagent/data",
+            "MODEL_ROOT=/srv/dcagent/models",
+            'grep -Fx "DCAGENT_UID=$deployment_uid" deploy/offline/.env',
+            'grep -Fx "DCAGENT_GID=$deployment_gid" deploy/offline/.env',
+        )
+        manual_sequence = (
+            "./tools/prepare_offline_env.sh --initialize-state",
+            "./tools/invoke_offline_compose.sh config",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "./tools/invoke_offline_compose.sh up -d",
+        )
+        gate_command = (
+            "python3 tools/intranet_deployment_gate.py --mode fresh --report "
+            "artifacts/benchmarks/intranet-deployment-gate.json"
+        )
+        for path in documents:
+            text = path.read_text(encoding="utf-8")
+            section_match = re.search(r"(?ms)^## Ubuntu 20\.04 .*?(?=^## |\Z)", text)
+            with self.subTest(document=path.relative_to(REPO_ROOT)):
+                self.assertIsNotNone(section_match)
+                assert section_match is not None
+                section = section_match.group(0)
+                for token in prerequisites:
+                    self.assertIn(token, section)
+                self.assertIn("已有 `deploy/offline/.env`", section)
+                self.assertIn("不得覆盖", section)
+                self.assertIn("二选一", section)
+                self.assertIn("手工路径", section)
+                self.assertIn("推荐 gate 路径", section)
+                self.assertIn("gate 自身执行", section)
+                self.assertIn("不要先运行手工路径", section)
+
+                prerequisite_end = max(section.index(token) for token in prerequisites)
+                manual_start = section.index(manual_sequence[0])
+                gate_start = section.index(gate_command)
+                self.assertLess(prerequisite_end, manual_start)
+                self.assertLess(prerequisite_end, gate_start)
+
+                manual_blocks = [
+                    block
+                    for block in bash_fenced_blocks(section)
+                    if all(token in block for token in manual_sequence)
+                ]
+                self.assertEqual(1, len(manual_blocks))
+                manual_positions = [
+                    manual_blocks[0].index(token) for token in manual_sequence
+                ]
+                self.assertEqual(sorted(manual_positions), manual_positions)
 
     def test_production_doc_command_order_and_windows_scope(self) -> None:
         documents = (
@@ -2225,7 +2301,6 @@ class ComposeContractTest(unittest.TestCase):
             REPO_ROOT / "deploy" / "offline" / "README.md",
         )
         sequence = (
-            "install -d -m 0700 /srv/dcagent/data /srv/dcagent/models",
             "./tools/prepare_offline_env.sh --initialize-state",
             "./tools/invoke_offline_compose.sh config",
             "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
