@@ -163,12 +163,26 @@ def _probe_command(script: str, *arguments: str) -> list[str]:
     return ["python3", "-c", script, *arguments]
 
 
-_HTTP_PROBE = (
-    "import sys,urllib.request; "
-    "r=urllib.request.urlopen(sys.argv[1], timeout=45); "
-    "r.read(65536); "
-    "assert 200 <= r.status < 300"
-)
+_HTTP_PROBE = """
+import sys, time, urllib.error, urllib.request
+
+deadline = time.monotonic() + 300
+while True:
+    try:
+        response = urllib.request.urlopen(sys.argv[1], timeout=min(10, max(1, deadline - time.monotonic())))
+        try:
+            response.read(65536)
+            if 200 <= response.status < 300:
+                break
+        finally:
+            response.close()
+    except (OSError, urllib.error.HTTPError):
+        pass
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SystemExit(1)
+    time.sleep(min(0.25, remaining))
+"""
 _OLLAMA_PROBE = (
     "import json,sys,urllib.request; "
     "u=sys.argv[1]; p=json.loads(sys.argv[2]) if len(sys.argv)>2 else None; "
@@ -329,32 +343,93 @@ assert not (root / "recovery-drill.marker").exists()
     ]
 
 
-def _assert_recovery_drill_clean(root: Path) -> None:
+def _audit_recovery_drill_artifacts(root: Path) -> tuple[Path, ...]:
     state_root = root / "data" / ".dcagent-deployment-state"
+    secret_root = root / "secrets"
+    identity = state_root / "deployment-identity.json"
+    expected_roots = (root / "data", root / "models", secret_root, root / "repo")
+    if (
+        not state_root.is_dir()
+        or not identity.is_file()
+        or any(not path.is_dir() for path in expected_roots)
+    ):
+        raise GateError("recovery drill expected artifact is missing")
     leftovers = [root / "recovery-drill.marker"]
     for directory in (
         state_root / "transactions",
-        state_root / "control",
+        state_root / "control-transactions",
         state_root / "quarantine",
     ):
-        if directory.exists() and any(directory.iterdir()):
+        if not directory.is_dir() or any(directory.iterdir()):
             leftovers.append(directory)
-    companion = root / "secrets" / ".dcagent-transactions"
+    companion = secret_root / ".dcagent-transactions"
     if companion.exists():
         leftovers.append(companion)
+    allowed_state = {
+        "deployment.lock",
+        "deployment-identity.json",
+        "transactions",
+        "control-transactions",
+        "history",
+        "quarantine",
+    }
+    leftovers.extend(
+        path for path in state_root.iterdir() if path.name not in allowed_state
+    )
+    leftovers.extend(path for path in (root / "data").iterdir() if path != state_root)
+    leftovers.extend((root / "models").iterdir())
+    allowed_secret_names = {
+        "postgres-password",
+        "database-url",
+        "clickhouse-query-password",
+        "clickhouse-ingest-password",
+    }
+    leftovers.extend(
+        path for path in secret_root.iterdir() if path.name not in allowed_secret_names
+    )
+    for candidate in root.rglob("*"):
+        if candidate.name in {"backup", "staging", ".dcagent-transactions"}:
+            leftovers.append(candidate)
     leftovers = [path for path in leftovers if path.exists()]
     if leftovers:
-        raise GateError("recovery drill left temporary state")
+        raise GateError("unexpected recovery drill artifact")
+
+    active_secrets = tuple(
+        path
+        for path in secret_root.iterdir()
+        if path.is_file() and not path.name.startswith(".")
+    )
+    if not active_secrets:
+        raise GateError("recovery drill expected artifact is missing")
+    history = state_root / "history"
+    if not history.is_dir():
+        raise GateError("recovery drill expected artifact is missing")
+    history_entries = tuple(history.rglob("*"))
+    return (
+        *active_secrets,
+        *history_entries,
+        identity,
+        state_root,
+        *expected_roots,
+        root,
+    )
 
 
-def _cleanup_recovery_drill(root: Path) -> GateError | None:
+def _assert_recovery_drill_clean(root: Path) -> tuple[Path, ...]:
+    return _audit_recovery_drill_artifacts(root)
+
+
+def _cleanup_recovery_drill(
+    root: Path, audited_cleanup: tuple[Path, ...] = ()
+) -> GateError | None:
     state_root = root / "data" / ".dcagent-deployment-state"
     targets = (
+        *audited_cleanup,
         root / "recovery-drill.marker",
         root / "secrets" / ".dcagent-transactions",
         root / "secrets",
         state_root / "transactions",
-        state_root / "control",
+        state_root / "control-transactions",
         state_root / "history",
         state_root / "quarantine",
         state_root,
@@ -380,6 +455,7 @@ def _run_recovery_drill(config: GateConfig, runner: Runner) -> None:
     root = Path(tempfile.mkdtemp(prefix="dcagent-recovery-drill-"))
     failure: GateError | None = None
     interrupted: KeyboardInterrupt | SystemExit | None = None
+    audited_cleanup: tuple[Path, ...] = ()
     commands = _recovery_drill_commands(config, root)
     container_command = commands.pop()
     deadline = time.monotonic() + _TIMEOUTS["recovery_drill"]
@@ -414,7 +490,7 @@ def _run_recovery_drill(config: GateConfig, runner: Runner) -> None:
                 raise GateError("prepare did not fail closed on unfinished transaction")
             if index != 0 and index != 1 and code != 0:
                 raise GateError("recovery drill command failed")
-        _assert_recovery_drill_clean(root)
+        audited_cleanup = _assert_recovery_drill_clean(root)
     except (KeyboardInterrupt, SystemExit) as exc:
         interrupted = exc
     except GateError as exc:
@@ -451,7 +527,7 @@ def _run_recovery_drill(config: GateConfig, runner: Runner) -> None:
             failure = GateError("recovery drill command failed")
 
     try:
-        cleanup_failure = _cleanup_recovery_drill(root)
+        cleanup_failure = _cleanup_recovery_drill(root, audited_cleanup)
     except Exception:  # noqa: BLE001 - cleanup failures use a fixed sanitized error
         cleanup_failure = GateError("recovery drill cleanup failed")
     if interrupted is not None:

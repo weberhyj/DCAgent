@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,6 +30,25 @@ class RecordingRunner:
         self.calls.append((argv, kwargs))
         failing = len(self.calls) == self.failing_call
         is_drill = any("dcagent-recovery-drill-" in value for value in argv)
+        if 'offline_env.prepare_environment(root / "repo"' in " ".join(argv):
+            root = Path(argv[-1])
+            state = root / "data" / ".dcagent-deployment-state"
+            for directory in (
+                state / "transactions",
+                state / "control-transactions",
+                state / "history",
+                state / "quarantine",
+                root / "models",
+                root / "repo",
+                root / "secrets",
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+            (state / "deployment-identity.json").write_text(
+                "identity", encoding="ascii"
+            )
+            (root / "secrets" / "postgres-password").write_text(
+                "test-secret", encoding="ascii"
+            )
         exit_code = -9 if is_drill and "KillAfterIntent" in " ".join(argv) else 0
         return subprocess.CompletedProcess(
             argv,
@@ -319,6 +340,125 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         self.assertTrue(
             any(argv[:3] == ["docker", "ps", "-a"] for argv, _ in runner.calls)
         )
+
+    def test_readyz_probe_retries_until_http_2xx(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        from tools.intranet_deployment_gate import _HTTP_PROBE
+
+        attempts = 0
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                nonlocal attempts
+                attempts += 1
+                self.send_response(503 if attempts < 3 else 200)
+                self.end_headers()
+
+            def log_message(self, *_: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _HTTP_PROBE,
+                    f"http://127.0.0.1:{server.server_port}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        self.assertEqual(0, result.returncode)
+        self.assertGreaterEqual(attempts, 3)
+
+    def test_recovery_audit_rejects_unexpected_backup_and_lists_cleanup_objects(
+        self,
+    ) -> None:
+        from tools.intranet_deployment_gate import _audit_recovery_drill_artifacts
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "data" / ".dcagent-deployment-state"
+            (state / "transactions").mkdir(parents=True)
+            (state / "control-transactions").mkdir()
+            (state / "history").mkdir()
+            (state / "quarantine").mkdir()
+            (state / "deployment-identity.json").write_text(
+                "identity", encoding="ascii"
+            )
+            (root / "models").mkdir()
+            (root / "repo").mkdir()
+            secrets = root / "secrets"
+            secrets.mkdir()
+            (secrets / "postgres-password").write_text("secret", encoding="ascii")
+            (state / "history" / "receipt.json").write_text("history", encoding="ascii")
+            (state / "transactions" / "unexpected-backup").write_text(
+                "x", encoding="ascii"
+            )
+
+            with self.assertRaisesRegex(
+                GateError, "unexpected recovery drill artifact"
+            ):
+                _audit_recovery_drill_artifacts(root)
+
+            (state / "transactions" / "unexpected-backup").unlink()
+            cleanup = _audit_recovery_drill_artifacts(root)
+
+        self.assertIn(secrets / "postgres-password", cleanup)
+        self.assertIn(state / "deployment-identity.json", cleanup)
+        self.assertIn(state / "history" / "receipt.json", cleanup)
+
+    @unittest.skipUnless(
+        os.name == "posix", "requires POSIX SIGKILL and ownership semantics"
+    )
+    def test_posix_run_recovery_drill_executes_full_contract_and_cleans_everything(
+        self,
+    ) -> None:
+        from tools.intranet_deployment_gate import _run_recovery_drill
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "full-drill"
+            root.mkdir()
+            calls: list[list[str]] = []
+
+            def runner(
+                argv: list[str],
+                *,
+                check: bool,
+                capture_output: bool,
+                text: bool,
+                cwd: Path,
+                timeout: float,
+            ) -> subprocess.CompletedProcess[str]:
+                calls.append(argv)
+                if argv[:3] == ["docker", "ps", "-a"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+                return subprocess.run(
+                    argv,
+                    check=check,
+                    capture_output=capture_output,
+                    text=text,
+                    cwd=cwd,
+                    timeout=timeout,
+                )
+
+            _run_recovery_drill(
+                self.config(Path(__file__).resolve().parents[2]), runner=runner
+            )
+
+        self.assertTrue(any(argv[:3] == ["docker", "ps", "-a"] for argv in calls))
+        self.assertFalse(root.exists())
 
     @unittest.skipUnless(
         os.name == "posix", "requires POSIX SIGKILL and ownership semantics"
