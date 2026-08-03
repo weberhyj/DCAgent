@@ -4,7 +4,6 @@ import subprocess
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -13,6 +12,7 @@ class UbuntuDeploymentEntrypointTests(unittest.TestCase):
         expected_helpers = {
             "prepare_offline_env.sh": "offline_env.py",
             "invoke_offline_compose.sh": "offline_compose.py",
+            "recover_offline_deployment.sh": "offline_recovery.py",
         }
 
         for filename, helper in expected_helpers.items():
@@ -38,13 +38,14 @@ class UbuntuDeploymentEntrypointTests(unittest.TestCase):
                 "--stage",
                 "tools/prepare_offline_env.sh",
                 "tools/invoke_offline_compose.sh",
+                "tools/recover_offline_deployment.sh",
             ],
             cwd=REPO_ROOT,
             check=True,
             capture_output=True,
             text=True,
         ).stdout.splitlines()
-        self.assertEqual(2, len(staged))
+        self.assertEqual(3, len(staged))
         self.assertTrue(all(line.startswith("100755 ") for line in staged))
 
     def test_gitattributes_forces_lf_for_shell_scripts(self) -> None:
