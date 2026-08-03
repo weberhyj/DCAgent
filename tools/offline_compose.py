@@ -6,12 +6,15 @@ import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 if __package__:
     from tools.offline_env import DeploymentError, load_env, resolve_env_path
+    from tools import offline_deployment_state as deployment_state
 else:
     from offline_env import DeploymentError, load_env, resolve_env_path
+    import offline_deployment_state as deployment_state
 
 
 VALUE_GLOBAL_OPTIONS = {"--ansi", "--parallel", "--profile", "--progress"}
@@ -24,7 +27,27 @@ OVERRIDE_OPTIONS = {
     "-p",
     "--project-name",
 }
-FORBIDDEN_COMMANDS = {"create", "restart", "run", "scale", "start"}
+ALLOWED_VERBS = frozenset({"config", "build", "up", "down", "exec", "cp"})
+MUTATING_VERBS = frozenset({"up", "exec", "cp"})
+ALLOWED_PROCESS_ENV = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "XDG_RUNTIME_DIR",
+        "DOCKER_CONFIG",
+        "LANG",
+        "LC_ALL",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+)
+HOST_ROOT_ENV = frozenset({"HOST_DATA_ROOT", "HOST_MODEL_ROOT"})
+DANGEROUS_PROCESS_ENV = frozenset(
+    {"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY"}
+)
 FORBIDDEN_BUILD_OPTIONS = {
     "--build-arg",
     "--build-context",
@@ -33,12 +56,6 @@ FORBIDDEN_BUILD_OPTIONS = {
     "--ssh",
 }
 FORBIDDEN_UP_OPTIONS = {"--no-build", "--no-deps", "--no-recreate", "--scale"}
-COMPOSE_OVERRIDE_ENV = {
-    "COMPOSE_ENV_FILES",
-    "COMPOSE_FILE",
-    "COMPOSE_PROFILES",
-    "COMPOSE_PROJECT_NAME",
-}
 INTERNAL_IMAGE = re.compile(
     r"^registry\.internal/dc-agent/[a-z0-9][a-z0-9._/-]*"
     r"@sha256:[0-9a-f]{64}$"
@@ -63,13 +80,19 @@ EXPECTED_NETWORKS = {
 }
 
 
+@dataclass(frozen=True)
+class ComposeInvocation:
+    arguments: tuple[str, ...]
+    verb: str
+
+
 def _option_matches(argument: str, names: set[str]) -> bool:
     return argument in names or any(
         argument.startswith(f"{name}=") for name in names if name.startswith("--")
     )
 
 
-def validate_compose_arguments(arguments: Sequence[str]) -> None:
+def validate_compose_arguments(arguments: Sequence[str]) -> ComposeInvocation:
     if not arguments:
         raise DeploymentError("Pass Docker Compose arguments, for example: up -d")
     if any(not isinstance(argument, str) or not argument for argument in arguments):
@@ -117,10 +140,9 @@ def validate_compose_arguments(arguments: Sequence[str]) -> None:
 
     if command is None:
         raise DeploymentError("A Docker Compose command is required")
-    if command in FORBIDDEN_COMMANDS:
+    if command not in ALLOWED_VERBS:
         raise DeploymentError(
-            f"docker compose {command} is not allowed because lifecycle overrides "
-            "bypass the validated service model"
+            f"docker compose {command} is not an approved offline Compose command"
         )
 
     command_arguments = arguments[command_index + 1 :]
@@ -136,18 +158,69 @@ def validate_compose_arguments(arguments: Sequence[str]) -> None:
                 raise DeploymentError(
                     f"Compose lifecycle override argument {argument} is not allowed"
                 )
+    return ComposeInvocation(tuple(arguments), command)
 
 
 def assert_local_docker_environment(environ: Mapping[str, str]) -> None:
-    docker_host = environ.get("DOCKER_HOST", "")
-    if docker_host and docker_host != "unix:///var/run/docker.sock":
+    dangerous = sorted(
+        name
+        for name in environ
+        if name in DANGEROUS_PROCESS_ENV
+        or name.startswith("COMPOSE_")
+        or name.startswith("DOCKER_")
+        and name not in {"DOCKER_CONFIG"}
+    )
+    if dangerous:
         raise DeploymentError(
-            "Only the local rootful Docker host at unix:///var/run/docker.sock is "
-            "supported"
+            "Docker and Compose process overrides are not allowed: "
+            + ", ".join(dangerous)
         )
-    docker_context = environ.get("DOCKER_CONTEXT", "")
-    if docker_context and docker_context != "default":
-        raise DeploymentError("Only the local default Docker context is supported")
+
+
+def _host_roots(environ: Mapping[str, str]) -> dict[str, Path]:
+    roots: dict[str, Path] = {}
+    for name in HOST_ROOT_ENV:
+        value = environ.get(name)
+        if not isinstance(value, str):
+            raise DeploymentError(f"{name} must be supplied by the calling process")
+        try:
+            roots[name] = deployment_state.normalize_absolute_root(value, name)
+        except deployment_state.DeploymentStateError as exc:
+            raise DeploymentError(str(exc)) from exc
+    return roots
+
+
+def _configured_root(
+    environment: Mapping[str, str],
+    name: str,
+    host_roots: Mapping[str, Path],
+) -> Path:
+    raw_value = environment.get(name)
+    if not isinstance(raw_value, str) or not raw_value:
+        raise DeploymentError(f"{name} must be explicitly defined")
+    expected_host = f"HOST_{name}"
+    if raw_value == f"${{{expected_host}}}":
+        return host_roots[expected_host]
+    if "$" in raw_value or not Path(raw_value).is_absolute():
+        raise DeploymentError(
+            f"{name} must be an absolute path or the complete ${{{expected_host}}} token"
+        )
+    try:
+        return deployment_state.normalize_absolute_root(raw_value, name)
+    except deployment_state.DeploymentStateError as exc:
+        raise DeploymentError(str(exc)) from exc
+
+
+def _child_environment(
+    environ: Mapping[str, str], host_roots: Mapping[str, Path]
+) -> dict[str, str]:
+    child = {
+        name: value
+        for name in ALLOWED_PROCESS_ENV
+        if isinstance((value := environ.get(name)), str)
+    }
+    child.update({name: root.as_posix() for name, root in host_roots.items()})
+    return child
 
 
 def _mapping(value: object, context: str) -> Mapping[str, object]:
@@ -354,10 +427,12 @@ def run_compose(
     repo_root: Path,
     *,
     environ: Mapping[str, str] | None = None,
+    runner: object = subprocess.run,
 ) -> int:
-    validate_compose_arguments(arguments)
+    invocation = validate_compose_arguments(arguments)
     effective_environ = os.environ if environ is None else environ
     assert_local_docker_environment(effective_environ)
+    host_roots = _host_roots(effective_environ)
 
     repo_root = repo_root.resolve()
     env_path = repo_root / "deploy" / "offline" / ".env"
@@ -367,78 +442,116 @@ def run_compose(
     if not compose_path.is_file():
         raise DeploymentError(f"Offline Compose file is missing: {compose_path}")
     environment = load_env(env_path)
-    child_environ = dict(effective_environ)
-    for name in set(environment) | COMPOSE_OVERRIDE_ENV:
-        child_environ.pop(name, None)
+    for name in HOST_ROOT_ENV:
+        if name in environment:
+            raise DeploymentError(f"{name} is process-environment only")
+    data_root = _configured_root(environment, "DATA_ROOT", host_roots)
+    model_root = _configured_root(environment, "MODEL_ROOT", host_roots)
+    paths = deployment_state.StatePaths(deployment_state.derive_state_root(data_root))
+    child_environ = _child_environment(effective_environ, host_roots)
 
-    context_process = subprocess.run(
-        [
-            "docker",
-            "context",
-            "inspect",
-            "default",
-            "--format",
-            "{{.Endpoints.docker.Host}}",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=child_environ,
-    )
-    if context_process.returncode != 0:
-        raise DeploymentError(
-            "Docker default context could not be inspected: "
-            + context_process.stderr.strip()
-        )
-    if context_process.stdout.strip() != "unix:///var/run/docker.sock":
-        raise DeploymentError(
-            "Docker default context must use unix:///var/run/docker.sock"
-        )
-
-    base_arguments = [
-        "docker",
-        "--context",
-        "default",
-        "compose",
-        "--env-file",
-        str(env_path),
-        "-f",
-        str(compose_path),
-    ]
-    config_process = subprocess.run(
-        [
-            *base_arguments,
-            "--profile",
-            "*",
-            "config",
-            "--format",
-            "json",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=child_environ,
-    )
-    if config_process.returncode != 0:
-        raise DeploymentError(
-            "Docker Compose configuration failed: " + config_process.stderr.strip()
-        )
     try:
-        rendered = json.loads(config_process.stdout)
-    except json.JSONDecodeError as error:
-        raise DeploymentError(
-            f"Docker Compose configuration did not return valid JSON: {error}"
-        ) from error
-    if not isinstance(rendered, Mapping):
-        raise DeploymentError("Docker Compose configuration must return a JSON object")
-    assert_rendered_compose(rendered, repo_root, environment)
+        with deployment_state.acquire_deployment_lock(paths):
+            identity = deployment_state.load_identity(paths)
+            if identity.data_root != data_root or identity.model_root != model_root:
+                raise DeploymentError(
+                    "Deployment identity does not match DATA_ROOT and MODEL_ROOT"
+                )
+            identity_hash = deployment_state.identity_digest(identity)
+            deployment_state.assert_no_incomplete_transactions(
+                paths,
+                expected_identity_hash=identity_hash,
+                secret_companion_root=identity.secret_root / ".dcagent-transactions",
+            )
 
-    compose_process = subprocess.run(
-        [*base_arguments, *arguments],
-        check=False,
-        env=child_environ,
-    )
-    return int(compose_process.returncode)
+            context_process = runner(
+                [
+                    "docker",
+                    "context",
+                    "inspect",
+                    "default",
+                    "--format",
+                    "{{.Endpoints.docker.Host}}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=repo_root,
+                env=child_environ,
+            )
+            if context_process.returncode != 0:
+                raise DeploymentError(
+                    "Docker default context could not be inspected: "
+                    + context_process.stderr.strip()
+                )
+            if context_process.stdout.strip() != "unix:///var/run/docker.sock":
+                raise DeploymentError(
+                    "Docker default context must use unix:///var/run/docker.sock"
+                )
+
+            base_arguments = [
+                "docker",
+                "--context",
+                "default",
+                "compose",
+                "--project-name",
+                "dcagent-offline",
+                "--env-file",
+                str(env_path),
+                "-f",
+                str(compose_path),
+            ]
+            config_process = runner(
+                [
+                    *base_arguments,
+                    "--profile",
+                    "*",
+                    "config",
+                    "--format",
+                    "json",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=repo_root,
+                env=child_environ,
+            )
+            if config_process.returncode != 0:
+                raise DeploymentError(
+                    "Docker Compose configuration failed: "
+                    + config_process.stderr.strip()
+                )
+            try:
+                rendered = json.loads(config_process.stdout)
+            except json.JSONDecodeError as error:
+                raise DeploymentError(
+                    f"Docker Compose configuration did not return valid JSON: {error}"
+                ) from error
+            if not isinstance(rendered, Mapping):
+                raise DeploymentError(
+                    "Docker Compose configuration must return a JSON object"
+                )
+            assert_rendered_compose(
+                rendered,
+                repo_root,
+                {**environment, **child_environ},
+            )
+
+            if invocation.verb in MUTATING_VERBS:
+                deployment_state.create_start_marker(
+                    paths,
+                    operation=invocation.verb,
+                    deployment_identity_hash=identity_hash,
+                )
+            compose_process = runner(
+                [*base_arguments, *invocation.arguments],
+                check=False,
+                cwd=repo_root,
+                env=child_environ,
+            )
+            return int(compose_process.returncode)
+    except deployment_state.DeploymentStateError as exc:
+        raise DeploymentError(str(exc)) from exc
 
 
 def main(argv: list[str] | None = None) -> int:

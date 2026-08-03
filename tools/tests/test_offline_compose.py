@@ -4,17 +4,21 @@ import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
 from tools.offline_compose import (
+    ALLOWED_VERBS,
+    ComposeInvocation,
     DeploymentError,
     assert_local_docker_environment,
     assert_rendered_compose,
     run_compose,
     validate_compose_arguments,
 )
+from tools import offline_deployment_state as deployment_state
 
 
 REQUIRED_SERVICES = (
@@ -60,6 +64,7 @@ def rendered_fixture(root: Path) -> dict[str, object]:
         "embedding-service": {"offline": {}, "ollama-egress": {}},
         "reranker-service": {"offline": {}, "ollama-egress": {}},
     }
+
     services: dict[str, dict[str, object]] = {}
     for service_name in REQUIRED_SERVICES:
         services[service_name] = {
@@ -102,6 +107,7 @@ def rendered_fixture(root: Path) -> dict[str, object]:
         ],
         "llama": [(models, "/models")],
     }
+
     for service_name, binds in expected_binds.items():
         services[service_name]["volumes"] = [
             {
@@ -134,7 +140,124 @@ def rendered_fixture(root: Path) -> dict[str, object]:
     }
 
 
+def initialized_compose_repo(root: Path) -> tuple[Path, dict[str, str]]:
+    env_path = root / "deploy" / "offline" / ".env"
+    env_path.parent.mkdir(parents=True)
+    data_root = root / "artifacts" / "data"
+    model_root = root / "artifacts" / "models"
+    secret_root = root / "artifacts" / "secrets"
+    data_root.mkdir(parents=True)
+    model_root.mkdir(parents=True)
+    secret_root.mkdir(parents=True)
+    env_path.write_text(
+        "DATA_ROOT=${HOST_DATA_ROOT}\n"
+        "MODEL_ROOT=${HOST_MODEL_ROOT}\n"
+        f"POSTGRES_PASSWORD_FILE={secret_root / 'postgres-password'}\n"
+        f"DATABASE_URL_SECRET_FILE={secret_root / 'database-url'}\n"
+        f"CLICKHOUSE_QUERY_PASSWORD_FILE={secret_root / 'clickhouse-query-password'}\n"
+        f"CLICKHOUSE_INGEST_PASSWORD_FILE={secret_root / 'clickhouse-ingest-password'}\n",
+        encoding="utf-8",
+    )
+    (env_path.parent / "compose.yaml").write_text(
+        "name: dc-agent-offline\n", encoding="utf-8"
+    )
+    paths = deployment_state.StatePaths(deployment_state.derive_state_root(data_root))
+    paths.ensure_layout(0, 0)
+    identity = deployment_state.DeploymentIdentity.new(
+        state_root=paths.root,
+        data_root=data_root,
+        model_root=model_root,
+        secret_root=secret_root,
+    )
+    deployment_state.write_identity_exclusive(paths, identity)
+    return paths.root, {
+        "PATH": "safe",
+        "HOME": "safe-home",
+        "HOST_DATA_ROOT": str(data_root),
+        "HOST_MODEL_ROOT": str(model_root),
+    }
+
+
+def approved_runner(
+    root: Path,
+    calls: list[tuple[list[str], dict[str, object]]],
+    *,
+    result: int = 0,
+):
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        if command[:3] == ["docker", "context", "inspect"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="unix:///var/run/docker.sock\n", stderr=""
+            )
+        if command[-3:] == ["config", "--format", "json"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps(rendered_fixture(root)), stderr=""
+            )
+        return subprocess.CompletedProcess(command, result, stdout="", stderr="")
+
+    return runner
+
+
+@contextmanager
+def unlocked_deployment_lock(_: object):
+    yield
+
+
 class OfflineComposeArgumentTests(unittest.TestCase):
+    def test_only_six_compose_verbs_are_allowed(self) -> None:
+        self.assertEqual(
+            frozenset({"config", "build", "up", "down", "exec", "cp"}),
+            ALLOWED_VERBS,
+        )
+        invocation = validate_compose_arguments(["--profile", "indexing", "up", "-d"])
+        self.assertEqual(
+            ComposeInvocation(("--profile", "indexing", "up", "-d"), "up"),
+            invocation,
+        )
+        for verb in (
+            "run",
+            "create",
+            "start",
+            "restart",
+            "scale",
+            "pull",
+            "push",
+            "logs",
+            "ps",
+            "version",
+        ):
+            with self.subTest(verb=verb):
+                with self.assertRaises(DeploymentError):
+                    validate_compose_arguments([verb])
+
+    def test_illegal_verb_is_rejected_before_env_or_state_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(DeploymentError):
+                run_compose(
+                    ["logs"],
+                    root,
+                    environ={"HOST_DATA_ROOT": str(root), "HOST_MODEL_ROOT": str(root)},
+                    runner=mock.Mock(),
+                )
+            self.assertFalse((root / "deploy").exists())
+
+    def test_rejects_all_docker_and_compose_process_overrides(self) -> None:
+        for name in (
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_API_VERSION",
+            "COMPOSE_FILE",
+            "COMPOSE_PROFILES",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(DeploymentError):
+                    assert_local_docker_environment({name: "unsafe"})
+
     def test_rejects_project_file_and_environment_overrides(self) -> None:
         for arguments in (
             ["-f", "other.yaml", "up"],
@@ -244,74 +367,219 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                     environment_fixture(root),
                 )
 
-    def test_run_compose_preflights_all_profiles_before_requested_command(
-        self,
-    ) -> None:
+    def test_child_environment_is_allowlisted_and_host_roots_survive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            env_path = root / "deploy" / "offline" / ".env"
-            env_path.parent.mkdir(parents=True)
-            env_path.write_text("DATA_ROOT=/data\n", encoding="utf-8")
-            (env_path.parent / "compose.yaml").write_text(
-                "name: dc-agent-offline\n", encoding="utf-8"
-            )
-            completed = [
-                subprocess.CompletedProcess(
-                    ["docker"],
-                    0,
-                    stdout="unix:///var/run/docker.sock\n",
-                    stderr="",
-                ),
-                subprocess.CompletedProcess(
-                    ["docker"],
-                    0,
-                    stdout=json.dumps(rendered_fixture(root)),
-                    stderr="",
-                ),
-                subprocess.CompletedProcess(["docker"], 0, stdout="", stderr=""),
-            ]
-            caller_environ = {
-                "PATH": "safe",
-                "DATA_ROOT": "/override",
-                "COMPOSE_FILE": "other.yaml",
-            }
-            with (
-                mock.patch(
-                    "tools.offline_compose.subprocess.run",
-                    side_effect=completed,
-                ) as runner,
-                mock.patch(
-                    "tools.offline_compose.assert_rendered_compose"
-                ) as rendered_assertion,
+            _, caller_environ = initialized_compose_repo(root)
+            caller_environ.update({"UNTRUSTED": "discard", "DOCKER_CONFIG": "safe"})
+            calls: list[tuple[list[str], dict[str, object]]] = []
+            with mock.patch(
+                "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                unlocked_deployment_lock,
             ):
                 self.assertEqual(
                     0,
-                    run_compose(["config"], root, environ=caller_environ),
+                    run_compose(
+                        ["config"],
+                        root,
+                        environ=caller_environ,
+                        runner=approved_runner(root, calls),
+                    ),
                 )
 
-            context_command = runner.call_args_list[0].args[0]
-            preflight_command = runner.call_args_list[1].args[0]
-            requested_command = runner.call_args_list[2].args[0]
-            self.assertEqual(
-                [
-                    "docker",
-                    "context",
-                    "inspect",
-                    "default",
-                    "--format",
-                    "{{.Endpoints.docker.Host}}",
-                ],
-                context_command,
-            )
-            self.assertIn("--profile", preflight_command)
-            self.assertIn("*", preflight_command)
-            self.assertEqual("config", requested_command[-1])
-            for call in runner.call_args_list:
-                child_environ = call.kwargs["env"]
-                self.assertNotIn("DATA_ROOT", child_environ)
-                self.assertNotIn("COMPOSE_FILE", child_environ)
+            for _, kwargs in calls:
+                child_environ = kwargs["env"]
                 self.assertEqual("safe", child_environ["PATH"])
-            rendered_assertion.assert_called_once()
+                self.assertEqual("safe", child_environ["DOCKER_CONFIG"])
+                self.assertEqual(
+                    str(root / "artifacts" / "data").replace("\\", "/"),
+                    child_environ["HOST_DATA_ROOT"],
+                )
+                self.assertNotIn("UNTRUSTED", child_environ)
+                self.assertNotIn("DATA_ROOT", child_environ)
+                self.assertEqual(root.resolve(), kwargs["cwd"])
+                self.assertIs(calls[0][1]["env"], child_environ)
+            self.assertIn("--project-name", calls[-1][0])
+            self.assertIn("dcagent-offline", calls[-1][0])
+
+    def test_env_cannot_define_host_roots_and_roots_must_match_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, caller_environ = initialized_compose_repo(root)
+            env_path = root / "deploy" / "offline" / ".env"
+            for data_root in ("relative-root", str(root / "other-data")):
+                with self.subTest(data_root=data_root):
+                    env_path.write_text(
+                        f"DATA_ROOT={data_root}\nMODEL_ROOT=${{HOST_MODEL_ROOT}}\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(DeploymentError):
+                        run_compose(
+                            ["config"],
+                            root,
+                            environ=caller_environ,
+                            runner=mock.Mock(),
+                        )
+            env_path.write_text(
+                "DATA_ROOT=${HOST_DATA_ROOT}\n"
+                "MODEL_ROOT=${HOST_MODEL_ROOT}\n"
+                "HOST_DATA_ROOT=/attacker\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(DeploymentError):
+                run_compose(
+                    ["config"], root, environ=caller_environ, runner=mock.Mock()
+                )
+
+    def test_mutating_verbs_write_marker_before_docker_and_keep_it_on_failure(
+        self,
+    ) -> None:
+        for verb, arguments in (
+            ("up", ["up", "-d"]),
+            ("exec", ["exec", "-T", "api", "true"]),
+            ("cp", ["cp", "api:/tmp/source", "artifacts/destination"]),
+        ):
+            with self.subTest(verb=verb), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state_root, caller_environ = initialized_compose_repo(root)
+                calls: list[tuple[list[str], dict[str, object]]] = []
+
+                def runner(
+                    command: list[str], **kwargs: object
+                ) -> subprocess.CompletedProcess[str]:
+                    if command[-len(arguments) :] == arguments:
+                        self.assertTrue(
+                            (state_root / "deployment-started.json").is_file()
+                        )
+                    return approved_runner(root, calls, result=19)(command, **kwargs)
+
+                with mock.patch(
+                    "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                    unlocked_deployment_lock,
+                ):
+                    self.assertEqual(
+                        19,
+                        run_compose(
+                            arguments,
+                            root,
+                            environ=caller_environ,
+                            runner=runner,
+                        ),
+                    )
+
+                marker = state_root / "deployment-started.json"
+                self.assertTrue(marker.is_file())
+                self.assertEqual(
+                    verb, json.loads(marker.read_text(encoding="utf-8"))["operation"]
+                )
+                self.assertEqual(arguments, calls[-1][0][-len(arguments) :])
+
+    def test_matching_existing_marker_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, caller_environ = initialized_compose_repo(root)
+            calls: list[tuple[list[str], dict[str, object]]] = []
+            with mock.patch(
+                "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                unlocked_deployment_lock,
+            ):
+                for _ in range(2):
+                    self.assertEqual(
+                        0,
+                        run_compose(
+                            ["up", "-d"],
+                            root,
+                            environ=caller_environ,
+                            runner=approved_runner(root, calls),
+                        ),
+                    )
+            self.assertEqual(6, len(calls))
+
+    def test_nonmutating_verbs_do_not_write_marker(self) -> None:
+        for verb in ("config", "build", "down"):
+            with self.subTest(verb=verb), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state_root, caller_environ = initialized_compose_repo(root)
+                calls: list[tuple[list[str], dict[str, object]]] = []
+                with mock.patch(
+                    "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                    unlocked_deployment_lock,
+                ):
+                    self.assertEqual(
+                        0,
+                        run_compose(
+                            [verb],
+                            root,
+                            environ=caller_environ,
+                            runner=approved_runner(root, calls),
+                        ),
+                    )
+                self.assertFalse((state_root / "deployment-started.json").exists())
+
+    def test_lock_is_held_until_compose_process_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, caller_environ = initialized_compose_repo(root)
+            held = False
+
+            @contextmanager
+            def controlled_lock(_: object):
+                nonlocal held
+                held = True
+                try:
+                    yield
+                finally:
+                    held = False
+
+            def runner(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                self.assertTrue(held)
+                return approved_runner(root, [])(command, **kwargs)
+
+            with mock.patch(
+                "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                controlled_lock,
+            ):
+                self.assertEqual(
+                    0,
+                    run_compose(
+                        ["config"], root, environ=caller_environ, runner=runner
+                    ),
+                )
+            self.assertFalse(held)
+
+    def test_all_verbs_fail_before_docker_for_unfinished_state(self) -> None:
+        phases = (
+            "normal transaction",
+            "control transaction",
+            "rollback_failed",
+            "committed_cleanup_required",
+        )
+        for phase in phases:
+            for verb in ALLOWED_VERBS:
+                with (
+                    self.subTest(phase=phase, verb=verb),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root = Path(directory)
+                    _, caller_environ = initialized_compose_repo(root)
+                    runner = mock.Mock()
+                    with (
+                        mock.patch(
+                            "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                            unlocked_deployment_lock,
+                        ),
+                        mock.patch(
+                            "tools.offline_compose.deployment_state.assert_no_incomplete_transactions",
+                            side_effect=deployment_state.DeploymentStateError(phase),
+                        ),
+                    ):
+                        with self.assertRaisesRegex(DeploymentError, phase):
+                            run_compose(
+                                [verb], root, environ=caller_environ, runner=runner
+                            )
+                    runner.assert_not_called()
 
 
 if __name__ == "__main__":
