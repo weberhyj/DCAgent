@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import dataclasses
+import os
 import subprocess
 import tempfile
 import unittest
@@ -521,6 +523,102 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                 run_compose(
                     ["config"], root, environ=caller_environ, runner=mock.Mock()
                 )
+
+    def test_different_checkout_secret_root_fails_before_docker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            checkout_a = parent / "checkout-a"
+            checkout_b = parent / "checkout-b"
+            _, caller_environ = initialized_compose_repo(checkout_a)
+            env_path = checkout_b / "deploy" / "offline" / ".env"
+            env_path.parent.mkdir(parents=True)
+            (checkout_b / "artifacts" / "secrets").mkdir(parents=True)
+            env_path.write_text(
+                "DATA_ROOT=${HOST_DATA_ROOT}\nMODEL_ROOT=${HOST_MODEL_ROOT}\n",
+                encoding="utf-8",
+            )
+            (env_path.parent / "compose.yaml").write_text(
+                "name: dc-agent-offline\n", encoding="utf-8"
+            )
+            calls: list[tuple[list[str], dict[str, object]]] = []
+            with mock.patch(
+                "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                unlocked_deployment_lock,
+            ):
+                with self.assertRaises(DeploymentError):
+                    run_compose(
+                        ["config"],
+                        checkout_b,
+                        environ=caller_environ,
+                        runner=approved_runner(checkout_b, calls),
+                    )
+            self.assertEqual([], calls)
+
+    def test_checkout_secret_symlink_is_rejected_before_docker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            checkout_a = parent / "checkout-a"
+            checkout_b = parent / "checkout-b"
+            _, caller_environ = initialized_compose_repo(checkout_a)
+            (checkout_b / "deploy" / "offline").mkdir(parents=True)
+            (checkout_b / "artifacts").mkdir(parents=True)
+            try:
+                os.symlink(
+                    checkout_a / "artifacts" / "secrets",
+                    checkout_b / "artifacts" / "secrets",
+                    target_is_directory=True,
+                )
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            env_path = checkout_b / "deploy" / "offline" / ".env"
+            env_path.write_text(
+                "DATA_ROOT=${HOST_DATA_ROOT}\nMODEL_ROOT=${HOST_MODEL_ROOT}\n",
+                encoding="utf-8",
+            )
+            (env_path.parent / "compose.yaml").write_text(
+                "name: dc-agent-offline\n", encoding="utf-8"
+            )
+            calls: list[tuple[list[str], dict[str, object]]] = []
+            with self.assertRaises(DeploymentError):
+                run_compose(
+                    ["config"],
+                    checkout_b,
+                    environ=caller_environ,
+                    runner=approved_runner(checkout_b, calls),
+                )
+            self.assertEqual([], calls)
+
+    def test_lock_revalidation_keeps_full_identity_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_root, caller_environ = initialized_compose_repo(root)
+            current_identity = deployment_state.load_identity(
+                deployment_state.StatePaths(state_root)
+            )
+            alternate_secret_root = root / "alternate-secrets"
+            alternate_secret_root.mkdir()
+            replaced_identity = dataclasses.replace(
+                current_identity, secret_root=alternate_secret_root
+            )
+            calls: list[tuple[list[str], dict[str, object]]] = []
+            with (
+                mock.patch(
+                    "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                    unlocked_deployment_lock,
+                ),
+                mock.patch(
+                    "tools.offline_compose.deployment_state.assert_identity_matches",
+                    return_value=replaced_identity,
+                ),
+            ):
+                with self.assertRaises(DeploymentError):
+                    run_compose(
+                        ["config"],
+                        root,
+                        environ=caller_environ,
+                        runner=approved_runner(root, calls),
+                    )
+            self.assertEqual([], calls)
 
     def test_mutating_verbs_write_marker_before_docker_and_keep_it_on_failure(
         self,

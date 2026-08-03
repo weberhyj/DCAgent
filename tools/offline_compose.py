@@ -211,6 +211,23 @@ def _configured_root(
         raise DeploymentError(str(exc)) from exc
 
 
+def _assert_identity_bindings(
+    identity: deployment_state.DeploymentIdentity,
+    *,
+    data_root: Path,
+    model_root: Path,
+    secret_root: Path,
+) -> None:
+    expected_state_root = deployment_state.derive_state_root(data_root)
+    if (
+        identity.state_root != expected_state_root
+        or identity.data_root != data_root
+        or identity.model_root != model_root
+        or identity.secret_root != secret_root
+    ):
+        raise DeploymentError("Deployment identity does not match configured roots")
+
+
 def _child_environment(
     environ: Mapping[str, str],
     env_values: Mapping[str, str],
@@ -338,7 +355,7 @@ def assert_rendered_compose(
                 f"{service_name} PYTHON_BASE_IMAGE",
             )
 
-    repo_root = repo_root.resolve()
+    repo_root = repo_root.absolute()
     env_path = repo_root / "deploy" / "offline" / ".env"
     data_root = _resolved_configured_path(env_path, environment, "DATA_ROOT")
     model_root = _resolved_configured_path(env_path, environment, "MODEL_ROOT")
@@ -453,18 +470,26 @@ def run_compose(
     child_environ = _child_environment(effective_environ, environment, host_roots)
 
     try:
+        checkout_secret_root = deployment_state.normalize_absolute_root(
+            repo_root / "artifacts" / "secrets", "checkout secret root"
+        )
         expected_identity = deployment_state.load_identity(paths)
-        if (
-            expected_identity.data_root != data_root
-            or expected_identity.model_root != model_root
-        ):
-            raise DeploymentError(
-                "Deployment identity does not match DATA_ROOT and MODEL_ROOT"
-            )
+        _assert_identity_bindings(
+            expected_identity,
+            data_root=data_root,
+            model_root=model_root,
+            secret_root=checkout_secret_root,
+        )
         identity_hash = deployment_state.identity_digest(expected_identity)
         with deployment_state.acquire_deployment_lock(paths):
             identity = deployment_state.assert_identity_matches(
                 paths, expected_identity
+            )
+            _assert_identity_bindings(
+                identity,
+                data_root=data_root,
+                model_root=model_root,
+                secret_root=checkout_secret_root,
             )
             deployment_state.assert_no_incomplete_transactions(
                 paths,
