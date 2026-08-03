@@ -212,12 +212,14 @@ def _configured_root(
 
 
 def _child_environment(
-    environ: Mapping[str, str], host_roots: Mapping[str, Path]
+    environ: Mapping[str, str],
+    env_values: Mapping[str, str],
+    host_roots: Mapping[str, Path],
 ) -> dict[str, str]:
     child = {
         name: value
         for name in ALLOWED_PROCESS_ENV
-        if isinstance((value := environ.get(name)), str)
+        if name not in env_values and isinstance((value := environ.get(name)), str)
     }
     child.update({name: root.as_posix() for name, root in host_roots.items()})
     return child
@@ -448,16 +450,22 @@ def run_compose(
     data_root = _configured_root(environment, "DATA_ROOT", host_roots)
     model_root = _configured_root(environment, "MODEL_ROOT", host_roots)
     paths = deployment_state.StatePaths(deployment_state.derive_state_root(data_root))
-    child_environ = _child_environment(effective_environ, host_roots)
+    child_environ = _child_environment(effective_environ, environment, host_roots)
 
     try:
+        expected_identity = deployment_state.load_identity(paths)
+        if (
+            expected_identity.data_root != data_root
+            or expected_identity.model_root != model_root
+        ):
+            raise DeploymentError(
+                "Deployment identity does not match DATA_ROOT and MODEL_ROOT"
+            )
+        identity_hash = deployment_state.identity_digest(expected_identity)
         with deployment_state.acquire_deployment_lock(paths):
-            identity = deployment_state.load_identity(paths)
-            if identity.data_root != data_root or identity.model_root != model_root:
-                raise DeploymentError(
-                    "Deployment identity does not match DATA_ROOT and MODEL_ROOT"
-                )
-            identity_hash = deployment_state.identity_digest(identity)
+            identity = deployment_state.assert_identity_matches(
+                paths, expected_identity
+            )
             deployment_state.assert_no_incomplete_transactions(
                 paths,
                 expected_identity_hash=identity_hash,

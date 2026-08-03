@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from tools.offline_compose import (
+    ALLOWED_PROCESS_ENV,
     ALLOWED_VERBS,
     ComposeInvocation,
     DeploymentError,
@@ -401,6 +402,96 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                 self.assertIs(calls[0][1]["env"], child_environ)
             self.assertIn("--project-name", calls[-1][0])
             self.assertIn("dcagent-offline", calls[-1][0])
+
+    def test_env_values_remove_every_allowlisted_process_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, caller_environ = initialized_compose_repo(root)
+            caller_environ.update(
+                {name: f"process-{name}" for name in ALLOWED_PROCESS_ENV}
+            )
+            env_path = root / "deploy" / "offline" / ".env"
+            env_path.write_text(
+                "DATA_ROOT=${HOST_DATA_ROOT}\n"
+                "MODEL_ROOT=${HOST_MODEL_ROOT}\n"
+                + "".join(f"{name}=env-{name}\n" for name in ALLOWED_PROCESS_ENV)
+                + "\n".join(
+                    f"{name}={value}"
+                    for name, value in environment_fixture(root).items()
+                    if name not in {"DATA_ROOT", "MODEL_ROOT"}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            calls: list[tuple[list[str], dict[str, object]]] = []
+            with mock.patch(
+                "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                unlocked_deployment_lock,
+            ):
+                self.assertEqual(
+                    0,
+                    run_compose(
+                        ["config"],
+                        root,
+                        environ=caller_environ,
+                        runner=approved_runner(root, calls),
+                    ),
+                )
+            for _, kwargs in calls:
+                child_environ = kwargs["env"]
+                self.assertTrue(ALLOWED_PROCESS_ENV.isdisjoint(child_environ))
+                self.assertIn("HOST_DATA_ROOT", child_environ)
+                self.assertIn("HOST_MODEL_ROOT", child_environ)
+
+    def test_identity_read_precedes_lock_and_is_revalidated_inside_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, caller_environ = initialized_compose_repo(root)
+            events: list[str] = []
+            held = False
+            actual_load_identity = deployment_state.load_identity
+
+            def load_identity(paths: deployment_state.StatePaths):
+                events.append("identity")
+                return actual_load_identity(paths)
+
+            @contextmanager
+            def controlled_lock(_: object):
+                nonlocal held
+                events.append("lock-enter")
+                held = True
+                try:
+                    yield
+                finally:
+                    held = False
+                    events.append("lock-exit")
+
+            def runner(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                self.assertTrue(held)
+                events.append("docker")
+                return approved_runner(root, [])(command, **kwargs)
+
+            with (
+                mock.patch(
+                    "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                    controlled_lock,
+                ),
+                mock.patch(
+                    "tools.offline_compose.deployment_state.load_identity",
+                    side_effect=load_identity,
+                ),
+            ):
+                self.assertEqual(
+                    0,
+                    run_compose(
+                        ["config"], root, environ=caller_environ, runner=runner
+                    ),
+                )
+            self.assertEqual(["identity", "lock-enter", "identity"], events[:3])
+            self.assertEqual(2, events.count("identity"))
+            self.assertLess(events.index("lock-enter"), events.index("docker"))
 
     def test_env_cannot_define_host_roots_and_roots_must_match_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
