@@ -237,6 +237,64 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 set(plan.publish_secret_names),
             )
 
+    def test_new_env_uses_complete_host_root_pair_as_absolute_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            data_root = root / "production" / "data"
+            model_root = root / "production" / "models"
+            data_root.mkdir(parents=True, mode=0o700)
+            model_root.mkdir(parents=True, mode=0o700)
+
+            with mock.patch(
+                "tools.offline_env._current_identity", return_value=("1000", "1000")
+            ):
+                plan = build_preparation_plan(
+                    root,
+                    initialize_state=True,
+                    environ={
+                        "HOST_DATA_ROOT": str(data_root),
+                        "HOST_MODEL_ROOT": str(model_root),
+                    },
+                    verify_posix_metadata=False,
+                )
+
+            self.assertEqual(data_root, plan.data_root)
+            self.assertEqual(model_root, plan.model_root)
+            self.assertEqual(data_root.as_posix(), plan.env_updates["DATA_ROOT"])
+            self.assertEqual(model_root.as_posix(), plan.env_updates["MODEL_ROOT"])
+
+    def test_new_env_rejects_partial_host_root_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repository(root)
+            data_root = root / "production" / "data"
+            model_root = root / "production" / "models"
+            data_root.mkdir(parents=True, mode=0o700)
+            model_root.mkdir(parents=True, mode=0o700)
+            data_root.chmod(0o700)
+            model_root.chmod(0o700)
+            for environ in (
+                {"HOST_DATA_ROOT": str(root / "production" / "data")},
+                {"HOST_MODEL_ROOT": str(root / "production" / "models")},
+            ):
+                with (
+                    self.subTest(environ=environ),
+                    mock.patch(
+                        "tools.offline_env._current_identity",
+                        return_value=("1000", "1000"),
+                    ),
+                    self.assertRaisesRegex(
+                        DeploymentError, "must be supplied together"
+                    ),
+                ):
+                    build_preparation_plan(
+                        root,
+                        initialize_state=True,
+                        environ=environ,
+                        verify_posix_metadata=False,
+                    )
+
     def test_plan_records_every_managed_directory_for_final_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1335,7 +1393,10 @@ class OfflineEnvironmentPreparationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             data_root = root / "artifacts" / "data"
-            environ = {"HOST_DATA_ROOT": str(data_root)}
+            environ = {
+                "HOST_DATA_ROOT": str(data_root),
+                "HOST_MODEL_ROOT": str(root / "artifacts" / "models"),
+            }
             self._prepare(root, environ=environ)
             (data_root / "postgres" / "PG_VERSION").write_text("16\n", encoding="ascii")
             before = self._snapshot_tree(root)

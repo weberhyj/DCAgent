@@ -2169,7 +2169,9 @@ class ComposeContractTest(unittest.TestCase):
             "DEPLOYMENT_STATE_ROOT",
             "deployment-started.json",
             "30 秒",
-            "install -d -m 0700 /srv/dcagent/data /srv/dcagent/models",
+            'sudo install -d -o "$deployment_user" -g "$deployment_group" -m 0700',
+            "export HOST_DATA_ROOT=/srv/dcagent/data",
+            "export HOST_MODEL_ROOT=/srv/dcagent/models",
             "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
             "config/build/up/down/exec/cp",
             "rollback_failed",
@@ -2242,12 +2244,12 @@ class ComposeContractTest(unittest.TestCase):
             REPO_ROOT / "deploy" / "offline" / "README.md",
         )
         prerequisites = (
-            "install -d -m 0700 /srv/dcagent/data /srv/dcagent/models",
-            "install -m 0600 deploy/offline/.env.example deploy/offline/.env",
-            "DATA_ROOT=/srv/dcagent/data",
-            "MODEL_ROOT=/srv/dcagent/models",
-            'grep -Fx "DCAGENT_UID=$deployment_uid" deploy/offline/.env',
-            'grep -Fx "DCAGENT_GID=$deployment_gid" deploy/offline/.env',
+            "deployment_user=dcagent",
+            "deployment_group=dcagent",
+            'sudo install -d -o "$deployment_user" -g "$deployment_group" -m 0700',
+            "export HOST_DATA_ROOT=/srv/dcagent/data",
+            "export HOST_MODEL_ROOT=/srv/dcagent/models",
+            "由 `--initialize-state` 自动创建",
         )
         manual_sequence = (
             "./tools/prepare_offline_env.sh --initialize-state",
@@ -2270,6 +2272,11 @@ class ComposeContractTest(unittest.TestCase):
                     self.assertIn(token, section)
                 self.assertIn("已有 `deploy/offline/.env`", section)
                 self.assertIn("不得覆盖", section)
+                self.assertNotIn(
+                    "install -m 0600 deploy/offline/.env.example deploy/offline/.env",
+                    section,
+                )
+                self.assertNotIn("sed -i", section)
                 self.assertIn("二选一", section)
                 self.assertIn("手工路径", section)
                 self.assertIn("推荐 gate 路径", section)

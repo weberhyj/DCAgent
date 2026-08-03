@@ -1261,6 +1261,30 @@ def build_preparation_plan(
     if created_env:
         env_updates["DCAGENT_UID"] = uid_text
         env_updates["DCAGENT_GID"] = gid_text
+        host_root_names = {
+            "DATA_ROOT": "HOST_DATA_ROOT",
+            "MODEL_ROOT": "HOST_MODEL_ROOT",
+        }
+        supplied_host_roots = {
+            host_name
+            for host_name in host_root_names.values()
+            if host_name in effective_environ
+        }
+        if supplied_host_roots and supplied_host_roots != set(host_root_names.values()):
+            raise DeploymentError(
+                "HOST_DATA_ROOT and HOST_MODEL_ROOT must be supplied together"
+            )
+        for configured_name, host_name in host_root_names.items():
+            if host_name not in supplied_host_roots:
+                continue
+            raw_root = effective_environ[host_name]
+            try:
+                normalized_root = deployment_state.normalize_absolute_root(
+                    raw_root, host_name
+                )
+            except deployment_state.DeploymentStateError as exc:
+                raise DeploymentError(str(exc)) from exc
+            env_updates[configured_name] = normalized_root.as_posix()
         env_text = _render_env_values(env_text, env_updates)
         values = _load_env_text(env_text)
     for name, expected in (("DCAGENT_UID", uid_text), ("DCAGENT_GID", gid_text)):

@@ -177,9 +177,11 @@ def assert_local_docker_environment(environ: Mapping[str, str]) -> None:
         )
 
 
-def _host_roots(environ: Mapping[str, str]) -> dict[str, Path]:
+def _host_roots(
+    environ: Mapping[str, str], required_names: Sequence[str]
+) -> dict[str, Path]:
     roots: dict[str, Path] = {}
-    for name in HOST_ROOT_ENV:
+    for name in sorted(required_names):
         value = environ.get(name)
         if not isinstance(value, str):
             raise DeploymentError(f"{name} must be supplied by the calling process")
@@ -451,7 +453,6 @@ def run_compose(
     invocation = validate_compose_arguments(arguments)
     effective_environ = os.environ if environ is None else environ
     assert_local_docker_environment(effective_environ)
-    host_roots = _host_roots(effective_environ)
 
     repo_root = repo_root.resolve()
     env_path = repo_root / "deploy" / "offline" / ".env"
@@ -464,6 +465,12 @@ def run_compose(
     for name in HOST_ROOT_ENV:
         if name in environment:
             raise DeploymentError(f"{name} is process-environment only")
+    required_host_roots = tuple(
+        f"HOST_{name}"
+        for name in ("DATA_ROOT", "MODEL_ROOT")
+        if environment.get(name) == f"${{HOST_{name}}}"
+    )
+    host_roots = _host_roots(effective_environ, required_host_roots)
     data_root = _configured_root(environment, "DATA_ROOT", host_roots)
     model_root = _configured_root(environment, "MODEL_ROOT", host_roots)
     paths = deployment_state.StatePaths(deployment_state.derive_state_root(data_root))

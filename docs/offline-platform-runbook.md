@@ -9,42 +9,21 @@
 `DATA_ROOT/.dcagent-deployment-state`，与 data/model/secret roots 绑定。普通 prepare/Compose
 不隐式创建 identity；更换 `DATA_ROOT` 视为新部署。
 
-新部署先完成公共前置。以下创建块只适用于首次不存在 `deploy/offline/.env` 的情况；若文件已存在会直接退出，已有 `deploy/offline/.env` 不得覆盖，必须人工审阅并把两个 root 改为同样的 `/srv` 路径后再执行后续核验。
+新部署先由 Ubuntu 管理员预创建固定数据目录，并把 owner 设置为实际的非 root 部署账号。下面的
+`dcagent` 只是示例账号；部署前必须改成实际账号和组：
 
 ```bash
 set -Eeuo pipefail
-install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
-if [[ -e deploy/offline/.env ]]; then
-  printf '%s\n' 'deploy/offline/.env already exists; review it instead of overwriting.' >&2
-  exit 1
-fi
-install -m 0600 deploy/offline/.env.example deploy/offline/.env
-deployment_uid="$(id -u)"
-deployment_gid="$(id -g)"
-sed -i \
-  -e 's|^DATA_ROOT=.*$|DATA_ROOT=/srv/dcagent/data|' \
-  -e 's|^MODEL_ROOT=.*$|MODEL_ROOT=/srv/dcagent/models|' \
-  -e "s|^DCAGENT_UID=.*$|DCAGENT_UID=$deployment_uid|" \
-  -e "s|^DCAGENT_GID=.*$|DCAGENT_GID=$deployment_gid|" \
-  deploy/offline/.env
-grep -Fx 'DATA_ROOT=/srv/dcagent/data' deploy/offline/.env
-grep -Fx 'MODEL_ROOT=/srv/dcagent/models' deploy/offline/.env
-grep -Fx "DCAGENT_UID=$deployment_uid" deploy/offline/.env
-grep -Fx "DCAGENT_GID=$deployment_gid" deploy/offline/.env
+deployment_user=dcagent
+deployment_group=dcagent
+sudo install -d -o "$deployment_user" -g "$deployment_group" -m 0700 \
+  /srv/dcagent/data /srv/dcagent/models
 ```
 
-已有 `.env` 经人工审阅两个 root 和 UID/GID 后必须单独核验，不能用模板覆盖：
-
-```bash
-set -Eeuo pipefail
-install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
-deployment_uid="$(id -u)"
-deployment_gid="$(id -g)"
-grep -Fx 'DATA_ROOT=/srv/dcagent/data' deploy/offline/.env
-grep -Fx 'MODEL_ROOT=/srv/dcagent/models' deploy/offline/.env
-grep -Fx "DCAGENT_UID=$deployment_uid" deploy/offline/.env
-grep -Fx "DCAGENT_GID=$deployment_gid" deploy/offline/.env
-```
+随后以该非 root 部署账号登录并进入仓库根目录。不要手工复制或改写 `.env.example`；首次不存在
+`deploy/offline/.env` 时，由 `--initialize-state` 自动创建 `.env`、写入当前 UID/GID，并把下面成对
+提供的 HOST roots 固化为绝对 `DATA_ROOT`/`MODEL_ROOT`。已有 `deploy/offline/.env` 不得覆盖，脚本会
+校验其 roots、UID/GID 和 deployment identity，不匹配时直接失败。
 
 公共前置完成后，手工路径与推荐 gate 路径二选一。
 
@@ -54,6 +33,8 @@ grep -Fx "DCAGENT_GID=$deployment_gid" deploy/offline/.env
 
 ```bash
 set -Eeuo pipefail
+export HOST_DATA_ROOT=/srv/dcagent/data
+export HOST_MODEL_ROOT=/srv/dcagent/models
 ./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
 ./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
@@ -66,6 +47,8 @@ gate 自身执行上述 prepare/config/build/up 固定序列及验收；不要�
 
 ```bash
 set -Eeuo pipefail
+export HOST_DATA_ROOT=/srv/dcagent/data
+export HOST_MODEL_ROOT=/srv/dcagent/models
 python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchmarks/intranet-deployment-gate.json
 ```
 
@@ -73,6 +56,8 @@ python3 tools/intranet_deployment_gate.py --mode fresh --report artifacts/benchm
 
 ```bash
 set -Eeuo pipefail
+export HOST_DATA_ROOT=/absolute/data/root
+export HOST_MODEL_ROOT=/absolute/model/root
 ./tools/recover_offline_deployment.sh adopt-existing --state-root /absolute/data/root/.dcagent-deployment-state
 ./tools/prepare_offline_env.sh
 ```

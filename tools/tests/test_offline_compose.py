@@ -405,6 +405,43 @@ class OfflineComposeRenderedTests(unittest.TestCase):
             self.assertIn("--project-name", calls[-1][0])
             self.assertIn("dcagent-offline", calls[-1][0])
 
+    def test_absolute_roots_do_not_require_host_process_variables(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, caller_environ = initialized_compose_repo(root)
+            data_root = root / "artifacts" / "data"
+            model_root = root / "artifacts" / "models"
+            env_path = root / "deploy" / "offline" / ".env"
+            env_text = env_path.read_text(encoding="utf-8")
+            env_path.write_text(
+                env_text.replace(
+                    "DATA_ROOT=${HOST_DATA_ROOT}", f"DATA_ROOT={data_root}"
+                ).replace("MODEL_ROOT=${HOST_MODEL_ROOT}", f"MODEL_ROOT={model_root}"),
+                encoding="utf-8",
+            )
+            caller_environ.pop("HOST_DATA_ROOT")
+            caller_environ.pop("HOST_MODEL_ROOT")
+            calls: list[tuple[list[str], dict[str, object]]] = []
+
+            with mock.patch(
+                "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                unlocked_deployment_lock,
+            ):
+                self.assertEqual(
+                    0,
+                    run_compose(
+                        ["config"],
+                        root,
+                        environ=caller_environ,
+                        runner=approved_runner(root, calls),
+                    ),
+                )
+
+            for _, kwargs in calls:
+                child_environ = kwargs["env"]
+                self.assertNotIn("HOST_DATA_ROOT", child_environ)
+                self.assertNotIn("HOST_MODEL_ROOT", child_environ)
+
     def test_env_values_remove_every_allowlisted_process_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
