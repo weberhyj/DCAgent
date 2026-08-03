@@ -125,7 +125,9 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = RecordingRunner()
-            report = run_gate(self.config(root), runner=runner)
+            report = run_gate(
+                self.config(root), runner=runner, _test_allow_portable_cleanup=True
+            )
 
         self.assertEqual("passed", report["status"])
         self.assertEqual(
@@ -185,7 +187,11 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = RecordingRunner()
-            run_gate(self.config(root, mode="adopt"), runner=runner)
+            run_gate(
+                self.config(root, mode="adopt"),
+                runner=runner,
+                _test_allow_portable_cleanup=True,
+            )
 
         recover, prepare = runner.calls[:2]
         self.assertIn("recover_offline_deployment.sh", recover[0][0])
@@ -200,7 +206,9 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             root = Path(directory)
             runner = RecordingRunner(failing_call=2)
             with self.assertRaises(GateError):
-                run_gate(self.config(root), runner=runner)
+                run_gate(
+                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
+                )
             raw = (root / "reports" / "gate.json").read_text(encoding="utf-8")
             report = json.loads(raw)
 
@@ -216,7 +224,11 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with self.assertRaises(GateError) as raised:
-                run_gate(self.config(root), runner=RaisingRunner())
+                run_gate(
+                    self.config(root),
+                    runner=RaisingRunner(),
+                    _test_allow_portable_cleanup=True,
+                )
             raw = (root / "reports" / "gate.json").read_text(encoding="utf-8")
 
         self.assertNotIn("TOP-SECRET", str(raised.exception))
@@ -232,7 +244,9 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 "tools.intranet_deployment_gate.time.monotonic",
                 side_effect=lambda: next(ticks),
             ):
-                run_gate(self.config(root), runner=runner)
+                run_gate(
+                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
+                )
 
         drill_timeouts = [
             kwargs["timeout"]
@@ -253,7 +267,9 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(GateError, "recovery drill timed out"),
             ):
-                run_gate(self.config(root), runner=runner)
+                run_gate(
+                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
+                )
 
     def test_recovery_drill_cleans_known_partial_root_after_first_command_failure(
         self,
@@ -282,7 +298,11 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 ),
                 self.assertRaises(GateError),
             ):
-                _run_recovery_drill(self.config(Path(directory)), runner=runner)
+                _run_recovery_drill(
+                    self.config(Path(directory)),
+                    runner=runner,
+                    _test_allow_portable_cleanup=True,
+                )
 
             self.assertFalse(root.exists())
 
@@ -326,7 +346,11 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                     GateError, "recovery drill failed and cleanup failed"
                 ),
             ):
-                _run_recovery_drill(self.config(Path(directory)), runner=runner)
+                _run_recovery_drill(
+                    self.config(Path(directory)),
+                    runner=runner,
+                    _test_allow_portable_cleanup=True,
+                )
 
             self.assertTrue(root.exists())
 
@@ -334,7 +358,9 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = RecordingRunner()
-            run_gate(self.config(root), runner=runner)
+            run_gate(
+                self.config(root), runner=runner, _test_allow_portable_cleanup=True
+            )
 
         all_commands = [" ".join(call[0]) for call in runner.calls]
         drill_commands = [
@@ -433,7 +459,9 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 ),
                 self.assertRaises(GateError),
             ):
-                run_gate(self.config(root), runner=runner)
+                run_gate(
+                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
+                )
             report = json.loads(
                 (root / "reports" / "gate.json").read_text(encoding="utf-8")
             )
@@ -451,7 +479,9 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(GateError, "residual drill state"),
             ):
-                run_gate(self.config(root), runner=runner)
+                run_gate(
+                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
+                )
             commands = [" ".join(argv) for argv, _ in runner.calls]
 
         self.assertTrue(
@@ -477,7 +507,11 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                     GateError, "recovery drill failed and cleanup failed"
                 ) as raised,
             ):
-                run_gate(self.config(root), runner=RecordingRunner())
+                run_gate(
+                    self.config(root),
+                    runner=RecordingRunner(),
+                    _test_allow_portable_cleanup=True,
+                )
             raw = (root / "reports" / "gate.json").read_text(encoding="utf-8")
 
         self.assertNotIn("TOP-SECRET", str(raised.exception))
@@ -497,7 +531,11 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as directory,
             self.assertRaisesRegex(GateError, "related container"),
         ):
-            run_gate(self.config(Path(directory)), runner=ContainerRunner())
+            run_gate(
+                self.config(Path(directory)),
+                runner=ContainerRunner(),
+                _test_allow_portable_cleanup=True,
+            )
 
     def test_drill_checks_for_containers_even_after_an_early_failure(self) -> None:
         class EarlyFailureRunner(RecordingRunner):
@@ -511,7 +549,11 @@ class IntranetDeploymentGateTests(unittest.TestCase):
 
         runner = EarlyFailureRunner()
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(GateError):
-            run_gate(self.config(Path(directory)), runner=runner)
+            run_gate(
+                self.config(Path(directory)),
+                runner=runner,
+                _test_allow_portable_cleanup=True,
+            )
 
         self.assertTrue(
             any(argv[:3] == ["docker", "ps", "-a"] for argv, _ in runner.calls)
@@ -755,6 +797,34 @@ urllib.request.urlopen = urlopen
         self.assertTrue(swapped)
         self.assertIsNotNone(cleanup_error)
         self.assertTrue(sentinel.exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX directory descriptors")
+    def test_posix_cleanup_rejects_whole_root_replacement(self) -> None:
+        from tools.intranet_deployment_gate import (
+            _audit_recovery_drill_artifacts,
+            _capture_recovery_drill_authority,
+            _cleanup_recovery_drill,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = self._drill_artifact_fixture(parent / "drill")
+            authority = _capture_recovery_drill_authority(root)
+            _audit_recovery_drill_artifacts(root)
+            original = parent / "original-drill"
+            root.rename(original)
+            replacement = self._drill_artifact_fixture(root)
+            sentinel = replacement / "secrets" / "postgres-password"
+            sentinel.write_text("replacement", encoding="ascii")
+
+            cleanup_error = _cleanup_recovery_drill(root, authority=authority)
+
+            os.close(authority.parent_fd)
+
+        self.assertIsNotNone(cleanup_error)
+        self.assertTrue(original.exists())
+        self.assertTrue(replacement.exists())
+        self.assertEqual("replacement", sentinel.read_text(encoding="ascii"))
 
     @unittest.skipUnless(
         os.name == "posix", "requires POSIX SIGKILL and ownership semantics"

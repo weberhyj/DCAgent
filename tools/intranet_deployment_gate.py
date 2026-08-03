@@ -41,6 +41,14 @@ class GateConfig:
     state_root: Path | None = None
 
 
+@dataclass(frozen=True)
+class _RecoveryDrillAuthority:
+    root: Path
+    device: int
+    inode: int
+    parent_fd: int | None = None
+
+
 _CATEGORIES = (
     "prepare",
     "compose_config",
@@ -531,7 +539,7 @@ def _audit_partial_recovery_drill_artifacts(root: Path) -> tuple[Path, ...]:
 
 
 def _portable_cleanup_recovery_drill(
-    root: Path, targets: tuple[Path, ...]
+    root: Path, targets: tuple[Path, ...], authority: _RecoveryDrillAuthority
 ) -> GateError | None:
     """Best-effort test-only fallback where directory descriptors are unavailable."""
 
@@ -541,6 +549,8 @@ def _portable_cleanup_recovery_drill(
         reverse=True,
     ):
         try:
+            if not _authority_still_matches(authority):
+                return GateError("recovery drill cleanup failed")
             path_stat = _safe_drill_lstat(root, path)
             if stat.S_ISDIR(path_stat.st_mode):
                 path.rmdir()
@@ -561,8 +571,80 @@ def _portable_cleanup_recovery_drill(
     return None
 
 
+def _drill_directory_open_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    except AttributeError:
+        raise GateError("unsafe recovery drill path") from None
+
+
+def _same_drill_identity(
+    path_stat: os.stat_result, authority: _RecoveryDrillAuthority
+) -> bool:
+    return (path_stat.st_dev, path_stat.st_ino) == (authority.device, authority.inode)
+
+
+def _capture_recovery_drill_authority(root: Path) -> _RecoveryDrillAuthority:
+    root = Path(root)
+    try:
+        root_stat = root.lstat()
+    except OSError:
+        raise GateError("unsafe recovery drill path") from None
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise GateError("unsafe recovery drill path")
+    if os.name != "posix":
+        return _RecoveryDrillAuthority(root, root_stat.st_dev, root_stat.st_ino)
+
+    parent_fd: int | None = None
+    try:
+        parent_fd = os.open(root.parent, _drill_directory_open_flags())
+        entry = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(entry.st_mode)
+            or not stat.S_ISDIR(entry.st_mode)
+            or (entry.st_dev, entry.st_ino) != (root_stat.st_dev, root_stat.st_ino)
+        ):
+            raise GateError("unsafe recovery drill path")
+    except OSError:
+        if parent_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(parent_fd)
+        raise GateError("unsafe recovery drill path") from None
+    except BaseException:
+        if parent_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(parent_fd)
+        raise
+    return _RecoveryDrillAuthority(root, root_stat.st_dev, root_stat.st_ino, parent_fd)
+
+
+def _close_recovery_drill_authority(authority: _RecoveryDrillAuthority) -> None:
+    if authority.parent_fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(authority.parent_fd)
+
+
+def _authority_still_matches(authority: _RecoveryDrillAuthority) -> bool:
+    try:
+        if authority.parent_fd is not None:
+            current = os.stat(
+                authority.root.name,
+                dir_fd=authority.parent_fd,
+                follow_symlinks=False,
+            )
+        else:
+            current = authority.root.lstat()
+    except OSError:
+        return False
+    return (
+        not stat.S_ISLNK(current.st_mode)
+        and stat.S_ISDIR(current.st_mode)
+        and _same_drill_identity(current, authority)
+    )
+
+
 def _open_drill_directory_at(parent_fd: int, name: str) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    flags = _drill_directory_open_flags()
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
@@ -585,35 +667,33 @@ def _open_drill_parent_fd(root_fd: int, relative_parts: tuple[str, ...]) -> int:
     try:
         for name in relative_parts[:-1]:
             child_fd = _open_drill_directory_at(parent_fd, name)
-            os.close(parent_fd)
+            try:
+                os.close(parent_fd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(child_fd)
+                raise
             parent_fd = child_fd
     except BaseException:
-        os.close(parent_fd)
+        with contextlib.suppress(OSError):
+            os.close(parent_fd)
         raise
     return parent_fd
 
 
 def _cleanup_recovery_drill_posix(
-    root: Path, targets: tuple[Path, ...]
+    root: Path, targets: tuple[Path, ...], authority: _RecoveryDrillAuthority
 ) -> GateError | None:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    root_fd: int | None = None
+    if authority.parent_fd is None or not _authority_still_matches(authority):
+        return GateError("recovery drill cleanup failed")
+    flags = _drill_directory_open_flags()
     try:
-        root_fd = os.open(root, flags)
-        root_parent_fd = os.open(root.parent, flags)
+        root_fd = os.open(root.name, flags, dir_fd=authority.parent_fd)
     except OSError:
-        if root_fd is not None:
-            os.close(root_fd)
         return GateError("recovery drill cleanup failed")
     try:
         root_stat = os.fstat(root_fd)
-        root_entry = os.stat(root.name, dir_fd=root_parent_fd, follow_symlinks=False)
-        if (
-            stat.S_ISLNK(root_entry.st_mode)
-            or not stat.S_ISDIR(root_entry.st_mode)
-            or (root_entry.st_dev, root_entry.st_ino)
-            != (root_stat.st_dev, root_stat.st_ino)
-        ):
+        if not _same_drill_identity(root_stat, authority):
             return GateError("recovery drill cleanup failed")
         for path in sorted(
             targets,
@@ -622,15 +702,9 @@ def _cleanup_recovery_drill_posix(
         ):
             relative_parts = path.relative_to(root).parts
             if not relative_parts:
-                entry = os.stat(root.name, dir_fd=root_parent_fd, follow_symlinks=False)
-                if (
-                    stat.S_ISLNK(entry.st_mode)
-                    or not stat.S_ISDIR(entry.st_mode)
-                    or (entry.st_dev, entry.st_ino)
-                    != (root_stat.st_dev, root_stat.st_ino)
-                ):
+                if not _authority_still_matches(authority):
                     return GateError("recovery drill cleanup failed")
-                os.rmdir(root.name, dir_fd=root_parent_fd)
+                os.rmdir(root.name, dir_fd=authority.parent_fd)
                 continue
             parent_fd = _open_drill_parent_fd(root_fd, relative_parts)
             try:
@@ -649,8 +723,8 @@ def _cleanup_recovery_drill_posix(
     except (GateError, OSError):
         return GateError("recovery drill cleanup failed")
     finally:
-        os.close(root_parent_fd)
-        os.close(root_fd)
+        with contextlib.suppress(OSError):
+            os.close(root_fd)
     return None
 
 
@@ -658,23 +732,35 @@ def _cleanup_recovery_drill(
     root: Path,
     audited_cleanup: tuple[Path, ...] = (),
     *,
+    authority: _RecoveryDrillAuthority | None = None,
     allow_portable_cleanup: bool = False,
 ) -> GateError | None:
     del audited_cleanup
+    owns_authority = authority is None
     try:
-        targets = _audit_recovery_drill_artifacts(root)
-    except GateError as exc:
-        if str(exc) != "recovery drill expected artifact is missing":
-            return GateError("recovery drill cleanup failed")
         try:
-            targets = _audit_partial_recovery_drill_artifacts(root)
-        except GateError:
-            return GateError("recovery drill cleanup failed")
-    if os.name == "posix":
-        return _cleanup_recovery_drill_posix(root, targets)
-    if allow_portable_cleanup:
-        return _portable_cleanup_recovery_drill(root, targets)
-    return GateError("recovery drill cleanup failed")
+            if authority is None:
+                authority = _capture_recovery_drill_authority(root)
+            if not _authority_still_matches(authority):
+                return GateError("recovery drill cleanup failed")
+            targets = _audit_recovery_drill_artifacts(root)
+        except GateError as exc:
+            if str(exc) != "recovery drill expected artifact is missing":
+                return GateError("recovery drill cleanup failed")
+            try:
+                targets = _audit_partial_recovery_drill_artifacts(root)
+            except GateError:
+                return GateError("recovery drill cleanup failed")
+        if os.name == "posix":
+            assert authority is not None
+            return _cleanup_recovery_drill_posix(root, targets, authority)
+        if allow_portable_cleanup:
+            assert authority is not None
+            return _portable_cleanup_recovery_drill(root, targets, authority)
+        return GateError("recovery drill cleanup failed")
+    finally:
+        if owns_authority and authority is not None:
+            _close_recovery_drill_authority(authority)
 
 
 def _persist_failed_report(path: Path, report: dict[str, object]) -> None:
@@ -683,12 +769,22 @@ def _persist_failed_report(path: Path, report: dict[str, object]) -> None:
         _write_report_atomically(path, report)
 
 
-def _run_recovery_drill(config: GateConfig, runner: Runner) -> None:
+def _run_recovery_drill(
+    config: GateConfig,
+    runner: Runner,
+    *,
+    _test_allow_portable_cleanup: bool = False,
+) -> None:
     root = Path(tempfile.mkdtemp(prefix="dcagent-recovery-drill-"))
+    authority = _capture_recovery_drill_authority(root)
     failure: GateError | None = None
     interrupted: KeyboardInterrupt | SystemExit | None = None
     audited_cleanup: tuple[Path, ...] = ()
-    commands = _recovery_drill_commands(config, root)
+    try:
+        commands = _recovery_drill_commands(config, root)
+    except BaseException:
+        _close_recovery_drill_authority(authority)
+        raise
     container_command = commands.pop()
     deadline = time.monotonic() + _TIMEOUTS["recovery_drill"]
     try:
@@ -759,11 +855,15 @@ def _run_recovery_drill(config: GateConfig, runner: Runner) -> None:
             failure = GateError("recovery drill command failed")
 
     try:
-        cleanup_failure = _cleanup_recovery_drill(
-            root,
-            audited_cleanup,
-            allow_portable_cleanup=runner is not subprocess.run,
-        )
+        try:
+            cleanup_failure = _cleanup_recovery_drill(
+                root,
+                audited_cleanup,
+                authority=authority,
+                allow_portable_cleanup=_test_allow_portable_cleanup,
+            )
+        finally:
+            _close_recovery_drill_authority(authority)
     except Exception:  # noqa: BLE001 - cleanup failures use a fixed sanitized error
         cleanup_failure = GateError("recovery drill cleanup failed")
     if interrupted is not None:
@@ -777,7 +877,10 @@ def _run_recovery_drill(config: GateConfig, runner: Runner) -> None:
 
 
 def run_gate(
-    config: GateConfig, *, runner: Runner = subprocess.run
+    config: GateConfig,
+    *,
+    runner: Runner = subprocess.run,
+    _test_allow_portable_cleanup: bool = False,
 ) -> dict[str, object]:
     steps: list[dict[str, object]] = []
     report: dict[str, object] = {
@@ -900,7 +1003,11 @@ def run_gate(
         started = time.time()
         recovery_error: GateError | None = None
         try:
-            _run_recovery_drill(config, runner)
+            _run_recovery_drill(
+                config,
+                runner,
+                _test_allow_portable_cleanup=_test_allow_portable_cleanup,
+            )
             exit_code = 0
         except GateError as exc:
             exit_code = 1
