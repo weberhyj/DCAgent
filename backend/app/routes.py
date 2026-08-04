@@ -17,6 +17,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BeforeValidator
+from starlette.concurrency import run_in_threadpool
 
 from .evaluation import (
     EvaluationCaseDuplicateError,
@@ -509,11 +510,10 @@ async def upload_knowledge_file(
     if not selected_files:
         raise HTTPException(status_code=400, detail="Upload at least one knowledge file")
 
-    sources = repository.list_knowledge_sources()
     for upload in selected_files:
         content = await upload.read()
         stored = storage.save(upload.filename or "", content)
-        sources = repository.add_uploaded_knowledge_source(
+        repository.add_uploaded_knowledge_source(
             source_id=stored.source_id,
             name=stored.original_name,
             source_type=stored.source_type,
@@ -523,9 +523,14 @@ async def upload_knowledge_file(
             file_size=stored.size,
             mime_type=upload.content_type,
         )
-        ingestion_queue.enqueue(stored.source_id, stored.path, stored.source_type)
+        await run_in_threadpool(
+            ingestion_queue.process,
+            stored.source_id,
+            stored.path,
+            stored.source_type,
+        )
 
-    return [KnowledgeSource.from_model(source) for source in sources]
+    return [KnowledgeSource.from_model(source) for source in repository.list_knowledge_sources()]
 
 
 @router.get(

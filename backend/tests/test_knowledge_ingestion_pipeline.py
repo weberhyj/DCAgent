@@ -30,7 +30,7 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_upload_registers_pending_source_then_background_task_indexes_chunks(self) -> None:
+    def test_upload_indexes_chunks_before_returning(self) -> None:
         body = ("第一段现金流分析。" * 80).encode("utf-8")
 
         response = self.client.post(
@@ -42,14 +42,14 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         uploaded = response.json()[0]
         self.assertEqual(uploaded["name"], "cashflow-note.txt")
-        self.assertEqual(uploaded["status"], "解析中")
-        self.assertEqual(uploaded["records"], 0)
+        self.assertEqual(uploaded["status"], "已索引")
+        self.assertGreater(uploaded["records"], 1)
 
         sources = self.client.get("/api/knowledge/sources").json()
         indexed = sources[0]
         self.assertEqual(indexed["id"], uploaded["id"])
         self.assertEqual(indexed["status"], "已索引")
-        self.assertGreater(indexed["records"], 1)
+        self.assertEqual(indexed["records"], uploaded["records"])
 
         chunks_response = self.client.get(f"/api/knowledge/sources/{uploaded['id']}/chunks")
         self.assertEqual(chunks_response.status_code, 200)

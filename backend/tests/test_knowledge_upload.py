@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 
+from docx import Document
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -14,13 +16,39 @@ from app.seed import build_seed_state
 class KnowledgeUploadTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        repository = InMemoryChatRepository(build_seed_state())
+        self.repository = InMemoryChatRepository(build_seed_state())
         self.client = TestClient(
-            create_app(repository=repository, upload_dir=Path(self.temp_dir.name))
+            create_app(repository=self.repository, upload_dir=Path(self.temp_dir.name))
         )
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def test_uploaded_word_document_is_searchable_before_upload_returns(self) -> None:
+        document = Document()
+        document.add_paragraph("年度培训预算为八十万元，申请部门为人力资源部。")
+        content = BytesIO()
+        document.save(content)
+
+        response = self.client.post(
+            "/api/knowledge/uploads",
+            files={
+                "file": (
+                    "training-budget.docx",
+                    content.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        uploaded = response.json()[0]
+        self.assertEqual(uploaded["status"], "已索引")
+        self.assertGreater(uploaded["records"], 0)
+
+        hits = self.repository.search_knowledge_chunks("年度培训预算")
+        self.assertGreater(len(hits), 0)
+        self.assertIn("八十万元", hits[0].chunk.text)
 
     def test_upload_without_classification_defaults_to_public(self) -> None:
         response = self.client.post(
@@ -31,7 +59,7 @@ class KnowledgeUploadTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()[0]["classification"], "公开")
 
-    def test_uploads_file_and_registers_pending_source_then_indexes_on_refresh(self) -> None:
+    def test_uploads_file_and_indexes_before_returning(self) -> None:
         response = self.client.post(
             "/api/knowledge/uploads",
             data={"classification": "内部·机密"},
@@ -43,8 +71,8 @@ class KnowledgeUploadTest(unittest.TestCase):
         self.assertEqual(source["name"], "董事会纪要.pdf")
         self.assertEqual(source["sourceType"], "PDF")
         self.assertEqual(source["classification"], "内部·机密")
-        self.assertEqual(source["status"], "解析中")
-        self.assertEqual(source["records"], 0)
+        self.assertEqual(source["status"], "已索引")
+        self.assertGreater(source["records"], 0)
         self.assertGreater(source["fileSize"], 0)
         self.assertEqual(source["mimeType"], "application/pdf")
 
@@ -55,7 +83,7 @@ class KnowledgeUploadTest(unittest.TestCase):
         indexed = self.client.get("/api/knowledge/sources").json()[0]
         self.assertEqual(indexed["id"], source["id"])
         self.assertEqual(indexed["status"], "已索引")
-        self.assertGreater(indexed["records"], 0)
+        self.assertEqual(indexed["records"], source["records"])
 
     def test_uploads_multiple_files_in_one_request(self) -> None:
         response = self.client.post(
@@ -69,8 +97,10 @@ class KnowledgeUploadTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         sources_by_name = {source["name"]: source for source in response.json()}
-        self.assertEqual(sources_by_name["policy-a.txt"]["status"], "解析中")
-        self.assertEqual(sources_by_name["policy-b.md"]["status"], "解析中")
+        self.assertEqual(sources_by_name["policy-a.txt"]["status"], "已索引")
+        self.assertEqual(sources_by_name["policy-b.md"]["status"], "已索引")
+        self.assertGreater(sources_by_name["policy-a.txt"]["records"], 0)
+        self.assertGreater(sources_by_name["policy-b.md"]["records"], 0)
         self.assertEqual(sources_by_name["policy-a.txt"]["classification"], "内部")
         self.assertEqual(sources_by_name["policy-b.md"]["classification"], "内部")
 
@@ -99,7 +129,7 @@ class KnowledgeUploadTest(unittest.TestCase):
         missing_chunks = self.client.get(f"/api/knowledge/sources/{source['id']}/chunks")
         self.assertEqual(missing_chunks.status_code, 404)
 
-    def test_deletes_pending_uploaded_source_without_indexing_it_later(self) -> None:
+    def test_deleted_uploaded_source_does_not_reappear(self) -> None:
         response = self.client.post(
             "/api/knowledge/uploads",
             data={"classification": "内部"},

@@ -73,7 +73,8 @@ class RagAcceptanceTest(unittest.TestCase):
         )
         self.assertEqual(upload_response.status_code, 200)
         source = upload_response.json()[0]
-        self.assertEqual(source["status"], "解析中")
+        self.assertEqual(source["status"], "已索引")
+        self.assertGreater(source["records"], 0)
 
         indexed_sources = self.client.get("/api/knowledge/sources").json()
         indexed = next(item for item in indexed_sources if item["id"] == source["id"])

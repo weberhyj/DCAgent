@@ -116,7 +116,7 @@ class StructuredApiTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         uploaded = response.json()[0]
-        self.assertEqual(uploaded["status"], INDEXING)
+        self.assertNotEqual(uploaded["status"], INDEXING)
         return uploaded["id"]
 
     def upload_xlsx(self, client: TestClient) -> str:

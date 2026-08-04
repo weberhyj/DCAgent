@@ -70,6 +70,15 @@ class KnowledgeIngestionQueue:
         with self._lock:
             self._pending.append(job)
 
+    def process(self, source_id: str, file_path: str | Path, source_type: str) -> None:
+        self._process(
+            KnowledgeIngestionJob(
+                source_id=source_id,
+                file_path=Path(file_path),
+                source_type=source_type,
+            )
+        )
+
     def discard_source(
         self,
         source_id: str,
