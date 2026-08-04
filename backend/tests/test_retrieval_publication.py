@@ -11,11 +11,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from qdrant_client.http import models
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import (
     Database,
     KnowledgeSourceRecord,
+    RetrievalPublicationRecord,
     StructuredColumnRecord,
     StructuredDatasetRecord,
     StructuredPreviewRecord,
@@ -810,6 +812,32 @@ class RetrievalPublicationTest(unittest.TestCase):
         self.assertEqual(publisher.audit.active_publication(), None)
         self.assertEqual(publisher.audit.publication.status, "failed")
         self.assertEqual(publisher.gateway.events[-1], "delete_collection")
+
+    def test_failed_build_persists_failure_after_alias_fence_rollback(self) -> None:
+        database = Database("sqlite+pysqlite:///:memory:")
+        database.create_schema()
+        audit = RetrievalAuditRepository(database)
+        publisher = build_publisher(
+            chunks=sample_chunks(3),
+            fail_validation=True,
+            audit=audit,
+        )
+
+        with self.assertRaises(IndexValidationError):
+            publisher.build_and_activate("knowledge_chunks_qwen3_v1")
+
+        with database.session() as session:
+            publication = session.scalar(
+                select(RetrievalPublicationRecord).where(
+                    RetrievalPublicationRecord.collection_name == "knowledge_chunks_qwen3_v1"
+                )
+            )
+
+        self.assertIsNotNone(publication)
+        assert publication is not None
+        self.assertEqual(publication.status, "failed")
+        self.assertEqual(publication.error_message, "IndexValidationError")
+        self.assertIsNotNone(publication.completed_at)
 
     def test_failed_build_never_deletes_collection_referenced_by_another_alias(self) -> None:
         publisher = build_publisher(chunks=sample_chunks(1), fail_validation=True)

@@ -281,6 +281,7 @@ class _ValidationSample:
 class _BuildFenceState:
     previous_alias: str | None = None
     previous_publication_id: str | None = None
+    primary_failure_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,7 +463,11 @@ class RetrievalIndexPublisher:
                 body_completed = True
                 return result
         except Exception as error:
-            primary_code = error.__class__.__name__
+            primary_code = fence_state.primary_failure_code or (
+                error.primary_code
+                if isinstance(error, PublicationRecoveryError)
+                else error.__class__.__name__
+            )
             if alias_fence_acquired:
                 if body_completed and activate:
                     exit_recovery = (
@@ -476,6 +481,30 @@ class RetrievalIndexPublisher:
                     )
                 else:
                     sanitized_error = _sanitized_build_error(error)
+                if exit_recovery is None:
+                    try:
+                        self.audit.mark_publication_failed(
+                            publication.id,
+                            primary_code,
+                        )
+                    except Exception:
+                        if isinstance(sanitized_error, PublicationRecoveryError):
+                            sanitized_error = PublicationRecoveryError(
+                                sanitized_error.primary_code,
+                                tuple(
+                                    dict.fromkeys(
+                                        (
+                                            *sanitized_error.recovery_codes,
+                                            "audit_mark_failed_failed",
+                                        )
+                                    )
+                                ),
+                            )
+                        else:
+                            sanitized_error = PublicationRecoveryError(
+                                primary_code,
+                                ("audit_mark_failed_failed",),
+                            )
             else:
                 try:
                     self.audit.mark_publication_failed(
@@ -582,6 +611,7 @@ class RetrievalIndexPublisher:
             return publication
         except Exception as error:
             primary_code = error.__class__.__name__
+            fence_state.primary_failure_code = primary_code
             recovery_codes: list[str] = []
             if alias_state_known and alias_switch_attempted:
                 try:
