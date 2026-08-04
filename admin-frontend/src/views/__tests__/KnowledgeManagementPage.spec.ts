@@ -264,7 +264,7 @@ describe('KnowledgeManagementPage', () => {
     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
     await wrapper.vm.$nextTick()
 
-    expect(knowledgeMock.uploadKnowledge).toHaveBeenCalledWith(files, expect.any(String))
+    expect(knowledgeMock.uploadKnowledge).toHaveBeenCalledWith(files, '公开')
   })
 
   it('selects multiple sources and confirms batch deletion', async () => {
