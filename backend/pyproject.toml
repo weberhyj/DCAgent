@@ -1,6 +1,6 @@
 [project]
 name = "dc-agent-backend"
-version = "0.1.0"
+dynamic = ["version"]
 description = "DC-Agent backend service"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -51,6 +51,16 @@ dev = ["fastapi-cli>=0.0.32"]
 [tool.uv]
 package = false
 default-groups = ["dev"]
+
+[tool.pdm]
+distribution = false
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.fastapi]
+entrypoint = "app.main:app"
 
 [tool.ruff]
 target-version = "py312"

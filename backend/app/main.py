@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import math
 import os
@@ -14,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.engine import make_url
 
+from . import __version__
 from .clickhouse_gateway import ClickHouseGateway, StructuredStorageError
 from .database import Database, resolve_database_url
 from .evaluation_import import EvaluationImportService
@@ -259,7 +261,8 @@ def create_app(
 def _build_app(*, lifespan: Any | None = None) -> FastAPI:
     app = FastAPI(
         title="DC-Agent API",
-        version="0.2.0",
+        docs_url="/api/docs",
+        version=__version__,
         lifespan=lifespan,
     )
     app.state.health_checks_active = False
@@ -681,10 +684,8 @@ def _close_clickhouse_clients(clients: tuple[object, ...]) -> None:
         closed_ids.add(id(client))
         close = getattr(client, "close", None)
         if callable(close):
-            try:
+            with contextlib.suppress(Exception):
                 close()
-            except Exception:
-                pass
 
 
 def _configure_retrieval_runtime(
