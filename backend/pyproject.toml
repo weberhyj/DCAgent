@@ -66,6 +66,10 @@ build-backend = "pdm.backend"
 [tool.fastapi]
 entrypoint = "app.main:app"
 
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+pythonpath = ["."]
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100

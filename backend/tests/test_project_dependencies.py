@@ -14,6 +14,19 @@ def test_runtime_and_development_dependencies_are_grouped_correctly() -> None:
 
 
 class ProjectDependencyContractTest(unittest.TestCase):
+    def test_pytest_uses_repository_import_path_and_importlib_mode(self) -> None:
+        project = tomllib.loads(
+            (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            {
+                "addopts": "--import-mode=importlib",
+                "pythonpath": ["."],
+            },
+            project["tool"]["pytest"]["ini_options"],
+        )
+
     def test_offline_group_contains_qwen3_cpu_runtime_packages(self) -> None:
         project = tomllib.loads(
             (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
