@@ -1,5 +1,18 @@
 # DC-Agent
 
+## 版本管理
+
+后端、用户端和管理端分别维护版本号，只升级实际发生代码修改的应用。后端版本源是 `backend/app/__init__.py`，两个前端各自使用自己的 `package.json`。完成修改后，默认执行对应应用的 patch 升级：
+
+```bash
+python tools/bump_version.py backend patch
+python tools/bump_version.py frontend patch
+python tools/bump_version.py admin-frontend patch
+cd backend && uv lock
+```
+
+只执行本次涉及的应用命令；仅后端版本变化时才需要重新运行 `uv lock`。需要发布新功能或不兼容变更时，分别使用 `minor`、`major`，也可以传入明确的 `X.Y.Z` 版本号。提交前运行 `uv run --project backend pytest tools/tests/test_version_contract.py -q` 检查各应用版本契约。
+
 DC-Agent 是一个公司内部只读知识 Agent。管理员把制度、合同、会议纪要、经营数据等资料上传到知识库后，DCAgent 会围绕用户问题执行有界的多步检索、资料深挖和证据对比，再基于已索引资料生成回答。
 
 ## 项目结构
