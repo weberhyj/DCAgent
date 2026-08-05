@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 
+from asynctor.contrib.fastapi import config_access_log
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
@@ -150,6 +151,7 @@ def _create_batched_app(
 def _build_reranker_app(*, lifespan: Any | None = None) -> FastAPI:
     app = FastAPI(title="DC-Agent Private Reranker Service", version="1", lifespan=lifespan)
     app.state.reranker_ready = False
+    config_access_log()
 
     def require_runtime() -> tuple[DynamicBatcher[tuple[str, str], float], RerankerModelMetadata]:
         batcher = getattr(app.state, "reranker_batcher", None)

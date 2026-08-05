@@ -15,6 +15,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, Protocol
 
+from asynctor.contrib.fastapi import config_access_log
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
@@ -166,6 +167,7 @@ def _build_embedding_app(*, lifespan: Any | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.embedding_ready = False
+    config_access_log()
 
     def require_runtime() -> tuple[EmbeddingBackend, EmbeddingModelMetadata]:
         if not getattr(app.state, "embedding_ready", False):
