@@ -31,10 +31,15 @@ from app.embedding_service import (
 from app.ollama_client import OllamaResponseError
 
 EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE_SHA256 = (
-    ollama_embedding_backend.ollama_embedding_encoding_profile_sha256("/api/embed")
+    ollama_embedding_backend.ollama_embedding_encoding_profile_sha256("/api/embed", "raw")
 )
 EXPECTED_OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE_SHA256 = (
-    ollama_embedding_backend.ollama_embedding_encoding_profile_sha256("/api/embeddings")
+    ollama_embedding_backend.ollama_embedding_encoding_profile_sha256("/api/embeddings", "raw")
+)
+EXPECTED_OLLAMA_MODERN_BGE_EMBEDDING_ENCODING_PROFILE_SHA256 = (
+    ollama_embedding_backend.ollama_embedding_encoding_profile_sha256(
+        "/api/embed", "bge-large-zh-v1.5"
+    )
 )
 
 
@@ -163,6 +168,7 @@ def production_environment(**overrides: str) -> dict[str, str]:
         "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
         "OLLAMA_EMBEDDING_MODEL": "bge-test",
         "OLLAMA_EMBEDDING_PATH": "/api/embed",
+        "OLLAMA_EMBEDDING_QUERY_PROFILE": "raw",
         "OLLAMA_KEEP_ALIVE": "5m",
         "OLLAMA_REQUEST_TIMEOUT_SECONDS": "15",
         **overrides,
@@ -399,6 +405,7 @@ class EmbeddingServiceTest(unittest.TestCase):
             "EMBEDDING_MODEL_NORMALIZED",
             "EMBEDDING_ENCODING_PROFILE_SHA256",
             "EMBEDDING_PROTOCOL_VERSION",
+            "OLLAMA_EMBEDDING_QUERY_PROFILE",
         )
         for field in fields:
             with self.subTest(field=field):
@@ -424,6 +431,7 @@ class EmbeddingServiceTest(unittest.TestCase):
             "EMBEDDING_MODEL_NORMALIZED",
             "EMBEDDING_ENCODING_PROFILE_SHA256",
             "EMBEDDING_PROTOCOL_VERSION",
+            "OLLAMA_EMBEDDING_QUERY_PROFILE",
         )
         for field in fields:
             with self.subTest(field=field):
@@ -466,6 +474,43 @@ class EmbeddingServiceTest(unittest.TestCase):
         loader_calls: list[object] = []
         app = create_production_app(
             environ=production_environment(EMBEDDING_ENCODING_PROFILE_SHA256="b" * 64),
+            backend_loader=lambda values, pinned: loader_calls.append(values),
+        )
+
+        with self.assertRaisesRegex(ValueError, "embedding encoding profile"):
+            with TestClient(app):
+                pass
+
+        self.assertEqual(loader_calls, [])
+        self.assertFalse(app.state.embedding_ready)
+
+    def test_production_startup_rejects_unknown_embedding_query_profiles(self) -> None:
+        for query_profile in ("BGE-LARGE-ZH-V1.5", "unknown"):
+            with self.subTest(query_profile=query_profile):
+                loader_calls: list[object] = []
+                app = create_production_app(
+                    environ=production_environment(OLLAMA_EMBEDDING_QUERY_PROFILE=query_profile),
+                    backend_loader=lambda values, pinned: loader_calls.append(values),
+                )
+
+                with self.assertRaisesRegex(ValueError, "query profile"):
+                    with TestClient(app):
+                        pass
+
+                self.assertEqual(loader_calls, [])
+                self.assertFalse(app.state.embedding_ready)
+
+    def test_production_startup_rejects_profile_hash_for_other_query_profile(
+        self,
+    ) -> None:
+        loader_calls: list[object] = []
+        app = create_production_app(
+            environ=production_environment(
+                OLLAMA_EMBEDDING_QUERY_PROFILE="raw",
+                EMBEDDING_ENCODING_PROFILE_SHA256=(
+                    EXPECTED_OLLAMA_MODERN_BGE_EMBEDDING_ENCODING_PROFILE_SHA256
+                ),
+            ),
             backend_loader=lambda values, pinned: loader_calls.append(values),
         )
 
@@ -602,6 +647,40 @@ class EmbeddingServiceTest(unittest.TestCase):
             path="/api/embed",
             dimensions=4,
             keep_alive="5m",
+            query_profile="raw",
+        )
+        self.assertEqual(backend.close_calls, 1)
+
+    def test_default_ollama_factory_constructs_bge_query_profile_backend(self) -> None:
+        backend = CloseTrackingEmbeddingBackend(dimensions=1024)
+        client = DigestClient()
+        environ = production_environment(
+            EMBEDDING_MODEL_NAME="bge-large-zh-v1.5:latest",
+            EMBEDDING_MODEL_VERSION="ollama-bge-large-zh-v15-v1",
+            EMBEDDING_MODEL_DIMENSIONS="1024",
+            EMBEDDING_ENCODING_PROFILE_SHA256=(
+                EXPECTED_OLLAMA_MODERN_BGE_EMBEDDING_ENCODING_PROFILE_SHA256
+            ),
+            OLLAMA_EMBEDDING_MODEL="bge-large-zh-v1.5:latest",
+            OLLAMA_EMBEDDING_QUERY_PROFILE="bge-large-zh-v1.5",
+        )
+        with (
+            patch("app.embedding_service.SyncOllamaClient", return_value=client),
+            patch(
+                "app.embedding_service.OllamaEmbeddingBackend", return_value=backend
+            ) as backend_type,
+        ):
+            app = create_production_app(environ=environ)
+            with TestClient(app) as test_client:
+                self.assertEqual(test_client.get("/readyz").status_code, 200)
+
+        backend_type.assert_called_once_with(
+            client,
+            model="bge-large-zh-v1.5:latest",
+            path="/api/embed",
+            dimensions=1024,
+            keep_alive="5m",
+            query_profile="bge-large-zh-v1.5",
         )
         self.assertEqual(backend.close_calls, 1)
 

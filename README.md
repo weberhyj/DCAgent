@@ -228,7 +228,7 @@ flowchart TD
 
     M -->|"普通文档问题"| O["RetrievalRouter"]
     O -->|"legacy"| P0["PostgreSQL Legacy 检索"]
-    O -->|"shadow / qwen3"| P1["Qwen2.5 Embedding adapter + BM25"]
+    O -->|"shadow / qwen3"| P1["BGE Chinese Embedding adapter + BM25"]
     P1 --> P2["Qdrant Dense + Sparse"]
     P2 --> P3["RRF 融合 + Qwen2.5 生成式 Reranker adapter"]
     P3 --> P["Top 8 授权证据"]
@@ -239,13 +239,14 @@ flowchart TD
     Q -.->|"超时、非 2xx 或异常 SSE"| Z["HTTP 502"]
 ```
 
-### Ollama Qwen2.5 混合检索链路（保留 qwen3 兼容命名）
+### Ollama BGE 中文混合检索链路（保留 qwen3 兼容命名）
 
 普通文档问答采用 `Qdrant Dense + Sparse/BM25 + RRF`：
 
 1. PostgreSQL 保存权威文档、切片、权限标签和发布状态；Qdrant 保存版本化检索点。
-2. 轻量 Embedding adapter 通过公司内网 Ollama 的 `qwen2.5:0.5b` 生成 Dense vector，并按
-   固定 profile 做归一化；维度必须以目标 `/api/embed` 的 `len(embeddings[0])` 实测值为准。
+2. 轻量 Embedding adapter 通过公司内网 Ollama 的 `bge-large-zh-v1.5:latest` 生成 Dense vector，并按
+   固定 profile 做归一化；仅 query 文本添加前缀 `为这个句子生成表示以用于检索相关文章：`，document
+   文本保持原文。维度必须以目标 `/api/embed` 的 `len(embeddings[0])` 实测值为准；本项目示例为 1024。
    本地 BM25 生成 Sparse query vector。
 3. 两路检索都先应用 knowledge-base、permission-tag 和 publication filters，各取 Top 50。
 4. RRF（`k=60`）融合候选，Reranker adapter 通过 `qwen2.5:3b` 的 `/api/generate` 生成并严格
@@ -335,7 +336,7 @@ Reranker Service、API，以及可选的 indexing worker 和 llama.cpp profile�
 - PostgreSQL 已用于会话、文档、切片、Agent 审计和结构化元数据。
 - ClickHouse 已用于启用后的 Excel/CSV 精确统计。
 - Physoc 是独立部署的公司内网模型服务，不包含在本 Compose 项目中。
-- Qdrant、Ollama Qwen2.5 Embedding adapter、BM25、RRF 和生成式 Reranker adapter 已接入
+- Qdrant、Ollama BGE 中文 Embedding adapter、BM25、RRF 和生成式 Reranker adapter 已接入
   普通文档检索，并由
   `RETRIEVAL_MODE` 控制 Legacy、Shadow 和 Qwen3 路由。
 - Redis 保留给后台任务和后续队列扩展；当前 Shadow 比较使用进程内有界队列。
@@ -385,7 +386,7 @@ set -Eeuo pipefail
 Windows 开发机兼容：本地开发者可以继续使用 `tools/prepare_offline_env.ps1` 和
 `tools/invoke_offline_compose.ps1`；这两个入口不是 Ubuntu 生产部署路径。
 
-### Ollama Qwen2.5 部署准备与上线门禁
+### Ollama BGE 中文部署准备与上线门禁
 
 如果目标环境已经部署过旧版 DC-Agent，本次升级不能只替换后端代码。DC-Agent 本身不再运行
 Embedding/Reranker 权重；公司内网 Ollama 必须可达，且不依赖外部 API。先在批准的 Ollama
@@ -405,13 +406,13 @@ Embedding/Reranker 权重；公司内网 Ollama 必须可达，且不依赖外�
 
 ```bash
 set -Eeuo pipefail
-ollama pull qwen2.5:0.5b
+ollama pull bge-large-zh-v1.5:latest
 ollama pull qwen2.5:3b
 ollama_url='http://127.0.0.1:11434'
 
 embed_json="$(curl --fail-with-body --silent --show-error \
   -H 'Content-Type: application/json' \
-  --data-binary '{"model":"qwen2.5:0.5b","input":["dimension-probe"],"truncate":true,"keep_alive":"30m"}' \
+  --data-binary '{"model":"bge-large-zh-v1.5:latest","input":["dimension-probe"],"truncate":true,"keep_alive":"30m"}' \
   "$ollama_url/api/embed")"
 dimensions="$(python3 -c 'import json,sys; body=json.load(sys.stdin); value=len(body["embeddings"][0]); assert value > 0; print(value)' <<<"$embed_json")"
 printf 'EMBEDDING_MODEL_DIMENSIONS=%s\n' "$dimensions"
@@ -428,7 +429,7 @@ generate_json="$(curl --fail-with-body --silent --show-error \
 python3 -c 'import json,sys; envelope=json.load(sys.stdin); scores=json.loads(envelope["response"])["scores"]; assert len(scores) == 2; print(json.dumps(scores))' <<<"$generate_json"
 
 tags_json="$(curl --fail-with-body --silent --show-error "$ollama_url/api/tags")"
-for model in qwen2.5:0.5b qwen2.5:3b; do
+for model in bge-large-zh-v1.5:latest qwen2.5:3b; do
   digest="$(python3 -c 'import json,re,sys; model=sys.argv[1]; body=json.load(sys.stdin); matches=[item for item in body["models"] if item.get("name") == model or item.get("model") == model]; len(matches) == 1 or sys.exit(f"expected exactly one model match: {model}"); digest=str(matches[0]["digest"]).removeprefix("sha256:"); re.fullmatch(r"[0-9a-f]{64}", digest) or sys.exit(f"invalid digest: {model}"); print(digest)' "$model" <<<"$tags_json")"
   printf '%s %s\n' "$model" "$digest"
 done
@@ -436,30 +437,37 @@ done
 
 把 Bash 探针输出的 `EMBEDDING_MODEL_DIMENSIONS` 填入实际环境文件。老 Ollama 只提供 legacy endpoint 时，显式
 设置 `OLLAMA_EMBEDDING_PATH=/api/embeddings`，并把
-`EMBEDDING_ENCODING_PROFILE_SHA256` 改为 legacy profile hash
-`23e5b954b6099dcc4427a33745ad03b9ce7dc6fbf2d8fd4728f1d7e1ce7db34c`；不得在任意错误后自动切换路径。上面的 Bash 命令还必须确认 3B 模型能返回 JSON score shape，并从 `/api/tags` 提取目标模型的真实 digest；去掉可选 `sha256:` 前缀后再写入配置，不要复制示例占位符。
+`EMBEDDING_ENCODING_PROFILE_SHA256` 改为 legacy/BGE profile hash
+`b8e7252a57feef349f02d6b2624ef3f9e8bc9e989d9073e37aa5df424cf26de4`；不得在任意错误后自动切换路径。
+上面的 Bash 命令还必须确认 3B 模型能返回 JSON score shape，并从 `/api/tags` 提取目标模型的真实 digest；去掉可选
+`sha256:` 前缀后再写入配置，不要复制示例占位符。
 
 关键配置必须绑定实测值和固定 profile：
 
 ```env
-EMBEDDING_MODEL_NAME=qwen2.5:0.5b
+EMBEDDING_MODEL_NAME=bge-large-zh-v1.5:latest
+EMBEDDING_MODEL_VERSION=ollama-bge-large-zh-v15-v1
 EMBEDDING_MODEL_DIMENSIONS=<len(embeddings[0])>
 EMBEDDING_MODEL_SHA256=<真实 embedding digest，无 sha256: 前缀>
-EMBEDDING_ENCODING_PROFILE_SHA256=fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10
+EMBEDDING_ENCODING_PROFILE_SHA256=3d5db261732d456b51fa4f9aa89cb15054c21772c0809a50a31f0911eb960170
+OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
+OLLAMA_EMBEDDING_PATH=/api/embed
+OLLAMA_EMBEDDING_QUERY_PROFILE=bge-large-zh-v1.5
 RERANKER_MODEL_NAME=qwen2.5:3b
 RERANKER_MODEL_SHA256=<真实 reranker digest，无 sha256: 前缀>
 RERANKER_PROMPT_PROFILE_SHA256=e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd
 ```
 
 升级后，缺少完整 embedding fingerprint 的旧 retrieval publication 会保持不可用；请用当前
-model digest、dimensions、protocol 和所选 endpoint profile 重新构建并激活 collection。
+model digest、实测 dimensions、protocol、endpoint、query profile 和前缀指纹重新构建。必须选择一个
+从未使用过的 `knowledge_chunks_qwen3_vN` collection 名称，完成全量验证后才能激活 Alias。
 
 目标防火墙只允许 DC-Agent 主机访问批准的 Ollama IP/端口；Ollama 侧代理/ACL 只开放
 `/api/tags`、`/api/embed`（或 `/api/embeddings`）和 `/api/generate`。Compose 中只有
 `embedding-service`、`reranker-service` 接入 `ollama-egress`，API、worker、数据库和 Qdrant
 不得借此获得通用出口。
 
-所有已有 Word/PDF/TXT/Excel 内容必须用新 embedding 全量重建，不能复用 Qwen3 或其他模型旧
+所有已有 Word/PDF/TXT/Excel 内容必须用新 BGE embedding 全量重建，不能复用 Qwen3 或其他模型旧
 向量。保持 `knowledge_chunks_qwen3_vN` 和 `RETRIEVAL_MODE=qwen3` 兼容命名，先构建新的不可变
 collection 并验证模型元数据、实测 dimensions、归一化、profile/digest、点数和检索质量：
 

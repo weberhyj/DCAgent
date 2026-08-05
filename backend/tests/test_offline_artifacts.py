@@ -29,6 +29,26 @@ def valid_artifact() -> dict[str, str]:
 
 
 class OfflineArtifactManifestTest(unittest.TestCase):
+    def test_embedding_compose_environment_pins_bge_query_profile(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        compose = (repository / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
+        example = (repository / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
+        self.assertIn(
+            "OLLAMA_EMBEDDING_QUERY_PROFILE: "
+            "${OLLAMA_EMBEDDING_QUERY_PROFILE:?OLLAMA_EMBEDDING_QUERY_PROFILE is required}",
+            compose,
+        )
+        for line in (
+            "EMBEDDING_MODEL_NAME=bge-large-zh-v1.5:latest",
+            "EMBEDDING_MODEL_VERSION=ollama-bge-large-zh-v15-v1",
+            "EMBEDDING_MODEL_DIMENSIONS=1024",
+            "EMBEDDING_ENCODING_PROFILE_SHA256="
+            "3d5db261732d456b51fa4f9aa89cb15054c21772c0809a50a31f0911eb960170",
+            "OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest",
+            "OLLAMA_EMBEDDING_QUERY_PROFILE=bge-large-zh-v1.5",
+        ):
+            self.assertIn(line, example)
+
     def test_accepts_nonempty_manifest_with_required_local_metadata(self) -> None:
         validate_artifact_manifest({"artifacts": [valid_artifact()]})
 

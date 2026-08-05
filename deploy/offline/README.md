@@ -108,11 +108,11 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 - `--profile generation` enables the private llama.cpp service after its locked local model is installed.
 - `--profile indexing` enables the structured spreadsheet worker (`app.structured_worker`). Keep it disabled while `STRUCTURED_QUERY_ENABLED=false`.
 
-## Ollama-backed Qwen2.5 hybrid retrieval rollout and rollback
+## Ollama-backed BGE Chinese hybrid retrieval rollout and rollback
 
 DC-Agent no longer loads or runs Embedding/Reranker weights. The lightweight adapter services keep
 the private `/v1/embeddings` and `/v1/rerank` contracts, while the approved company-intranet Ollama
-instance serves `qwen2.5:0.5b` through `/api/embed` and `qwen2.5:3b` through `/api/generate`.
+instance serves `bge-large-zh-v1.5:latest` through `/api/embed` and `qwen2.5:3b` through `/api/generate`.
 Ollama must be reachable from the adapter containers before startup; this deployment does not use
 an external model API. Ordinary document retrieval remains `Qdrant Dense + Sparse/BM25 + RRF`,
 followed by bounded reranking. Exact spreadsheet statistics remain on the structured ClickHouse
@@ -135,13 +135,13 @@ cause the production DC-Agent host to contact a public model service:
 
 ```bash
 set -Eeuo pipefail
-ollama pull qwen2.5:0.5b
+ollama pull bge-large-zh-v1.5:latest
 ollama pull qwen2.5:3b
 ollama_url='http://127.0.0.1:11434'
 
 embed_json="$(curl --fail-with-body --silent --show-error \
   -H 'Content-Type: application/json' \
-  --data-binary '{"model":"qwen2.5:0.5b","input":["dimension-probe"],"truncate":true,"keep_alive":"30m"}' \
+  --data-binary '{"model":"bge-large-zh-v1.5:latest","input":["dimension-probe"],"truncate":true,"keep_alive":"30m"}' \
   "$ollama_url/api/embed")"
 dimensions="$(python3 -c 'import json,sys; body=json.load(sys.stdin); value=len(body["embeddings"][0]); assert value > 0; print(value)' <<<"$embed_json")"
 printf 'EMBEDDING_MODEL_DIMENSIONS=%s\n' "$dimensions"
@@ -158,7 +158,7 @@ generate_json="$(curl --fail-with-body --silent --show-error \
 python3 -c 'import json,sys; envelope=json.load(sys.stdin); scores=json.loads(envelope["response"])["scores"]; assert len(scores) == 2; print(json.dumps(scores))' <<<"$generate_json"
 
 tags_json="$(curl --fail-with-body --silent --show-error "$ollama_url/api/tags")"
-for model in qwen2.5:0.5b qwen2.5:3b; do
+for model in bge-large-zh-v1.5:latest qwen2.5:3b; do
   digest="$(python3 -c 'import json,re,sys; model=sys.argv[1]; body=json.load(sys.stdin); matches=[item for item in body["models"] if item.get("name") == model or item.get("model") == model]; len(matches) == 1 or sys.exit(f"expected exactly one model match: {model}"); digest=str(matches[0]["digest"]).removeprefix("sha256:"); re.fullmatch(r"[0-9a-f]{64}", digest) or sys.exit(f"invalid digest: {model}"); print(digest)' "$model" <<<"$tags_json")"
   printf '%s %s\n' "$model" "$digest"
 done
@@ -166,7 +166,7 @@ done
 
 Set `EMBEDDING_MODEL_DIMENSIONS` to exactly the value printed by the Bash probe. Older Ollama releases that do
 not expose `/api/embed` must use `OLLAMA_EMBEDDING_PATH=/api/embeddings` and set
-`EMBEDDING_ENCODING_PROFILE_SHA256=23e5b954b6099dcc4427a33745ad03b9ce7dc6fbf2d8fd4728f1d7e1ce7db34c`;
+`EMBEDDING_ENCODING_PROFILE_SHA256=b8e7252a57feef349f02d6b2624ef3f9e8bc9e989d9073e37aa5df424cf26de4`;
 the adapter then sends one legacy `prompt` request per text. Do not silently switch paths after an
 arbitrary error.
 
@@ -182,22 +182,28 @@ Copy those two real values into `EMBEDDING_MODEL_SHA256` and `RERANKER_MODEL_SHA
 The locked adapter profiles are:
 
 ```env
-EMBEDDING_MODEL_NAME=qwen2.5:0.5b
+EMBEDDING_MODEL_NAME=bge-large-zh-v1.5:latest
+EMBEDDING_MODEL_VERSION=ollama-bge-large-zh-v15-v1
 EMBEDDING_MODEL_DIMENSIONS=<len(embeddings[0]) from the target /api/embed probe>
-EMBEDDING_MODEL_SHA256=<normalized qwen2.5:0.5b digest from /api/tags>
-EMBEDDING_ENCODING_PROFILE_SHA256=fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10
+EMBEDDING_MODEL_SHA256=<normalized bge-large-zh-v1.5:latest digest from /api/tags>
+EMBEDDING_ENCODING_PROFILE_SHA256=3d5db261732d456b51fa4f9aa89cb15054c21772c0809a50a31f0911eb960170
+OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
+OLLAMA_EMBEDDING_PATH=/api/embed
+OLLAMA_EMBEDDING_QUERY_PROFILE=bge-large-zh-v1.5
 RERANKER_MODEL_NAME=qwen2.5:3b
 RERANKER_MODEL_SHA256=<normalized qwen2.5:3b digest from /api/tags>
 RERANKER_PROMPT_PROFILE_SHA256=e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd
 ```
 
-After upgrading, legacy retrieval publications without a complete embedding fingerprint remain
-unavailable. Rebuild and activate the collection with the current model digest, dimensions,
-protocol, and the profile hash for the selected endpoint.
+Only query text is prefixed with `为这个句子生成表示以用于检索相关文章：`; document text is sent
+unchanged. After upgrading, legacy retrieval publications without a complete embedding fingerprint
+remain unavailable. Rebuild into a never-used collection name with the current model digest,
+measured dimensions, protocol, endpoint path, query profile, and profile hash before activation.
 
 Startup checks `/api/tags` and fails closed when either configured digest differs from the target
-Ollama model. The embedding profile hash is derived from the canonical raw-text/normalization
-profile; the reranker hash pins the generated-score prompt contract.
+Ollama model. The embedding profile hash is derived from the endpoint path, query profile, query
+prefix, document raw-text behavior, and normalization contract; the reranker hash pins the
+generated-score prompt contract.
 
 ### Egress and wheel/image build contract
 
@@ -274,7 +280,7 @@ set -Eeuo pipefail
 Review the publication row and verify the exact embedding model metadata, measured dimensions,
 normalized vectors, encoding profile hash, model digest, sparse profile, point count, filters and
 fixed quality set. Keep `knowledge_chunks_qwen3_vN` collection names and `RETRIEVAL_MODE=qwen3` for
-backward compatibility even though the dense/rerank backends now use Qwen2.5. Collections are
+backward compatibility even though the dense backend now uses BGE and reranking uses Qwen2.5 3B. Collections are
 immutable and names are unique.
 
 Run Shadow/Canary and the 15-user gate in an isolated acceptance deployment that uses its own

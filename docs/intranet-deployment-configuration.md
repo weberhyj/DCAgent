@@ -2,7 +2,7 @@
 
 本文用于把 DC-Agent 部署到公司内网。当前生产路线为：
 
-- 普通 Word、文本型 PDF、TXT、Markdown 等文档：解析与切片 → Qwen2.5 Embedding → Qdrant Dense/Sparse 混合检索 → Qwen2.5 生成式 Reranker → Physoc DeepSeek 汇总回答。
+- 普通 Word、文本型 PDF、TXT、Markdown 等文档：解析与切片 → BGE 中文 Embedding → Qdrant Dense/Sparse 混合检索 → Qwen2.5 生成式 Reranker → Physoc DeepSeek 汇总回答。
 - Excel/CSV 统计问题：管理员确认表结构 → indexing worker → Parquet/ClickHouse → 精确执行 `avg`、`sum`、`count`、`min`、`max`。
 - 不调用公网大模型 API。Embedding 和 Reranker 通过公司内网 Ollama 提供，大模型回答通过公司内网 Physoc 接口提供。
 
@@ -170,16 +170,31 @@ fi
 
 ```bash
 set -Eeuo pipefail
-ollama pull qwen2.5:0.5b
+ollama pull bge-large-zh-v1.5:latest
 ollama pull qwen2.5:3b
+
+ollama_url='http://127.0.0.1:11434'
+embed_json="$(curl --fail-with-body --silent --show-error \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"model":"bge-large-zh-v1.5:latest","input":["dimension-probe"],"truncate":true,"keep_alive":"30m"}' \
+  "$ollama_url/api/embed")"
+dimensions="$(python3 -c 'import json,sys; body=json.load(sys.stdin); value=len(body["embeddings"][0]); assert value > 0; print(value)' <<<"$embed_json")"
+printf 'EMBEDDING_MODEL_DIMENSIONS=%s\n' "$dimensions"
+
+tags_json="$(curl --fail-with-body --silent --show-error "$ollama_url/api/tags")"
+for model in bge-large-zh-v1.5:latest qwen2.5:3b; do
+  digest="$(python3 -c 'import json,re,sys; model=sys.argv[1]; body=json.load(sys.stdin); matches=[item for item in body["models"] if item.get("name") == model or item.get("model") == model]; len(matches) == 1 or sys.exit(f"expected exactly one model match: {model}"); digest=str(matches[0]["digest"]).removeprefix("sha256:"); re.fullmatch(r"[0-9a-f]{64}", digest) or sys.exit(f"invalid digest: {model}"); print(digest)' "$model" <<<"$tags_json")"
+  printf '%s %s\n' "$model" "$digest"
+done
 ```
 
 在 DC-Agent 实际环境文件中配置：
 
 ```env
 OLLAMA_BASE_URL=http://<Ollama内网IP>:11434
-OLLAMA_EMBEDDING_MODEL=qwen2.5:0.5b
+OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
 OLLAMA_EMBEDDING_PATH=/api/embed
+OLLAMA_EMBEDDING_QUERY_PROFILE=bge-large-zh-v1.5
 OLLAMA_RERANKER_MODEL=qwen2.5:3b
 OLLAMA_GENERATE_PATH=/api/generate
 OLLAMA_KEEP_ALIVE=30m
@@ -204,24 +219,27 @@ POST http://<Ollama内网IP>:11434/api/generate
 ```env
 EMBEDDING_MODEL_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 RERANKER_MODEL_SHA256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-EMBEDDING_MODEL_DIMENSIONS=896
+EMBEDDING_MODEL_DIMENSIONS=1024
 ```
 
 需要执行：
 
-1. 从 Ollama `/api/tags` 获取 `qwen2.5:0.5b` 和 `qwen2.5:3b` 的真实 digest。
+1. 从 Ollama `/api/tags` 获取 `bge-large-zh-v1.5:latest` 和 `qwen2.5:3b` 的真实 digest。
 2. 去掉可选的 `sha256:` 前缀，保存为 64 位小写十六进制字符。
 3. 调用 `/api/embed`，将 `len(embeddings[0])` 的实测结果写入 `EMBEDDING_MODEL_DIMENSIONS`。
 
 最终配置形态：
 
 ```env
-EMBEDDING_MODEL_NAME=qwen2.5:0.5b
-EMBEDDING_MODEL_VERSION=ollama-qwen25-05b-v1
-EMBEDDING_MODEL_SHA256=<qwen2.5:0.5b真实digest>
-EMBEDDING_MODEL_DIMENSIONS=<实测向量维度>
+EMBEDDING_MODEL_NAME=bge-large-zh-v1.5:latest
+EMBEDDING_MODEL_VERSION=ollama-bge-large-zh-v15-v1
+EMBEDDING_MODEL_SHA256=<bge-large-zh-v1.5:latest真实digest>
+EMBEDDING_MODEL_DIMENSIONS=<实测向量维度，BGE示例为1024>
 EMBEDDING_MODEL_NORMALIZED=true
-EMBEDDING_ENCODING_PROFILE_SHA256=fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10
+EMBEDDING_ENCODING_PROFILE_SHA256=3d5db261732d456b51fa4f9aa89cb15054c21772c0809a50a31f0911eb960170
+OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
+OLLAMA_EMBEDDING_PATH=/api/embed
+OLLAMA_EMBEDDING_QUERY_PROFILE=bge-large-zh-v1.5
 
 RERANKER_MODEL_NAME=qwen2.5:3b
 RERANKER_MODEL_VERSION=ollama-qwen25-3b-v1
@@ -229,7 +247,9 @@ RERANKER_MODEL_SHA256=<qwen2.5:3b真实digest>
 RERANKER_PROMPT_PROFILE_SHA256=e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd
 ```
 
-如果没有修改项目的 Embedding 编码规则和 Reranker Prompt，可以保留项目提供的两个 profile SHA-256。
+只有在 endpoint、query profile 和前缀契约均未修改时，才可以保留项目提供的 profile SHA-256。
+BGE query 会自动添加 `为这个句子生成表示以用于检索相关文章：`，document 文本不添加前缀；如果只提供 legacy
+`/api/embeddings`，请使用 BGE legacy profile hash `b8e7252a57feef349f02d6b2624ef3f9e8bc9e989d9073e37aa5df424cf26de4`。
 
 ## 5. 配置数据库和内部服务
 
@@ -382,9 +402,9 @@ RETRIEVAL_CANARY_PERCENT=100
 QDRANT_COLLECTION_ALIAS=knowledge_chunks_current
 ```
 
-`qwen3` 是为兼容既有 collection、数据库记录和环境变量保留的路由名称，当前实际 Embedding 和 Reranker 模型是 Qwen2.5。
+`qwen3` 是为兼容既有 collection、数据库记录和环境变量保留的路由名称，当前实际 Embedding 是 BGE 中文，Reranker 是 Qwen2.5 3B。
 
-更换 Embedding 模型、digest、向量维度或编码 profile 后，必须创建新的不可变 collection 并重新构建全部向量，不能复用旧向量。
+更换 Embedding 模型、digest、向量维度、endpoint 或 query profile 后，必须使用从未使用过的新 collection 名称并重新构建全部 Word/PDF/TXT/Excel 向量，不能复用旧向量。
 
 ## 10. 配置前端和反向代理
 

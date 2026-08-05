@@ -9,39 +9,36 @@ from app import ollama_embedding_backend
 from app.ollama_client import OllamaResponseError, OllamaServiceError
 from app.ollama_embedding_backend import OllamaEmbeddingBackend
 
-EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE = "\n".join(
-    (
-        "profile=dc-agent.ollama.embedding",
-        "protocol=dc-agent.ollama.embedding.v1",
-        "purpose.query=raw_text",
-        "purpose.document=raw_text",
-        "path=/api/embed",
-        "input=raw_text_batch",
-        "truncate=true",
-        "output.count=one_per_input",
-        "output.dimensions=configured_exact",
-        "output.coordinates=finite_numeric",
-        "output.vector=nonzero",
-        "normalization.algorithm=max_abs_scaled_l2",
-        "normalization.output=unit_l2",
+RAW_PREFIX_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+BGE_PREFIX_SHA256 = "2bb658b7e092d6b4b1dbde4c3fc5f281f9ed9f1ace5b49566fb8b10f57836e48"
+BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
+
+
+def expected_encoding_profile(path: str, query_profile: str) -> str:
+    prefix_sha256 = RAW_PREFIX_SHA256 if query_profile == "raw" else BGE_PREFIX_SHA256
+    query_mode = "raw_text" if query_profile == "raw" else "prefixed_text"
+    endpoint_lines = (
+        ("input=transformed_text_batch", "truncate=true", "output.count=one_per_input")
+        if path == "/api/embed"
+        else ("prompt=single_transformed_text", "output.count=one_per_input")
     )
-)
-EXPECTED_OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE = "\n".join(
-    (
-        "profile=dc-agent.ollama.embedding",
-        "protocol=dc-agent.ollama.embedding.v1",
-        "purpose.query=raw_text",
-        "purpose.document=raw_text",
-        "path=/api/embeddings",
-        "prompt=single_raw_text",
-        "output.count=one_per_input",
-        "output.dimensions=configured_exact",
-        "output.coordinates=finite_numeric",
-        "output.vector=nonzero",
-        "normalization.algorithm=max_abs_scaled_l2",
-        "normalization.output=unit_l2",
+    return "\n".join(
+        (
+            "profile=dc-agent.ollama.embedding",
+            "protocol=dc-agent.ollama.embedding.v2",
+            f"purpose.query={query_mode}",
+            f"purpose.query.profile={query_profile}",
+            f"purpose.query.prefix_sha256={prefix_sha256}",
+            "purpose.document=raw_text",
+            f"path={path}",
+            *endpoint_lines,
+            "output.dimensions=configured_exact",
+            "output.coordinates=finite_numeric",
+            "output.vector=nonzero",
+            "normalization.algorithm=max_abs_scaled_l2",
+            "normalization.output=unit_l2",
+        )
     )
-)
 
 
 class RecordingOllamaClient:
@@ -71,34 +68,53 @@ class RecordingOllamaClient:
 
 
 class OllamaEmbeddingBackendTest(unittest.TestCase):
-    def test_endpoint_profiles_are_canonical_distinct_and_hash_derived(self) -> None:
-        profiles = {
-            "/api/embed": EXPECTED_OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE,
-            "/api/embeddings": EXPECTED_OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE,
-        }
+    def test_endpoint_and_query_profiles_are_canonical_distinct_and_hash_derived(
+        self,
+    ) -> None:
         hashes = set()
-        for path, expected_profile in profiles.items():
-            with self.subTest(path=path):
-                profile = ollama_embedding_backend.ollama_embedding_encoding_profile(path)
-                profile_hash = ollama_embedding_backend.ollama_embedding_encoding_profile_sha256(
-                    path
-                )
-                self.assertEqual(profile, expected_profile)
-                self.assertTrue(profile.isascii())
-                self.assertNotIn("\r", profile)
-                self.assertFalse(profile.endswith("\n"))
-                self.assertTrue(
-                    all(
-                        line.count("=") == 1 and line.split("=", 1)[0]
-                        for line in profile.split("\n")
+        for path in ("/api/embed", "/api/embeddings"):
+            for query_profile in ("raw", "bge-large-zh-v1.5"):
+                with self.subTest(path=path, query_profile=query_profile):
+                    expected_profile = expected_encoding_profile(path, query_profile)
+                    profile = ollama_embedding_backend.ollama_embedding_encoding_profile(
+                        path, query_profile
                     )
-                )
-                self.assertEqual(
-                    profile_hash,
-                    hashlib.sha256(expected_profile.encode("utf-8")).hexdigest(),
-                )
-                hashes.add(profile_hash)
-        self.assertEqual(len(hashes), 2)
+                    profile_hash = (
+                        ollama_embedding_backend.ollama_embedding_encoding_profile_sha256(
+                            path, query_profile
+                        )
+                    )
+                    self.assertEqual(profile, expected_profile)
+                    self.assertTrue(profile.isascii())
+                    self.assertNotIn("\r", profile)
+                    self.assertFalse(profile.endswith("\n"))
+                    self.assertTrue(
+                        all(
+                            line.count("=") == 1 and line.split("=", 1)[0]
+                            for line in profile.split("\n")
+                        )
+                    )
+                    self.assertEqual(
+                        profile_hash,
+                        hashlib.sha256(expected_profile.encode("utf-8")).hexdigest(),
+                    )
+                    hashes.add(profile_hash)
+        self.assertEqual(len(hashes), 4)
+
+    def test_constructor_rejects_unknown_query_profiles(self) -> None:
+        for query_profile in ("", "   ", "BGE-LARGE-ZH-V1.5", "unknown"):
+            with self.subTest(query_profile=query_profile):
+                client = RecordingOllamaClient([])
+                with self.assertRaisesRegex(ValueError, "query profile"):
+                    OllamaEmbeddingBackend(
+                        client,
+                        model="bge-large-zh-v1.5:latest",
+                        path="/api/embed",
+                        dimensions=2,
+                        keep_alive="10m",
+                        query_profile=query_profile,
+                    )
+                self.assertEqual(client.calls, [])
 
     def assert_response_error(self, operation: Callable[[], object]) -> None:
         try:
@@ -123,6 +139,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                 "path": "/api/embed",
                 "dimensions": 2,
                 "keep_alive": "10m",
+                "query_profile": "raw",
             }
             kwargs[field] = value
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
@@ -136,6 +153,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
             path="/api/embed",
             dimensions=2,
             keep_alive="10m",
+            query_profile="raw",
         )
 
         self.assertTrue(hasattr(backend, "close"), "backend must expose close()")
@@ -154,6 +172,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
             path="/api/embed",
             dimensions=2,
             keep_alive="10m",
+            query_profile="raw",
         )
 
         with self.assertRaises(OllamaServiceError) as raised:
@@ -171,6 +190,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embed",
                     dimensions=dimensions,  # type: ignore[arg-type]
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
     def test_constructor_accepts_only_supported_paths(self) -> None:
@@ -183,6 +203,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path=path,  # type: ignore[arg-type]
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
     def test_embed_rejects_invalid_text_sequences_before_calling_client(self) -> None:
@@ -195,6 +216,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embed",
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 with self.assertRaises(ValueError):
@@ -212,6 +234,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embed",
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 with self.assertRaises(ValueError):
@@ -227,6 +250,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
             path="/api/embed",
             dimensions=2,
             keep_alive="10m",
+            query_profile="raw",
         )
 
         vectors = backend.embed(["alpha", "beta"], purpose="document")
@@ -257,6 +281,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embed",
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 self.assert_response_error(
@@ -282,6 +307,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embed",
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 self.assert_response_error(lambda: backend.embed(["text"], purpose="document"))
@@ -302,6 +328,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embeddings",
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 self.assert_response_error(lambda: backend.embed(["text"], purpose="query"))
@@ -319,6 +346,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path=path,
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 self.assert_response_error(lambda: backend.embed(["text"], purpose="document"))
@@ -342,6 +370,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embed",
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 self.assert_response_error(lambda: backend.embed(["text"], purpose="document"))
@@ -356,6 +385,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embed",
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 self.assert_response_error(lambda: backend.embed(["text"], purpose="document"))
@@ -374,6 +404,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                     path="/api/embed",
                     dimensions=2,
                     keep_alive="10m",
+                    query_profile="raw",
                 )
 
                 try:
@@ -393,6 +424,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
             path="/api/embed",
             dimensions=2,
             keep_alive="10m",
+            query_profile="raw",
         )
 
         self.assert_response_error(lambda: backend.embed(["text"], purpose="document"))
@@ -410,6 +442,7 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
             path="/api/embeddings",
             dimensions=2,
             keep_alive="30m",
+            query_profile="raw",
         )
 
         vectors = backend.embed(["first", "second"], purpose="query")
@@ -443,12 +476,40 @@ class OllamaEmbeddingBackendTest(unittest.TestCase):
                         path=path,
                         dimensions=2,
                         keep_alive="10m",
+                        query_profile="raw",
                     )
 
                     backend.embed(["raw text"], purpose=purpose)
 
                     expected_text: object = ["raw text"] if path == "/api/embed" else "raw text"
                     self.assertEqual(client.calls[0][1][payload_field], expected_text)  # type: ignore[index]
+
+    def test_bge_profile_prefixes_only_query_text_for_both_endpoints(self) -> None:
+        for path, response, payload_field in (
+            ("/api/embed", {"embeddings": [[1, 0]]}, "input"),
+            ("/api/embeddings", {"embedding": [1, 0]}, "prompt"),
+        ):
+            for purpose, expected_text in (
+                ("query", f"{BGE_QUERY_PREFIX}原始查询"),
+                ("document", "原始查询"),
+            ):
+                with self.subTest(path=path, purpose=purpose):
+                    client = RecordingOllamaClient([response])
+                    backend = OllamaEmbeddingBackend(
+                        client,
+                        model="bge-large-zh-v1.5:latest",
+                        path=path,
+                        dimensions=2,
+                        keep_alive="10m",
+                        query_profile="bge-large-zh-v1.5",
+                    )
+                    backend.embed(["原始查询"], purpose=purpose)
+                    payload = client.calls[0][1]
+                    assert isinstance(payload, Mapping)
+                    expected_payload_value: object = (
+                        [expected_text] if path == "/api/embed" else expected_text
+                    )
+                    self.assertEqual(payload[payload_field], expected_payload_value)
 
 
 if __name__ == "__main__":

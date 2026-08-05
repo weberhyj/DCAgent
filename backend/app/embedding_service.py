@@ -35,6 +35,7 @@ from .ollama_client import SyncOllamaClient
 from .ollama_embedding_backend import (
     OllamaEmbeddingBackend,
     ollama_embedding_encoding_profile_sha256,
+    ollama_embedding_query_prefix,
 )
 
 EMBEDDING_METADATA_FILENAME = "embedding-metadata.json"
@@ -459,7 +460,9 @@ def _load_environment_metadata(environ: Mapping[str, str]) -> EmbeddingModelMeta
             "EMBEDDING_ENCODING_PROFILE_SHA256 must be exactly 64 lowercase hexadecimal characters"
         )
     path = _required_environment_value(environ, "OLLAMA_EMBEDDING_PATH")
-    expected_profile_sha256 = ollama_embedding_encoding_profile_sha256(path)
+    query_profile = _required_environment_value(environ, "OLLAMA_EMBEDDING_QUERY_PROFILE")
+    ollama_embedding_query_prefix(query_profile)
+    expected_profile_sha256 = ollama_embedding_encoding_profile_sha256(path, query_profile)
     if not hmac.compare_digest(encoding_profile_sha256, expected_profile_sha256):
         raise ValueError(
             "EMBEDDING_ENCODING_PROFILE_SHA256 must match the Ollama embedding encoding profile"
@@ -487,6 +490,8 @@ def _load_ollama_embedding_backend(
     path = _required_environment_value(environ, "OLLAMA_EMBEDDING_PATH")
     if path not in ("/api/embed", "/api/embeddings"):
         raise ValueError("Ollama embedding path must be /api/embed or /api/embeddings")
+    query_profile = _required_environment_value(environ, "OLLAMA_EMBEDDING_QUERY_PROFILE")
+    ollama_embedding_query_prefix(query_profile)
     keep_alive = _required_environment_value(environ, "OLLAMA_KEEP_ALIVE")
     timeout_seconds = _required_positive_float(environ, "OLLAMA_REQUEST_TIMEOUT_SECONDS")
     client = SyncOllamaClient(base_url, timeout_seconds=timeout_seconds)
@@ -500,6 +505,7 @@ def _load_ollama_embedding_backend(
             path=path,
             dimensions=metadata.dimensions,
             keep_alive=keep_alive,
+            query_profile=query_profile,
         )
     except Exception:
         try:
