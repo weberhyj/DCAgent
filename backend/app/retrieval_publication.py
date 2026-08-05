@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
+from loguru import logger
 from qdrant_client.http import models
 
 from .embedding_contracts import (
@@ -463,6 +464,7 @@ class RetrievalIndexPublisher:
                 body_completed = True
                 return result
         except Exception as error:
+            logger.exception(error)
             primary_code = fence_state.primary_failure_code or (
                 error.primary_code
                 if isinstance(error, PublicationRecoveryError)
@@ -647,8 +649,8 @@ class RetrievalIndexPublisher:
                 )
             else:
                 sanitized_error = _sanitized_build_error(error)
-        if sanitized_error is not None:
-            raise sanitized_error
+            if sanitized_error is not None:
+                raise sanitized_error from error
         raise AssertionError("Retrieval publication failure handling reached an invalid state")
 
     def _recover_fence_exit_failure(
