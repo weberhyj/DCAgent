@@ -628,11 +628,7 @@ class LazyStartupTest(unittest.TestCase):
                 ) -> list[DependencyCheck]:
                     captured.update(dependencies)
                     retrieval = dependencies["retrieval_settings"]
-                    detail = (
-                        "degraded"
-                        if retrieval.mode.value == "shadow"
-                        else "unavailable"
-                    )
+                    detail = "degraded" if retrieval.mode.value == "shadow" else "unavailable"
                     return [
                         DependencyCheck(
                             "reranker",

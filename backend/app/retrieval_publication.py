@@ -489,9 +489,9 @@ class RetrievalIndexPublisher:
                             publication.id,
                             primary_code,
                         )
-                    except Exception as e:
+                    except Exception:
                         if isinstance(sanitized_error, PublicationRecoveryError):
-                            raise PublicationRecoveryError(
+                            sanitized_error = PublicationRecoveryError(
                                 sanitized_error.primary_code,
                                 tuple(
                                     dict.fromkeys(
@@ -501,29 +501,27 @@ class RetrievalIndexPublisher:
                                         )
                                     )
                                 ),
-                            ) from e
+                            )
                         else:
-                            raise PublicationRecoveryError(
+                            sanitized_error = PublicationRecoveryError(
                                 primary_code,
                                 ("audit_mark_failed_failed",),
-                            ) from e
-                if sanitized_error is not None:
-                    raise sanitized_error from error
+                            )
             else:
                 try:
                     self.audit.mark_publication_failed(
                         publication.id,
                         primary_code,
                     )
-                except Exception as e:
-                    raise PublicationRecoveryError(
+                except Exception:
+                    sanitized_error = PublicationRecoveryError(
                         primary_code,
                         ("audit_mark_failed_failed",),
-                    ) from e
+                    )
                 else:
-                    raise RetrievalPublicationError(
+                    sanitized_error = RetrievalPublicationError(
                         "retrieval publication coordination failed"
-                    ) from error
+                    )
         if exit_recovery is not None:
             previous_alias, previous_publication_id, primary_code = exit_recovery
             return self._recover_fence_exit_failure(
@@ -532,6 +530,8 @@ class RetrievalIndexPublisher:
                 previous_publication_id=previous_publication_id,
                 primary_code=primary_code,
             )
+        if sanitized_error is not None:
+            raise sanitized_error
         raise AssertionError("Retrieval publication build reached an invalid state")
 
     def _build_with_alias_fence(
@@ -649,8 +649,8 @@ class RetrievalIndexPublisher:
                 )
             else:
                 sanitized_error = _sanitized_build_error(error)
-            if sanitized_error is not None:
-                raise sanitized_error from error
+        if sanitized_error is not None:
+            raise sanitized_error
         raise AssertionError("Retrieval publication failure handling reached an invalid state")
 
     def _recover_fence_exit_failure(
