@@ -147,8 +147,8 @@ def fake_model_modules(
     optimum = types.ModuleType("optimum")
     intel = types.ModuleType("optimum.intel")
     onnx = types.ModuleType("optimum.onnxruntime")
-    setattr(intel, "OVModelForFeatureExtraction", ModelFactory)
-    setattr(onnx, "ORTModelForFeatureExtraction", ModelFactory)
+    intel.OVModelForFeatureExtraction = ModelFactory
+    onnx.ORTModelForFeatureExtraction = ModelFactory
     modules = {
         "transformers": transformers,
         "optimum": optimum,

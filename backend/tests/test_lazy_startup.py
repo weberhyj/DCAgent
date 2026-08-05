@@ -200,7 +200,7 @@ class ScopeQueryingRetrievalResourceFactory(RecordingRetrievalResourceFactory):
         self._record("gateway")
         self.gateway = QdrantRetrievalGateway(
             client,  # type: ignore[arg-type]
-            alias_name=getattr(settings, "qdrant_collection_alias"),
+            alias_name=settings.qdrant_collection_alias,
         )
         return self.gateway
 
@@ -630,7 +630,7 @@ class LazyStartupTest(unittest.TestCase):
                     retrieval = dependencies["retrieval_settings"]
                     detail = (
                         "degraded"
-                        if getattr(retrieval, "mode").value == "shadow"
+                        if retrieval.mode.value == "shadow"
                         else "unavailable"
                     )
                     return [
@@ -667,7 +667,7 @@ class LazyStartupTest(unittest.TestCase):
                 )
                 self.assertIs(captured["retrieval_gateway"], resources.gateway)
                 self.assertEqual(
-                    getattr(captured["retrieval_settings"], "mode").value,
+                    captured["retrieval_settings"].mode.value,
                     mode,
                 )
 

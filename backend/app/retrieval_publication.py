@@ -487,9 +487,9 @@ class RetrievalIndexPublisher:
                             publication.id,
                             primary_code,
                         )
-                    except Exception:
+                    except Exception as e:
                         if isinstance(sanitized_error, PublicationRecoveryError):
-                            sanitized_error = PublicationRecoveryError(
+                            raise PublicationRecoveryError(
                                 sanitized_error.primary_code,
                                 tuple(
                                     dict.fromkeys(
@@ -499,27 +499,29 @@ class RetrievalIndexPublisher:
                                         )
                                     )
                                 ),
-                            )
+                            ) from e
                         else:
-                            sanitized_error = PublicationRecoveryError(
+                            raise PublicationRecoveryError(
                                 primary_code,
                                 ("audit_mark_failed_failed",),
-                            )
+                            ) from e
+                if sanitized_error is not None:
+                    raise sanitized_error from error
             else:
                 try:
                     self.audit.mark_publication_failed(
                         publication.id,
                         primary_code,
                     )
-                except Exception:
-                    sanitized_error = PublicationRecoveryError(
+                except Exception as e:
+                    raise PublicationRecoveryError(
                         primary_code,
                         ("audit_mark_failed_failed",),
-                    )
+                    ) from e
                 else:
-                    sanitized_error = RetrievalPublicationError(
+                    raise RetrievalPublicationError(
                         "retrieval publication coordination failed"
-                    )
+                    ) from error
         if exit_recovery is not None:
             previous_alias, previous_publication_id, primary_code = exit_recovery
             return self._recover_fence_exit_failure(
@@ -528,8 +530,6 @@ class RetrievalIndexPublisher:
                 previous_publication_id=previous_publication_id,
                 primary_code=primary_code,
             )
-        if sanitized_error is not None:
-            raise sanitized_error
         raise AssertionError("Retrieval publication build reached an invalid state")
 
     def _build_with_alias_fence(
@@ -752,15 +752,17 @@ class RetrievalIndexPublisher:
         finalize: Callable[[SourceIndexResult], object] | None = None,
         on_failure: Callable[[Exception], object] | None = None,
     ) -> object:
-        with self.audit.alias_publication_lock(self._alias_name):
-            with self.audit.source_maintenance_lock(source_id):
-                try:
-                    result = self._upsert_source_locked(source_id)
-                except Exception as error:
-                    if on_failure is not None:
-                        on_failure(error)
-                    raise
-                return result if finalize is None else finalize(result)
+        with (
+            self.audit.alias_publication_lock(self._alias_name),
+            self.audit.source_maintenance_lock(source_id),
+        ):
+            try:
+                result = self._upsert_source_locked(source_id)
+            except Exception as error:
+                if on_failure is not None:
+                    on_failure(error)
+                raise
+            return result if finalize is None else finalize(result)
 
     def _upsert_source_locked(self, source_id: str) -> SourceIndexResult:
         publication = self._audited_live_publication()
@@ -791,19 +793,21 @@ class RetrievalIndexPublisher:
         *,
         finalize: Callable[[], object] | None = None,
     ) -> object | None:
-        with self.audit.alias_publication_lock(self._alias_name):
-            with self.audit.source_maintenance_lock(source_id):
-                publication = self._destructive_publication()
-                if publication is None:
-                    return None if finalize is None else finalize()
-                version = collection_publication_version(publication.collection_name)
-                self.gateway.delete_source(
-                    source_id,
-                    maintenance_scope=IndexMaintenanceScope(self._knowledge_base_id, version),
-                    collection_name=publication.collection_name,
-                )
-                self._require_live_alias(publication.collection_name)
+        with (
+            self.audit.alias_publication_lock(self._alias_name),
+            self.audit.source_maintenance_lock(source_id),
+        ):
+            publication = self._destructive_publication()
+            if publication is None:
                 return None if finalize is None else finalize()
+            version = collection_publication_version(publication.collection_name)
+            self.gateway.delete_source(
+                source_id,
+                maintenance_scope=IndexMaintenanceScope(self._knowledge_base_id, version),
+                collection_name=publication.collection_name,
+            )
+            self._require_live_alias(publication.collection_name)
+            return None if finalize is None else finalize()
 
     def index_publication(
         self,
@@ -813,15 +817,17 @@ class RetrievalIndexPublisher:
         finalize: Callable[[SourceIndexResult], object] | None = None,
         on_failure: Callable[[Exception], object] | None = None,
     ) -> object:
-        with self.audit.alias_publication_lock(self._alias_name):
-            with self.audit.source_maintenance_lock(schema.source_id):
-                try:
-                    indexed = self._index_publication_locked(schema, result)
-                except Exception as error:
-                    if on_failure is not None:
-                        on_failure(error)
-                    raise
-                return indexed if finalize is None else finalize(indexed)
+        with (
+            self.audit.alias_publication_lock(self._alias_name),
+            self.audit.source_maintenance_lock(schema.source_id),
+        ):
+            try:
+                indexed = self._index_publication_locked(schema, result)
+            except Exception as error:
+                if on_failure is not None:
+                    on_failure(error)
+                raise
+            return indexed if finalize is None else finalize(indexed)
 
     def _index_publication_locked(
         self,

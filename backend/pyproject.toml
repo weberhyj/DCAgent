@@ -55,6 +55,9 @@ default-groups = ["dev"]
 [tool.pdm]
 distribution = false
 
+[tool.pdm.version]
+path = "app/__init__.py"
+
 [build-system]
 requires = ["pdm-backend"]
 build-backend = "pdm.backend"
