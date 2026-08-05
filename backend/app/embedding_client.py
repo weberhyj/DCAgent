@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from ipaddress import IPv4Network, IPv6Network, ip_address
@@ -133,13 +134,15 @@ class _SyncHttpxEmbeddingTransport:
         *,
         timeout_seconds: float | None = None,
     ) -> Mapping[str, object]:
-        request_kwargs: dict[str, object] = {}
+        timeout: httpx.Timeout | int | None = None
         if timeout_seconds is not None:
-            request_kwargs["timeout"] = httpx.Timeout(
+            timeout = httpx.Timeout(
                 timeout_seconds,
                 connect=min(timeout_seconds, 2.0),
             )
-        response = self._client.post(url, json=dict(payload), **request_kwargs)
+        elif t := os.getenv("HTTPX_TIMEOUT"):
+            timeout = int(t)
+        response = self._client.post(url, json=dict(payload), timeout=timeout)
         response.raise_for_status()
         try:
             result = response.json()
@@ -374,10 +377,7 @@ def _validate_base_url(base_url: str) -> str:
         raise ValueError("EMBEDDING_SERVICE_URL path must be empty or /v1")
     host = parsed.hostname
     assert host is not None  # guarded above
-    if ":" in host:
-        authority_host = f"[{host}]"
-    else:
-        authority_host = host
+    authority_host = f"[{host}]" if ":" in host else host
     authority = authority_host
     if parsed.port is not None:
         authority += f":{parsed.port}"
