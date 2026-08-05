@@ -262,6 +262,7 @@ def _build_app(*, lifespan: Any | None = None) -> FastAPI:
     app = FastAPI(
         title="DC-Agent API",
         docs_url="/api/docs",
+        openapi_url=f"/api/{__version__}/openapi.json",
         version=__version__,
         lifespan=lifespan,
     )
