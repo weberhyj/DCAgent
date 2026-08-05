@@ -93,7 +93,7 @@ class _ScopedHttpxTransport:
 class HttpxEmbeddingTransport:
     """Default network transport; every scope owns and closes one AsyncClient."""
 
-    def __init__(self, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(self, *, timeout_seconds: float = 30.0) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive and finite")
         self.timeout_seconds = timeout_seconds
