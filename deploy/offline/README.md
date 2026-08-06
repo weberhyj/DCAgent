@@ -37,7 +37,7 @@ export HOST_DATA_ROOT=/srv/dcagent/data
 export HOST_MODEL_ROOT=/srv/dcagent/models
 ./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
-./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d
 ```
 
@@ -103,10 +103,40 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 
 ## Profiles
 
-- The default topology starts data services, schema migration, the embedding service, the reranker
-  service, and API.
+- The default topology starts data services, schema migration, the embedding service, and API.
+- `--profile reranker` explicitly enables the optional Reranker adapter.
 - `--profile generation` enables the private llama.cpp service after its locked local model is installed.
 - `--profile indexing` enables the structured spreadsheet worker (`app.structured_worker`). Keep it disabled while `STRUCTURED_QUERY_ENABLED=false`.
+
+## 默认 RRF-only 检索路线
+
+生产模板默认使用 `Dense + BM25 + RRF`，不启动 Reranker：
+
+```env
+RETRIEVAL_MODE=qwen3
+RERANKER_ENABLED=false
+RETRIEVAL_FINAL_TOP_K=8
+OLLAMA_BASE_URL=http://ollama.inner:11434
+OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
+```
+
+此时 Smoke 与内网 Gate 不构建、不启动、不探测 `reranker-service`，API `/readyz` 也不会把它列为
+依赖。RRF 融合后的稳定顺序直接进入 Top 8 和邻接扩展，再交给 Physoc DeepSeek 总结。
+
+`kopens/bge-reranker-large:latest` 通过 Ollama `/api/embed` 返回 1024 维向量；向量不是
+query/passage 的单一相关性分数，所以不能直接替换 `/v1/rerank`。下面涉及 `qwen2.5:3b`、
+`/api/generate`、Reranker digest、prompt profile 和容量探针的内容，只适用于显式重新启用：
+
+```env
+RERANKER_ENABLED=true
+RERANKER_SERVICE_URL=http://reranker-service:8082
+```
+
+```bash
+set -Eeuo pipefail
+./tools/invoke_offline_compose.sh --profile reranker build reranker-service api
+./tools/invoke_offline_compose.sh --profile reranker up -d reranker-service api
+```
 
 ## Ollama-backed BGE Chinese hybrid retrieval rollout and rollback
 
@@ -223,7 +253,7 @@ set -Eeuo pipefail
 export UV_PYTHON_DOWNLOADS=never
 uv sync --project backend --frozen --offline --no-install-project --no-dev --group offline --no-index --find-links artifacts/wheels
 uv sync --project backend --frozen --offline --no-install-project --no-dev --no-index --find-links artifacts/wheels
-./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker
 ```
 
 The first sync matches backend/worker images; the second matches the lightweight adapter images.
@@ -257,7 +287,7 @@ set -Eeuo pipefail
 install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
 ./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
-./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d
 ```
 

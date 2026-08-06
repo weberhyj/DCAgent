@@ -43,7 +43,7 @@ export HOST_DATA_ROOT=/srv/dcagent/data
 export HOST_MODEL_ROOT=/srv/dcagent/models
 ./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
-./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d
 ```
 
@@ -164,14 +164,25 @@ fi
 
 探针返回非零状态时，不要切换生产流量。
 
-## 4. 配置 Ollama Embedding 和 Reranker
+## 4. 配置 Ollama Embedding（默认 RRF-only）
 
-在 Ollama 服务器上准备模型：
+默认检索链路为 `Dense + BM25 + RRF → Top 8 → 邻接扩展 → Physoc DeepSeek 总结`：
+
+```env
+RETRIEVAL_MODE=qwen3
+RERANKER_ENABLED=false
+RETRIEVAL_FINAL_TOP_K=8
+OLLAMA_BASE_URL=http://ollama.inner:11434
+OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
+```
+
+默认部署不构建、不启动、不探测 Reranker，也不要求任何 Reranker 模型元数据。
+
+在 Ollama 服务器上只准备 Embedding 模型：
 
 ```bash
 set -Eeuo pipefail
 ollama pull bge-large-zh-v1.5:latest
-ollama pull qwen2.5:3b
 
 ollama_url='http://127.0.0.1:11434'
 embed_json="$(curl --fail-with-body --silent --show-error \
@@ -182,7 +193,7 @@ dimensions="$(python3 -c 'import json,sys; body=json.load(sys.stdin); value=len(
 printf 'EMBEDDING_MODEL_DIMENSIONS=%s\n' "$dimensions"
 
 tags_json="$(curl --fail-with-body --silent --show-error "$ollama_url/api/tags")"
-for model in bge-large-zh-v1.5:latest qwen2.5:3b; do
+for model in bge-large-zh-v1.5:latest; do
   digest="$(python3 -c 'import json,re,sys; model=sys.argv[1]; body=json.load(sys.stdin); matches=[item for item in body["models"] if item.get("name") == model or item.get("model") == model]; len(matches) == 1 or sys.exit(f"expected exactly one model match: {model}"); digest=str(matches[0]["digest"]).removeprefix("sha256:"); re.fullmatch(r"[0-9a-f]{64}", digest) or sys.exit(f"invalid digest: {model}"); print(digest)' "$model" <<<"$tags_json")"
   printf '%s %s\n' "$model" "$digest"
 done
@@ -195,13 +206,8 @@ OLLAMA_BASE_URL=http://<Ollama内网IP>:11434
 OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
 OLLAMA_EMBEDDING_PATH=/api/embed
 OLLAMA_EMBEDDING_QUERY_PROFILE=bge-large-zh-v1.5
-OLLAMA_RERANKER_MODEL=qwen2.5:3b
-OLLAMA_GENERATE_PATH=/api/generate
 OLLAMA_KEEP_ALIVE=30m
 OLLAMA_REQUEST_TIMEOUT_SECONDS=15
-OLLAMA_RERANK_FORMAT_JSON=true
-OLLAMA_RERANK_BATCH_MAX_ITEMS=8
-OLLAMA_RERANK_NUM_PREDICT=512
 ```
 
 必须从 API 容器所在网络验证以下接口：
@@ -209,7 +215,6 @@ OLLAMA_RERANK_NUM_PREDICT=512
 ```text
 GET  http://<Ollama内网IP>:11434/api/tags
 POST http://<Ollama内网IP>:11434/api/embed
-POST http://<Ollama内网IP>:11434/api/generate
 ```
 
 ### 4.1 替换模型指纹和向量维度
@@ -218,13 +223,12 @@ POST http://<Ollama内网IP>:11434/api/generate
 
 ```env
 EMBEDDING_MODEL_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-RERANKER_MODEL_SHA256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 EMBEDDING_MODEL_DIMENSIONS=1024
 ```
 
 需要执行：
 
-1. 从 Ollama `/api/tags` 获取 `bge-large-zh-v1.5:latest` 和 `qwen2.5:3b` 的真实 digest。
+1. 从 Ollama `/api/tags` 获取 `bge-large-zh-v1.5:latest` 的真实 digest。
 2. 去掉可选的 `sha256:` 前缀，保存为 64 位小写十六进制字符。
 3. 调用 `/api/embed`，将 `len(embeddings[0])` 的实测结果写入 `EMBEDDING_MODEL_DIMENSIONS`。
 
@@ -241,15 +245,35 @@ OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
 OLLAMA_EMBEDDING_PATH=/api/embed
 OLLAMA_EMBEDDING_QUERY_PROFILE=bge-large-zh-v1.5
 
-RERANKER_MODEL_NAME=qwen2.5:3b
-RERANKER_MODEL_VERSION=ollama-qwen25-3b-v1
-RERANKER_MODEL_SHA256=<qwen2.5:3b真实digest>
-RERANKER_PROMPT_PROFILE_SHA256=e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd
 ```
 
 只有在 endpoint、query profile 和前缀契约均未修改时，才可以保留项目提供的 profile SHA-256。
 BGE query 会自动添加 `为这个句子生成表示以用于检索相关文章：`，document 文本不添加前缀；如果只提供 legacy
 `/api/embeddings`，请使用 BGE legacy profile hash `b8e7252a57feef349f02d6b2624ef3f9e8bc9e989d9073e37aa5df424cf26de4`。
+
+### 4.2 可选：重新启用 Reranker
+
+`kopens/bge-reranker-large:latest` 在当前 Ollama 上通过 `/api/embed` 返回 1024 维向量，
+并不返回 query/passage 的单一相关性分数，因此不能直接替换 `/v1/rerank`。只有准备好经过验证的
+打分服务后，才设置：
+
+```env
+RERANKER_ENABLED=true
+RERANKER_SERVICE_URL=http://reranker-service:8082
+RERANKER_MODEL_NAME=<已验证模型>
+RERANKER_MODEL_VERSION=<固定版本>
+RERANKER_MODEL_SHA256=<真实digest>
+RERANKER_PROMPT_PROFILE_SHA256=<固定prompt profile hash>
+RERANKER_PROTOCOL_VERSION=v1
+```
+
+旧的 `qwen2.5:3b` `/api/generate` 生成式打分仅为兼容模式，不等价于专用 cross-encoder。启用时使用：
+
+```bash
+set -Eeuo pipefail
+./tools/invoke_offline_compose.sh --profile reranker build reranker-service api
+./tools/invoke_offline_compose.sh --profile reranker up -d reranker-service api
+```
 
 ## 5. 配置数据库和内部服务
 
@@ -262,7 +286,6 @@ QDRANT_URL=http://<Qdrant内网IP>:6333
 REDIS_URL=redis://<Redis内网IP>:6379/0
 CLAMAV_HOST=<ClamAV内网IP或服务名>
 EMBEDDING_SERVICE_URL=http://<Embedding适配器内网IP>:8081
-RERANKER_SERVICE_URL=http://<Reranker适配器内网IP>:8082
 PARQUET_ROOT=<持久化Parquet目录>
 ```
 
@@ -273,7 +296,6 @@ CLICKHOUSE_URL=http://clickhouse:8123
 QDRANT_URL=http://qdrant:6333
 REDIS_URL=redis://redis:6379/0
 EMBEDDING_SERVICE_URL=http://embedding-service:8081
-RERANKER_SERVICE_URL=http://reranker-service:8082
 PARQUET_ROOT=/data/parquet
 ```
 
@@ -402,7 +424,7 @@ RETRIEVAL_CANARY_PERCENT=100
 QDRANT_COLLECTION_ALIAS=knowledge_chunks_current
 ```
 
-`qwen3` 是为兼容既有 collection、数据库记录和环境变量保留的路由名称，当前实际 Embedding 是 BGE 中文，Reranker 是 Qwen2.5 3B。
+`qwen3` 是为兼容既有 collection、数据库记录和环境变量保留的路由名称，当前默认实际链路是 BGE 中文 Embedding + BM25 + RRF，Reranker 关闭。
 
 更换 Embedding 模型、digest、向量维度、endpoint 或 query profile 后，必须使用从未使用过的新 collection 名称并重新构建全部 Word/PDF/TXT/Excel 向量，不能复用旧向量。
 
@@ -448,7 +470,7 @@ set -Eeuo pipefail
 install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
 ./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
-./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d
 ./tools/invoke_offline_compose.sh --profile indexing up -d
 ```
@@ -457,7 +479,7 @@ install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
 
 1. PostgreSQL migration 成功。
 2. `/api/readyz` 返回正常。
-3. Ollama `/api/tags`、`/api/embed`、`/api/generate` 可用。
+3. Ollama `/api/tags`、`/api/embed` 可用；只有启用 Reranker 时才验收 `/api/generate` 或专用打分端点。
 4. Physoc 探针通过。
 5. 构建并激活 Qdrant collection。
 6. 上传并发布测试文档。
@@ -530,7 +552,7 @@ install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
 2. Physoc 探针是否通过。
 3. 是否仍处于不符合预期的 Legacy/Shadow 检索配置。
 4. Qdrant collection 是否已经构建并激活。
-5. Embedding/Reranker adapter 是否能访问 Ollama。
+5. Embedding adapter 是否能访问 Ollama；若显式启用 Reranker，再检查其 adapter 和打分端点。
 
 ## 14. 相关文档
 

@@ -37,7 +37,7 @@ export HOST_DATA_ROOT=/srv/dcagent/data
 export HOST_MODEL_ROOT=/srv/dcagent/models
 ./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
-./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d
 ```
 

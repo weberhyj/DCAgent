@@ -36,6 +36,19 @@ def service_block(compose: str, service: str) -> str:
 
 
 class ComposeContractTest(unittest.TestCase):
+    def test_operator_docs_describe_default_rrf_only_route(self) -> None:
+        for path in (
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "deploy" / "offline" / "README.md",
+            REPO_ROOT / "docs" / "intranet-deployment-configuration.md",
+        ):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertIn("RERANKER_ENABLED=false", text)
+                self.assertIn("Dense + BM25 + RRF", text)
+                self.assertIn("kopens/bge-reranker-large:latest", text)
+                self.assertIn("1024", text)
+
     def test_rrf_only_is_the_documented_default(self) -> None:
         env_text = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
             encoding="utf-8"
@@ -2209,7 +2222,7 @@ class ComposeContractTest(unittest.TestCase):
             'sudo install -d -o "$deployment_user" -g "$deployment_group" -m 0700',
             "export HOST_DATA_ROOT=/srv/dcagent/data",
             "export HOST_MODEL_ROOT=/srv/dcagent/models",
-            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker",
             "config/build/up/down/exec/cp",
             "rollback_failed",
             "committed_cleanup_required",
@@ -2291,7 +2304,7 @@ class ComposeContractTest(unittest.TestCase):
         manual_sequence = (
             "./tools/prepare_offline_env.sh --initialize-state",
             "./tools/invoke_offline_compose.sh config",
-            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker",
             "./tools/invoke_offline_compose.sh up -d",
         )
         gate_command = (
@@ -2347,7 +2360,7 @@ class ComposeContractTest(unittest.TestCase):
         sequence = (
             "./tools/prepare_offline_env.sh --initialize-state",
             "./tools/invoke_offline_compose.sh config",
-            "./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker",
+            "./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker",
             "./tools/invoke_offline_compose.sh up -d",
         )
         for path in documents:

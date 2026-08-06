@@ -11,6 +11,11 @@ BACKEND_ROOT = REPOSITORY_ROOT / "backend"
 
 
 class BackendUvContractTest(unittest.TestCase):
+    def test_backend_version_is_0_1_6(self) -> None:
+        text = (BACKEND_ROOT / "app" / "__init__.py").read_text(encoding="utf-8")
+
+        self.assertIn('__version__ = "0.1.6"', text)
+
     def normalize_command_text(self, text: str) -> str:
         without_shell_continuations = re.sub(r"(?:`|\\)[ \t]*\r?\n[ \t]*", " ", text)
         return re.sub(r"\s+", " ", without_shell_continuations).strip()

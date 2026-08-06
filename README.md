@@ -151,7 +151,7 @@ export HOST_DATA_ROOT=/srv/dcagent/data
 export HOST_MODEL_ROOT=/srv/dcagent/models
 ./tools/prepare_offline_env.sh --initialize-state
 ./tools/invoke_offline_compose.sh config
-./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker
 ./tools/invoke_offline_compose.sh up -d
 ```
 
@@ -243,7 +243,7 @@ flowchart TD
     O -->|"legacy"| P0["PostgreSQL Legacy 检索"]
     O -->|"shadow / qwen3"| P1["BGE Chinese Embedding adapter + BM25"]
     P1 --> P2["Qdrant Dense + Sparse"]
-    P2 --> P3["RRF 融合 + Qwen2.5 生成式 Reranker adapter"]
+    P2 --> P3["RRF 融合（默认不启用 Reranker）"]
     P3 --> P["Top 8 授权证据"]
     P0 --> P
     P -.->|"无可靠证据"| Y["拒绝回答，不调用模型"]
@@ -254,7 +254,19 @@ flowchart TD
 
 ### Ollama BGE 中文混合检索链路（保留 qwen3 兼容命名）
 
-普通文档问答采用 `Qdrant Dense + Sparse/BM25 + RRF`：
+普通文档问答默认采用 `Dense + BM25 + RRF`，完整配置如下：
+
+```env
+RETRIEVAL_MODE=qwen3
+RERANKER_ENABLED=false
+RETRIEVAL_FINAL_TOP_K=8
+OLLAMA_BASE_URL=http://ollama.inner:11434
+OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
+```
+
+该路线只启动 BGE Embedding adapter，不创建、不探测也不调用 Reranker。Qdrant Dense 与 BM25
+Sparse 各自召回候选，RRF 融合后按稳定顺序取 Top 8，再执行邻接片段扩展，最后由 Physoc
+DeepSeek 基于证据归纳答案。
 
 1. PostgreSQL 保存权威文档、切片、权限标签和发布状态；Qdrant 保存版本化检索点。
 2. 轻量 Embedding adapter 通过公司内网 Ollama 的 `bge-large-zh-v1.5:latest` 生成 Dense vector，并按
@@ -262,10 +274,8 @@ flowchart TD
    文本保持原文。维度必须以目标 `/api/embed` 的 `len(embeddings[0])` 实测值为准；本项目示例为 1024。
    本地 BM25 生成 Sparse query vector。
 3. 两路检索都先应用 knowledge-base、permission-tag 和 publication filters，各取 Top 50。
-4. RRF（`k=60`）融合候选，Reranker adapter 通过 `qwen2.5:3b` 的 `/api/generate` 生成并严格
-   校验 `[0,1]` JSON scores。初始 8/4/4/20 配置是 `RETRIEVAL_RERANK_TOP_K=8`、
-   `RETRIEVAL_DEGRADED_RERANK_TOP_K=4`、`RETRIEVAL_FINAL_TOP_K=4`、
-   `RETRIEVAL_TOTAL_TIMEOUT_SECONDS=20`，最终只给 Agent 提供有界授权证据。
+4. RRF（`k=60`）融合候选；默认 `RERANKER_ENABLED=false`，直接保持 RRF 顺序并取
+   `RETRIEVAL_FINAL_TOP_K=8`，最终只给 Agent 提供有界授权证据。
 5. Agent 把授权证据、调查摘要和近期会话组成完整 RAG 提示词，再通过
    `POST /api/physoc/deepseeks/stream` 交给私有 Physoc DeepSeek 归纳。
 
@@ -276,7 +286,7 @@ flowchart TD
   只存 case/chunk ID、排名指标、耗时和脱敏失败码，不保存原始问题或证据正文。
 - `qwen3`：为保持 collection、数据库记录和环境变量兼容而保留的路由名；按稳定会话哈希和
   `RETRIEVAL_CANARY_PERCENT` 选择 Ollama-backed 混合检索；未命中 canary 或
-  Embedding、Reranker、Qdrant、Alias、超时/熔断异常时安全回退 Legacy。
+  Embedding、Qdrant、Alias、超时/熔断异常时安全回退 Legacy；只有显式启用 Reranker 时才检查其状态。
 
 新上传知识库文档的默认分类为“公开”，默认部署模板使用：
 
@@ -286,9 +296,21 @@ RETRIEVAL_PERMISSION_TAGS=公开
 
 显式提交的其他分类仍会保留。升级不会修改数据库中的历史分类，现有文档不会自动迁移；如需采用新默认值，请删除后重新导入并等待索引完成。
 
-DC-Agent 本身不再运行 Embedding/Reranker 权重；只有两个 adapter 服务调用公司内网可达的
-Ollama，不依赖外部 API。`qwen2.5:3b` 生成式 rerank 是兼容模式，不等价于专用 cross-encoder，
-必须在目标服务器完成 15 并发容量测试并观测 429/503、延迟和 controlled fallback。
+DC-Agent 本身不运行 Embedding/Reranker 权重；默认只有 Embedding adapter 调用公司内网可达的
+Ollama，不依赖外部 API。服务器现有的 `kopens/bge-reranker-large:latest` 经 Ollama
+`/api/embed` 返回的是 1024 维向量，不是 cross-encoder 的单一相关性分数，因此不能作为当前
+`/v1/rerank` 的替代实现。
+
+如以后有经过验证、能够输出每个 query/passage 相关性分数的 Reranker，再显式启用：
+
+```env
+RERANKER_ENABLED=true
+RERANKER_SERVICE_URL=http://reranker-service:8082
+```
+
+并使用 `./tools/invoke_offline_compose.sh --profile reranker up -d reranker-service api` 启动可选服务。
+旧的 `qwen2.5:3b` `/api/generate` 生成式 rerank 仅为兼容模式，不等价于专用 cross-encoder；
+重新启用前必须完成目标服务器 15 并发容量测试并观测 429/503、延迟和 controlled fallback。
 `/v1/rerank` 的 wire contract 始终接受 1–32 个 passages；`RERANKER_BATCH_MAX_ITEMS=32`
 保证单个合法请求可以进入服务，`OLLAMA_RERANK_BATCH_MAX_ITEMS=8` 则只限制一次
 `/api/generate` 的候选数，较大请求按连续分块执行并恢复原顺序。输出预算必须满足
@@ -516,7 +538,7 @@ set -Eeuo pipefail
 export UV_PYTHON_DOWNLOADS=never
 uv sync --project backend --frozen --offline --no-install-project --no-dev --group offline --no-index --find-links artifacts/wheels
 uv sync --project backend --frozen --offline --no-install-project --no-dev --no-index --find-links artifacts/wheels
-./tools/invoke_offline_compose.sh build schema-migration embedding-service reranker-service api ingestion-worker
+./tools/invoke_offline_compose.sh build schema-migration embedding-service api ingestion-worker
 ```
 
 真实 Ollama probe、镜像构建、全量索引、15 用户容量、目标服务器 acceptance 和 Alias activation
