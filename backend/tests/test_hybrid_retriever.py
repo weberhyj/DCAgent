@@ -13,7 +13,7 @@ from app.hybrid_retriever import (
     reciprocal_rank_fusion,
 )
 from app.models import knowledge_search_hit_from_candidate
-from app.reranker_client import RerankerBusy, RerankerServiceError
+from app.reranker_client import RerankerBusy, RerankerResponseError, RerankerServiceError
 from app.retrieval_models import RetrievalCandidate, RetrievalRequest, RetrievalScope
 from app.retrieval_publication import deterministic_point_id
 from app.retrieval_settings import RerankerModelSettings
@@ -170,11 +170,25 @@ class BusyOnceReranker(RecordingReranker):
         return [1.0 - index / 100 for index in range(len(passages))]
 
 
+class AlwaysBusyReranker(RecordingReranker):
+    def rerank(self, query, passages, *, expected, timeout_seconds=None):
+        self.batch_sizes.append(len(passages))
+        self.timeouts.append(timeout_seconds)
+        raise RerankerBusy("busy")
+
+
 class FailingReranker(RecordingReranker):
     def rerank(self, query, passages, *, expected, timeout_seconds=None):
         self.batch_sizes.append(len(passages))
         self.timeouts.append(timeout_seconds)
         raise RerankerServiceError("unavailable")
+
+
+class InvalidResponseReranker(RecordingReranker):
+    def rerank(self, query, passages, *, expected, timeout_seconds=None):
+        self.batch_sizes.append(len(passages))
+        self.timeouts.append(timeout_seconds)
+        raise RerankerResponseError("invalid response")
 
 
 class NonCooperativeGate:
@@ -413,14 +427,35 @@ class HybridRetrieverTest(unittest.TestCase):
         self.assertEqual(reranker.batch_sizes, [24, 12])
         self.assertTrue(outcome.candidates)
 
-    def test_does_not_retry_non_busy_reranker_failures(self) -> None:
+    def test_degrades_to_rrf_candidates_when_busy_retry_is_rejected(self) -> None:
+        reranker = AlwaysBusyReranker()
+        retriever = self.addCleanupFor(build_retriever(reranker=reranker))
+
+        outcome = retriever.retrieve(request())
+
+        self.assertEqual(reranker.batch_sizes, [24, 12])
+        self.assertEqual(len(outcome.candidates), 8)
+        self.assertTrue(all(item.rerank_score is None for item in outcome.candidates))
+
+    def test_degrades_to_rrf_candidates_when_reranker_service_is_unavailable(self) -> None:
         reranker = FailingReranker()
         retriever = self.addCleanupFor(build_retriever(reranker=reranker))
 
-        with self.assertRaises(RerankerServiceError):
-            retriever.retrieve(request())
+        outcome = retriever.retrieve(request())
 
         self.assertEqual(reranker.batch_sizes, [24])
+        self.assertEqual(len(outcome.candidates), 8)
+        self.assertTrue(all(item.rerank_score is None for item in outcome.candidates))
+
+    def test_degrades_to_rrf_candidates_when_reranker_response_is_invalid(self) -> None:
+        reranker = InvalidResponseReranker()
+        retriever = self.addCleanupFor(build_retriever(reranker=reranker))
+
+        outcome = retriever.retrieve(request())
+
+        self.assertEqual(reranker.batch_sizes, [24])
+        self.assertEqual(len(outcome.candidates), 8)
+        self.assertTrue(all(item.rerank_score is None for item in outcome.candidates))
 
     def test_uses_one_absolute_deadline_across_encoding_and_search(self) -> None:
         retriever = self.addCleanupFor(

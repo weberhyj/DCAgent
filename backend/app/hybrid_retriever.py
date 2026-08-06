@@ -12,7 +12,7 @@ from typing import Protocol
 
 from .embedding_contracts import EmbeddingMetadataExpectation
 from .models import KnowledgeSearchHitModel, knowledge_search_hit_from_candidate
-from .reranker_client import RerankerBusy
+from .reranker_client import RerankerBusy, RerankerResponseError, RerankerServiceError
 from .reranker_contracts import RerankerMetadataExpectation
 from .retrieval import (
     DEFAULT_HYBRID_EVIDENCE_CHAR_BUDGET,
@@ -365,16 +365,21 @@ class HybridRetriever:
             )
         except RerankerBusy:
             candidates = candidates[: self._degraded_rerank_top_k]
-            scores = self._run_one(
-                lambda: self.reranker.rerank(
-                    query,
-                    [item.text for item in candidates],
-                    expected=self._reranker_metadata,
-                    timeout_seconds=self._remaining_timeout(deadline),
-                ),
-                deadline=deadline,
-                generation=generation,
-            )
+            try:
+                scores = self._run_one(
+                    lambda: self.reranker.rerank(
+                        query,
+                        [item.text for item in candidates],
+                        expected=self._reranker_metadata,
+                        timeout_seconds=self._remaining_timeout(deadline),
+                    ),
+                    deadline=deadline,
+                    generation=generation,
+                )
+            except (RerankerBusy, RerankerResponseError, RerankerServiceError):
+                return candidates
+        except (RerankerResponseError, RerankerServiceError):
+            return candidates[: self._degraded_rerank_top_k]
         if len(scores) != len(candidates):
             raise ValueError("reranker returned an unexpected score count")
         scored: list[tuple[int, RetrievalCandidate]] = []
