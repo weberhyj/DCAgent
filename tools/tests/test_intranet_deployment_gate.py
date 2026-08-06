@@ -24,9 +24,7 @@ class RecordingRunner:
         self.calls: list[tuple[list[str], dict[str, object]]] = []
         self.failing_call = failing_call
 
-    def __call__(
-        self, argv: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    def __call__(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         self.calls.append((argv, kwargs))
         failing = len(self.calls) == self.failing_call
         is_drill = any("dcagent-recovery-drill-" in value for value in argv)
@@ -43,9 +41,7 @@ class RecordingRunner:
                 root / "repo" / "deploy" / "offline",
             ):
                 directory.mkdir(parents=True, exist_ok=True)
-            (state / "deployment-identity.json").write_text(
-                "identity", encoding="ascii"
-            )
+            (state / "deployment-identity.json").write_text("identity", encoding="ascii")
             (state / "deployment.lock").write_text("lock", encoding="ascii")
             for name in (
                 "postgres-password",
@@ -65,19 +61,13 @@ class RecordingRunner:
         return subprocess.CompletedProcess(
             argv,
             1 if failing else exit_code,
-            stdout="secret=TOP-SECRET prompt=do-not-store data: raw-sse"
-            if failing
-            else "",
-            stderr="secret=TOP-SECRET prompt=do-not-store data: raw-sse"
-            if failing
-            else "",
+            stdout="secret=TOP-SECRET prompt=do-not-store data: raw-sse" if failing else "",
+            stderr="secret=TOP-SECRET prompt=do-not-store data: raw-sse" if failing else "",
         )
 
 
 class RaisingRunner(RecordingRunner):
-    def __call__(
-        self, argv: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    def __call__(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         super().__call__(argv, **kwargs)
         raise RuntimeError("TOP-SECRET prompt=do-not-store data: raw-sse")
 
@@ -113,9 +103,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         ):
             (root / "secrets" / name).write_text("secret", encoding="ascii")
         for name in (".env", ".env.example"):
-            (root / "repo" / "deploy" / "offline" / name).write_text(
-                "fixture", encoding="ascii"
-            )
+            (root / "repo" / "deploy" / "offline" / name).write_text("fixture", encoding="ascii")
         (state / "history" / ("recovery-" + "a" * 32 + ".json")).write_text(
             "receipt", encoding="ascii"
         )
@@ -153,9 +141,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = RecordingRunner()
-            report = run_gate(
-                self.config(root), runner=runner, _test_allow_portable_cleanup=True
-            )
+            report = run_gate(self.config(root), runner=runner, _test_allow_portable_cleanup=True)
 
         self.assertEqual("passed", report["status"])
         self.assertEqual(
@@ -182,9 +168,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             "duration_ms",
             "sanitized_status",
         }
-        self.assertTrue(
-            all(set(step) == expected_step_keys for step in report["steps"])
-        )
+        self.assertTrue(all(set(step) == expected_step_keys for step in report["steps"]))
         self.assertNotIn("live", json.dumps(report).casefold())
         self.assertIn("--initialize-state", runner.calls[0][0])
         categories = report["steps"]
@@ -234,16 +218,12 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             root = Path(directory)
             runner = RecordingRunner(failing_call=2)
             with self.assertRaises(GateError):
-                run_gate(
-                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
-                )
+                run_gate(self.config(root), runner=runner, _test_allow_portable_cleanup=True)
             raw = (root / "reports" / "gate.json").read_text(encoding="utf-8")
             report = json.loads(raw)
 
         self.assertEqual("failed", report["status"])
-        self.assertEqual(
-            ["prepare", "compose_config"], [x["category"] for x in report["steps"]]
-        )
+        self.assertEqual(["prepare", "compose_config"], [x["category"] for x in report["steps"]])
         for forbidden in ("TOP-SECRET", "do-not-store", "data:", "stdout", "stderr"):
             self.assertNotIn(forbidden, raw)
         self.assertEqual("failed", report["steps"][-1]["sanitized_status"])
@@ -272,9 +252,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 "tools.intranet_deployment_gate.time.monotonic",
                 side_effect=lambda: next(ticks),
             ):
-                run_gate(
-                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
-                )
+                run_gate(self.config(root), runner=runner, _test_allow_portable_cleanup=True)
 
         drill_timeouts = [
             kwargs["timeout"]
@@ -295,9 +273,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(GateError, "recovery drill timed out"),
             ):
-                run_gate(
-                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
-                )
+                run_gate(self.config(root), runner=runner, _test_allow_portable_cleanup=True)
 
     def test_recovery_drill_cleans_known_partial_root_after_first_command_failure(
         self,
@@ -312,9 +288,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 root.mkdir()
                 return str(root)
 
-            def runner(
-                argv: list[str], **_: object
-            ) -> subprocess.CompletedProcess[str]:
+            def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
                 return subprocess.CompletedProcess(
                     argv, 0 if argv[:3] == ["docker", "ps", "-a"] else 1
                 )
@@ -346,9 +320,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 root.mkdir()
                 return str(root)
 
-            def runner(
-                argv: list[str], **_: object
-            ) -> subprocess.CompletedProcess[str]:
+            def runner(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
                 return subprocess.CompletedProcess(
                     argv, 0 if argv[:3] == ["docker", "ps", "-a"] else 1
                 )
@@ -367,12 +339,8 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                     "tools.intranet_deployment_gate.tempfile.mkdtemp",
                     side_effect=mkdtemp,
                 ),
-                mock.patch(
-                    "tools.intranet_deployment_gate.os.rmdir", side_effect=rmdir
-                ),
-                self.assertRaisesRegex(
-                    GateError, "recovery drill failed and cleanup failed"
-                ),
+                mock.patch("tools.intranet_deployment_gate.os.rmdir", side_effect=rmdir),
+                self.assertRaisesRegex(GateError, "recovery drill failed and cleanup failed"),
             ):
                 _run_recovery_drill(
                     self.config(Path(directory)),
@@ -386,23 +354,14 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = RecordingRunner()
-            run_gate(
-                self.config(root), runner=runner, _test_allow_portable_cleanup=True
-            )
+            run_gate(self.config(root), runner=runner, _test_allow_portable_cleanup=True)
 
         all_commands = [" ".join(call[0]) for call in runner.calls]
-        drill_commands = [
-            command for command in all_commands if "recovery-drill" in command
-        ]
+        drill_commands = [command for command in all_commands if "recovery-drill" in command]
         self.assertTrue(drill_commands)
+        self.assertTrue(all("dcagent-offline" not in command for command in drill_commands))
         self.assertTrue(
-            all("dcagent-offline" not in command for command in drill_commands)
-        )
-        self.assertTrue(
-            all(
-                "down -v" not in command and "--volumes" not in command
-                for command in all_commands
-            )
+            all("down -v" not in command and "--volumes" not in command for command in all_commands)
         )
         self.assertTrue(any("docker ps -a" in command for command in drill_commands))
 
@@ -427,9 +386,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             report_path = Path(directory) / "report.json"
             report_path.write_text("old", encoding="utf-8")
             with (
-                mock.patch(
-                    "tools.intranet_deployment_gate.os.fsync", side_effect=OSError
-                ),
+                mock.patch("tools.intranet_deployment_gate.os.fsync", side_effect=OSError),
                 self.assertRaises(GateError),
             ):
                 _write_report_atomically(report_path, {"status": "failed"})
@@ -440,9 +397,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             report_path = Path(directory) / "reports" / "report.json"
             with (
                 mock.patch.object(Path, "mkdir", side_effect=OSError("TOP-SECRET")),
-                self.assertRaisesRegex(
-                    GateError, "report could not be committed"
-                ) as raised,
+                self.assertRaisesRegex(GateError, "report could not be committed") as raised,
             ):
                 _write_report_atomically(report_path, {"status": "failed"})
 
@@ -460,10 +415,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             def open_directory(
                 path: str | bytes | os.PathLike[str], flags: int, *args: object
             ) -> int:
-                if (
-                    os.fspath(path) == os.fspath(root / "reports")
-                    and flags == os.O_RDONLY
-                ):
+                if os.fspath(path) == os.fspath(root / "reports") and flags == os.O_RDONLY:
                     return 7
                 return original_open(path, flags, *args)
 
@@ -474,9 +426,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
             with (
                 mock.patch("tools.intranet_deployment_gate._run_recovery_drill"),
                 mock.patch("tools.intranet_deployment_gate.os.name", "posix"),
-                mock.patch(
-                    "tools.intranet_deployment_gate.os.open", side_effect=open_directory
-                ),
+                mock.patch("tools.intranet_deployment_gate.os.open", side_effect=open_directory),
                 mock.patch(
                     "tools.intranet_deployment_gate.os.close",
                     side_effect=close_directory,
@@ -487,12 +437,8 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 ),
                 self.assertRaises(GateError),
             ):
-                run_gate(
-                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
-                )
-            report = json.loads(
-                (root / "reports" / "gate.json").read_text(encoding="utf-8")
-            )
+                run_gate(self.config(root), runner=runner, _test_allow_portable_cleanup=True)
+            report = json.loads((root / "reports" / "gate.json").read_text(encoding="utf-8"))
 
         self.assertEqual("failed", report["status"])
 
@@ -507,16 +453,11 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(GateError, "residual drill state"),
             ):
-                run_gate(
-                    self.config(root), runner=runner, _test_allow_portable_cleanup=True
-                )
+                run_gate(self.config(root), runner=runner, _test_allow_portable_cleanup=True)
             commands = [" ".join(argv) for argv, _ in runner.calls]
 
         self.assertTrue(
-            all(
-                "down -v" not in command and "--volumes" not in command
-                for command in commands
-            )
+            all("down -v" not in command and "--volumes" not in command for command in commands)
         )
 
     def test_drill_and_cleanup_failures_use_one_sanitized_error(self) -> None:
@@ -583,9 +524,7 @@ class IntranetDeploymentGateTests(unittest.TestCase):
                 _test_allow_portable_cleanup=True,
             )
 
-        self.assertTrue(
-            any(argv[:3] == ["docker", "ps", "-a"] for argv, _ in runner.calls)
-        )
+        self.assertTrue(any(argv[:3] == ["docker", "ps", "-a"] for argv, _ in runner.calls))
 
     def test_readyz_probe_retries_until_http_2xx(self) -> None:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -713,13 +652,9 @@ urllib.request.urlopen = urlopen
             secrets = root / "secrets"
             receipt = state / "history" / ("b" * 32 + ".json")
             receipt.write_text("history", encoding="ascii")
-            (state / "transactions" / "unexpected-backup").write_text(
-                "x", encoding="ascii"
-            )
+            (state / "transactions" / "unexpected-backup").write_text("x", encoding="ascii")
 
-            with self.assertRaisesRegex(
-                GateError, "unexpected recovery drill artifact"
-            ):
+            with self.assertRaisesRegex(GateError, "unexpected recovery drill artifact"):
                 _audit_recovery_drill_artifacts(root)
 
             (state / "transactions" / "unexpected-backup").unlink()
@@ -741,9 +676,7 @@ urllib.request.urlopen = urlopen
             cleanup = _audit_recovery_drill_artifacts(root)
             self.assertIn(normal_receipt, cleanup)
             (history / "receipt.json").write_text("rogue", encoding="ascii")
-            with self.assertRaisesRegex(
-                GateError, "unexpected recovery drill artifact"
-            ):
+            with self.assertRaisesRegex(GateError, "unexpected recovery drill artifact"):
                 _audit_recovery_drill_artifacts(root)
 
     def test_recovery_audit_rejects_unknown_root_and_repo_entries(self) -> None:
@@ -752,15 +685,11 @@ urllib.request.urlopen = urlopen
         with tempfile.TemporaryDirectory() as directory:
             root = self._drill_artifact_fixture(Path(directory))
             (root / "rogue-root").write_text("rogue", encoding="ascii")
-            with self.assertRaisesRegex(
-                GateError, "unexpected recovery drill artifact"
-            ):
+            with self.assertRaisesRegex(GateError, "unexpected recovery drill artifact"):
                 _audit_recovery_drill_artifacts(root)
             (root / "rogue-root").unlink()
             (root / "repo" / "rogue-repo").write_text("rogue", encoding="ascii")
-            with self.assertRaisesRegex(
-                GateError, "unexpected recovery drill artifact"
-            ):
+            with self.assertRaisesRegex(GateError, "unexpected recovery drill artifact"):
                 _audit_recovery_drill_artifacts(root)
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX symlink semantics")
@@ -809,17 +738,14 @@ urllib.request.urlopen = urlopen
             ) -> None:
                 nonlocal swapped
                 if not swapped and (
-                    os.fspath(path) == "postgres-password"
-                    or os.fspath(path) == os.fspath(secret)
+                    os.fspath(path) == "postgres-password" or os.fspath(path) == os.fspath(secret)
                 ):
                     (root / "secrets").rename(root / "secrets-held")
                     (root / "secrets").symlink_to(external, target_is_directory=True)
                     swapped = True
                 original_unlink(path, *args, **kwargs)
 
-            with mock.patch(
-                "tools.intranet_deployment_gate.os.unlink", side_effect=swap_parent
-            ):
+            with mock.patch("tools.intranet_deployment_gate.os.unlink", side_effect=swap_parent):
                 cleanup_error = _cleanup_recovery_drill(root)
 
         self.assertTrue(swapped)
@@ -854,9 +780,7 @@ urllib.request.urlopen = urlopen
         self.assertTrue(replacement.exists())
         self.assertEqual("replacement", sentinel.read_text(encoding="ascii"))
 
-    @unittest.skipUnless(
-        os.name == "posix", "requires POSIX SIGKILL and ownership semantics"
-    )
+    @unittest.skipUnless(os.name == "posix", "requires POSIX SIGKILL and ownership semantics")
     def test_posix_run_recovery_drill_executes_full_contract_and_cleans_everything(
         self,
     ) -> None:
@@ -896,9 +820,7 @@ urllib.request.urlopen = urlopen
             with mock.patch(
                 "tools.intranet_deployment_gate.tempfile.mkdtemp", side_effect=mkdtemp
             ) as mocked_mkdtemp:
-                _run_recovery_drill(
-                    self.config(Path(__file__).resolve().parents[2]), runner=runner
-                )
+                _run_recovery_drill(self.config(Path(__file__).resolve().parents[2]), runner=runner)
 
             mocked_mkdtemp.assert_called_once_with(prefix="dcagent-recovery-drill-")
             self.assertTrue(any(argv[:3] == ["docker", "ps", "-a"] for argv in calls))
@@ -919,9 +841,7 @@ urllib.request.urlopen = urlopen
             ):
                 self.assertFalse(path.exists(), path)
 
-    @unittest.skipUnless(
-        os.name == "posix", "requires POSIX SIGKILL and ownership semantics"
-    )
+    @unittest.skipUnless(os.name == "posix", "requires POSIX SIGKILL and ownership semantics")
     def test_posix_recovery_drill_contract_uses_real_transaction_journal(self) -> None:
         from tools.intranet_deployment_gate import _recovery_drill_commands
 
@@ -931,16 +851,10 @@ urllib.request.urlopen = urlopen
             commands = _recovery_drill_commands(config, root)
             for name in ("data", "models", "secrets"):
                 (root / name).mkdir(parents=True, mode=0o700, exist_ok=True)
-            crashed = subprocess.run(
-                commands[0], check=False, capture_output=True, text=True
-            )
+            crashed = subprocess.run(commands[0], check=False, capture_output=True, text=True)
             self.assertIn(crashed.returncode, {-9, 137})
             self.assertTrue(
-                any(
-                    (
-                        root / "data" / ".dcagent-deployment-state" / "transactions"
-                    ).iterdir()
-                )
+                any((root / "data" / ".dcagent-deployment-state" / "transactions").iterdir())
             )
             self.assertEqual(0, subprocess.run(commands[1], check=False).returncode)
             self.assertEqual(0, subprocess.run(commands[2], check=False).returncode)

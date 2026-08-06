@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import contextlib
-from functools import cache
 import hashlib
 import io
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
@@ -14,8 +12,9 @@ import tempfile
 import time
 import unittest
 import urllib.error
+from functools import cache
+from pathlib import Path
 from unittest import mock
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = REPO_ROOT / "tools" / "compose_smoke.py"
@@ -24,12 +23,8 @@ QWEN25_RERANKER_MODEL = "qwen2.5:3b"
 MEASURED_EMBEDDING_DIMENSIONS = 37
 MODEL_SHA256 = "a" * 64
 RERANKER_SHA256 = "c" * 64
-ENCODING_PROFILE_SHA256 = (
-    "fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10"
-)
-PROMPT_PROFILE_SHA256 = (
-    "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd"
-)
+ENCODING_PROFILE_SHA256 = "fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10"
+PROMPT_PROFILE_SHA256 = "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd"
 
 
 def _operation(**overrides: object) -> dict[str, object]:
@@ -129,12 +124,8 @@ def _bash_blocks_after_heading(text: str, heading: str) -> list[str]:
     if heading_match is None:
         return []
     section_start = heading_match.end()
-    next_heading = re.search(
-        rf"(?m)^#{{1,{heading_level}}}[ \t]+", text[section_start:]
-    )
-    section_end = (
-        section_start + next_heading.start() if next_heading is not None else len(text)
-    )
+    next_heading = re.search(rf"(?m)^#{{1,{heading_level}}}[ \t]+", text[section_start:])
+    section_end = section_start + next_heading.start() if next_heading is not None else len(text)
     return re.findall(
         r"(?ms)^[ \t]*```bash[ \t]*$\n(?P<body>.*?)^[ \t]*```[ \t]*$",
         text[section_start:section_end],
@@ -143,9 +134,7 @@ def _bash_blocks_after_heading(text: str, heading: str) -> list[str]:
 
 def _ollama_probe_blocks(blocks: list[str]) -> list[str]:
     endpoints = ("/api/embed", "/api/generate", "/api/tags")
-    return [
-        block for block in blocks if all(endpoint in block for endpoint in endpoints)
-    ]
+    return [block for block in blocks if all(endpoint in block for endpoint in endpoints)]
 
 
 def _windows_markers_in_bash(block: str) -> list[str]:
@@ -175,11 +164,7 @@ def _windows_markers_in_bash(block: str) -> list[str]:
 class _HelperResponse:
     def __init__(self, payload: dict[str, object] | bytes, status: int = 200) -> None:
         self.status = status
-        self._body = (
-            payload
-            if isinstance(payload, bytes)
-            else json.dumps(payload).encode("utf-8")
-        )
+        self._body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
         self.read_limits: list[int] = []
 
     def __enter__(self):
@@ -476,9 +461,7 @@ class ComposeSmokeTest(unittest.TestCase):
         for component, script, environ, urls, operations in cases:
             with self.subTest(component=component):
                 oversized = _HelperResponse(
-                    b'{"canary":"'
-                    + b"x" * compose_smoke.ADAPTER_MAX_RESPONSE_BYTES
-                    + b'"}'
+                    b'{"canary":"' + b"x" * compose_smoke.ADAPTER_MAX_RESPONSE_BYTES + b'"}'
                 )
                 result = _run_helper(
                     script,
@@ -612,9 +595,7 @@ class ComposeSmokeTest(unittest.TestCase):
 
         adapter_calls = [
             (key, timeout_seconds)
-            for (command, _), timeout_seconds in zip(
-                runner.calls, runner.timeouts, strict=True
-            )
+            for (command, _), timeout_seconds in zip(runner.calls, runner.timeouts, strict=True)
             if (key := runner._key(command)).startswith(("embedding.", "reranker."))
         ]
         self.assertEqual(
@@ -712,8 +693,7 @@ class ComposeSmokeTest(unittest.TestCase):
         embedding = _run_embedding_helper(compose_smoke.HTTP_HELPER_SCRIPT)
         self.assertTrue(
             all(
-                embedding[name]["errorCode"] is None
-                for name in ("ready", "metadata", "embeddings")
+                embedding[name]["errorCode"] is None for name in ("ready", "metadata", "embeddings")
             )
         )
         self.assertEqual(
@@ -727,10 +707,7 @@ class ComposeSmokeTest(unittest.TestCase):
 
         reranker = _run_reranker_helper(compose_smoke.RERANKER_HTTP_HELPER_SCRIPT)
         self.assertTrue(
-            all(
-                reranker[name]["errorCode"] is None
-                for name in ("ready", "metadata", "rerank")
-            )
+            all(reranker[name]["errorCode"] is None for name in ("ready", "metadata", "rerank"))
         )
         self.assertEqual(reranker["rerank"]["scoreCount"], 9)
 
@@ -833,9 +810,7 @@ class ComposeSmokeTest(unittest.TestCase):
         compose_smoke = _module()
         postgres = json.loads(FakeRunner._default_output("postgres"))
 
-        self.assertEqual(
-            postgres["alembicRevision"], compose_smoke._discover_migration_head()
-        )
+        self.assertEqual(postgres["alembicRevision"], compose_smoke._discover_migration_head())
 
     def test_stale_postgres_migration_revision_fails_smoke_and_still_cleans_up(
         self,
@@ -899,9 +874,7 @@ class ComposeSmokeTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "ORIGINAL") as caught:
                     compose_smoke._write_atomic(destination, {"passed": False})
 
-        self.assertTrue(
-            any("cleanup also failed" in note for note in caught.exception.__notes__)
-        )
+        self.assertTrue(any("cleanup also failed" in note for note in caught.exception.__notes__))
 
     def test_builds_only_wrapper_commands_with_fixed_safe_arguments(self) -> None:
         compose_smoke = _module()
@@ -936,9 +909,7 @@ class ComposeSmokeTest(unittest.TestCase):
             prefix + ["down", "--remove-orphans"],
         )
         self.assertEqual(
-            compose_smoke.build_compose_command(
-                "down", wrapper_path=wrapper, remove_volumes=True
-            ),
+            compose_smoke.build_compose_command("down", wrapper_path=wrapper, remove_volumes=True),
             prefix + ["down", "--remove-orphans", "--volumes"],
         )
         for forbidden in ("worker", "ingestion-worker", "llama", "--profile"):
@@ -994,9 +965,7 @@ class ComposeSmokeTest(unittest.TestCase):
     def test_standard_stack_starts_models_without_consumer_health_dependencies(
         self,
     ) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
 
         def block(service: str) -> str:
             match = re.search(
@@ -1060,9 +1029,7 @@ class ComposeSmokeTest(unittest.TestCase):
     ) -> None:
         compose_smoke = _module()
         wrappers = {
-            "invoke_offline_compose.sh": [
-                str(REPO_ROOT / "tools" / "invoke_offline_compose.sh")
-            ],
+            "invoke_offline_compose.sh": [str(REPO_ROOT / "tools" / "invoke_offline_compose.sh")],
             "invoke_offline_compose.ps1": [
                 "pwsh",
                 "-NoProfile",
@@ -1088,14 +1055,10 @@ class ComposeSmokeTest(unittest.TestCase):
 
                 self.assertTrue(report["passed"])
                 wrapper_calls = [
-                    command
-                    for command, _ in runner.calls
-                    if command[0] != sys.executable
+                    command for command, _ in runner.calls if command[0] != sys.executable
                 ]
                 self.assertTrue(wrapper_calls)
-                self.assertTrue(
-                    all(command[: len(prefix)] == prefix for command in wrapper_calls)
-                )
+                self.assertTrue(all(command[: len(prefix)] == prefix for command in wrapper_calls))
                 self.assertEqual(
                     [runner._key(command) for command, _ in runner.calls],
                     [
@@ -1143,14 +1106,9 @@ class ComposeSmokeTest(unittest.TestCase):
             str(REPO_ROOT / "tools" / "invoke_offline_compose.sh"),
         }
         self.assertTrue(
-            all(
-                command[0] in wrapper_commands | {sys.executable}
-                for command, _ in runner.calls
-            )
+            all(command[0] in wrapper_commands | {sys.executable} for command, _ in runner.calls)
         )
-        host_calls = [
-            command for command, _ in runner.calls if command[0] == sys.executable
-        ]
+        host_calls = [command for command, _ in runner.calls if command[0] == sys.executable]
         self.assertEqual(len(host_calls), 1)
         self.assertIn("http://127.0.0.1:8000/api/readyz", " ".join(host_calls[0]))
         self.assertFalse(any(command[0] == "docker" for command, _ in runner.calls))
@@ -1271,9 +1229,7 @@ class ComposeSmokeTest(unittest.TestCase):
         compose_smoke = _module()
         cases = {
             "malformed": "not-json",
-            "ready": _embedding_payload(
-                ready=_operation(status=503, errorCode="http_503")
-            ),
+            "ready": _embedding_payload(ready=_operation(status=503, errorCode="http_503")),
             "metadata": _embedding_payload(
                 metadata=_operation(
                     status=200,
@@ -1281,9 +1237,7 @@ class ComposeSmokeTest(unittest.TestCase):
                     errorCode="metadata_mismatch",
                 )
             ),
-            "dimensions": _embedding_payload(
-                embeddings=_operation(vectorCount=1, dimensions=384)
-            ),
+            "dimensions": _embedding_payload(embeddings=_operation(vectorCount=1, dimensions=384)),
             "count": _embedding_payload(
                 embeddings=_operation(
                     vectorCount=0,
@@ -1306,12 +1260,8 @@ class ComposeSmokeTest(unittest.TestCase):
         compose_smoke = _module()
         cases = {
             "malformed": "not-json",
-            "ready": _reranker_payload(
-                ready=_operation(status=503, errorCode="http_503")
-            ),
-            "metadata": _reranker_payload(
-                metadata=_operation(errorCode="metadata_mismatch")
-            ),
+            "ready": _reranker_payload(ready=_operation(status=503, errorCode="http_503")),
+            "metadata": _reranker_payload(metadata=_operation(errorCode="metadata_mismatch")),
             "scores": _reranker_payload(rerank=_operation(scoreCount=0)),
         }
         for label, output in cases.items():
@@ -1376,9 +1326,7 @@ class ComposeSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report = compose_smoke.run_compose_smoke(
                 report_path=Path(directory) / "report.json",
-                runner=FakeRunner(
-                    outputs={"clamav_ping": "ERROR: daemon unavailable\n"}
-                ),
+                runner=FakeRunner(outputs={"clamav_ping": "ERROR: daemon unavailable\n"}),
                 hardware_collector=lambda: {},
                 software_collector=lambda: {},
             )
@@ -1401,16 +1349,12 @@ class ComposeSmokeTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 9)
         self.assertEqual(result.stdout, "wrapper failed")
         self.assertFalse(result.timed_out)
-        process.communicate.assert_called_once_with(
-            timeout=compose_smoke.COMMAND_TIMEOUT_SECONDS
-        )
+        process.communicate.assert_called_once_with(timeout=compose_smoke.COMMAND_TIMEOUT_SECONDS)
         options = popen.call_args.kwargs
         self.assertIs(options["stdout"], subprocess.PIPE)
         self.assertIs(options["stderr"], subprocess.STDOUT)
         if os.name == "nt":
-            self.assertTrue(
-                options["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
-            )
+            self.assertTrue(options["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP)
             self.assertTrue(options["creationflags"] & subprocess.CREATE_NO_WINDOW)
         else:
             self.assertTrue(options["start_new_session"])
@@ -1431,9 +1375,7 @@ class ComposeSmokeTest(unittest.TestCase):
             "Popen",
             return_value=short_process,
         ):
-            compose_smoke._default_runner(
-                ["pwsh", "--version"], shell=False, timeout_seconds=7
-            )
+            compose_smoke._default_runner(["pwsh", "--version"], shell=False, timeout_seconds=7)
         short_process.communicate.assert_called_once_with(timeout=7)
 
     def test_default_runner_timeout_kills_descendant_process_tree_promptly(
@@ -1508,9 +1450,7 @@ class ComposeSmokeTest(unittest.TestCase):
                     software_collector=lambda: {},
                 )
                 down = next(
-                    command
-                    for command, _ in runner.calls
-                    if runner._key(command) == "down"
+                    command for command, _ in runner.calls if runner._key(command) == "down"
                 )
                 self.assertEqual("--volumes" in down, remove_volumes)
 
@@ -1538,9 +1478,7 @@ class ComposeSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "nested" / "compose-smoke.json"
             report_path.parent.mkdir(parents=True)
-            report_path.write_text(
-                '{"passed":true,"LLM_API_KEY":"stale-secret"}', encoding="utf-8"
-            )
+            report_path.write_text('{"passed":true,"LLM_API_KEY":"stale-secret"}', encoding="utf-8")
             kwargs = {
                 "report_path": report_path,
                 "hardware_collector": lambda: {
@@ -1554,9 +1492,7 @@ class ComposeSmokeTest(unittest.TestCase):
             second = compose_smoke.run_compose_smoke(runner=FakeRunner(), **kwargs)
             self.assertEqual(first, second)
             self.assertEqual(first_bytes, report_path.read_bytes())
-            self.assertEqual(
-                list(report_path.parent.glob(f".{report_path.name}.*.tmp")), []
-            )
+            self.assertEqual(list(report_path.parent.glob(f".{report_path.name}.*.tmp")), [])
             text = first_bytes.decode("utf-8")
             for forbidden in (
                 "stale-secret",
@@ -1774,8 +1710,7 @@ Write-Host 'This second fence must also be audited'
 
         self.assertEqual(
             [
-                "set -Eeuo pipefail\n"
-                "curl --fail-with-body http://127.0.0.1:11434/api/tags\n",
+                "set -Eeuo pipefail\ncurl --fail-with-body http://127.0.0.1:11434/api/tags\n",
                 "Write-Host 'This second fence must also be audited'\n",
             ],
             _bash_blocks_after_heading(text, "#### Linux (Bash)"),
@@ -1826,9 +1761,7 @@ Write-Host 'This second fence must also be audited'
                 self.assertNotIn("$modelMatches", linux)
                 self.assertNotIn("Select-Object -First 1", linux)
 
-                command_match = re.search(
-                    r"python3 -c '(?P<code>[^']+)' \"\$model\"", linux
-                )
+                command_match = re.search(r"python3 -c '(?P<code>[^']+)' \"\$model\"", linux)
                 self.assertIsNotNone(command_match)
                 assert command_match is not None
                 command = command_match.group("code")
@@ -1871,9 +1804,7 @@ Write-Host 'This second fence must also be audited'
                         shell=False,
                         check=False,
                     )
-                    self.assertEqual(
-                        completed.returncode, expected_return_code, completed.stderr
-                    )
+                    self.assertEqual(completed.returncode, expected_return_code, completed.stderr)
 
 
 if __name__ == "__main__":

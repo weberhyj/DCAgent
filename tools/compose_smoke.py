@@ -7,12 +7,10 @@ offline wrapper.  It never reads or forwards the deployment environment file.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import platform
 import re
 import signal
@@ -20,7 +18,8 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-
+from dataclasses import dataclass
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_WRAPPER_PATHS = (
@@ -115,9 +114,7 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         pass
 
 
-def _drain_terminated_process(
-    process: subprocess.Popen[str], partial_output: object
-) -> str:
+def _drain_terminated_process(process: subprocess.Popen[str], partial_output: object) -> str:
     output = ""
     try:
         output, _ = process.communicate(timeout=PROCESS_DRAIN_TIMEOUT_SECONDS)
@@ -154,8 +151,7 @@ def _default_runner(
     popen_options: dict[str, object] = {}
     if os.name == "nt":
         popen_options.update(
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.CREATE_NO_WINDOW,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
             startupinfo=_windows_startupinfo(),
         )
     else:
@@ -287,9 +283,7 @@ def _discover_migration_head() -> str:
             parent = re.search(
                 r"^down_revision\s*=\s*(?:None|[\"']([^\"']+)[\"'])", text, re.MULTILINE
             )
-            revisions[revision.group(1)] = (
-                parent.group(1) if parent and parent.group(1) else None
-            )
+            revisions[revision.group(1)] = parent.group(1) if parent and parent.group(1) else None
     if not revisions:
         raise ValueError("no Alembic revisions found")
     children = {parent for parent in revisions.values() if parent}
@@ -820,11 +814,7 @@ def _adapter_operation(
     status = operation.get("status")
     latency = operation.get("latencyMs")
     error_code = operation.get("errorCode")
-    if (
-        isinstance(status, bool)
-        or not isinstance(status, int)
-        or not 0 <= status <= 599
-    ):
+    if isinstance(status, bool) or not isinstance(status, int) or not 0 <= status <= 599:
         raise ValueError(f"{name} probe status is invalid")
     if (
         isinstance(latency, bool)
@@ -834,8 +824,7 @@ def _adapter_operation(
     ):
         raise ValueError(f"{name} probe latency is invalid")
     if error_code is not None and (
-        not isinstance(error_code, str)
-        or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code) is None
+        not isinstance(error_code, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code) is None
     ):
         raise ValueError(f"{name} probe error code is invalid")
     sanitized: dict[str, object] = {
@@ -863,10 +852,7 @@ def _validate_check(
 ) -> tuple[bool, str | None, dict[str, object]]:
     if check.name == "postgres":
         payload = _json_object(output, "postgres")
-        ok = (
-            payload.get("selectOne") == 1
-            and payload.get("alembicRevision") == migration_head
-        )
+        ok = payload.get("selectOne") == 1 and payload.get("alembicRevision") == migration_head
         return (
             ok,
             str(payload.get("version")) if payload.get("version") else None,
@@ -1010,10 +996,7 @@ def _write_atomic(path: Path, payload: Mapping[str, object]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     encoded = (
-        json.dumps(
-            payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
-        )
-        + "\n"
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
     )
     temporary: Path | None = None
     try:
@@ -1041,9 +1024,7 @@ def _write_atomic(path: Path, payload: Mapping[str, object]) -> None:
                 if active_exception is None:
                     raise
                 if hasattr(active_exception, "add_note"):
-                    active_exception.add_note(
-                        f"atomic report cleanup also failed: {cleanup_error}"
-                    )
+                    active_exception.add_note(f"atomic report cleanup also failed: {cleanup_error}")
 
 
 def run_compose_smoke(
@@ -1062,9 +1043,7 @@ def run_compose_smoke(
     destination.unlink(missing_ok=True)
     try:
         wrapper = Path(wrapper_path).resolve(strict=True)
-        expected_wrappers = {
-            path.resolve(strict=True) for path in REPOSITORY_WRAPPER_PATHS
-        }
+        expected_wrappers = {path.resolve(strict=True) for path in REPOSITORY_WRAPPER_PATHS}
     except OSError as error:
         raise ValueError("offline smoke wrapper is unavailable") from error
     if wrapper not in expected_wrappers:
@@ -1128,9 +1107,7 @@ def run_compose_smoke(
                     failures.append("command:version")
                 else:
                     try:
-                        component_versions["compose"] = _version(
-                            version.stdout, "compose"
-                        )
+                        component_versions["compose"] = _version(version.stdout, "compose")
                     except ValueError:
                         failures.append("version:compose")
                 for check in checks:
@@ -1147,9 +1124,7 @@ def run_compose_smoke(
                                 "status": 0,
                                 "latencyMs": 0.0,
                                 "errorCode": (
-                                    "probe_timeout"
-                                    if result.timed_out
-                                    else "probe_failed"
+                                    "probe_timeout" if result.timed_out else "probe_failed"
                                 ),
                             }
                         continue
@@ -1159,9 +1134,7 @@ def run_compose_smoke(
                             operation = probe_output.get(check.operation)
                             if not isinstance(operation, Mapping):
                                 raise ValueError("adapter probe output is invalid")
-                            adapter_payloads[check.report_name][check.operation] = dict(
-                                operation
-                            )
+                            adapter_payloads[check.report_name][check.operation] = dict(operation)
                         except ValueError:
                             adapter_payloads[check.report_name][check.operation] = {
                                 "status": 0,
@@ -1180,11 +1153,7 @@ def run_compose_smoke(
                         component_versions[check.component] = version_value
                     if not ok:
                         failures.append(f"check:{check.name}")
-                adapter_names = (
-                    ("embedding", "reranker")
-                    if reranker_enabled
-                    else ("embedding",)
-                )
+                adapter_names = ("embedding", "reranker") if reranker_enabled else ("embedding",)
                 for adapter_name in adapter_names:
                     adapter_check = _Check(adapter_name, adapter_name, ())
                     try:
@@ -1202,9 +1171,7 @@ def run_compose_smoke(
         active_exception = sys.exc_info()[1]
         try:
             down = runner(
-                build_compose_command(
-                    "down", wrapper_path=wrapper, remove_volumes=remove_volumes
-                ),
+                build_compose_command("down", wrapper_path=wrapper, remove_volumes=remove_volumes),
                 shell=False,
                 timeout_seconds=COMMAND_TIMEOUT_SECONDS,
             )
@@ -1212,9 +1179,7 @@ def run_compose_smoke(
             if active_exception is None:
                 raise
             if hasattr(active_exception, "add_note"):
-                active_exception.add_note(
-                    f"compose smoke cleanup also failed: {cleanup_error}"
-                )
+                active_exception.add_note(f"compose smoke cleanup also failed: {cleanup_error}")
         else:
             command_exit_codes["down"] = down.exit_code
             if down.exit_code != 0:
@@ -1232,9 +1197,7 @@ def run_compose_smoke(
         "commandExitCodes": command_exit_codes,
         "readyResults": ready_results,
         "checksums": {
-            "composeYamlSha256": _sha256(
-                REPO_ROOT / "deploy" / "offline" / "compose.yaml"
-            ),
+            "composeYamlSha256": _sha256(REPO_ROOT / "deploy" / "offline" / "compose.yaml"),
             "wrapperSha256": _sha256(wrapper),
         },
         "migrationHead": migration_head,

@@ -90,9 +90,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(values["RETRIEVAL_SHADOW_PERCENT"], "10")
                 self.assertEqual(values["RETRIEVAL_CANARY_PERCENT"], "0")
                 self.assertEqual(values["RETRIEVAL_PERMISSION_TAGS"], "公开")
-                self.assertEqual(
-                    values["QDRANT_COLLECTION_ALIAS"], "knowledge_chunks_current"
-                )
+                self.assertEqual(values["QDRANT_COLLECTION_ALIAS"], "knowledge_chunks_current")
                 self.assertEqual(values["RETRIEVAL_RERANK_TOP_K"], "8")
                 if offline_example:
                     self.assertEqual(values["RETRIEVAL_DEGRADED_RERANK_TOP_K"], "8")
@@ -106,9 +104,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     "bge-large-zh-v1.5:latest" if offline_example else "qwen2.5:0.5b"
                 )
                 expected_embedding_version = (
-                    "ollama-bge-large-zh-v15-v1"
-                    if offline_example
-                    else "ollama-qwen25-05b-v1"
+                    "ollama-bge-large-zh-v15-v1" if offline_example else "ollama-qwen25-05b-v1"
                 )
                 self.assertEqual(values["EMBEDDING_MODEL_NAME"], expected_embedding_name)
                 self.assertEqual(values["EMBEDDING_MODEL_VERSION"], expected_embedding_version)
@@ -140,9 +136,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     expected_profile_sha256,
                 )
                 self.assertEqual(values["RERANKER_MODEL_NAME"], "qwen2.5:3b")
-                self.assertEqual(
-                    values["RERANKER_MODEL_VERSION"], "ollama-qwen25-3b-v1"
-                )
+                self.assertEqual(values["RERANKER_MODEL_VERSION"], "ollama-qwen25-3b-v1")
                 self.assertRegex(values["RERANKER_MODEL_SHA256"], r"^[0-9a-f]{64}$")
                 self.assertRegex(
                     text,
@@ -171,9 +165,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     self.assertNotIn(key, values)
 
         offline_values = active_assignments(
-            (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
-                encoding="utf-8"
-            )
+            (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
         )
         self.assertEqual(offline_values["RERANKER_BATCH_MAX_ITEMS"], "32")
 
@@ -188,9 +180,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertIn("现有文档不会自动迁移", text)
 
     def test_api_receives_retrieval_rollout_and_pinned_metadata(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         api = service_block(compose, "api")
         for key in (
             "RETRIEVAL_MODE",
@@ -232,12 +222,8 @@ class StructuredDeploymentContractTests(unittest.TestCase):
     def test_model_readiness_is_mode_aware_in_application_not_compose_dependencies(
         self,
     ) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
-        self.assertNotRegex(
-            service_block(compose, "embedding-service"), r"(?m)^\s+profiles:"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
+        self.assertNotRegex(service_block(compose, "embedding-service"), r"(?m)^\s+profiles:")
         self.assertIn(
             'profiles: ["reranker"]',
             service_block(compose, "reranker-service"),
@@ -271,9 +257,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     self.assertTrue(values[key])
 
     def test_compose_passes_only_query_settings_to_api(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         api = service_block(compose, "api")
         for key in (
             "STRUCTURED_QUERY_ENABLED",
@@ -287,9 +271,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             self.assertNotRegex(api, rf"(?m)^\s+{key}:")
 
     def test_compose_passes_only_ingestion_settings_to_indexing_worker(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         worker = service_block(compose, "ingestion-worker")
         for key in (
             "STRUCTURED_QUERY_ENABLED",
@@ -312,12 +294,8 @@ class StructuredDeploymentContractTests(unittest.TestCase):
     def test_compose_uses_physoc_default_and_declares_generation_password_secrets(
         self,
     ) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
-        env = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
-            encoding="utf-8"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
+        env = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
         self.assertIn("LLM_PROVIDER=physoc_deepseek", env)
         self.assertIn('profiles: ["indexing"]', compose)
         self.assertIn('profiles: ["generation"]', compose)
@@ -327,9 +305,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertIn("CLICKHOUSE_INGEST_PASSWORD_FILE", env)
 
     def test_compose_bootstraps_role_specific_clickhouse_accounts(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         clickhouse = service_block(compose, "clickhouse")
         for token in (
             "CLICKHOUSE_QUERY_USER:",
@@ -361,12 +337,8 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             self.assertIn(token, script)
 
     def test_offline_tools_govern_clickhouse_secrets_at_fixed_paths(self) -> None:
-        prepare = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(
-            encoding="utf-8"
-        )
-        wrapper = (REPO_ROOT / "tools" / "invoke_offline_compose.ps1").read_text(
-            encoding="utf-8"
-        )
+        prepare = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(encoding="utf-8")
+        wrapper = (REPO_ROOT / "tools" / "invoke_offline_compose.ps1").read_text(encoding="utf-8")
         for filename, env_name, compose_name in (
             (
                 "clickhouse-query-password",
@@ -387,12 +359,8 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 )
                 self.assertIn(filename, wrapper)
                 self.assertIn(f'"{compose_name}"', wrapper)
-        self.assertIn(
-            "Publish-OfflinePasswordSecret -Path $clickhouseSecretPath", prepare
-        )
-        self.assertIn(
-            "Assert-OfflinePasswordSecret -Path $clickhouseSecretPath", prepare
-        )
+        self.assertIn("Publish-OfflinePasswordSecret -Path $clickhouseSecretPath", prepare)
+        self.assertIn("Assert-OfflinePasswordSecret -Path $clickhouseSecretPath", prepare)
 
         for security_check in (
             "Assert-OfflinePathAncestorsAreNotLinks",
@@ -414,9 +382,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         def replace_function(text: str, name: str, replacement: str) -> str:
             start = text.index(f"function {name} {{")
             next_function = text.index("\nfunction ", start + 1)
-            return (
-                text[:start] + replacement.rstrip() + "\n" + text[next_function + 1 :]
-            )
+            return text[:start] + replacement.rstrip() + "\n" + text[next_function + 1 :]
 
         source_script = replace_function(
             source_script,
@@ -503,9 +469,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             second = run()
             self.assertEqual(0, second.returncode, second.stderr)
             self.assertEqual(first_env, env_path.read_bytes())
-            self.assertEqual(
-                first_secrets, tuple(path.read_bytes() for path in secret_paths)
-            )
+            self.assertEqual(first_secrets, tuple(path.read_bytes() for path in secret_paths))
 
             partial_env = (
                 "\n".join(
@@ -522,9 +486,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 "Both ClickHouse password file paths must be configured together",
                 partial.stdout + partial.stderr,
             )
-            self.assertEqual(
-                first_secrets, tuple(path.read_bytes() for path in secret_paths)
-            )
+            self.assertEqual(first_secrets, tuple(path.read_bytes() for path in secret_paths))
 
     def test_docs_describe_enablement_migration_smoke_and_fail_closed_rollback(
         self,
@@ -550,9 +512,9 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, combined)
 
-        intranet = (
-            REPO_ROOT / "docs" / "intranet-deployment-configuration.md"
-        ).read_text(encoding="utf-8")
+        intranet = (REPO_ROOT / "docs" / "intranet-deployment-configuration.md").read_text(
+            encoding="utf-8"
+        )
         self.assertIn(
             "./tools/invoke_offline_compose.sh --profile indexing up -d",
             intranet,

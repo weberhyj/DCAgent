@@ -50,17 +50,13 @@ class ComposeContractTest(unittest.TestCase):
                 self.assertIn("1024", text)
 
     def test_rrf_only_is_the_documented_default(self) -> None:
-        env_text = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
-            encoding="utf-8"
-        )
+        env_text = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
 
         self.assertIn("RERANKER_ENABLED=false", env_text)
         self.assertIn("RETRIEVAL_FINAL_TOP_K=8", env_text)
 
     def test_reranker_service_requires_explicit_profile(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         reranker = service_block(compose, "reranker-service")
         api = service_block(compose, "api")
         worker = service_block(compose, "ingestion-worker")
@@ -99,9 +95,7 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn("/var/lib/clamav:ro", text)
 
     def test_compose_has_independent_cpu_bounded_model_services(self) -> None:
-        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         service_requirements = {
             "embedding-service": (
                 "EMBEDDING_MODEL_SHA256",
@@ -200,9 +194,7 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn("OLLAMA_BASE_URL", service_block("api"))
 
     def test_compose_supports_keyless_physoc_stream_configuration(self) -> None:
-        text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
 
         self.assertIn(
             "LLM_STREAM_PATH: ${LLM_STREAM_PATH:-/api/physoc/deepseeks/stream}",
@@ -212,9 +204,7 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn("LLM_API_KEY: ${LLM_API_KEY:?", text)
 
     def test_compose_keeps_only_api_port_published(self) -> None:
-        text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
-            encoding="utf-8"
-        )
+        text = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         self.assertIn('"127.0.0.1:8000:8000"', text)
         self.assertNotIn('"8123:8123"', text)
         self.assertNotIn('"6333:6333"', text)
@@ -309,9 +299,7 @@ class ComposeContractTest(unittest.TestCase):
             )
             data_root = (root / "artifacts" / "data").resolve()
             model_root = (root / "artifacts" / "models").resolve()
-            password_path = (
-                root / "artifacts" / "secrets" / "postgres-password"
-            ).resolve()
+            password_path = (root / "artifacts" / "secrets" / "postgres-password").resolve()
             database_path = (root / "artifacts" / "secrets" / "database-url").resolve()
             query_password_path = (
                 root / "artifacts" / "secrets" / "clickhouse-query-password"
@@ -333,9 +321,7 @@ class ComposeContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def bind(
-                source: Path, target: str, *, read_only: bool = False
-            ) -> dict[str, object]:
+            def bind(source: Path, target: str, *, read_only: bool = False) -> dict[str, object]:
                 return {
                     "type": "bind",
                     "source": str(source),
@@ -353,9 +339,7 @@ class ComposeContractTest(unittest.TestCase):
                     "postgres": {
                         "image": safe_image,
                         "networks": service_networks("offline"),
-                        "volumes": [
-                            bind(data_root / "postgres", "/var/lib/postgresql/data")
-                        ],
+                        "volumes": [bind(data_root / "postgres", "/var/lib/postgresql/data")],
                     },
                     "clickhouse": {
                         "image": safe_image,
@@ -471,14 +455,10 @@ class ComposeContractTest(unittest.TestCase):
             process_environment["FAKE_DOCKER_RENDER"] = str(render_path)
             process_environment["FAKE_DOCKER_LOG"] = str(log_path)
             process_environment["FAKE_PYTHON"] = sys.executable
-            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = (
-                "unix:///var/run/docker.sock"
-            )
+            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = "unix:///var/run/docker.sock"
             process_environment["POSTGRES_IMAGE"] = "docker.io/library/postgres:latest"
             process_environment["DATA_ROOT"] = str(root / "external-data")
-            process_environment["POSTGRES_PASSWORD_FILE"] = str(
-                root / "external-secret"
-            )
+            process_environment["POSTGRES_PASSWORD_FILE"] = str(root / "external-secret")
             process_environment["COMPOSE_PROJECT_NAME"] = "attacker-project"
 
             def run(
@@ -513,8 +493,7 @@ class ComposeContractTest(unittest.TestCase):
             accepted = run(rendered)
             self.assertEqual(0, accepted.returncode, accepted.stderr)
             records = [
-                json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual(2, len(records))
             for record in records:
@@ -537,23 +516,17 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_missing_api_egress.returncode)
             self.assertIn(
                 "network",
-                (
-                    rejected_missing_api_egress.stdout
-                    + rejected_missing_api_egress.stderr
-                ).lower(),
+                (rejected_missing_api_egress.stdout + rejected_missing_api_egress.stderr).lower(),
             )
 
             missing_adapter_egress = json.loads(json.dumps(rendered))
-            del missing_adapter_egress["services"]["embedding-service"]["networks"][
-                "ollama-egress"
-            ]
+            del missing_adapter_egress["services"]["embedding-service"]["networks"]["ollama-egress"]
             rejected_missing_adapter_egress = run(missing_adapter_egress)
             self.assertNotEqual(0, rejected_missing_adapter_egress.returncode)
             self.assertIn(
                 "network",
                 (
-                    rejected_missing_adapter_egress.stdout
-                    + rejected_missing_adapter_egress.stderr
+                    rejected_missing_adapter_egress.stdout + rejected_missing_adapter_egress.stderr
                 ).lower(),
             )
 
@@ -563,9 +536,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_non_api_egress.returncode)
             self.assertIn(
                 "network",
-                (
-                    rejected_non_api_egress.stdout + rejected_non_api_egress.stderr
-                ).lower(),
+                (rejected_non_api_egress.stdout + rejected_non_api_egress.stderr).lower(),
             )
 
             public_core_network = json.loads(json.dumps(rendered))
@@ -583,9 +554,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_internal_egress.returncode)
             self.assertIn(
                 "network",
-                (
-                    rejected_internal_egress.stdout + rejected_internal_egress.stderr
-                ).lower(),
+                (rejected_internal_egress.stdout + rejected_internal_egress.stderr).lower(),
             )
 
             internal_ollama_egress = json.loads(json.dumps(rendered))
@@ -594,9 +563,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_internal_ollama.returncode)
             self.assertIn(
                 "network",
-                (
-                    rejected_internal_ollama.stdout + rejected_internal_ollama.stderr
-                ).lower(),
+                (rejected_internal_ollama.stdout + rejected_internal_ollama.stderr).lower(),
             )
 
             extra_api_network = json.loads(json.dumps(rendered))
@@ -605,10 +572,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_extra_api_network.returncode)
             self.assertIn(
                 "network",
-                (
-                    rejected_extra_api_network.stdout
-                    + rejected_extra_api_network.stderr
-                ).lower(),
+                (rejected_extra_api_network.stdout + rejected_extra_api_network.stderr).lower(),
             )
 
             for safe_arguments in (
@@ -684,9 +648,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_missing_profile.returncode)
             self.assertIn(
                 "service",
-                (
-                    rejected_missing_profile.stdout + rejected_missing_profile.stderr
-                ).lower(),
+                (rejected_missing_profile.stdout + rejected_missing_profile.stderr).lower(),
             )
 
             unsafe_project_name = json.loads(json.dumps(rendered))
@@ -703,36 +665,24 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_remote_context.returncode)
             self.assertIn(
                 "context",
-                (
-                    rejected_remote_context.stdout + rejected_remote_context.stderr
-                ).lower(),
+                (rejected_remote_context.stdout + rejected_remote_context.stderr).lower(),
             )
             process_environment.pop("DOCKER_CONTEXT")
 
-            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = (
-                "tcp://remote.example:2375"
-            )
+            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = "tcp://remote.example:2375"
             rejected_remote_default = run(rendered)
             self.assertNotEqual(0, rejected_remote_default.returncode)
             self.assertIn(
                 "context",
-                (
-                    rejected_remote_default.stdout + rejected_remote_default.stderr
-                ).lower(),
+                (rejected_remote_default.stdout + rejected_remote_default.stderr).lower(),
             )
-            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = (
-                "unix:///var/run/docker.sock"
-            )
+            process_environment["FAKE_DOCKER_CONTEXT_HOST"] = "unix:///var/run/docker.sock"
 
             unsafe_image = json.loads(json.dumps(rendered))
-            unsafe_image["services"]["postgres"]["image"] = (
-                "docker.io/library/postgres:latest"
-            )
+            unsafe_image["services"]["postgres"]["image"] = "docker.io/library/postgres:latest"
             rejected_image = run(unsafe_image)
             self.assertNotEqual(0, rejected_image.returncode)
-            self.assertIn(
-                "image", (rejected_image.stdout + rejected_image.stderr).lower()
-            )
+            self.assertIn("image", (rejected_image.stdout + rejected_image.stderr).lower())
             self.assertEqual(1, len(log_path.read_text(encoding="utf-8").splitlines()))
 
             uppercase_digest = json.loads(json.dumps(rendered))
@@ -743,9 +693,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_uppercase_digest.returncode)
             self.assertIn(
                 "image",
-                (
-                    rejected_uppercase_digest.stdout + rejected_uppercase_digest.stderr
-                ).lower(),
+                (rejected_uppercase_digest.stdout + rejected_uppercase_digest.stderr).lower(),
             )
 
             unsafe_bind = json.loads(json.dumps(rendered))
@@ -764,21 +712,14 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rejected_extra_reranker_bind.returncode)
             self.assertIn(
                 "bind",
-                (
-                    rejected_extra_reranker_bind.stdout
-                    + rejected_extra_reranker_bind.stderr
-                ).lower(),
+                (rejected_extra_reranker_bind.stdout + rejected_extra_reranker_bind.stderr).lower(),
             )
 
             unsafe_secret = json.loads(json.dumps(rendered))
-            unsafe_secret["secrets"]["postgres_password"]["file"] = str(
-                root / "external-secret"
-            )
+            unsafe_secret["secrets"]["postgres_password"]["file"] = str(root / "external-secret")
             rejected_secret = run(unsafe_secret)
             self.assertNotEqual(0, rejected_secret.returncode)
-            self.assertIn(
-                "secret", (rejected_secret.stdout + rejected_secret.stderr).lower()
-            )
+            self.assertIn("secret", (rejected_secret.stdout + rejected_secret.stderr).lower())
 
             for secret_name in (
                 "clickhouse_query_password",
@@ -794,8 +735,7 @@ class ComposeContractTest(unittest.TestCase):
                     self.assertIn(
                         "secret",
                         (
-                            rejected_clickhouse_secret.stdout
-                            + rejected_clickhouse_secret.stderr
+                            rejected_clickhouse_secret.stdout + rejected_clickhouse_secret.stderr
                         ).lower(),
                     )
 
@@ -910,9 +850,7 @@ class ComposeContractTest(unittest.TestCase):
         self.assertIn("LASTEXITCODE", text)
         self.assertIn("SetAccessRuleProtection", text)
         self.assertIn("Set-Acl", text)
-        self.assertIn(
-            "artifacts/secrets/", (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
-        )
+        self.assertIn("artifacts/secrets/", (REPO_ROOT / ".gitignore").read_text(encoding="utf-8"))
 
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if powershell is None:
@@ -988,12 +926,8 @@ class ComposeContractTest(unittest.TestCase):
             first_env = env_path.read_bytes()
             first_password = password_path.read_bytes()
             first_database = database_path.read_bytes()
-            self.assertNotIn(
-                first_password.decode("ascii"), first.stdout + first.stderr
-            )
-            self.assertNotIn(
-                first_database.decode("ascii"), first.stdout + first.stderr
-            )
+            self.assertNotIn(first_password.decode("ascii"), first.stdout + first.stderr)
+            self.assertNotIn(first_database.decode("ascii"), first.stdout + first.stderr)
             self.assertNotIn(b"\n", first_password)
             self.assertNotIn(b"\n", first_database)
             self.assertIn(b"postgresql+psycopg://dc_agent:", first_database)
@@ -1003,9 +937,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertEqual(first_env, env_path.read_bytes())
             self.assertEqual(first_password, password_path.read_bytes())
             self.assertEqual(first_database, database_path.read_bytes())
-            self.assertTrue(
-                all(path.read_text(encoding="utf-8") == "kept\n" for path in sentinels)
-            )
+            self.assertTrue(all(path.read_text(encoding="utf-8") == "kept\n" for path in sentinels))
 
             identity_lines = [
                 line
@@ -1106,12 +1038,8 @@ class ComposeContractTest(unittest.TestCase):
             self.assertEqual(before_password, password_path.read_bytes())
             self.assertEqual(before_database, database_path.read_bytes())
             self.assertIn("ALTER ROLE", rotated.stderr + rotated.stdout)
-            self.assertNotIn(
-                before_password.decode("ascii"), rotated.stderr + rotated.stdout
-            )
-            self.assertNotIn(
-                before_database.decode("ascii"), rotated.stderr + rotated.stdout
-            )
+            self.assertNotIn(before_password.decode("ascii"), rotated.stderr + rotated.stdout)
+            self.assertNotIn(before_database.decode("ascii"), rotated.stderr + rotated.stdout)
 
     def test_variable_data_root_rotation_fails_closed_without_secret_changes(
         self,
@@ -1144,9 +1072,7 @@ class ComposeContractTest(unittest.TestCase):
                 (root / "deploy" / "offline").mkdir(parents=True)
                 (root / "tools").mkdir()
                 initial_data_root_value = (
-                    "../../artifacts/data"
-                    if name == "unsupported-expansion"
-                    else data_root_value
+                    "../../artifacts/data" if name == "unsupported-expansion" else data_root_value
                 )
                 env_text = (
                     f"DATA_ROOT={initial_data_root_value}\n"
@@ -1323,9 +1249,7 @@ class ComposeContractTest(unittest.TestCase):
             copied_script = root / "tools" / "prepare_offline_env.ps1"
             copied_script.write_bytes(script.read_bytes())
 
-            def run(
-                *arguments: str, override: str | None
-            ) -> subprocess.CompletedProcess[str]:
+            def run(*arguments: str, override: str | None) -> subprocess.CompletedProcess[str]:
                 process_environment = os.environ.copy()
                 process_environment.pop("POSTGRES_PASSWORD_FILE", None)
                 process_environment.pop("DATABASE_URL_SECRET_FILE", None)
@@ -1365,9 +1289,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertNotEqual(0, rotated.returncode)
             self.assertEqual(before_password, password_path.read_bytes())
             self.assertEqual(before_database, database_path.read_bytes())
-            self.assertEqual(
-                before_entries, sorted(path.name for path in secret_dir.iterdir())
-            )
+            self.assertEqual(before_entries, sorted(path.name for path in secret_dir.iterdir()))
 
     def test_writable_bind_preflight_leaves_no_partial_directory(self) -> None:
         script = REPO_ROOT / "tools" / "prepare_offline_env.ps1"
@@ -1861,9 +1783,7 @@ class ComposeContractTest(unittest.TestCase):
             "worker.Dockerfile",
             "embedding.Dockerfile",
         ):
-            text = (REPO_ROOT / "deploy" / "docker" / dockerfile_name).read_text(
-                encoding="utf-8"
-            )
+            text = (REPO_ROOT / "deploy" / "docker" / dockerfile_name).read_text(encoding="utf-8")
             self.assertNotIn("# syntax=docker/dockerfile:1", text)
 
     def test_docker_build_context_is_allowlisted(self) -> None:
@@ -1913,9 +1833,7 @@ class ComposeContractTest(unittest.TestCase):
         self.assertNotIn("!artifacts/secrets/**", lines)
 
     def test_uid_gid_and_non_root_image_contract(self) -> None:
-        env_text = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
-            encoding="utf-8"
-        )
+        env_text = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
         self.assertEqual(1, len(re.findall(r"^DCAGENT_UID=", env_text, re.MULTILINE)))
         self.assertEqual(1, len(re.findall(r"^DCAGENT_GID=", env_text, re.MULTILINE)))
         self.assertRegex(env_text, r"(?m)^DCAGENT_UID=[1-9][0-9]*$")
@@ -1962,9 +1880,7 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn('case "$DCAGENT_GID"', text)
             self.assertIn("id -u dcagent", text)
             self.assertIn("id -g dcagent", text)
-            writable_directory_command = (
-                "install -d -o dcagent -g dcagent /app/uploads/knowledge"
-            )
+            writable_directory_command = "install -d -o dcagent -g dcagent /app/uploads/knowledge"
             if dockerfile_name == "reranker.Dockerfile":
                 self.assertNotIn(writable_directory_command, text)
                 self.assertNotIn("install -d -o dcagent -g dcagent", text)
@@ -1978,8 +1894,7 @@ class ComposeContractTest(unittest.TestCase):
             version_pattern = '"uv 0.11.29"|"uv 0.11.29 "*)'
             if dockerfile_name in ("embedding.Dockerfile", "reranker.Dockerfile"):
                 sync_command = (
-                    "uv sync --frozen --offline --no-install-project --no-dev "
-                    "--find-links=/wheels"
+                    "uv sync --frozen --offline --no-install-project --no-dev --find-links=/wheels"
                 )
                 self.assertNotIn("--group offline", text)
                 for adapter_only_env in (
@@ -2006,9 +1921,7 @@ class ComposeContractTest(unittest.TestCase):
             )
             self.assertNotRegex(text, r"\brequirements[^\s/]*\.(?:txt|in)\b")
             self.assertLess(text.index("UV_NO_INDEX=1"), text.index(sync_command))
-            self.assertLess(
-                text.index("UV_PYTHON_DOWNLOADS=never"), text.index(sync_command)
-            )
+            self.assertLess(text.index("UV_PYTHON_DOWNLOADS=never"), text.index(sync_command))
             self.assertLess(text.index("UV_LINK_MODE=copy"), text.index(sync_command))
             self.assertLess(text.index(version_gate), text.index(sync_command))
             self.assertLess(text.index(version_pattern), text.index(sync_command))
@@ -2026,18 +1939,10 @@ class ComposeContractTest(unittest.TestCase):
             self.assertIn("ENV HOME=/nonexistent", text)
             self.assertLess(text.index("useradd --uid"), text.rindex("USER dcagent"))
             if dockerfile_name != "reranker.Dockerfile":
-                self.assertLess(
-                    text.index("useradd --uid"), text.index(writable_directory_command)
-                )
-                self.assertLess(
-                    text.index(writable_directory_command), text.rindex("USER dcagent")
-                )
-            self.assertLess(
-                text.index("ENV HOME=/nonexistent"), text.rindex("USER dcagent")
-            )
-            commands.add(
-                next(line for line in text.splitlines() if line.startswith("CMD "))
-            )
+                self.assertLess(text.index("useradd --uid"), text.index(writable_directory_command))
+                self.assertLess(text.index(writable_directory_command), text.rindex("USER dcagent"))
+            self.assertLess(text.index("ENV HOME=/nonexistent"), text.rindex("USER dcagent"))
+            commands.add(next(line for line in text.splitlines() if line.startswith("CMD ")))
         self.assertEqual(4, len(commands))
 
     def test_bind_mounts_never_implicitly_create_host_paths(self) -> None:
@@ -2049,9 +1954,7 @@ class ComposeContractTest(unittest.TestCase):
         self.assertEqual(12, compose_text.count("create_host_path: false"))
 
     def test_linux_identity_and_path_hardening_contract(self) -> None:
-        script_text = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(
-            encoding="utf-8"
-        )
+        script_text = (REPO_ROOT / "tools" / "prepare_offline_env.ps1").read_text(encoding="utf-8")
         for token in (
             "id -u",
             "id -g",
@@ -2076,9 +1979,7 @@ class ComposeContractTest(unittest.TestCase):
         )
 
     def test_readme_documents_rotation_limit_and_target_host_gates(self) -> None:
-        text = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
-            encoding="utf-8"
-        )
+        text = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(encoding="utf-8")
         self.assertIn("pre-initialization only", text)
         self.assertIn("不提供在线 PostgreSQL role 密码修改", text)
         self.assertIn("advisory lock", text)
@@ -2101,9 +2002,7 @@ class ComposeContractTest(unittest.TestCase):
     def test_ubuntu_production_docs_use_bash_compose_entrypoints(self) -> None:
         documents = {
             "root readme": REPO_ROOT / "README.md",
-            "intranet checklist": (
-                REPO_ROOT / "docs" / "intranet-deployment-configuration.md"
-            ),
+            "intranet checklist": (REPO_ROOT / "docs" / "intranet-deployment-configuration.md"),
             "offline runbook": REPO_ROOT / "docs" / "offline-platform-runbook.md",
             "offline compose readme": REPO_ROOT / "deploy" / "offline" / "README.md",
         }
@@ -2153,9 +2052,7 @@ class ComposeContractTest(unittest.TestCase):
         ):
             text = path.read_text(encoding="utf-8")
             with self.subTest(path=path.relative_to(REPO_ROOT)):
-                self.assertNotIn(
-                    "cp deploy/offline/.env.example deploy/offline/.env", text
-                )
+                self.assertNotIn("cp deploy/offline/.env.example deploy/offline/.env", text)
                 for phrase in (
                     "首次运行",
                     "./tools/prepare_offline_env.sh",
@@ -2194,9 +2091,7 @@ class ComposeContractTest(unittest.TestCase):
                     continue
                 checked += 1
                 with self.subTest(path=path.relative_to(REPO_ROOT), block=index):
-                    self.assertRegex(
-                        first_effective_bash_command(block), r"^set -E?euo pipefail$"
-                    )
+                    self.assertRegex(first_effective_bash_command(block), r"^set -E?euo pipefail$")
         self.assertGreaterEqual(checked, 10)
 
     def test_transactional_intranet_deployment_docs_share_recovery_contract(
@@ -2272,8 +2167,7 @@ class ComposeContractTest(unittest.TestCase):
                 clear_paragraphs = [
                     paragraph
                     for paragraph in re.split(r"\n\s*\n", text)
-                    if "./tools/recover_offline_deployment.sh clear-start-marker"
-                    in paragraph
+                    if "./tools/recover_offline_deployment.sh clear-start-marker" in paragraph
                 ]
                 self.assertEqual(1, len(clear_paragraphs))
                 for precondition in (
@@ -2345,9 +2239,7 @@ class ComposeContractTest(unittest.TestCase):
                     if all(token in block for token in manual_sequence)
                 ]
                 self.assertEqual(1, len(manual_blocks))
-                manual_positions = [
-                    manual_blocks[0].index(token) for token in manual_sequence
-                ]
+                manual_positions = [manual_blocks[0].index(token) for token in manual_sequence]
                 self.assertEqual(sorted(manual_positions), manual_positions)
 
     def test_production_doc_command_order_and_windows_scope(self) -> None:

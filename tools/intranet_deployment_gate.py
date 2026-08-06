@@ -93,14 +93,10 @@ def _write_report_atomically(path: Path, report: dict[str, object]) -> None:
     try:
         path = path.resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         temporary = Path(name)
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(
-                report, stream, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-            )
+            json.dump(report, stream, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -258,10 +254,7 @@ def _compose_services(*, reranker_enabled: bool) -> tuple[str, ...]:
 
 def _configured_url(repo_root: Path, endpoint: str) -> str:
     return (
-        _read_setting(repo_root, "OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip(
-            "/"
-        )
-        + endpoint
+        _read_setting(repo_root, "OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/") + endpoint
     )
 
 
@@ -406,9 +399,7 @@ def _safe_drill_lstat(root: Path, path: Path) -> os.stat_result:
     try:
         for component in relative.parts:
             current_stat = current.lstat()
-            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(
-                current_stat.st_mode
-            ):
+            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(current_stat.st_mode):
                 raise GateError("unsafe recovery drill path")
             current = current / component
         result = current.lstat()
@@ -456,9 +447,7 @@ def _require_drill_children(
 
 def _audit_recovery_drill_artifacts(root: Path) -> tuple[Path, ...]:
     root = Path(root)
-    _require_drill_children(
-        root, root, frozenset({"data", "models", "secrets", "repo"})
-    )
+    _require_drill_children(root, root, frozenset({"data", "models", "secrets", "repo"}))
 
     data = root / "data"
     models = root / "models"
@@ -510,9 +499,7 @@ def _audit_recovery_drill_artifacts(root: Path) -> tuple[Path, ...]:
     offline = deploy / "offline"
     _require_drill_children(root, repo, frozenset({deploy.name}))
     _require_drill_children(root, deploy, frozenset({offline.name}))
-    environment_files = _require_drill_children(
-        root, offline, frozenset({".env", ".env.example"})
-    )
+    environment_files = _require_drill_children(root, offline, frozenset({".env", ".env.example"}))
     for environment_file in environment_files:
         _require_drill_regular_file(root, environment_file)
 
@@ -596,9 +583,7 @@ def _drill_directory_open_flags() -> int:
         raise GateError("unsafe recovery drill path") from None
 
 
-def _same_drill_identity(
-    path_stat: os.stat_result, authority: _RecoveryDrillAuthority
-) -> bool:
+def _same_drill_identity(path_stat: os.stat_result, authority: _RecoveryDrillAuthority) -> bool:
     return (path_stat.st_dev, path_stat.st_ino) == (authority.device, authority.inode)
 
 
@@ -986,7 +971,9 @@ def run_gate(
             ),
             (
                 "ollama_generate",
-                [] if not reranker_enabled else [
+                []
+                if not reranker_enabled
+                else [
                     _probe_command(
                         _OLLAMA_PROBE,
                         _configured_url(config.repo_root, "/api/generate"),
@@ -1004,11 +991,7 @@ def run_gate(
             ),
             (
                 "ollama_tags",
-                [
-                    _probe_command(
-                        _OLLAMA_PROBE, _configured_url(config.repo_root, "/api/tags")
-                    )
-                ],
+                [_probe_command(_OLLAMA_PROBE, _configured_url(config.repo_root, "/api/tags"))],
             ),
             (
                 "metadata",
@@ -1018,11 +1001,7 @@ def run_gate(
                         str(config.repo_root / "deploy" / "offline" / ".env"),
                         str(_setting_path(config.repo_root, "DATA_ROOT")),
                         str(_setting_path(config.repo_root, "MODEL_ROOT")),
-                        str(
-                            _setting_path(
-                                config.repo_root, "POSTGRES_PASSWORD_FILE"
-                            ).parent
-                        ),
+                        str(_setting_path(config.repo_root, "POSTGRES_PASSWORD_FILE").parent),
                     )
                 ],
             ),
@@ -1062,9 +1041,7 @@ def run_gate(
             {
                 "category": "recovery_drill",
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
-                "finished_at": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished)
-                ),
+                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished)),
                 "exit_code": exit_code,
                 "duration_ms": max(0, round((finished - started) * 1000)),
                 "sanitized_status": _status(exit_code),
@@ -1087,9 +1064,7 @@ def run_gate(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="intranet-deployment-gate", allow_abbrev=False
-    )
+    parser = argparse.ArgumentParser(prog="intranet-deployment-gate", allow_abbrev=False)
     parser.add_argument("--mode", choices=("fresh", "adopt"), required=True)
     parser.add_argument("--state-root", type=Path)
     parser.add_argument("--report", type=Path, required=True)

@@ -1118,8 +1118,7 @@ def validate_health_service_urls(
             )
         )
     retrieval_enabled = (
-        retrieval_settings is not None
-        and retrieval_settings.mode is not RetrievalMode.LEGACY
+        retrieval_settings is not None and retrieval_settings.mode is not RetrievalMode.LEGACY
     )
     reranker_enabled = retrieval_enabled and retrieval_settings.reranker_enabled
     if reranker_enabled:

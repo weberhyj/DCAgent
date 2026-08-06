@@ -1,10 +1,9 @@
 import ast
 import re
+import tomllib
 import unittest
 from pathlib import Path
 from urllib.parse import urlsplit
-
-import tomllib
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 BACKEND_ROOT = REPOSITORY_ROOT / "backend"
@@ -26,9 +25,7 @@ class BackendUvContractTest(unittest.TestCase):
         )
 
     def bash_blocks(self, text: str) -> list[str]:
-        return re.findall(
-            r"```bash[ \t]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL
-        )
+        return re.findall(r"```bash[ \t]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
 
     def powershell_block_containing(self, text: str, command: str) -> str:
         matches = [
@@ -36,9 +33,7 @@ class BackendUvContractTest(unittest.TestCase):
             for block in self.powershell_blocks(text)
             if command in self.normalize_command_text(block)
         ]
-        self.assertEqual(
-            len(matches), 1, f"Expected one PowerShell block containing: {command}"
-        )
+        self.assertEqual(len(matches), 1, f"Expected one PowerShell block containing: {command}")
         return matches[0]
 
     def markdown_section(self, text: str, heading: str) -> str:
@@ -48,19 +43,13 @@ class BackendUvContractTest(unittest.TestCase):
         self.assertIsNotNone(heading_match, f"Missing Markdown heading: {heading}")
         assert heading_match is not None
         section_start = heading_match.end()
-        next_heading = re.search(
-            rf"(?m)^#{{1,{heading_level}}}[ \t]+", text[section_start:]
-        )
+        next_heading = re.search(rf"(?m)^#{{1,{heading_level}}}[ \t]+", text[section_start:])
         section_end = (
-            section_start + next_heading.start()
-            if next_heading is not None
-            else len(text)
+            section_start + next_heading.start() if next_heading is not None else len(text)
         )
         return text[section_start:section_end]
 
-    def bash_block_under_heading_containing(
-        self, text: str, heading: str, command: str
-    ) -> str:
+    def bash_block_under_heading_containing(self, text: str, heading: str, command: str) -> str:
         section = self.markdown_section(text, heading)
         matches = []
         for block in self.bash_blocks(section):
@@ -166,8 +155,7 @@ class BackendUvContractTest(unittest.TestCase):
                 and node.func.id == "validate_artifact_manifest"
                 for node in ast.walk(validation_tree)
             ),
-            "Manifest validation command imports but never calls "
-            "validate_artifact_manifest",
+            "Manifest validation command imports but never calls validate_artifact_manifest",
         )
 
     def test_bash_block_selector_scopes_commands_to_the_documented_heading(
@@ -196,9 +184,7 @@ export UV_PYTHON_DOWNLOADS=never
 ```
 """
 
-        block = self.bash_block_under_heading_containing(
-            text, "## Offline dependencies", command
-        )
+        block = self.bash_block_under_heading_containing(text, "## Offline dependencies", command)
 
         self.assertIn("export UV_PYTHON_DOWNLOADS=never", block)
         self.assertEqual(
@@ -249,7 +235,9 @@ export UV_PYTHON_DOWNLOADS=never
                     invalid_block, lock_command, offline_sync, benchmark_sync
                 )
 
-        offline_uv = "uv run --project backend --frozen --offline --no-default-groups --group offline python"
+        offline_uv = (
+            "uv run --project backend --frozen --offline --no-default-groups --group offline python"
+        )
         valid_validation_block = "\n".join(
             (
                 "export PYTHONPATH=backend",
@@ -285,12 +273,8 @@ export UV_PYTHON_DOWNLOADS=never
             with self.subTest(block=invalid_block), self.assertRaises(AssertionError):
                 self.assert_manifest_validation_command(invalid_block, offline_uv)
 
-    def assert_exact_requirements(
-        self, requirements: list[object], expected: set[str]
-    ) -> None:
-        self.assertTrue(
-            all(isinstance(requirement, str) for requirement in requirements)
-        )
+    def assert_exact_requirements(self, requirements: list[object], expected: set[str]) -> None:
+        self.assertTrue(all(isinstance(requirement, str) for requirement in requirements))
         self.assertEqual(len(requirements), len(expected))
         self.assertEqual(set(requirements), expected)
 
@@ -307,9 +291,7 @@ export UV_PYTHON_DOWNLOADS=never
             return tomllib.load(file)
 
     def requirement_name_and_specifier(self, requirement: str) -> tuple[str, str]:
-        match = re.fullmatch(
-            r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^]]+])?(.*)", requirement
-        )
+        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^]]+])?(.*)", requirement)
         self.assertIsNotNone(match, f"Unsupported requirement format: {requirement}")
         assert match is not None
         return (match.group(1).lower().replace("_", "-"), match.group(2))
@@ -324,9 +306,7 @@ export UV_PYTHON_DOWNLOADS=never
             else:
                 self.assertEqual(set(dependency), {"include-group"})
                 expanded.extend(
-                    self.expand_dependency_group(
-                        dependency_groups, dependency["include-group"]
-                    )
+                    self.expand_dependency_group(dependency_groups, dependency["include-group"])
                 )
         return expanded
 
@@ -334,8 +314,7 @@ export UV_PYTHON_DOWNLOADS=never
         self, lock_requirements: list[dict[str, str]], expected_requirements: list[str]
     ) -> None:
         actual = sorted(
-            (requirement["name"], requirement["specifier"])
-            for requirement in lock_requirements
+            (requirement["name"], requirement["specifier"]) for requirement in lock_requirements
         )
         expected = sorted(
             self.requirement_name_and_specifier(requirement)
@@ -406,17 +385,11 @@ export UV_PYTHON_DOWNLOADS=never
         benchmark_dependencies = dependency_groups["benchmark"]
         self.assertEqual(len(benchmark_dependencies), 2)
         self.assertEqual(
-            [
-                dependency
-                for dependency in benchmark_dependencies
-                if isinstance(dependency, dict)
-            ],
+            [dependency for dependency in benchmark_dependencies if isinstance(dependency, dict)],
             [{"include-group": "offline"}],
         )
         benchmark_strings = [
-            dependency
-            for dependency in benchmark_dependencies
-            if isinstance(dependency, str)
+            dependency for dependency in benchmark_dependencies if isinstance(dependency, str)
         ]
         self.assertEqual(benchmark_strings, ["locust>=2.37"])
 
@@ -464,16 +437,10 @@ export UV_PYTHON_DOWNLOADS=never
         self.assertEqual(lock["requires-python"], "==3.12.*")
 
         root_package = next(
-            (
-                package
-                for package in lock["package"]
-                if package["name"] == "dc-agent-backend"
-            ),
+            (package for package in lock["package"] if package["name"] == "dc-agent-backend"),
             None,
         )
-        self.assertIsNotNone(
-            root_package, "The backend package is missing from uv.lock"
-        )
+        self.assertIsNotNone(root_package, "The backend package is missing from uv.lock")
         assert root_package is not None
         self.assertEqual(root_package["source"], {"virtual": "."})
 
@@ -482,9 +449,7 @@ export UV_PYTHON_DOWNLOADS=never
             group: self.expand_dependency_group(dependency_groups, group)
             for group in ("offline", "benchmark", "dev")
         }
-        self.assertEqual(
-            set(root_package["dev-dependencies"]), set(expected_group_requirements)
-        )
+        self.assertEqual(set(root_package["dev-dependencies"]), set(expected_group_requirements))
 
         self.assert_lock_requirements_match(
             root_package["metadata"]["requires-dist"],
@@ -525,9 +490,7 @@ export UV_PYTHON_DOWNLOADS=never
                 dockerfile = REPOSITORY_ROOT / "deploy" / "docker" / filename
                 text = dockerfile.read_text(encoding="utf-8")
                 active_text = "\n".join(
-                    line
-                    for line in text.splitlines()
-                    if not line.lstrip().startswith("#")
+                    line for line in text.splitlines() if not line.lstrip().startswith("#")
                 )
                 active_commands = re.sub(r"\\\s*\n\s*", " ", active_text)
                 active_normalized = re.sub(r"\s+", " ", active_commands)
@@ -557,22 +520,14 @@ export UV_PYTHON_DOWNLOADS=never
                     self.fail("Missing the required offline uv sync command")
                 self.assertLess(version_gate_indices[-1], sync_match.start())
                 before_sync_environment = "\n".join(
-                    re.findall(
-                        r"(?m)^ENV\s+([^\n]+)$", active_commands[: sync_match.start()]
-                    )
+                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands[: sync_match.start()])
                 )
                 after_sync_environment = "\n".join(
-                    re.findall(
-                        r"(?m)^ENV\s+([^\n]+)$", active_commands[sync_match.end() :]
-                    )
+                    re.findall(r"(?m)^ENV\s+([^\n]+)$", active_commands[sync_match.end() :])
                 )
                 self.assertRegex(before_sync_environment, r"\bUV_NO_INDEX=1(?:\s|$)")
-                self.assertRegex(
-                    before_sync_environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)"
-                )
-                self.assertRegex(
-                    before_sync_environment, r"\bUV_LINK_MODE=copy(?:\s|$)"
-                )
+                self.assertRegex(before_sync_environment, r"\bUV_PYTHON_DOWNLOADS=never(?:\s|$)")
+                self.assertRegex(before_sync_environment, r"\bUV_LINK_MODE=copy(?:\s|$)")
                 self.assertRegex(
                     after_sync_environment,
                     r"\bPATH=(?:['\"])?/app/\.venv/bin(?=[:'\"\s]|$)",
@@ -642,9 +597,7 @@ export UV_PYTHON_DOWNLOADS=never
 
     def test_uv_lock_uses_only_approved_hashed_registry_artifacts(self) -> None:
         packages = self.load_uv_lock()["package"]
-        root_packages = [
-            package for package in packages if package["name"] == "dc-agent-backend"
-        ]
+        root_packages = [package for package in packages if package["name"] == "dc-agent-backend"]
         self.assertEqual(len(root_packages), 1)
 
         approved_registry = "https://pypi.org/simple"
@@ -668,9 +621,7 @@ export UV_PYTHON_DOWNLOADS=never
                 if "sdist" in package:
                     artifacts.append(package["sdist"])
                 artifacts.extend(package.get("wheels", []))
-                self.assertTrue(
-                    artifacts, "Registry packages must have an sdist or wheel"
-                )
+                self.assertTrue(artifacts, "Registry packages must have an sdist or wheel")
                 for artifact in artifacts:
                     artifact_url = urlsplit(artifact["url"])
                     self.assertEqual(artifact_url.scheme, "https")
@@ -748,20 +699,16 @@ export UV_PYTHON_DOWNLOADS=never
         self.assertLess(sync_index, backend_index)
         self.assertLess(backend_index, run_index)
 
-        test_command = 'uv run --project . --group dev python -m unittest discover -s tests -p "test_*.py" -v'
-        test_block = self.bash_block_under_heading_containing(
-            text, "## 本地开发补充", test_command
+        test_command = (
+            'uv run --project . --group dev python -m unittest discover -s tests -p "test_*.py" -v'
         )
+        test_block = self.bash_block_under_heading_containing(text, "## 本地开发补充", test_command)
         normalized_test = self.normalize_command_text(test_block)
         backend_index = normalized_test.index("cd backend")
         test_index = normalized_test.index(test_command, backend_index)
         self.assertLess(backend_index, test_index)
-        self.assertIn(
-            "uv run --project backend --group dev ruff check backend", normalized
-        )
-        self.assertIn(
-            "uv run --project backend --group dev ruff format backend", normalized
-        )
+        self.assertIn("uv run --project backend --group dev ruff check backend", normalized)
+        self.assertIn("uv run --project backend --group dev ruff format backend", normalized)
 
     def test_offline_documentation_uses_the_frozen_lock_and_wheelhouse(self) -> None:
         documentation_contracts = (
@@ -822,9 +769,9 @@ export UV_PYTHON_DOWNLOADS=never
                     benchmark_sync,
                 )
 
-        offline_readme = (
-            REPOSITORY_ROOT / "deploy" / "offline" / "README.md"
-        ).read_text(encoding="utf-8")
+        offline_readme = (REPOSITORY_ROOT / "deploy" / "offline" / "README.md").read_text(
+            encoding="utf-8"
+        )
         for required_text in (
             "digest-pinned PYTHON_BASE_IMAGE",
             "uv 0.11.29",
@@ -849,7 +796,9 @@ export UV_PYTHON_DOWNLOADS=never
             if "windows" in line.lower():
                 self.assertNotRegex(line.lower(), r"\bpy\b")
 
-        offline_uv = "uv run --project backend --frozen --offline --no-default-groups --group offline python"
+        offline_uv = (
+            "uv run --project backend --frozen --offline --no-default-groups --group offline python"
+        )
         benchmark_uv = (
             "uv run --project backend --frozen --offline --no-default-groups "
             "--group benchmark python"
@@ -900,9 +849,7 @@ export UV_PYTHON_DOWNLOADS=never
         run_index = lower_normalized.index(run_command, backend_index)
         self.assertLess(backend_index, run_index)
         self.assertNotIn("py -m uvicorn", lower_normalized)
-        self.assertNotRegex(
-            lower_normalized, r"\b(?:pip3?|uv\s+pip|python\s+-m\s+pip)\s+install\b"
-        )
+        self.assertNotRegex(lower_normalized, r"\b(?:pip3?|uv\s+pip|python\s+-m\s+pip)\s+install\b")
 
 
 if __name__ == "__main__":

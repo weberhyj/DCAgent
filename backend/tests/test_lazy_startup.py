@@ -10,9 +10,6 @@ from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
-from sqlalchemy.engine import make_url
-
 from app.database import Database
 from app.infra.health import (
     DependencyCheck,
@@ -26,6 +23,8 @@ from app.main import _database_url_with_connect_timeout, create_app
 from app.offline_settings import OfflineSettings
 from app.qdrant_retrieval import QdrantRetrievalGateway
 from app.retrieval_settings import RetrievalSettings
+from fastapi.testclient import TestClient
+from sqlalchemy.engine import make_url
 
 
 class ClosableFake:

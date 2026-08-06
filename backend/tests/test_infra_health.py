@@ -13,8 +13,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
-from fastapi.testclient import TestClient
-
 from app.infra import health as health_module
 from app.infra.health import DependencyCheck, DependencyHealthRegistry, build_dependency_checks
 from app.main import create_app
@@ -24,6 +22,7 @@ from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.retrieval_settings import RetrievalSettings
 from app.routes import router as app_router
 from app.seed import build_seed_state
+from fastapi.testclient import TestClient
 
 
 def retrieval_health_environment(mode: str = "qwen3") -> dict[str, str]:

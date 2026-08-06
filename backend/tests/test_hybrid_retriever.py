@@ -426,7 +426,10 @@ class HybridRetrieverTest(unittest.TestCase):
         self.assertEqual(outcome.stage_ms["reranker"], 0.0)
         self.assertEqual(
             [item.chunk_id for item in outcome.candidates],
-            [item.chunk_id for item in sorted(outcome.candidates, key=lambda item: -item.rrf_score)],
+            [
+                item.chunk_id
+                for item in sorted(outcome.candidates, key=lambda item: -item.rrf_score)
+            ],
         )
 
     def test_requires_reranker_and_metadata_to_be_enabled_together(self) -> None:
