@@ -476,6 +476,35 @@ class LazyStartupTest(unittest.TestCase):
             ["shadow_queue", "hybrid", "reranker", "embedding", "qdrant"],
         )
 
+    def test_rrf_only_startup_does_not_create_reranker_client(self) -> None:
+        module = importlib.import_module("app.main")
+        environ = private_qwen_environment(RERANKER_ENABLED="false")
+        for key in tuple(environ):
+            if key == "RERANKER_SERVICE_URL" or key.startswith("RERANKER_MODEL_"):
+                environ.pop(key)
+        resources = RecordingRetrievalResourceFactory()
+
+        app = module.create_production_app(
+            environ=environ,
+            repository_factory=ConfigurableRepository,
+            retrieval_resource_factory=resources,
+            health_registry_factory=DependencyHealthRegistry,
+            ingestion_queue_factory=lambda **_kwargs: ClosableFake("queue"),
+            database_factory=lambda _url: ClosableFake("database"),
+            llm_provider_factory=lambda _environment: ClosableFake("llm"),
+            storage_factory=lambda _root: ClosableFake("storage"),
+            evaluation_import_service_factory=lambda: ClosableFake("evaluation"),
+        )
+
+        with TestClient(app):
+            pass
+
+        self.assertIn("embedding", resources.calls)
+        self.assertIn("gateway", resources.calls)
+        self.assertNotIn("reranker", resources.calls)
+        self.assertIsNone(resources.hybrid.dependencies["reranker"])
+        self.assertNotIn("reranker", resources.closed)
+
     def test_startup_scope_matches_the_version_in_qdrant_payload_filters(self) -> None:
         module = importlib.import_module("app.main")
         resources = ScopeQueryingRetrievalResourceFactory()

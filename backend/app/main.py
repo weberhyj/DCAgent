@@ -89,12 +89,13 @@ class _DefaultRetrievalResourceFactory:
         settings = dependencies.pop("settings")
         assert isinstance(settings, RetrievalSettings)
         assert settings.embedding is not None
-        assert settings.reranker is not None
+        if settings.reranker_enabled:
+            assert settings.reranker is not None
         return HybridRetriever(
             embedding=dependencies["embedding"],  # type: ignore[arg-type]
             sparse=dependencies["sparse"],  # type: ignore[arg-type]
             gateway=dependencies["gateway"],  # type: ignore[arg-type]
-            reranker=dependencies["reranker"],  # type: ignore[arg-type]
+            reranker=dependencies.get("reranker"),  # type: ignore[arg-type]
             embedding_metadata=settings.embedding,
             reranker_metadata=settings.reranker,
             dense_top_k=settings.dense_top_k,
@@ -702,7 +703,9 @@ def _configure_retrieval_runtime(
     qdrant = own(factory.create_qdrant_client(settings))  # type: ignore[attr-defined]
     gateway = factory.create_gateway(qdrant, settings)  # type: ignore[attr-defined]
     embedding = own(factory.create_embedding_client(settings))  # type: ignore[attr-defined]
-    reranker = own(factory.create_reranker_client(settings))  # type: ignore[attr-defined]
+    reranker = None
+    if settings.reranker_enabled:
+        reranker = own(factory.create_reranker_client(settings))  # type: ignore[attr-defined]
     sparse = factory.create_sparse_encoder(environ)  # type: ignore[attr-defined]
     hybrid = own(  # type: ignore[assignment]
         factory.create_hybrid_retriever(  # type: ignore[attr-defined]
