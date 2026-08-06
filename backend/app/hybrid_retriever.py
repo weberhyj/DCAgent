@@ -176,9 +176,9 @@ class HybridRetriever:
         embedding: DenseEmbeddingClient,
         sparse: SparseQueryEncoder,
         gateway: HybridSearchGateway,
-        reranker: PassageReranker,
+        reranker: PassageReranker | None,
         embedding_metadata: EmbeddingMetadataExpectation,
-        reranker_metadata: RerankerMetadataExpectation,
+        reranker_metadata: RerankerMetadataExpectation | None,
         dense_top_k: int = 50,
         sparse_top_k: int = 50,
         rerank_top_k: int = 24,
@@ -192,9 +192,13 @@ class HybridRetriever:
         self.embedding = _required_dependency(embedding, "embedding")
         self.sparse = _required_dependency(sparse, "sparse")
         self.gateway = _required_dependency(gateway, "gateway")
-        self.reranker = _required_dependency(reranker, "reranker")
+        if (reranker is None) != (reranker_metadata is None):
+            raise ValueError(
+                "reranker and reranker_metadata must both be configured or both be None"
+            )
+        self.reranker = reranker
         self._embedding_metadata = _required_dependency(embedding_metadata, "embedding_metadata")
-        self._reranker_metadata = _required_dependency(reranker_metadata, "reranker_metadata")
+        self._reranker_metadata = reranker_metadata
         self._dense_top_k = _positive_integer(dense_top_k, "dense_top_k")
         self._sparse_top_k = _positive_integer(sparse_top_k, "sparse_top_k")
         self._rerank_top_k = _positive_integer(rerank_top_k, "rerank_top_k")
@@ -297,14 +301,18 @@ class HybridRetriever:
         self._require_time(deadline)
         stage_ms["rrf"] = _elapsed_ms(stage_started, self._monotonic())
 
-        stage_started = self._monotonic()
-        reranked = self._rerank(
-            query,
-            fused,
-            deadline=deadline,
-            generation=generation,
-        )
-        stage_ms["reranker"] = _elapsed_ms(stage_started, self._monotonic())
+        if self.reranker is None:
+            reranked = fused
+            stage_ms["reranker"] = 0.0
+        else:
+            stage_started = self._monotonic()
+            reranked = self._rerank(
+                query,
+                fused,
+                deadline=deadline,
+                generation=generation,
+            )
+            stage_ms["reranker"] = _elapsed_ms(stage_started, self._monotonic())
 
         stage_started = self._monotonic()
         evidence_limit = resolve_hybrid_evidence_limit(
@@ -349,6 +357,8 @@ class HybridRetriever:
         deadline: float,
         generation: _ExecutorGeneration,
     ) -> tuple[RetrievalCandidate, ...]:
+        if self.reranker is None or self._reranker_metadata is None:
+            raise RuntimeError("reranker is disabled")
         candidates = tuple(fused[: self._rerank_top_k])
         if not candidates:
             return ()

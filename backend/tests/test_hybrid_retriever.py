@@ -276,6 +276,7 @@ def build_retriever(
     embedding: RecordingEmbedding | None = None,
     sparse_encoder: RecordingSparse | None = None,
     reranker: RecordingReranker | None = None,
+    reranker_enabled: bool = True,
     gateway_delay: float = 0.0,
     timeout: float = 5.0,
     final_top_k: int = 8,
@@ -287,6 +288,7 @@ def build_retriever(
     sparse_values = sparse or tuple(
         candidate(f"c{index:02d}", chunk_index=index) for index in range(49, -1, -1)
     )
+    resolved_reranker = (reranker or RecordingReranker()) if reranker_enabled else None
     return HybridRetriever(
         embedding=embedding or RecordingEmbedding(),
         sparse=sparse_encoder or RecordingSparse(),
@@ -296,9 +298,9 @@ def build_retriever(
             adjacent,
             delay=gateway_delay,
         ),
-        reranker=reranker or RecordingReranker(),
+        reranker=resolved_reranker,
         embedding_metadata=EMBEDDING,
-        reranker_metadata=RERANKER,
+        reranker_metadata=RERANKER if reranker_enabled else None,
         dense_top_k=50,
         sparse_top_k=50,
         rerank_top_k=24,
@@ -405,6 +407,38 @@ class HybridRetrieverTest(unittest.TestCase):
         )
         self.assertTrue(propagated)
         self.assertTrue(all(timeout is not None and 0 < timeout <= 5.0 for timeout in propagated))
+
+    def test_rrf_only_skips_reranker_and_preserves_fused_order(self) -> None:
+        reranker = RecordingReranker()
+        retriever = self.addCleanupFor(
+            build_retriever(
+                reranker=reranker,
+                reranker_enabled=False,
+                final_top_k=8,
+            )
+        )
+
+        outcome = retriever.retrieve(request())
+
+        self.assertEqual(reranker.batch_sizes, [])
+        self.assertEqual(len(outcome.candidates), 8)
+        self.assertTrue(all(item.rerank_score is None for item in outcome.candidates))
+        self.assertEqual(outcome.stage_ms["reranker"], 0.0)
+        self.assertEqual(
+            [item.chunk_id for item in outcome.candidates],
+            [item.chunk_id for item in sorted(outcome.candidates, key=lambda item: -item.rrf_score)],
+        )
+
+    def test_requires_reranker_and_metadata_to_be_enabled_together(self) -> None:
+        with self.assertRaisesRegex(ValueError, "reranker and reranker_metadata"):
+            HybridRetriever(
+                embedding=RecordingEmbedding(),
+                sparse=RecordingSparse(),
+                gateway=RecordingGateway((), (), ()),
+                reranker=None,
+                embedding_metadata=EMBEDDING,
+                reranker_metadata=RERANKER,
+            )
 
     def test_reuses_one_persistent_executor_across_requests(self) -> None:
         retriever = self.addCleanupFor(build_retriever())
