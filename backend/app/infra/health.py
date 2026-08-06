@@ -1117,7 +1117,12 @@ def validate_health_service_urls(
                 frozenset({"llama", "localhost"}),
             )
         )
-    if retrieval_settings is not None and retrieval_settings.mode is not RetrievalMode.LEGACY:
+    retrieval_enabled = (
+        retrieval_settings is not None
+        and retrieval_settings.mode is not RetrievalMode.LEGACY
+    )
+    reranker_enabled = retrieval_enabled and retrieval_settings.reranker_enabled
+    if reranker_enabled:
         services.append(
             (
                 "RERANKER_SERVICE_URL",
@@ -1171,6 +1176,7 @@ def build_dependency_checks(
     retrieval_enabled = (
         retrieval_settings is not None and retrieval_settings.mode is not RetrievalMode.LEGACY
     )
+    reranker_enabled = retrieval_enabled and retrieval_settings.reranker_enabled
     qdrant_check = _http_status_check(
         settings.qdrant_url,
         "/readyz",
@@ -1189,7 +1195,6 @@ def build_dependency_checks(
     if retrieval_enabled:
         assert retrieval_settings is not None
         assert retrieval_settings.embedding is not None
-        assert retrieval_settings.reranker is not None
         qdrant_check = _qdrant_retrieval_check(
             qdrant_check,
             retrieval_gateway,
@@ -1247,7 +1252,7 @@ def build_dependency_checks(
             embedding_check,
         ),
     ]
-    if retrieval_enabled:
+    if reranker_enabled:
         assert retrieval_settings is not None
         assert retrieval_settings.reranker is not None
         raw_checks.append(
@@ -1289,7 +1294,9 @@ def build_dependency_checks(
         for item in raw_checks
     ]
     if retrieval_enabled and retrieval_settings.mode is RetrievalMode.SHADOW:
-        retrieval_names = {"qdrant", "embedding", "reranker"}
+        retrieval_names = {"qdrant", "embedding"}
+        if reranker_enabled:
+            retrieval_names.add("reranker")
         bounded_checks = [
             DependencyCheck(item.name, _degraded_dependency(item.check))
             if item.name in retrieval_names

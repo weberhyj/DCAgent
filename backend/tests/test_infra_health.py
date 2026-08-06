@@ -192,6 +192,33 @@ def retrieval_health_responses(*, reranker_version: str = "1.0.0") -> dict[str, 
 
 
 class InfraHealthTest(unittest.TestCase):
+    def test_qwen3_rrf_only_health_omits_reranker_dependency(self) -> None:
+        environ = retrieval_health_environment()
+        environ["RERANKER_ENABLED"] = "false"
+        for key in tuple(environ):
+            if key == "RERANKER_SERVICE_URL" or key.startswith("RERANKER_MODEL_"):
+                environ.pop(key)
+        gateway = RetrievalHealthGateway()
+        http_client = RetrievalHealthHttpClient(retrieval_health_responses())
+
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=http_client,
+            retrieval_settings=RetrievalSettings.from_environ(environ),
+            retrieval_gateway=gateway,
+            retrieval_scope_provider=retrieval_scope_provider(gateway),
+        )
+        retrieval_checks = [
+            check for check in checks if check.name in {"qdrant", "embedding", "reranker"}
+        ]
+        for check in retrieval_checks:
+            check.check()
+
+        self.assertNotIn("reranker", {check.name for check in checks})
+        self.assertNotIn("http://127.0.0.1:8082/v1/metadata", http_client.urls)
+
     def test_qwen3_retrieval_health_checks_metadata_alias_and_dimension(self) -> None:
         environ = retrieval_health_environment()
         offline = OfflineSettings.from_environ(environ)
