@@ -36,6 +36,26 @@ def service_block(compose: str, service: str) -> str:
 
 
 class ComposeContractTest(unittest.TestCase):
+    def test_rrf_only_is_the_documented_default(self) -> None:
+        env_text = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("RERANKER_ENABLED=false", env_text)
+        self.assertIn("RETRIEVAL_FINAL_TOP_K=8", env_text)
+
+    def test_reranker_service_requires_explicit_profile(self) -> None:
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        reranker = service_block(compose, "reranker-service")
+        api = service_block(compose, "api")
+        worker = service_block(compose, "ingestion-worker")
+
+        self.assertIn('profiles: ["reranker"]', reranker)
+        self.assertIn("RERANKER_ENABLED: ${RERANKER_ENABLED:-false}", api)
+        self.assertIn("RERANKER_ENABLED: ${RERANKER_ENABLED:-false}", worker)
+
     def test_declares_required_offline_services_and_private_network(self) -> None:
         compose_path = REPO_ROOT / "deploy" / "offline" / "compose.yaml"
         text = compose_path.read_text(encoding="utf-8")
@@ -802,6 +822,23 @@ class ComposeContractTest(unittest.TestCase):
         optional_expansions = {
             "LLM_STREAM_PATH": ":-/api/physoc/deepseeks/stream",
             "LLM_API_KEY": ":-",
+            "RERANKER_ENABLED": ":-false",
+            "RERANKER_SERVICE_URL": ":-http://reranker-service:8082",
+            "RERANKER_MODEL_NAME": ":-",
+            "RERANKER_MODEL_VERSION": ":-",
+            "RERANKER_MODEL_SHA256": ":-",
+            "RERANKER_PROMPT_PROFILE_SHA256": ":-",
+            "RERANKER_PROTOCOL_VERSION": ":-",
+            "OLLAMA_RERANKER_MODEL": ":-",
+            "OLLAMA_GENERATE_PATH": ":-",
+            "OLLAMA_RERANK_FORMAT_JSON": ":-",
+            "OLLAMA_RERANK_NUM_PREDICT": ":-",
+            "OLLAMA_RERANK_BATCH_MAX_ITEMS": ":-",
+            "RERANKER_BATCH_MAX_ITEMS": ":-",
+            "RERANKER_QUEUE_MAX_ITEMS": ":-",
+            "RERANKER_BATCH_WAIT_MS": ":-",
+            "RERANKER_CPU_LIMIT": ":-4.0",
+            "RERANKER_MEMORY_LIMIT": ":-6g",
         }
         for name, suffix in expansions:
             with self.subTest(name=name, suffix=suffix):

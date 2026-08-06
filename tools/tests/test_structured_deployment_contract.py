@@ -80,6 +80,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             values = active_assignments(text)
             with self.subTest(path=path.relative_to(REPO_ROOT)):
+                offline_example = path == REPO_ROOT / "deploy" / "offline" / ".env.example"
                 for key in REQUIRED_ENV_KEYS:
                     self.assertIn(key, values)
                 self.assertEqual(values["STRUCTURED_QUERY_ENABLED"].lower(), "true")
@@ -93,21 +94,29 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     values["QDRANT_COLLECTION_ALIAS"], "knowledge_chunks_current"
                 )
                 self.assertEqual(values["RETRIEVAL_RERANK_TOP_K"], "8")
-                self.assertEqual(values["RETRIEVAL_DEGRADED_RERANK_TOP_K"], "4")
-                self.assertEqual(values["RETRIEVAL_FINAL_TOP_K"], "4")
+                if offline_example:
+                    self.assertEqual(values["RETRIEVAL_DEGRADED_RERANK_TOP_K"], "8")
+                    self.assertEqual(values["RETRIEVAL_FINAL_TOP_K"], "8")
+                    self.assertEqual(values["RERANKER_ENABLED"], "false")
+                else:
+                    self.assertEqual(values["RETRIEVAL_DEGRADED_RERANK_TOP_K"], "4")
+                    self.assertEqual(values["RETRIEVAL_FINAL_TOP_K"], "4")
                 self.assertEqual(values["RETRIEVAL_TOTAL_TIMEOUT_SECONDS"], "20")
-                self.assertEqual(values["EMBEDDING_MODEL_NAME"], "qwen2.5:0.5b")
-                self.assertEqual(
-                    values["EMBEDDING_MODEL_VERSION"], "ollama-qwen25-05b-v1"
+                expected_embedding_name = (
+                    "bge-large-zh-v1.5:latest" if offline_example else "qwen2.5:0.5b"
                 )
+                expected_embedding_version = (
+                    "ollama-bge-large-zh-v15-v1"
+                    if offline_example
+                    else "ollama-qwen25-05b-v1"
+                )
+                self.assertEqual(values["EMBEDDING_MODEL_NAME"], expected_embedding_name)
+                self.assertEqual(values["EMBEDDING_MODEL_VERSION"], expected_embedding_version)
                 self.assertRegex(values["EMBEDDING_MODEL_SHA256"], r"^[0-9a-f]{64}$")
-                self.assertRegex(
+                self.assertIn(
+                    "# Operator action: replace with the target Ollama /api/tags digest "
+                    f"for {expected_embedding_name}.",
                     text,
-                    r"(?m)^# Operator action: replace with the target Ollama "
-                    r"/api/tags digest for qwen2\.5:0\.5b\.\n"
-                    r"# Store the normalized 64 lowercase hex characters without "
-                    r"the optional sha256: prefix\.\n"
-                    r"EMBEDDING_MODEL_SHA256=[0-9a-f]{64}$",
                 )
                 dimensions = values["EMBEDDING_MODEL_DIMENSIONS"]
                 self.assertRegex(dimensions, r"^[1-9][0-9]*$")
@@ -121,9 +130,14 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     r"EMBEDDING_MODEL_DIMENSIONS=[1-9][0-9]*$",
                 )
                 self.assertEqual(values["EMBEDDING_MODEL_NORMALIZED"], "true")
+                expected_profile_sha256 = (
+                    "3d5db261732d456b51fa4f9aa89cb15054c21772c0809a50a31f0911eb960170"
+                    if offline_example
+                    else "fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10"
+                )
                 self.assertEqual(
                     values["EMBEDDING_ENCODING_PROFILE_SHA256"],
-                    "fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10",
+                    expected_profile_sha256,
                 )
                 self.assertEqual(values["RERANKER_MODEL_NAME"], "qwen2.5:3b")
                 self.assertEqual(
@@ -143,7 +157,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd",
                 )
                 self.assertEqual(values["OLLAMA_BASE_URL"], "http://172.16.0.10:11434")
-                self.assertEqual(values["OLLAMA_EMBEDDING_MODEL"], "qwen2.5:0.5b")
+                self.assertEqual(values["OLLAMA_EMBEDDING_MODEL"], expected_embedding_name)
                 self.assertEqual(values["OLLAMA_EMBEDDING_PATH"], "/api/embed")
                 self.assertEqual(values["OLLAMA_RERANKER_MODEL"], "qwen2.5:3b")
                 self.assertEqual(values["OLLAMA_GENERATE_PATH"], "/api/generate")
@@ -221,8 +235,13 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
             encoding="utf-8"
         )
-        for service in ("embedding-service", "reranker-service"):
-            self.assertNotRegex(service_block(compose, service), r"(?m)^\s+profiles:")
+        self.assertNotRegex(
+            service_block(compose, "embedding-service"), r"(?m)^\s+profiles:"
+        )
+        self.assertIn(
+            'profiles: ["reranker"]',
+            service_block(compose, "reranker-service"),
+        )
         for consumer in ("api", "ingestion-worker"):
             block = service_block(compose, consumer)
             depends_on = re.search(
