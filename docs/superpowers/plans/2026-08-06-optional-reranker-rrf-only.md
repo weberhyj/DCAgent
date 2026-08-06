@@ -438,7 +438,7 @@ Pass this into both `api` and `ingestion-worker`:
 RERANKER_ENABLED: ${RERANKER_ENABLED:-false}
 ```
 
-For Reranker-only variables passed into API and Worker, replace Compose interpolation that uses `:?` with empty defaults such as `${RERANKER_MODEL_NAME:-}`. Keep strict `:?` validation inside the optional `reranker-service`; enabling its profile without complete settings must still fail before becoming healthy.
+For every Reranker-only variable in Compose, including values passed into the optional `reranker-service`, replace interpolation that uses `:?` with empty defaults such as `${RERANKER_MODEL_NAME:-}`. Docker Compose may expand inactive-profile services during `config`, so `:?` would incorrectly make Reranker configuration mandatory in RRF-only mode. When the `reranker` profile is explicitly enabled, `backend/app/reranker_service.py` keeps strict runtime validation through `_required()` and its startup health checks, so incomplete configuration still fails before becoming healthy.
 
 - [ ] **Step 4: Run Compose contract tests**
 
