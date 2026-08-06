@@ -403,6 +403,48 @@ class FakeRunner:
 
 
 class ComposeSmokeTest(unittest.TestCase):
+    def test_rrf_only_up_omits_reranker_service(self) -> None:
+        compose_smoke = _module()
+
+        command = compose_smoke.build_compose_command("up", reranker_enabled=False)
+
+        self.assertIn("embedding-service", command)
+        self.assertIn("api", command)
+        self.assertNotIn("reranker-service", command)
+
+    def test_rrf_only_checks_omit_reranker_probes(self) -> None:
+        compose_smoke = _module()
+
+        checks = compose_smoke._checks(
+            compose_smoke.DEFAULT_WRAPPER_PATH,
+            reranker_enabled=False,
+        )
+
+        self.assertFalse(any(check.component == "reranker" for check in checks))
+
+    def test_rrf_only_report_marks_reranker_disabled_without_running_it(self) -> None:
+        compose_smoke = _module()
+        runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text("RERANKER_ENABLED=false\n", encoding="utf-8")
+            report = compose_smoke.run_compose_smoke(
+                env_path=env_path,
+                report_path=Path(directory) / "report.json",
+                runner=runner,
+                hardware_collector=lambda: {},
+                software_collector=lambda: {},
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(
+            report["readyResults"]["reranker"],
+            {"status": "disabled", "enabled": False},
+        )
+        self.assertFalse(
+            any(runner._key(command).startswith("reranker") for command, _ in runner.calls)
+        )
+
     def test_adapter_helpers_bound_response_reads_and_fail_closed_when_oversized(
         self,
     ) -> None:
@@ -965,8 +1007,8 @@ class ComposeSmokeTest(unittest.TestCase):
             assert match is not None
             return match.group("body")
 
-        for service in ("embedding-service", "reranker-service"):
-            self.assertNotRegex(block(service), r"(?m)^\s+profiles:")
+        self.assertNotRegex(block("embedding-service"), r"(?m)^\s+profiles:")
+        self.assertIn('profiles: ["reranker"]', block("reranker-service"))
         for consumer in ("api", "ingestion-worker"):
             depends_on = re.search(
                 r"(?ms)^    depends_on:\n(?P<body>.*?)(?=^    [a-z_]+:|\Z)",

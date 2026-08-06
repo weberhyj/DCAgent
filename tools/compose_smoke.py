@@ -34,6 +34,7 @@ def default_wrapper_path() -> Path:
 
 
 DEFAULT_WRAPPER_PATH = default_wrapper_path()
+DEFAULT_ENV_PATH = REPO_ROOT / "deploy" / "offline" / ".env"
 DEFAULT_REPORT_PATH = REPO_ROOT / "artifacts" / "benchmarks" / "compose-smoke.json"
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 APPROVED_EMBEDDING_MODEL = "qwen2.5:0.5b"
@@ -193,11 +194,38 @@ def _wrapper_prefix(wrapper_path: Path) -> list[str]:
     raise ValueError("wrapper_path must end with .sh or .ps1")
 
 
+def _read_env_value(path: Path, key: str) -> str | None:
+    if not path.is_file():
+        return None
+    value: str | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        candidate_key, candidate_value = stripped.split("=", 1)
+        if candidate_key.strip() == key:
+            value = candidate_value.strip()
+    return value
+
+
+def _read_env_bool(path: Path, key: str, *, default: bool) -> bool:
+    value = _read_env_value(path, key)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{key} must be true or false")
+
+
 def build_compose_command(
     action: str,
     *arguments: str,
     wrapper_path: Path = DEFAULT_WRAPPER_PATH,
     remove_volumes: bool = False,
+    reranker_enabled: bool = True,
 ) -> list[str]:
     """Build one fixed argv invocation of the offline Compose wrapper."""
 
@@ -217,15 +245,17 @@ def build_compose_command(
     if action == "up":
         if arguments:
             raise ValueError("up does not accept extra arguments")
+        services = ["embedding-service"]
+        if reranker_enabled:
+            services.append("reranker-service")
+        services.append("api")
         return prefix + [
             "up",
             "-d",
             "--build",
             "--wait",
             "--remove-orphans",
-            "embedding-service",
-            "reranker-service",
-            "api",
+            *services,
         ]
     if action == "version":
         if arguments:
@@ -547,7 +577,11 @@ class _Check:
     operation: str | None = None
 
 
-def _checks(wrapper_path: Path) -> tuple[_Check, ...]:
+def _checks(
+    wrapper_path: Path,
+    *,
+    reranker_enabled: bool = True,
+) -> tuple[_Check, ...]:
     return (
         _Check(
             "postgres",
@@ -705,24 +739,28 @@ def _checks(wrapper_path: Path) -> tuple[_Check, ...]:
             for operation in ("ready", "metadata", "embeddings")
         ),
         *(
-            _Check(
-                f"reranker.{operation}",
-                "reranker",
-                tuple(
-                    build_compose_command(
-                        "exec",
-                        "reranker-service",
-                        "python",
-                        "-c",
-                        _reranker_probe_script(operation),
-                        wrapper_path=wrapper_path,
-                    )
-                ),
-                ADAPTER_PROBE_TIMEOUT_SECONDS,
-                "reranker",
-                operation,
+            (
+                _Check(
+                    f"reranker.{operation}",
+                    "reranker",
+                    tuple(
+                        build_compose_command(
+                            "exec",
+                            "reranker-service",
+                            "python",
+                            "-c",
+                            _reranker_probe_script(operation),
+                            wrapper_path=wrapper_path,
+                        )
+                    ),
+                    ADAPTER_PROBE_TIMEOUT_SECONDS,
+                    "reranker",
+                    operation,
+                )
+                for operation in ("ready", "metadata", "rerank")
             )
-            for operation in ("ready", "metadata", "rerank")
+            if reranker_enabled
+            else ()
         ),
         # The API is published on the host loopback interface.  Probe that
         # binding directly so a container-internal loopback cannot mask a bad
@@ -1011,6 +1049,7 @@ def _write_atomic(path: Path, payload: Mapping[str, object]) -> None:
 def run_compose_smoke(
     *,
     wrapper_path: Path = DEFAULT_WRAPPER_PATH,
+    env_path: Path = DEFAULT_ENV_PATH,
     report_path: Path = DEFAULT_REPORT_PATH,
     remove_volumes: bool = False,
     runner: Runner = _default_runner,
@@ -1031,6 +1070,11 @@ def run_compose_smoke(
     if wrapper not in expected_wrappers:
         raise ValueError("offline smoke must use the repository Compose wrapper")
     migration_head = _discover_migration_head()
+    reranker_enabled = _read_env_bool(
+        Path(env_path),
+        "RERANKER_ENABLED",
+        default=True,
+    )
     failures: list[str] = []
     component_versions: dict[str, str] = {}
     ready_results: dict[str, object] = {}
@@ -1041,9 +1085,13 @@ def run_compose_smoke(
     }
     adapter_payloads: dict[str, dict[str, object]] = {
         "embedding": {},
-        "reranker": {},
     }
-    for check in _checks(wrapper):
+    if reranker_enabled:
+        adapter_payloads["reranker"] = {}
+    else:
+        ready_results["reranker"] = {"status": "disabled", "enabled": False}
+    checks = _checks(wrapper, reranker_enabled=reranker_enabled)
+    for check in checks:
         command_exit_codes[check.name] = None
     command_exit_codes["down"] = None
     active_exception: BaseException | None = None
@@ -1058,7 +1106,11 @@ def run_compose_smoke(
             failures.append("command:config")
         else:
             up = runner(
-                build_compose_command("up", wrapper_path=wrapper),
+                build_compose_command(
+                    "up",
+                    wrapper_path=wrapper,
+                    reranker_enabled=reranker_enabled,
+                ),
                 shell=False,
                 timeout_seconds=COMMAND_TIMEOUT_SECONDS,
             )
@@ -1081,7 +1133,7 @@ def run_compose_smoke(
                         )
                     except ValueError:
                         failures.append("version:compose")
-                for check in _checks(wrapper):
+                for check in checks:
                     result = runner(
                         check.command,
                         shell=False,
@@ -1128,7 +1180,12 @@ def run_compose_smoke(
                         component_versions[check.component] = version_value
                     if not ok:
                         failures.append(f"check:{check.name}")
-                for adapter_name in ("embedding", "reranker"):
+                adapter_names = (
+                    ("embedding", "reranker")
+                    if reranker_enabled
+                    else ("embedding",)
+                )
+                for adapter_name in adapter_names:
                     adapter_check = _Check(adapter_name, adapter_name, ())
                     try:
                         ok, _, details = _validate_check(

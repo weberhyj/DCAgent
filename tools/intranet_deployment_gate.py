@@ -75,10 +75,9 @@ _TIMEOUTS = {
     "metadata": 60,
     "recovery_drill": 120,
 }
-_SERVICES = (
+_BASE_SERVICES = (
     "schema-migration",
     "embedding-service",
-    "reranker-service",
     "api",
     "ingestion-worker",
 )
@@ -236,6 +235,25 @@ def _read_setting(repo_root: Path, key: str, default: str = "") -> str:
     except OSError:
         pass
     return default
+
+
+def _read_bool_setting(repo_root: Path, key: str, *, default: bool) -> bool:
+    value = _read_setting(repo_root, key, "")
+    if not value:
+        return default
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise GateError(f"{key} must be true or false")
+
+
+def _compose_services(*, reranker_enabled: bool) -> tuple[str, ...]:
+    services = list(_BASE_SERVICES)
+    if reranker_enabled:
+        services.insert(2, "reranker-service")
+    return tuple(services)
 
 
 def _configured_url(repo_root: Path, endpoint: str) -> str:
@@ -894,6 +912,11 @@ def run_gate(
         if config.deployment_mode == "fresh" and config.state_root is not None:
             raise GateError("fresh mode does not accept --state-root")
         config = replace(config, repo_root=config.repo_root.resolve())
+        reranker_enabled = _read_bool_setting(
+            config.repo_root,
+            "RERANKER_ENABLED",
+            default=True,
+        )
         prepare = [str(config.repo_root / "tools" / "prepare_offline_env.sh")]
         prepare_commands: list[list[str]] = []
         if config.deployment_mode == "fresh":
@@ -912,7 +935,16 @@ def run_gate(
         commands: list[tuple[str, list[list[str]]]] = [
             ("prepare", prepare_commands),
             ("compose_config", [_compose_command(config, "config")]),
-            ("compose_build", [_compose_command(config, "build", *_SERVICES)]),
+            (
+                "compose_build",
+                [
+                    _compose_command(
+                        config,
+                        "build",
+                        *_compose_services(reranker_enabled=reranker_enabled),
+                    )
+                ],
+            ),
             ("compose_up", [_compose_command(config, "up", "-d")]),
             (
                 "readyz",
@@ -954,7 +986,7 @@ def run_gate(
             ),
             (
                 "ollama_generate",
-                [
+                [] if not reranker_enabled else [
                     _probe_command(
                         _OLLAMA_PROBE,
                         _configured_url(config.repo_root, "/api/generate"),
@@ -996,6 +1028,19 @@ def run_gate(
             ),
         ]
         for category, category_commands in commands:
+            if category == "ollama_generate" and not reranker_enabled:
+                timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                steps.append(
+                    {
+                        "category": category,
+                        "started_at": timestamp,
+                        "finished_at": timestamp,
+                        "exit_code": None,
+                        "duration_ms": 0,
+                        "sanitized_status": "disabled",
+                    }
+                )
+                continue
             step, ok = _record_step(category, category_commands, config, runner)
             steps.append(step)
             if not ok:

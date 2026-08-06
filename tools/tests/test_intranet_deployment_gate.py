@@ -121,6 +121,34 @@ class IntranetDeploymentGateTests(unittest.TestCase):
         )
         return root
 
+    def test_rrf_only_skips_reranker_build_and_ollama_generate_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = root / "deploy" / "offline" / ".env"
+            env.parent.mkdir(parents=True)
+            env.write_text("RERANKER_ENABLED=false\n", encoding="utf-8")
+            runner = RecordingRunner()
+
+            report = run_gate(
+                self.config(root),
+                runner=runner,
+                _test_allow_portable_cleanup=True,
+            )
+
+        build_call = next(
+            argv
+            for argv, _ in runner.calls
+            if "offline_compose.py" in " ".join(argv) and "build" in argv
+        )
+        self.assertNotIn("reranker-service", build_call)
+        self.assertFalse(any("/api/generate" in " ".join(argv) for argv, _ in runner.calls))
+        generate_step = next(
+            step for step in report["steps"] if step["category"] == "ollama_generate"
+        )
+        self.assertEqual(generate_step["exit_code"], None)
+        self.assertEqual(generate_step["sanitized_status"], "disabled")
+        self.assertEqual(report["status"], "passed")
+
     def test_fresh_runs_fixed_categories_and_timeouts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
