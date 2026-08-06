@@ -31,6 +31,33 @@ def private_hybrid_environment() -> dict[str, str]:
 
 
 class RetrievalSettingsTest(unittest.TestCase):
+    def test_rrf_only_does_not_require_reranker_service_or_metadata(self) -> None:
+        environ = private_hybrid_environment()
+        environ["RERANKER_ENABLED"] = "false"
+        for key in tuple(environ):
+            if key == "RERANKER_SERVICE_URL" or key.startswith("RERANKER_MODEL_"):
+                environ.pop(key)
+
+        settings = RetrievalSettings.from_environ(environ)
+
+        self.assertFalse(settings.reranker_enabled)
+        self.assertIsNone(settings.reranker_service_url)
+        self.assertIsNone(settings.reranker)
+
+    def test_reranker_remains_enabled_by_default(self) -> None:
+        settings = RetrievalSettings.from_environ(private_hybrid_environment())
+
+        self.assertTrue(settings.reranker_enabled)
+        self.assertIsNotNone(settings.reranker_service_url)
+        self.assertIsNotNone(settings.reranker)
+
+    def test_rejects_invalid_reranker_enabled_value(self) -> None:
+        environ = private_hybrid_environment()
+        environ["RERANKER_ENABLED"] = "sometimes"
+
+        with self.assertRaisesRegex(ValueError, "RERANKER_ENABLED must be a boolean"):
+            RetrievalSettings.from_environ(environ)
+
     def test_exposes_immutable_embedding_fingerprint_for_configured_embedding(self) -> None:
         settings = RetrievalSettings.from_environ(private_hybrid_environment())
 

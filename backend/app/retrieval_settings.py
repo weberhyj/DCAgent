@@ -141,6 +141,7 @@ def _reranker_metadata(environ: Mapping[str, str]) -> RerankerModelSettings:
 @dataclass(frozen=True, slots=True)
 class RetrievalSettings:
     mode: RetrievalMode
+    reranker_enabled: bool
     knowledge_base_id: str
     permission_tags: tuple[str, ...]
     dense_top_k: int
@@ -175,6 +176,11 @@ class RetrievalSettings:
                 "RETRIEVAL_MODE must be legacy, shadow, or qwen3"
             ) from error
 
+        try:
+            reranker_enabled = parse_bool(environ.get("RERANKER_ENABLED"), default=True)
+        except ValueError as error:
+            raise RetrievalSettingsError("RERANKER_ENABLED must be a boolean") from error
+
         knowledge_base_id = environ.get("RETRIEVAL_KNOWLEDGE_BASE_ID", "default").strip()
         if not knowledge_base_id:
             raise RetrievalSettingsError("RETRIEVAL_KNOWLEDGE_BASE_ID must not be empty")
@@ -207,6 +213,7 @@ class RetrievalSettings:
         if mode is RetrievalMode.LEGACY:
             return cls(
                 mode=mode,
+                reranker_enabled=reranker_enabled,
                 knowledge_base_id=knowledge_base_id,
                 permission_tags=(),
                 dense_top_k=dense_top_k,
@@ -227,6 +234,8 @@ class RetrievalSettings:
             )
 
         permission_tags = _permission_tags(environ)
+        reranker_service_url: str | None = None
+        reranker: RerankerModelSettings | None = None
         try:
             qdrant_url = require_private_url(
                 environ.get("QDRANT_URL", "http://127.0.0.1:6333"), "qdrant_url"
@@ -235,15 +244,19 @@ class RetrievalSettings:
                 environ.get("EMBEDDING_SERVICE_URL", "http://127.0.0.1:8081"),
                 "embedding_service_url",
             )
-            reranker_service_url = require_private_url(
-                environ.get("RERANKER_SERVICE_URL", "http://127.0.0.1:8082"),
-                "reranker_service_url",
-            )
+            if reranker_enabled:
+                reranker_service_url = require_private_url(
+                    environ.get("RERANKER_SERVICE_URL", "http://127.0.0.1:8082"),
+                    "reranker_service_url",
+                )
         except ValueError as error:
             raise RetrievalSettingsError(str(error)) from error
+        if reranker_enabled:
+            reranker = _reranker_metadata(environ)
 
         return cls(
             mode=mode,
+            reranker_enabled=reranker_enabled,
             knowledge_base_id=knowledge_base_id,
             permission_tags=permission_tags,
             dense_top_k=dense_top_k,
@@ -263,5 +276,5 @@ class RetrievalSettings:
                 environ,
                 prefix="EMBEDDING",
             ),
-            reranker=_reranker_metadata(environ),
+            reranker=reranker,
         )
