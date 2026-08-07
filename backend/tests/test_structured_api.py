@@ -200,6 +200,9 @@ class StructuredApiTest(unittest.TestCase):
         self.assertEqual(first.json()["datasets"][0]["columns"][0]["allowAggregate"], True)
 
     def test_publication_post_only_enqueues_and_status_reports_job(self) -> None:
+        with self.database.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+
         client = self.build_client()
         source_id = self.upload_xlsx(client)
         client.get("/api/knowledge/sources")

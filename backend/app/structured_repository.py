@@ -468,6 +468,7 @@ class StructuredRepository:
                 error_message=None,
             )
             session.add(publication)
+            session.flush()
             session.add(job)
             self._refresh_source_publication_state(session, source)
             session.flush()
