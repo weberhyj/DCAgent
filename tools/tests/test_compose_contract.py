@@ -109,6 +109,7 @@ class ComposeContractTest(unittest.TestCase):
                 "EMBEDDING_BATCH_WAIT_MS",
             ),
             "reranker-service": (
+                "RERANKER_RUNTIME",
                 "RERANKER_MODEL_SHA256",
                 "OLLAMA_BASE_URL",
                 "OLLAMA_RERANKER_MODEL",
@@ -118,6 +119,11 @@ class ComposeContractTest(unittest.TestCase):
                 "OLLAMA_RERANK_FORMAT_JSON",
                 "OLLAMA_RERANK_NUM_PREDICT",
                 "OLLAMA_RERANK_BATCH_MAX_ITEMS",
+                "LLAMA_CPP_RERANKER_URL",
+                "LLAMA_CPP_RERANKER_PATH",
+                "LLAMA_CPP_RERANKER_MODEL",
+                "LLAMA_CPP_RERANK_TIMEOUT_SECONDS",
+                "LLAMA_CPP_RERANK_BATCH_MAX_ITEMS",
                 "RERANKER_BATCH_MAX_ITEMS",
                 "RERANKER_QUEUE_MAX_ITEMS",
                 "RERANKER_BATCH_WAIT_MS",
@@ -136,7 +142,8 @@ class ComposeContractTest(unittest.TestCase):
                 self.assertNotRegex(block, r"(?m)^\s+volumes:")
                 self.assertNotIn("MODEL_ROOT", block)
                 self.assertNotIn("MODEL_DIR", block)
-                self.assertNotIn("_RUNTIME", block)
+                if service == "embedding-service":
+                    self.assertNotIn("EMBEDDING_RUNTIME", block)
                 self.assertNotIn("OMP_NUM_THREADS", block)
                 self.assertNotIn("OPENVINO_NUM_THREADS", block)
                 for variable in variables:
@@ -782,11 +789,17 @@ class ComposeContractTest(unittest.TestCase):
             "RERANKER_MODEL_SHA256": ":-",
             "RERANKER_PROMPT_PROFILE_SHA256": ":-",
             "RERANKER_PROTOCOL_VERSION": ":-",
+            "RERANKER_RUNTIME": ":-ollama",
             "OLLAMA_RERANKER_MODEL": ":-",
             "OLLAMA_GENERATE_PATH": ":-",
             "OLLAMA_RERANK_FORMAT_JSON": ":-",
             "OLLAMA_RERANK_NUM_PREDICT": ":-",
             "OLLAMA_RERANK_BATCH_MAX_ITEMS": ":-",
+            "LLAMA_CPP_RERANKER_URL": ":-",
+            "LLAMA_CPP_RERANKER_PATH": ":-/v1/rerank",
+            "LLAMA_CPP_RERANKER_MODEL": ":-",
+            "LLAMA_CPP_RERANK_TIMEOUT_SECONDS": ":-10",
+            "LLAMA_CPP_RERANK_BATCH_MAX_ITEMS": ":-32",
             "RERANKER_BATCH_MAX_ITEMS": ":-",
             "RERANKER_QUEUE_MAX_ITEMS": ":-",
             "RERANKER_BATCH_WAIT_MS": ":-",

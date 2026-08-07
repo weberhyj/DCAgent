@@ -1,5 +1,13 @@
 <script setup lang="ts">
 import { Bot, Database, LayoutDashboard, ListChecks, ShieldCheck } from 'lucide-vue-next'
+import { onMounted } from 'vue'
+import { useBackendVersion } from '@/composables/useBackendVersion'
+
+const { displayVersion, load: loadBackendVersion } = useBackendVersion()
+
+onMounted(() => {
+  void loadBackendVersion()
+})
 
 const navigation = [
   { name: 'overview', label: '管理概览', icon: LayoutDashboard },
@@ -50,6 +58,7 @@ const navigation = [
         <span class="admin-topbar__service">
           <i aria-hidden="true" />
           服务运行中
+          <small data-testid="backend-version">{{ displayVersion }}</small>
         </span>
       </header>
 
@@ -217,6 +226,14 @@ const navigation = [
   border-radius: 50%;
   background: #16a36f;
   box-shadow: 0 0 0 4px rgba(22, 163, 111, 0.12);
+}
+
+.admin-topbar__service small {
+  padding-left: 8px;
+  border-left: 1px solid #c5d0dc;
+  color: #7a8999;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
 }
 
 .admin-content {

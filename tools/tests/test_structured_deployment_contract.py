@@ -48,7 +48,6 @@ REMOVED_LOCAL_ADAPTER_KEYS = (
     "EMBEDDING_THREADS",
     "RERANKER_MODEL_DIR",
     "RERANKER_MODEL_ROOT",
-    "RERANKER_RUNTIME",
     "RERANKER_MAX_LENGTH",
     "RERANKER_THREADS",
 )
@@ -135,20 +134,36 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                     values["EMBEDDING_ENCODING_PROFILE_SHA256"],
                     expected_profile_sha256,
                 )
-                self.assertEqual(values["RERANKER_MODEL_NAME"], "qwen2.5:3b")
-                self.assertEqual(values["RERANKER_MODEL_VERSION"], "ollama-qwen25-3b-v1")
-                self.assertRegex(values["RERANKER_MODEL_SHA256"], r"^[0-9a-f]{64}$")
-                self.assertRegex(
-                    text,
-                    r"(?m)^# Operator action: replace with the target Ollama "
-                    r"/api/tags digest for qwen2\.5:3b\.\n"
-                    r"# Store the normalized 64 lowercase hex characters without "
-                    r"the optional sha256: prefix\.\n"
-                    r"RERANKER_MODEL_SHA256=[0-9a-f]{64}$",
+                expected_reranker_name = (
+                    "bge-reranker-v2-m3-Q4_K_M.gguf" if offline_example else "qwen2.5:3b"
                 )
+                expected_reranker_version = (
+                    "llama-cpp-bge-reranker-v2-m3-q4km-v1"
+                    if offline_example
+                    else "ollama-qwen25-3b-v1"
+                )
+                self.assertEqual(values["RERANKER_MODEL_NAME"], expected_reranker_name)
+                self.assertEqual(values["RERANKER_MODEL_VERSION"], expected_reranker_version)
+                self.assertRegex(values["RERANKER_MODEL_SHA256"], r"^[0-9a-f]{64}$")
+                if offline_example:
+                    self.assertEqual(values["RERANKER_RUNTIME"], "llama_cpp")
+                    self.assertEqual(values["LLAMA_CPP_RERANKER_MODEL"], expected_reranker_name)
+                else:
+                    self.assertRegex(
+                        text,
+                        r"(?m)^# Operator action: replace with the target Ollama "
+                        r"/api/tags digest for qwen2\.5:3b\.\n"
+                        r"# Store the normalized 64 lowercase hex characters without "
+                        r"the optional sha256: prefix\.\n"
+                        r"RERANKER_MODEL_SHA256=[0-9a-f]{64}$",
+                    )
                 self.assertEqual(
                     values["RERANKER_PROMPT_PROFILE_SHA256"],
-                    "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd",
+                    (
+                        "6f7fb308e56ddbdb5e2cf8536141b9d038e5fe69e12791c9a5142e6e68ef0cc9"
+                        if offline_example
+                        else "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd"
+                    ),
                 )
                 self.assertEqual(values["OLLAMA_BASE_URL"], "http://172.16.0.10:11434")
                 self.assertEqual(values["OLLAMA_EMBEDDING_MODEL"], expected_embedding_name)

@@ -19,6 +19,7 @@ from loguru import logger
 from pydantic import BeforeValidator
 from starlette.concurrency import run_in_threadpool
 
+from . import __version__
 from .evaluation import (
     EvaluationCaseDuplicateError,
     EvaluationCaseFilterStatus,
@@ -40,6 +41,7 @@ from .llm import LLMProviderError
 from .repository import ChatRepository
 from .schemas import (
     AgentRunAudit,
+    ApplicationVersion,
     ChatMessage,
     ConversationBundle,
     EvaluationBatch,
@@ -109,6 +111,11 @@ async def health() -> dict[str, str]:
 @router.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/version", response_model=ApplicationVersion)
+async def application_version() -> ApplicationVersion:
+    return ApplicationVersion(version=__version__)
 
 
 @router.get("/readyz")

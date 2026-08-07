@@ -27,6 +27,18 @@ const http = axios.create({
   timeout: 15000,
 })
 
+interface ApplicationVersionResponse {
+  version: string
+}
+
+export async function fetchBackendVersion() {
+  const { data } = await http.get<ApplicationVersionResponse>('/version')
+  if (!/^\d+\.\d+\.\d+$/.test(data.version)) {
+    throw new Error('Invalid backend version response')
+  }
+  return data.version
+}
+
 export async function fetchKnowledgeSources() {
   const { data } = await http.get<KnowledgeSource[]>('/knowledge/sources')
   return data

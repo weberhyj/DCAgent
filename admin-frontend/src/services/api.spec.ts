@@ -54,6 +54,21 @@ describe('knowledge api service', () => {
     vi.resetModules()
   })
 
+  it('loads the backend application version', async () => {
+    httpMock.get.mockResolvedValue({ data: { version: '0.1.9' } })
+    const { fetchBackendVersion } = await loadApi()
+
+    await expect(fetchBackendVersion()).resolves.toBe('0.1.9')
+    expect(httpMock.get).toHaveBeenCalledWith('/version')
+  })
+
+  it('rejects an invalid backend application version response', async () => {
+    httpMock.get.mockResolvedValue({ data: { version: 'unknown' } })
+    const { fetchBackendVersion } = await loadApi()
+
+    await expect(fetchBackendVersion()).rejects.toThrow('Invalid backend version response')
+  })
+
   it('posts multiple upload files with the backend batch field name', async () => {
     httpMock.post.mockResolvedValue({ data: [source] })
     const { uploadKnowledgeFiles } = await loadApi()

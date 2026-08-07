@@ -1,6 +1,7 @@
 import { mount } from '@vue/test-utils'
 import { computed, nextTick, shallowRef } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import manifest from '../../../../package.json'
 import ChatShell from '../ChatShell.vue'
 import KnowledgeSearchHero from '../KnowledgeSearchHero.vue'
 
@@ -77,6 +78,23 @@ describe('ChatShell', () => {
     expect(wrapper.find('[data-testid="admin-knowledge-drawer"]').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('内部知识检索')
     expect(wrapper.text()).not.toContain('新建搜查')
+  })
+
+  it('shows only the user frontend version in the lower-left page corner', () => {
+    const wrapper = mount(ChatShell, {
+      global: {
+        stubs: {
+          QuantumNetworkBackground: true,
+          ChatTranscript: true,
+          ComposerBar: true,
+        },
+      },
+    })
+
+    const version = wrapper.get('[data-testid="user-app-version"]')
+    expect(version.text()).toBe(`v${manifest.version}`)
+    expect(version.classes()).toContain('app-version')
+    expect(wrapper.text()).not.toContain('后端版本')
   })
 
   it('keeps empty background clicks available for quantum pulse interactions', () => {

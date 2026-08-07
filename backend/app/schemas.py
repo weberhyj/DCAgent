@@ -97,6 +97,10 @@ class ApiModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class ApplicationVersion(ApiModel):
+    version: str
+
+
 class Citation(ApiModel):
     label: str
     classification: str

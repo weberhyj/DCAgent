@@ -11,6 +11,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app import reranker_service
+from app.llama_cpp_reranker_backend import LLAMA_CPP_RERANK_PROFILE_SHA256
 from app.ollama_client import OllamaResponseError, OllamaServiceError
 from app.ollama_reranker_backend import (
     RERANK_PROMPT_PROFILE_SHA256,
@@ -205,6 +206,27 @@ def production_metadata() -> RerankerModelMetadata:
 
 
 class RerankerServiceTest(unittest.TestCase):
+    def test_llama_cpp_runtime_selects_native_backend(self) -> None:
+        environ = production_environment(
+            RERANKER_RUNTIME="llama_cpp",
+            RERANKER_PROMPT_PROFILE_SHA256=LLAMA_CPP_RERANK_PROFILE_SHA256,
+            LLAMA_CPP_RERANKER_URL="http://127.0.0.1:8089",
+            LLAMA_CPP_RERANKER_MODEL="qwen-test",
+            LLAMA_CPP_RERANK_TIMEOUT_SECONDS="5",
+        )
+        backend = CloseTrackingBackend()
+        with (
+            patch("app.reranker_service.SyncLlamaCppRerankClient") as client_type,
+            patch(
+                "app.reranker_service.LlamaCppRerankerBackend", return_value=backend
+            ) as backend_type,
+        ):
+            app = create_production_app(environ=environ)
+            with TestClient(app) as test_client:
+                self.assertEqual(test_client.get("/readyz").status_code, 200)
+        client_type.assert_called_once_with("http://127.0.0.1:8089", timeout_seconds=5.0)
+        backend_type.assert_called_once()
+
     def test_production_lifecycle_loads_environment_backend_and_resets_state(self) -> None:
         environ = production_environment()
         backend = CloseTrackingBackend()

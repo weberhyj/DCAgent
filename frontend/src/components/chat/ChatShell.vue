@@ -7,6 +7,7 @@ import CompanyBrand from './CompanyBrand.vue'
 import KnowledgeSearchHero from './KnowledgeSearchHero.vue'
 import { useChat } from '@/composables/useChat'
 import type { ComposerMode } from '@/types/chat'
+import { APP_VERSION_LABEL } from '@/version'
 
 const QuantumNetworkBackground = defineAsyncComponent(() => import('./QuantumNetworkBackground.vue'))
 const HERO_CLOSING_DURATION_MS = 720
@@ -253,6 +254,10 @@ function handleSend(payload: { content: string; mode: ComposerMode }) {
 
     <CompanyBrand />
 
+    <span class="app-version" data-testid="user-app-version">
+      {{ APP_VERSION_LABEL }}
+    </span>
+
     <section
       class="knowledge-workspace"
       :class="{ 'knowledge-workspace--empty': isHeroVisible }"
@@ -315,6 +320,18 @@ function handleSend(payload: { content: string; mode: ComposerMode }) {
 
 .quantum-bg {
   z-index: 0;
+}
+
+.app-version {
+  position: absolute;
+  bottom: 18px;
+  left: 26px;
+  z-index: 4;
+  color: rgba(207, 230, 239, 0.56);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  pointer-events: none;
 }
 
 .knowledge-workspace {
@@ -409,6 +426,11 @@ function handleSend(payload: { content: string; mode: ComposerMode }) {
 
   .app-shell::before {
     opacity: 0.56;
+  }
+
+  .app-version {
+    bottom: 12px;
+    left: 14px;
   }
 
   .knowledge-workspace {

@@ -19,6 +19,13 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
 
 from .inference_batching import DynamicBatcher, InferenceQueueFull
+from .llama_cpp_reranker_backend import (
+    DEFAULT_LLAMA_CPP_RERANK_BATCH_MAX_ITEMS,
+    DEFAULT_LLAMA_CPP_RERANKER_PATH,
+    LLAMA_CPP_RERANK_PROFILE_SHA256,
+    LlamaCppRerankerBackend,
+    SyncLlamaCppRerankClient,
+)
 from .offline_artifacts import is_local_filesystem_path
 from .ollama_client import SyncOllamaClient
 from .ollama_reranker_backend import (
@@ -227,12 +234,18 @@ def create_production_app(
         backend: RerankerBackend | None = None
         batcher: DynamicBatcher[tuple[str, str], float] | None = None
         try:
-            metadata = _load_environment_metadata(target)
+            runtime = _reranker_runtime(target)
+            metadata = _load_environment_metadata(target, runtime=runtime)
             max_items = _positive_int(target, "RERANKER_BATCH_MAX_ITEMS", MAX_RERANK_PASSAGES)
             max_queue_items = _positive_int(target, "RERANKER_QUEUE_MAX_ITEMS", 192)
             _validate_batch_capacity(max_items, max_queue_items)
             wait_ms = _nonnegative_float(target, "RERANKER_BATCH_WAIT_MS", 10.0)
-            loader = _load_ollama_reranker_backend if backend_loader is None else backend_loader
+            if backend_loader is not None:
+                loader = backend_loader
+            elif runtime == "llama_cpp":
+                loader = _load_llama_cpp_reranker_backend
+            else:
+                loader = _load_ollama_reranker_backend
             backend = await run_in_threadpool(loader, target, metadata)
             await run_in_threadpool(_validate_reranker_backend_startup, backend)
             batcher = DynamicBatcher(
@@ -264,7 +277,16 @@ def create_production_app(
     return _build_reranker_app(lifespan=lifespan)
 
 
-def _load_environment_metadata(environ: Mapping[str, str]) -> RerankerModelMetadata:
+def _reranker_runtime(environ: Mapping[str, str]) -> str:
+    runtime = environ.get("RERANKER_RUNTIME", "ollama").strip().lower().replace("-", "_")
+    if runtime not in {"ollama", "llama_cpp"}:
+        raise ValueError("RERANKER_RUNTIME must be ollama or llama_cpp")
+    return runtime
+
+
+def _load_environment_metadata(
+    environ: Mapping[str, str], *, runtime: str = "ollama"
+) -> RerankerModelMetadata:
     name = _required(environ, "RERANKER_MODEL_NAME")
     version = _required(environ, "RERANKER_MODEL_VERSION")
     sha256 = _required(environ, "RERANKER_MODEL_SHA256")
@@ -277,8 +299,13 @@ def _load_environment_metadata(environ: Mapping[str, str]) -> RerankerModelMetad
         raise ValueError(
             "RERANKER_PROMPT_PROFILE_SHA256 must be exactly 64 lowercase hexadecimal characters"
         )
-    if not hmac.compare_digest(prompt_profile_sha256, RERANK_PROMPT_PROFILE_SHA256):
-        raise ValueError("RERANKER_PROMPT_PROFILE_SHA256 must match the reranker prompt profile")
+    expected_profile = (
+        LLAMA_CPP_RERANK_PROFILE_SHA256 if runtime == "llama_cpp" else RERANK_PROMPT_PROFILE_SHA256
+    )
+    if not hmac.compare_digest(prompt_profile_sha256, expected_profile):
+        raise ValueError(
+            "RERANKER_PROMPT_PROFILE_SHA256 must match the selected reranker profile prompt"
+        )
     protocol_version = _required(environ, "RERANKER_PROTOCOL_VERSION")
     return RerankerModelMetadata(
         name,
@@ -286,6 +313,34 @@ def _load_environment_metadata(environ: Mapping[str, str]) -> RerankerModelMetad
         sha256,
         prompt_profile_sha256,
         protocol_version,
+    )
+
+
+def _load_llama_cpp_reranker_backend(
+    environ: Mapping[str, str],
+    metadata: RerankerModelMetadata,
+) -> RerankerBackend:
+    base_url = _required(environ, "LLAMA_CPP_RERANKER_URL")
+    model = _required(environ, "LLAMA_CPP_RERANKER_MODEL")
+    if model != metadata.name:
+        raise ValueError("LLAMA_CPP_RERANKER_MODEL must equal RERANKER_MODEL_NAME")
+    path = environ.get("LLAMA_CPP_RERANKER_PATH", DEFAULT_LLAMA_CPP_RERANKER_PATH)
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError("LLAMA_CPP_RERANKER_PATH must be an absolute path")
+    batch_max_items = _int_in_range(
+        environ,
+        "LLAMA_CPP_RERANK_BATCH_MAX_ITEMS",
+        default=DEFAULT_LLAMA_CPP_RERANK_BATCH_MAX_ITEMS,
+        minimum=1,
+        maximum=MAX_RERANK_PASSAGES,
+    )
+    timeout_seconds = _required_positive_float(environ, "LLAMA_CPP_RERANK_TIMEOUT_SECONDS")
+    client = SyncLlamaCppRerankClient(base_url, timeout_seconds=timeout_seconds)
+    return LlamaCppRerankerBackend(
+        client,
+        base_path=path,
+        model=model,
+        batch_max_items=batch_max_items,
     )
 
 

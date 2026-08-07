@@ -308,6 +308,9 @@ RERANKER_ENABLED=true
 RERANKER_SERVICE_URL=http://reranker-service:8082
 ```
 
+llama.cpp `bge-reranker-v2-m3-Q4_K_M.gguf` 的部署配置与原生 `/v1/rerank`
+适配说明见 [deploy/offline/LLAMA_CPP_RERANKER.md](deploy/offline/LLAMA_CPP_RERANKER.md)。
+
 并使用 `./tools/invoke_offline_compose.sh --profile reranker up -d reranker-service api` 启动可选服务。
 旧的 `qwen2.5:3b` `/api/generate` 生成式 rerank 仅为兼容模式，不等价于专用 cross-encoder；
 重新启用前必须完成目标服务器 15 并发容量测试并观测 429/503、延迟和 controlled fallback。

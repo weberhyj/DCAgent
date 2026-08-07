@@ -32,6 +32,14 @@ class ApiContractTest(unittest.TestCase):
         self.repository = InMemoryChatRepository(build_seed_state())
         self.client = TestClient(create_app(self.repository))
 
+    def test_reports_backend_application_version_without_dependency_checks(self) -> None:
+        from app import __version__
+
+        response = self.client.get("/api/version")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"version": __version__})
+
     def test_lists_conversations_with_frontend_contract_fields(self) -> None:
         response = self.client.get("/api/conversations")
 
