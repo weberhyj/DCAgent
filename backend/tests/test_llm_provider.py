@@ -540,6 +540,50 @@ class LLMProviderTest(unittest.TestCase):
         for leaked in ("model", "created_at", "response", "done"):
             self.assertNotIn(leaked, answer)
 
+    def test_physoc_provider_unwraps_fragmented_nested_event_without_metadata(
+        self,
+    ) -> None:
+        nested = json.dumps(
+            {
+                "model": "deepseek-r1",
+                "created_at": "2026-08-07T00:00:00Z",
+                "response": "XX位于示例区域。",
+                "done": True,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        split_at = nested.index('"response"')
+        response_lines: list[str] = []
+        for index, fragment in enumerate((nested[:split_at], nested[split_at:])):
+            outer = {
+                "model": "deepseek-r1",
+                "response": fragment,
+                "done": index == 1,
+            }
+            response_lines.extend([f"data: {json.dumps(outer, ensure_ascii=False)}", ""])
+        response = FakePhysocResponse(response_lines)
+        client = RecordingPhysocClient(response)
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434",
+            stream_path="/private-stream",
+            model="deepseek-r1",
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client):
+            reply = provider.generate_reply(
+                LLMRequest(
+                    content="XX的地理位置",
+                    mode="source",
+                    knowledge_hits=[indexed_hit()],
+                )
+            )
+
+        answer = reply.paragraphs[0].text
+        self.assertEqual(answer, "XX位于示例区域。")
+        for leaked in ("model", "created_at", "response", "done"):
+            self.assertNotIn(leaked, answer)
+
     def test_physoc_provider_accepts_event_stream_content_type_parameters(self) -> None:
         response = FakePhysocResponse(
             ['data: {"response":"ok","done":true}', ""],

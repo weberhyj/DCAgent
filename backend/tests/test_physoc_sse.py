@@ -144,6 +144,132 @@ class PhysocSseTests(unittest.TestCase):
         for leaked in ("model", "created_at", "response", "done"):
             self.assertNotIn(leaked, result)
 
+    def test_collect_unwraps_nested_event_fragmented_across_outer_events(self) -> None:
+        nested = json.dumps(
+            {
+                "model": "deepseek-llm:7b",
+                "created_at": "2026-08-07T00:00:00Z",
+                "response": "正确答案",
+                "done": True,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        split_at = nested.index('"response"')
+        fragments = (nested[:split_at], nested[split_at:])
+        lines: list[str] = []
+        for index, fragment in enumerate(fragments):
+            outer = {
+                "model": "deepseek-llm:7b",
+                "response": fragment,
+                "done": index == len(fragments) - 1,
+            }
+            lines.extend([f"data: {json.dumps(outer, ensure_ascii=False)}\n", "\n"])
+
+        result = collect_physoc_response(lines, expected_model="deepseek-llm:7b")
+
+        self.assertEqual(result, "正确答案")
+        for leaked in ("model", "created_at", "response", "done"):
+            self.assertNotIn(leaked, result)
+
+    def test_collect_removes_fragmented_event_metadata_appended_after_plain_text(
+        self,
+    ) -> None:
+        suffix = json.dumps(
+            {
+                "model": "deepseek-llm:7b",
+                "created_at": "2026-08-07T00:00:00Z",
+                "response": "",
+                "done": True,
+            },
+            separators=(",", ":"),
+        )
+        fragments = ("XX位于示例区域。" + suffix[:24], suffix[24:])
+        lines: list[str] = []
+        for index, fragment in enumerate(fragments):
+            outer = {
+                "model": "deepseek-llm:7b",
+                "response": fragment,
+                "done": index == len(fragments) - 1,
+            }
+            lines.extend([f"data: {json.dumps(outer, ensure_ascii=False)}\n", "\n"])
+
+        self.assertEqual(
+            collect_physoc_response(lines, expected_model="deepseek-llm:7b"),
+            "XX位于示例区域。",
+        )
+
+    def test_collect_joins_fragmented_physoc_event_sequence(self) -> None:
+        sequence = "".join(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            for event in (
+                {"model": "physoc-v1", "response": "地理", "done": False},
+                {"model": "physoc-v1", "response": "位置", "done": True},
+            )
+        )
+        midpoint = len(sequence) // 2
+        lines: list[str] = []
+        for index, fragment in enumerate((sequence[:midpoint], sequence[midpoint:])):
+            outer = {"model": "physoc-v1", "response": fragment, "done": index == 1}
+            lines.extend([f"data: {json.dumps(outer, ensure_ascii=False)}\n", "\n"])
+
+        self.assertEqual(
+            collect_physoc_response(lines, expected_model="physoc-v1"),
+            "地理位置",
+        )
+
+    def test_collect_preserves_non_physoc_json_in_plain_text(self) -> None:
+        answer = '接口示例：{"status":"ok","value":1}'
+        outer = {"model": "physoc-v1", "response": answer, "done": True}
+
+        self.assertEqual(
+            collect_physoc_response(
+                [f"data: {json.dumps(outer, ensure_ascii=False)}\n", "\n"],
+                expected_model="physoc-v1",
+            ),
+            answer,
+        )
+
+    def test_collect_rejects_fragmented_sequence_without_final_done(self) -> None:
+        nested = json.dumps(
+            {"model": "physoc-v1", "response": "未完成", "done": False},
+            separators=(",", ":"),
+        )
+        midpoint = len(nested) // 2
+        lines: list[str] = []
+        for index, fragment in enumerate((nested[:midpoint], nested[midpoint:])):
+            outer = {"model": "physoc-v1", "response": fragment, "done": index == 1}
+            lines.extend([f"data: {json.dumps(outer)}\n", "\n"])
+
+        with self.assertRaisesRegex(PhysocStreamError, "before completion"):
+            collect_physoc_response(
+                lines,
+                expected_model="physoc-v1",
+            )
+
+    def test_collect_rejects_invalid_fragmented_event_contracts(self) -> None:
+        invalid_events = {
+            "missing done": '{"model":"physoc-v1","response":"secret"}',
+            "duplicate response": (
+                '{"model":"physoc-v1","response":"secret","response":"leak","done":true}'
+            ),
+        }
+
+        for label, nested in invalid_events.items():
+            with self.subTest(label=label):
+                midpoint = len(nested) // 2
+                lines: list[str] = []
+                for index, fragment in enumerate((nested[:midpoint], nested[midpoint:])):
+                    outer = {
+                        "model": "physoc-v1",
+                        "response": fragment,
+                        "done": index == 1,
+                    }
+                    lines.extend([f"data: {json.dumps(outer)}\n", "\n"])
+
+                with self.assertRaises(PhysocStreamError):
+                    collect_physoc_response(lines, expected_model="physoc-v1")
+
     def test_collect_rejects_ambiguous_nested_physoc_events(self) -> None:
         invalid_nested_events = {
             "done mismatch": (

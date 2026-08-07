@@ -26,15 +26,31 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
+_STRICT_JSON_DECODER = json.JSONDecoder(
+    object_pairs_hook=_reject_duplicate_keys,
+    parse_constant=_reject_json_constant,
+)
+_PERMISSIVE_JSON_DECODER = json.JSONDecoder()
+
+
 def _decode_payload(data: str) -> object:
     try:
-        return json.loads(
-            data,
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_json_constant,
-        )
+        return _STRICT_JSON_DECODER.decode(data)
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         raise PhysocStreamError("invalid Physoc JSON") from exc
+
+
+def _try_decode_payload_at(data: str, start: int) -> tuple[object, int] | None:
+    try:
+        return _STRICT_JSON_DECODER.raw_decode(data, start)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        try:
+            preliminary, _end = _PERMISSIVE_JSON_DECODER.raw_decode(data, start)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if isinstance(preliminary, dict) and {"response", "done"}.intersection(preliminary):
+            raise PhysocStreamError("invalid fragmented Physoc JSON") from None
+        return None
 
 
 def _event_fields(
@@ -111,6 +127,75 @@ def _unwrap_nested_event(
     if _nested_event_payload(nested_response) is not None:
         raise PhysocStreamError("nested Physoc payload depth exceeded")
     return nested_response, nested_done
+
+
+def _event_sequence_response(
+    data: str,
+    start: int,
+    *,
+    expected_model: str,
+) -> str | None:
+    position = start
+    response_parts: list[str] = []
+    recognized = False
+    completed = False
+
+    while position < len(data):
+        while position < len(data) and data[position].isspace():
+            position += 1
+        if position == len(data):
+            break
+
+        decoded = _try_decode_payload_at(data, position)
+        if decoded is None:
+            if recognized:
+                raise PhysocStreamError("fragmented Physoc payload is invalid")
+            return None
+        payload, end = decoded
+        if not isinstance(payload, dict):
+            if recognized:
+                raise PhysocStreamError("fragmented Physoc payload is invalid")
+            return None
+        event_keys = {"response", "done"}.intersection(payload)
+        if not event_keys:
+            if recognized:
+                raise PhysocStreamError("fragmented Physoc payload is invalid")
+            return None
+        if event_keys != {"response", "done"}:
+            raise PhysocStreamError("fragmented Physoc payload is incomplete")
+
+        if completed:
+            raise PhysocStreamError("fragmented Physoc data follows completion")
+        response, done, _model = _event_fields(payload, expected_model=expected_model)
+        if _nested_event_payload(response) is not None:
+            raise PhysocStreamError("nested Physoc payload depth exceeded")
+        response_parts.append(response)
+        recognized = True
+        completed = done
+        position = end
+
+        if completed and data[position:].strip():
+            raise PhysocStreamError("fragmented Physoc data follows completion")
+
+    if not recognized:
+        return None
+    if not completed:
+        raise PhysocStreamError("fragmented Physoc stream ended before completion")
+    return "".join(response_parts)
+
+
+def _normalize_assembled_response(data: str, *, expected_model: str) -> str:
+    for start, character in enumerate(data):
+        if character != "{":
+            continue
+        event_response = _event_sequence_response(
+            data,
+            start,
+            expected_model=expected_model,
+        )
+        if event_response is not None:
+            return data[:start] + event_response
+    return data
 
 
 def iter_sse_lines(
@@ -267,7 +352,10 @@ def collect_physoc_response(
         response_chars += len(response)
 
         if done:
-            result = "".join(response_parts)
+            result = _normalize_assembled_response(
+                "".join(response_parts),
+                expected_model=expected_model,
+            )
             if not result:
                 raise PhysocStreamError("Physoc response is empty")
             return result
