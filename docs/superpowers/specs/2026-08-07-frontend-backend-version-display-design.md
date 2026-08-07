@@ -29,7 +29,7 @@
 
 ### 用户端
 
-`ConversationSidebar.vue` 负责用户端侧栏展示，在侧栏底部以弱化的小字号显示用户端版本。组件只消费构建时提供的只读版本常量，不执行网络请求。
+`ChatShell.vue` 负责当前用户端全局页面布局，在视口左下角以弱化的小字号显示用户端版本。版本元素保持在页面布局层，不依赖未挂载的历史侧栏组件。页面只消费构建时提供的只读版本常量，不执行网络请求。
 
 显示内容只有：
 
@@ -74,7 +74,7 @@ GET /api/version
 用户端数据流：
 
 ```text
-frontend/package.json -> Vite 构建常量 -> ConversationSidebar -> vX.Y.Z
+frontend/package.json -> Vite 构建常量 -> ChatShell 左下角 -> vX.Y.Z
 ```
 
 管理端数据流：
@@ -93,7 +93,7 @@ backend/app/__init__.py -> GET /api/version -> 管理端版本状态 -> AdminLay
 ## 测试范围
 
 - 验证 Vite 注入值来自 `frontend/package.json`。
-- 验证用户端侧栏只显示用户端版本，不出现后端版本标签。
+- 验证用户端左下角只显示用户端版本，不出现后端版本标签。
 - 验证 `/api/version` 返回后端 `__version__`，且响应结构固定。
 - 验证管理端成功获取后显示后端版本。
 - 验证管理端接口失败时显示 `版本未知`，其他布局内容仍正常渲染。
