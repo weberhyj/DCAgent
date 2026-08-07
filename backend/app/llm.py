@@ -371,22 +371,13 @@ def build_prompt(request: LLMRequest) -> str:
         f"检索请求：{request.content}\n"
         f"检索模式：{request.mode}\n\n"
         f"可用知识片段：\n{build_knowledge_context(request.knowledge_hits) or '无'}\n\n"
-        f"Agent 调查摘要：\n{request.agent_context or '未启用多步调查'}\n\n"
         f"当前会话上下文：\n{history or '无'}"
     )
 
 
 def build_knowledge_context(hits: list[KnowledgeSearchHitModel]) -> str:
     return "\n\n".join(
-        "\n".join(
-            [
-                f"[{index}] source={hit.source.name}",
-                f"classification={hit.source.classification}",
-                f"rank={hit.rank}",
-                f"score={hit.score:.2f}",
-                f"text={snippet_text(hit.chunk.text, 500)}",
-            ]
-        )
+        f"[知识片段 {index}]\n{snippet_text(hit.chunk.text, 500)}"
         for index, hit in enumerate(hits, start=1)
     )
 

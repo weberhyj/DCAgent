@@ -37,6 +37,82 @@ def _decode_payload(data: str) -> object:
         raise PhysocStreamError("invalid Physoc JSON") from exc
 
 
+def _event_fields(
+    payload: object,
+    *,
+    expected_model: str,
+) -> tuple[str, bool, str | None]:
+    if not isinstance(payload, dict):
+        raise PhysocStreamError("Physoc payload must be an object")
+
+    response = payload.get("response")
+    if not isinstance(response, str):
+        raise PhysocStreamError("Physoc response must be a string")
+
+    done = payload.get("done")
+    if type(done) is not bool:
+        raise PhysocStreamError("Physoc done must be a boolean")
+
+    model: str | None = None
+    if "model" in payload:
+        raw_model = payload["model"]
+        if not isinstance(raw_model, str) or not raw_model:
+            raise PhysocStreamError("Physoc model must be a non-empty string")
+        if raw_model != expected_model:
+            raise PhysocStreamError("Physoc model mismatch")
+        model = raw_model
+
+    return response, done, model
+
+
+def _nested_event_payload(response: str) -> dict[str, object] | None:
+    candidate = response.strip()
+    if not candidate.startswith("{") or not candidate.endswith("}"):
+        return None
+
+    try:
+        preliminary = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(preliminary, dict):
+        return None
+
+    event_keys = {"response", "done"}.intersection(preliminary)
+    if not event_keys:
+        return None
+    if event_keys != {"response", "done"}:
+        raise PhysocStreamError("nested Physoc payload is incomplete")
+
+    decoded = _decode_payload(candidate)
+    if not isinstance(decoded, dict):
+        raise PhysocStreamError("nested Physoc payload must be an object")
+    return decoded
+
+
+def _unwrap_nested_event(
+    response: str,
+    done: bool,
+    outer_model: str | None,
+    *,
+    expected_model: str,
+) -> tuple[str, bool]:
+    nested = _nested_event_payload(response)
+    if nested is None:
+        return response, done
+
+    nested_response, nested_done, nested_model = _event_fields(
+        nested,
+        expected_model=expected_model,
+    )
+    if nested_done is not done:
+        raise PhysocStreamError("nested Physoc done mismatch")
+    if outer_model is not None and nested_model is not None and nested_model != outer_model:
+        raise PhysocStreamError("nested Physoc model mismatch")
+    if _nested_event_payload(nested_response) is not None:
+        raise PhysocStreamError("nested Physoc payload depth exceeded")
+    return nested_response, nested_done
+
+
 def iter_sse_lines(
     chunks: Iterable[bytes],
     *,
@@ -176,24 +252,13 @@ def collect_physoc_response(
         if event_count > max_events:
             raise PhysocStreamError("Physoc events exceed limit")
         payload = _decode_payload(data)
-
-        if not isinstance(payload, dict):
-            raise PhysocStreamError("Physoc payload must be an object")
-
-        response = payload.get("response")
-        if not isinstance(response, str):
-            raise PhysocStreamError("Physoc response must be a string")
-
-        done = payload.get("done")
-        if type(done) is not bool:
-            raise PhysocStreamError("Physoc done must be a boolean")
-
-        if "model" in payload:
-            model = payload["model"]
-            if not isinstance(model, str) or not model:
-                raise PhysocStreamError("Physoc model must be a non-empty string")
-            if model != expected_model:
-                raise PhysocStreamError("Physoc model mismatch")
+        response, done, model = _event_fields(payload, expected_model=expected_model)
+        response, done = _unwrap_nested_event(
+            response,
+            done,
+            model,
+            expected_model=expected_model,
+        )
 
         if len(response) > max_response_chars - response_chars:
             raise PhysocStreamError("Physoc response size exceeds limit")

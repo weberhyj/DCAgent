@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from app.physoc_sse import (
@@ -112,6 +113,73 @@ class PhysocSseTests(unittest.TestCase):
             collect_physoc_response(lines, expected_model="physoc-v1"),
             "hello world",
         )
+
+    def test_collect_unwraps_one_nested_physoc_event_layer(self) -> None:
+        nested_events = [
+            {
+                "model": "physoc-v1",
+                "created_at": "2026-07-20T06:21:33Z",
+                "response": "地理",
+                "done": False,
+            },
+            {
+                "model": "physoc-v1",
+                "created_at": "2026-07-20T06:21:34Z",
+                "response": "位置",
+                "done": True,
+            },
+        ]
+        lines: list[str] = []
+        for event in nested_events:
+            outer = {
+                "model": "physoc-v1",
+                "response": json.dumps(event, ensure_ascii=False),
+                "done": event["done"],
+            }
+            lines.extend([f"data: {json.dumps(outer, ensure_ascii=False)}\n", "\n"])
+
+        result = collect_physoc_response(lines, expected_model="physoc-v1")
+
+        self.assertEqual(result, "地理位置")
+        for leaked in ("model", "created_at", "response", "done"):
+            self.assertNotIn(leaked, result)
+
+    def test_collect_rejects_ambiguous_nested_physoc_events(self) -> None:
+        invalid_nested_events = {
+            "done mismatch": (
+                {"response": "ok", "done": True, "model": "physoc-v1"},
+                False,
+            ),
+            "model mismatch": (
+                {"response": "ok", "done": True, "model": "other"},
+                True,
+            ),
+            "missing done": (
+                {"response": "ok", "model": "physoc-v1"},
+                True,
+            ),
+            "second nested layer": (
+                {
+                    "response": json.dumps(
+                        {"response": "secret", "done": True, "model": "physoc-v1"}
+                    ),
+                    "done": True,
+                    "model": "physoc-v1",
+                },
+                True,
+            ),
+        }
+
+        for label, (nested, outer_done) in invalid_nested_events.items():
+            with self.subTest(label=label):
+                outer = {
+                    "model": "physoc-v1",
+                    "response": json.dumps(nested),
+                    "done": outer_done,
+                }
+                lines = [f"data: {json.dumps(outer)}\n", "\n"]
+                with self.assertRaises(PhysocStreamError):
+                    collect_physoc_response(lines, expected_model="physoc-v1")
 
     def test_empty_event_fields_fall_back_to_message(self) -> None:
         for event_line in ("event:\r\n", "event\r\n"):

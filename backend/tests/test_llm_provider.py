@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -190,17 +191,21 @@ class RecordingPhysocClient:
 
 
 class LLMProviderTest(unittest.TestCase):
-    def test_build_knowledge_context_formats_numbered_evidence(self) -> None:
+    def test_build_knowledge_context_exposes_only_numbered_chunk_text(self) -> None:
         context = build_knowledge_context([indexed_hit(score=8.75, rank=1)])
 
-        self.assertIn("[1]", context)
-        self.assertIn("cashflow.txt", context)
-        self.assertIn("内部·机密", context)
-        self.assertIn("rank=1", context)
-        self.assertIn("score=8.75", context)
-        self.assertIn("现金流风险", context)
+        self.assertEqual(context, "[知识片段 1]\n现金流风险与回款周期直接相关。")
+        for leaked in (
+            "cashflow.txt",
+            "内部·机密",
+            "source=",
+            "classification=",
+            "rank=",
+            "score=",
+        ):
+            self.assertNotIn(leaked, context)
 
-    def test_build_prompt_includes_guardrails_evidence_and_recent_history(self) -> None:
+    def test_build_prompt_includes_guardrails_text_and_recent_history(self) -> None:
         prompt = build_prompt(
             LLMRequest(
                 content="请分析现金流风险",
@@ -214,16 +219,30 @@ class LLMProviderTest(unittest.TestCase):
                         content="上一轮问题",
                     )
                 ],
+                agent_context="Agent 已完成 2 轮检索。来源：cashflow.txt。",
             )
         )
 
-        self.assertIn("请分析现金流风险", prompt)
-        self.assertIn("source", prompt)
-        self.assertIn("仅基于可用知识片段", prompt)
-        self.assertIn("未检索到足够依据", prompt)
-        self.assertIn("[1]", prompt)
-        self.assertIn("cashflow.txt", prompt)
-        self.assertIn("上一轮问题", prompt)
+        for expected in (
+            "请分析现金流风险",
+            "仅基于可用知识片段",
+            "未检索到足够依据",
+            "[知识片段 1]",
+            "现金流风险与回款周期直接相关。",
+            "上一轮问题",
+        ):
+            self.assertIn(expected, prompt)
+        for leaked in (
+            "cashflow.txt",
+            "内部·机密",
+            "source=",
+            "classification=",
+            "rank=",
+            "score=",
+            "Agent 调查摘要",
+            "Agent 已完成",
+        ):
+            self.assertNotIn(leaked, prompt)
 
     def test_system_and_user_prompts_require_plain_text_without_markup(self) -> None:
         prompt = build_prompt(
@@ -329,8 +348,8 @@ class LLMProviderTest(unittest.TestCase):
         self.assertEqual(payload["messages"][0]["role"], "system")
         self.assertEqual(payload["messages"][0]["content"], RAG_SYSTEM_PROMPT)
         self.assertIn("不要在回答中输出", payload["messages"][0]["content"])
-        self.assertIn("[1]", payload["messages"][1]["content"])
-        self.assertIn("cashflow.txt", payload["messages"][1]["content"])
+        self.assertIn("[知识片段 1]", payload["messages"][1]["content"])
+        self.assertNotIn("cashflow.txt", payload["messages"][1]["content"])
         self.assertEqual(reply.paragraphs[0].citations[0].source_id, "kb-llm")
         self.assertNotIn("[1]", reply.paragraphs[0].text)
 
@@ -480,11 +499,46 @@ class LLMProviderTest(unittest.TestCase):
             },
         )
         self.assertIn(RAG_SYSTEM_PROMPT, recorded["json"]["query"])
-        self.assertIn("cashflow.txt", recorded["json"]["query"])
+        self.assertIn("[知识片段 1]", recorded["json"]["query"])
+        self.assertNotIn("cashflow.txt", recorded["json"]["query"])
         self.assertEqual(reply.paragraphs[0].text, "现金流风险。")
         self.assertEqual(reply.paragraphs[0].citations[0].source_id, "kb-llm")
         self.assertEqual(reply.paragraphs[0].citations[0].chunk_id, "chunk-llm")
         self.assertEqual(reply.artifacts, [])
+
+    def test_physoc_provider_unwraps_nested_events_without_exposing_metadata(self) -> None:
+        nested = {
+            "model": "deepseek-r1",
+            "created_at": "2026-07-20T06:21:33Z",
+            "response": "XX位于示例区域。",
+            "done": True,
+        }
+        outer = {
+            "model": "deepseek-r1",
+            "response": json.dumps(nested, ensure_ascii=False),
+            "done": True,
+        }
+        response = FakePhysocResponse([f"data: {json.dumps(outer, ensure_ascii=False)}", ""])
+        client = RecordingPhysocClient(response)
+        provider = PhysocDeepSeekLLMProvider(
+            api_base="http://127.0.0.1:11434",
+            stream_path="/private-stream",
+            model="deepseek-r1",
+        )
+
+        with patch("app.llm.httpx.Client", return_value=client):
+            reply = provider.generate_reply(
+                LLMRequest(
+                    content="XX的地理位置",
+                    mode="source",
+                    knowledge_hits=[indexed_hit()],
+                )
+            )
+
+        answer = reply.paragraphs[0].text
+        self.assertEqual(answer, "XX位于示例区域。")
+        for leaked in ("model", "created_at", "response", "done"):
+            self.assertNotIn(leaked, answer)
 
     def test_physoc_provider_accepts_event_stream_content_type_parameters(self) -> None:
         response = FakePhysocResponse(
