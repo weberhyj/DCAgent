@@ -870,9 +870,9 @@ class ComposeSmokeTest(unittest.TestCase):
                     "unlink",
                     side_effect=RuntimeError("CLEANUP"),
                 ),
+                self.assertRaisesRegex(RuntimeError, "ORIGINAL") as caught,
             ):
-                with self.assertRaisesRegex(RuntimeError, "ORIGINAL") as caught:
-                    compose_smoke._write_atomic(destination, {"passed": False})
+                compose_smoke._write_atomic(destination, {"passed": False})
 
         self.assertTrue(any("cleanup also failed" in note for note in caught.exception.__notes__))
 

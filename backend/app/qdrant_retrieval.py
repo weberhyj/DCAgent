@@ -487,7 +487,7 @@ def _finite_dense_vector(vector: Sequence[float]) -> list[float]:
         raise ValueError("dense vector must be a non-empty sequence")
     materialized: list[float] = []
     for coordinate in vector:
-        if isinstance(coordinate, bool) or isinstance(coordinate, (str, bytes, bytearray)):
+        if isinstance(coordinate, (bool, str, bytes, bytearray)):
             raise TypeError("dense vector coordinates must be numeric")
         try:
             numeric = float(coordinate)

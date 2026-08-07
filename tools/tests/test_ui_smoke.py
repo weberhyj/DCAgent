@@ -73,9 +73,7 @@ class UiSmokeContractTests(unittest.TestCase):
     def test_main_runs_all_smoke_verifications(self) -> None:
         ui_smoke = _module()
         with (
-            patch.object(
-                ui_smoke, "_require_ui_smoke_dependencies"
-            ) as require_dependencies,
+            patch.object(ui_smoke, "_require_ui_smoke_dependencies") as require_dependencies,
             patch.object(ui_smoke, "verify_user_app") as verify_user_app,
             patch.object(ui_smoke, "verify_admin_app") as verify_admin_app,
             patch.object(ui_smoke, "verify_quality_app") as verify_quality_app,

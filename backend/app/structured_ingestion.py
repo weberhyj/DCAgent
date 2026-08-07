@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import contextlib
 import csv
 import hashlib
 import re
@@ -272,10 +273,8 @@ class SpreadsheetPublisher:
         except Exception:
             discard = getattr(self.clickhouse, "discard_publication", None)
             if discard is not None and target is not None:
-                try:
+                with contextlib.suppress(Exception):
                     discard(target)
-                except Exception:
-                    pass
             _clear_publication_directory(output_root, best_effort=True)
             raise
         return StructuredPublicationResult(

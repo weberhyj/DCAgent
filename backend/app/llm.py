@@ -154,8 +154,9 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
 
         query = RAG_SYSTEM_PROMPT + "\n\n" + build_prompt(request)
         try:
-            with httpx.Client(timeout=self.timeout_seconds, trust_env=False) as client:
-                with client.stream(
+            with (
+                httpx.Client(timeout=self.timeout_seconds, trust_env=False) as client,
+                client.stream(
                     "POST",
                     self.stream_url,
                     json={"query": query, "model": self.model},
@@ -163,22 +164,23 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
                         "Accept": "text/event-stream",
                         "Accept-Encoding": "identity",
                     },
-                ) as response:
-                    response.raise_for_status()
-                    content_type = response.headers.get("Content-Type", "")
-                    media_type = content_type.split(";", 1)[0].strip().lower()
-                    if media_type != "text/event-stream":
-                        raise PhysocStreamError("Physoc response Content-Type is invalid")
-                    content_encoding = response.headers.get("Content-Encoding", "")
-                    if content_encoding.strip().lower() not in {"", "identity"}:
-                        raise PhysocStreamError("Physoc response Content-Encoding is invalid")
-                    collected = collect_physoc_response(
-                        iter_sse_lines(response.iter_raw(chunk_size=4096)),
-                        expected_model=self.model,
-                    )
-                    content = normalize_plain_text_answer(collected)
-                    if not content.strip():
-                        raise PhysocStreamError("Physoc response is empty after normalization")
+                ) as response,
+            ):
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "")
+                media_type = content_type.split(";", 1)[0].strip().lower()
+                if media_type != "text/event-stream":
+                    raise PhysocStreamError("Physoc response Content-Type is invalid")
+                content_encoding = response.headers.get("Content-Encoding", "")
+                if content_encoding.strip().lower() not in {"", "identity"}:
+                    raise PhysocStreamError("Physoc response Content-Encoding is invalid")
+                collected = collect_physoc_response(
+                    iter_sse_lines(response.iter_raw(chunk_size=4096)),
+                    expected_model=self.model,
+                )
+                content = normalize_plain_text_answer(collected)
+                if not content.strip():
+                    raise PhysocStreamError("Physoc response is empty after normalization")
         except httpx.TimeoutException as exc:
             raise LLMProviderError("大模型响应超时，请稍后重试。") from exc
         except httpx.HTTPError as exc:

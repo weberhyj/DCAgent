@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
-from dataclasses import asdict, dataclass
 import json
 import math
 import os
-from pathlib import Path
 import tempfile
-from typing import Literal, Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Literal
 
 
 def _is_finite_number(value: object) -> bool:
@@ -89,11 +89,13 @@ def evaluate_capacity(
     failures: list[str] = []
     for gate in gates:
         value = metrics.get(gate.name)
-        if not _is_finite_number(value):
-            failures.append(gate.name)
-        elif gate.operator == "lte" and float(value) > float(gate.limit):
-            failures.append(gate.name)
-        elif gate.operator == "gte" and float(value) < float(gate.limit):
+        if (
+            not _is_finite_number(value)
+            or gate.operator == "lte"
+            and float(value) > float(gate.limit)
+            or gate.operator == "gte"
+            and float(value) < float(gate.limit)
+        ):
             failures.append(gate.name)
     return CapacityResult(passed=not failures, failures=failures)
 

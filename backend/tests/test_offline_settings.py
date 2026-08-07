@@ -99,18 +99,20 @@ class OfflineSettingsTest(unittest.TestCase):
             "service=external",
             "servicefile=%2Ftmp%2Fpg_service.conf",
         ):
-            with self.subTest(query=query):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(query=query),
+                self.assertRaisesRegex(
                     OfflineSettingsError, "(?i)(private or loopback|offline.*routing)"
-                ):
-                    OfflineSettings.from_environ(
-                        {
-                            "OFFLINE_MODE": "true",
-                            "DATABASE_URL": (
-                                f"postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?{query}"
-                            ),
-                        }
-                    )
+                ),
+            ):
+                OfflineSettings.from_environ(
+                    {
+                        "OFFLINE_MODE": "true",
+                        "DATABASE_URL": (
+                            f"postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?{query}"
+                        ),
+                    }
+                )
 
     def test_allows_harmless_postgres_query_options_in_offline_mode(self) -> None:
         database_url = "postgresql+psycopg://dc_agent@127.0.0.1/dc_agent?sslmode=require"
@@ -146,11 +148,13 @@ class OfflineSettingsTest(unittest.TestCase):
         )
 
         for value in ("0", "50001", "many"):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
                     OfflineSettingsError, "STRUCTURED_INGEST_BATCH_ROWS.*1.*50000"
-                ):
-                    OfflineSettings.from_environ({"STRUCTURED_INGEST_BATCH_ROWS": value})
+                ),
+            ):
+                OfflineSettings.from_environ({"STRUCTURED_INGEST_BATCH_ROWS": value})
 
     def test_structured_clickhouse_settings_parse_password_files_without_loading_secrets(
         self,
@@ -203,12 +207,14 @@ class OfflineSettingsTest(unittest.TestCase):
             12,
         )
         for value in ("0", "61", "1.5", "many"):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
                     OfflineSettingsError,
                     "STRUCTURED_QUERY_TIMEOUT_SECONDS.*1.*60",
-                ):
-                    OfflineSettings.from_environ({"STRUCTURED_QUERY_TIMEOUT_SECONDS": value})
+                ),
+            ):
+                OfflineSettings.from_environ({"STRUCTURED_QUERY_TIMEOUT_SECONDS": value})
 
     def test_secret_reader_rejects_missing_or_unsafe_password_files(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -219,12 +225,14 @@ class OfflineSettingsTest(unittest.TestCase):
             oversized = root / "oversized"
             oversized.write_bytes(b"x" * 4097)
             for path in (missing, directory, oversized):
-                with self.subTest(path=path.name):
-                    with self.assertRaisesRegex(
+                with (
+                    self.subTest(path=path.name),
+                    self.assertRaisesRegex(
                         OfflineSettingsError,
                         "CLICKHOUSE_QUERY_PASSWORD_FILE",
-                    ):
-                        read_secret_file(path, "CLICKHOUSE_QUERY_PASSWORD_FILE")
+                    ),
+                ):
+                    read_secret_file(path, "CLICKHOUSE_QUERY_PASSWORD_FILE")
 
     def test_existing_llm_provider_rejects_public_api_in_offline_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "private or loopback"):

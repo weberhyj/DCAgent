@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 if __package__:
-    from tools.offline_env import DeploymentError, load_env, resolve_env_path
     from tools import offline_deployment_state as deployment_state
+    from tools.offline_env import DeploymentError, load_env, resolve_env_path
 else:
-    from offline_env import DeploymentError, load_env, resolve_env_path
     import offline_deployment_state as deployment_state
+    from offline_env import DeploymentError, load_env, resolve_env_path
 
 
 VALUE_GLOBAL_OPTIONS = {"--ansi", "--parallel", "--profile", "--progress"}
@@ -45,9 +45,7 @@ ALLOWED_PROCESS_ENV = frozenset(
     }
 )
 HOST_ROOT_ENV = frozenset({"HOST_DATA_ROOT", "HOST_MODEL_ROOT"})
-DANGEROUS_PROCESS_ENV = frozenset(
-    {"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY"}
-)
+DANGEROUS_PROCESS_ENV = frozenset({"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY"})
 FORBIDDEN_BUILD_OPTIONS = {
     "--build-arg",
     "--build-context",
@@ -121,17 +119,15 @@ def validate_compose_arguments(arguments: Sequence[str]) -> ComposeInvocation:
         if argument in VALUE_GLOBAL_OPTIONS:
             index += 1
             if index >= len(arguments):
-                raise DeploymentError(
-                    f"Compose global option {argument} requires a value"
-                )
-        elif re.match(r"^--(?:ansi|parallel|profile|progress)=", argument):
-            pass
-        elif argument in FLAG_GLOBAL_OPTIONS:
+                raise DeploymentError(f"Compose global option {argument} requires a value")
+        elif (
+            re.match(r"^--(?:ansi|parallel|profile|progress)=", argument)
+            or argument in FLAG_GLOBAL_OPTIONS
+        ):
             pass
         elif argument.startswith("-"):
             raise DeploymentError(
-                f"Unsupported Compose global option {argument} could bypass "
-                "preflight validation"
+                f"Unsupported Compose global option {argument} could bypass preflight validation"
             )
         else:
             command = argument
@@ -149,9 +145,7 @@ def validate_compose_arguments(arguments: Sequence[str]) -> ComposeInvocation:
     if command == "build":
         for argument in command_arguments:
             if _option_matches(argument, FORBIDDEN_BUILD_OPTIONS):
-                raise DeploymentError(
-                    f"Compose build override argument {argument} is not allowed"
-                )
+                raise DeploymentError(f"Compose build override argument {argument} is not allowed")
     if command == "up":
         for argument in command_arguments:
             if _option_matches(argument, FORBIDDEN_UP_OPTIONS):
@@ -172,14 +166,11 @@ def assert_local_docker_environment(environ: Mapping[str, str]) -> None:
     )
     if dangerous:
         raise DeploymentError(
-            "Docker and Compose process overrides are not allowed: "
-            + ", ".join(dangerous)
+            "Docker and Compose process overrides are not allowed: " + ", ".join(dangerous)
         )
 
 
-def _host_roots(
-    environ: Mapping[str, str], required_names: Sequence[str]
-) -> dict[str, Path]:
+def _host_roots(environ: Mapping[str, str], required_names: Sequence[str]) -> dict[str, Path]:
     roots: dict[str, Path] = {}
     for name in sorted(required_names):
         value = environ.get(name)
@@ -261,8 +252,7 @@ def _network_names(value: object, context: str) -> set[str]:
 def _assert_internal_digest_image(image: object, context: str) -> None:
     if not isinstance(image, str) or INTERNAL_IMAGE.fullmatch(image) is None:
         raise DeploymentError(
-            f"{context} image must use registry.internal/dc-agent/ and an exact "
-            "sha256 digest"
+            f"{context} image must use registry.internal/dc-agent/ and an exact sha256 digest"
         )
 
 
@@ -299,22 +289,17 @@ def assert_rendered_compose(
     for network_name in ("physoc-egress", "ollama-egress"):
         network = _mapping(networks.get(network_name), f"{network_name} network")
         if network.get("internal") is True:
-            raise DeploymentError(
-                f"Rendered Compose {network_name} network must not be internal"
-            )
+            raise DeploymentError(f"Rendered Compose {network_name} network must not be internal")
 
     missing_services = REQUIRED_SERVICES - set(services)
     if missing_services:
         raise DeploymentError(
-            "Rendered Compose is missing required services: "
-            + ", ".join(sorted(missing_services))
+            "Rendered Compose is missing required services: " + ", ".join(sorted(missing_services))
         )
 
     for service_name, raw_service in services.items():
         service = _mapping(raw_service, f"{service_name} service")
-        actual_networks = _network_names(
-            service.get("networks"), f"{service_name} networks"
-        )
+        actual_networks = _network_names(service.get("networks"), f"{service_name} networks")
         expected_networks = EXPECTED_NETWORKS.get(str(service_name), {"offline"})
         if actual_networks != expected_networks:
             raise DeploymentError(
@@ -349,9 +334,7 @@ def assert_rendered_compose(
         build = service.get("build")
         if build is not None:
             build_mapping = _mapping(build, f"{service_name} build")
-            args = _mapping(
-                build_mapping.get("args"), f"{service_name} build arguments"
-            )
+            args = _mapping(build_mapping.get("args"), f"{service_name} build arguments")
             _assert_internal_digest_image(
                 args.get("PYTHON_BASE_IMAGE"),
                 f"{service_name} PYTHON_BASE_IMAGE",
@@ -396,19 +379,14 @@ def assert_rendered_compose(
                 continue
             target = str(volume.get("target"))
             if target not in expected:
-                raise DeploymentError(
-                    f"{service_name} has an unexpected bind mount for {target}"
-                )
+                raise DeploymentError(f"{service_name} has an unexpected bind mount for {target}")
             source = Path(str(volume.get("source"))).resolve(strict=False)
             if source != expected[target].resolve(strict=False):
-                raise DeploymentError(
-                    f"{service_name} bind source for {target} is not approved"
-                )
+                raise DeploymentError(f"{service_name} bind source for {target} is not approved")
             bind = _mapping(volume.get("bind"), f"{service_name} bind options")
             if bind.get("create_host_path") is not False:
                 raise DeploymentError(
-                    f"{service_name} bind mount for {target} must disable "
-                    "create_host_path"
+                    f"{service_name} bind mount for {target} must disable create_host_path"
                 )
             seen.add(target)
         if seen != set(expected):
@@ -438,9 +416,7 @@ def assert_rendered_compose(
         rendered_path = Path(str(secret.get("file"))).resolve(strict=False)
         expected_path = managed_path.resolve(strict=False)
         if configured != expected_path or rendered_path != expected_path:
-            raise DeploymentError(
-                f"{secret_name} secret must use the repository-managed path"
-            )
+            raise DeploymentError(f"{secret_name} secret must use the repository-managed path")
 
 
 def run_compose(
@@ -489,9 +465,7 @@ def run_compose(
         )
         identity_hash = deployment_state.identity_digest(expected_identity)
         with deployment_state.acquire_deployment_lock(paths):
-            identity = deployment_state.assert_identity_matches(
-                paths, expected_identity
-            )
+            identity = deployment_state.assert_identity_matches(paths, expected_identity)
             _assert_identity_bindings(
                 identity,
                 data_root=data_root,
@@ -525,9 +499,7 @@ def run_compose(
                     + context_process.stderr.strip()
                 )
             if context_process.stdout.strip() != "unix:///var/run/docker.sock":
-                raise DeploymentError(
-                    "Docker default context must use unix:///var/run/docker.sock"
-                )
+                raise DeploymentError("Docker default context must use unix:///var/run/docker.sock")
 
             base_arguments = [
                 "docker",
@@ -558,8 +530,7 @@ def run_compose(
             )
             if config_process.returncode != 0:
                 raise DeploymentError(
-                    "Docker Compose configuration failed: "
-                    + config_process.stderr.strip()
+                    "Docker Compose configuration failed: " + config_process.stderr.strip()
                 )
             try:
                 rendered = json.loads(config_process.stdout)
@@ -568,9 +539,7 @@ def run_compose(
                     f"Docker Compose configuration did not return valid JSON: {error}"
                 ) from error
             if not isinstance(rendered, Mapping):
-                raise DeploymentError(
-                    "Docker Compose configuration must return a JSON object"
-                )
+                raise DeploymentError("Docker Compose configuration must return a JSON object")
             assert_rendered_compose(
                 rendered,
                 repo_root,

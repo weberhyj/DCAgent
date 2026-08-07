@@ -7,20 +7,19 @@ inject a runner and exercise the reporting/threshold contract without ClickHouse
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import os
+import sys
+import time
+import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
-import json
-import math
-import os
 from pathlib import Path
-import sys
-import time
 from typing import Any
-import uuid
-
 
 DEFAULT_ROWS = 1_000_000
 DEFAULT_CONCURRENCY = 15
@@ -182,18 +181,14 @@ def build_clickhouse_clients(
     return ingest, query
 
 
-def _iter_rows(
-    total: int, batch_rows: int = INGEST_BATCH_ROWS
-) -> Iterable[list[list[object]]]:
+def _iter_rows(total: int, batch_rows: int = INGEST_BATCH_ROWS) -> Iterable[list[list[object]]]:
     regions = ("华东", "华南", "华北", "西部")
     epoch = date(2025, 1, 1)
     for start in range(0, total, batch_rows):
         stop = min(total, start + batch_rows)
         batch: list[list[object]] = []
         for index in range(start, stop):
-            amount = (
-                None if index % 97 == 0 else Decimal(index % 100_000) / Decimal(100)
-            )
+            amount = None if index % 97 == 0 else Decimal(index % 100_000) / Decimal(100)
             batch.append(
                 [
                     index,
@@ -282,14 +277,8 @@ def execute_workload(
             try:
                 batch_rows = len(batch)  # type: ignore[arg-type]
             except TypeError as error:
-                raise ValueError(
-                    "ingestion batches must expose a bounded row count"
-                ) from error
-        if (
-            isinstance(batch_rows, bool)
-            or not isinstance(batch_rows, int)
-            or batch_rows <= 0
-        ):
+                raise ValueError("ingestion batches must expose a bounded row count") from error
+        if isinstance(batch_rows, bool) or not isinstance(batch_rows, int) or batch_rows <= 0:
             raise ValueError("ingestion batch row counts must be positive integers")
         published_rows += batch_rows
         rss_samples.append(int(rss_reader()))
@@ -307,9 +296,7 @@ def execute_workload(
         return max(0.0, clock() - started)
 
     with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
-        futures = [
-            executor.submit(timed_query, index) for index in range(config.requests)
-        ]
+        futures = [executor.submit(timed_query, index) for index in range(config.requests)]
         for future in as_completed(futures):
             try:
                 latencies.append(future.result())
@@ -368,9 +355,7 @@ class _ClickHouseTarget:
         result = self.query_client.query(statement)
         rows = getattr(result, "result_rows", None)
         if not rows or not rows[0] or len(rows[0]) != 1:
-            raise RuntimeError(
-                "structured benchmark aggregate returned an invalid result"
-            )
+            raise RuntimeError("structured benchmark aggregate returned an invalid result")
         actual = rows[0][0]
         expected = self.expected_values[query_index]
         if isinstance(expected, int):
@@ -381,9 +366,7 @@ class _ClickHouseTarget:
             except Exception:
                 matches = False
         if not matches:
-            raise RuntimeError(
-                f"structured benchmark aggregate mismatch for query {query_index}"
-            )
+            raise RuntimeError(f"structured benchmark aggregate mismatch for query {query_index}")
 
     def close(self) -> None:
         try:
@@ -430,9 +413,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--requests", type=int, default=DEFAULT_REQUESTS)
     parser.add_argument("--p95-seconds", type=float, default=DEFAULT_P95_SECONDS)
-    parser.add_argument(
-        "--max-rss-growth-mb", type=float, default=DEFAULT_MAX_RSS_GROWTH_MB
-    )
+    parser.add_argument("--max-rss-growth-mb", type=float, default=DEFAULT_MAX_RSS_GROWTH_MB)
     return parser
 
 

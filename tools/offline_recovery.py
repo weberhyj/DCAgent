@@ -316,9 +316,7 @@ class PosixFilesystemMutationBackend:
         return st.st_dev, st.st_ino
 
     @staticmethod
-    def _wal_identity(
-        payload: Mapping[str, object], prefix: str
-    ) -> tuple[int, int] | None:
+    def _wal_identity(payload: Mapping[str, object], prefix: str) -> tuple[int, int] | None:
         device = payload[f"{prefix}_device"]
         inode = payload[f"{prefix}_inode"]
         if device is None and inode is None:
@@ -388,8 +386,7 @@ class PosixFilesystemMutationBackend:
             owner_gid=owner_gid,
         )
         if (
-            expected_identity is not None
-            and cls._identity(observed) != expected_identity
+            expected_identity is not None and cls._identity(observed) != expected_identity
         ) or digest != expected_digest:
             raise OSError(errno.EAGAIN, "environment rollback file changed")
         return observed
@@ -419,9 +416,9 @@ class PosixFilesystemMutationBackend:
         fd = os.open(name, flags, dir_fd=directory_fd)
         try:
             opened = os.fstat(fd)
-            if not stat.S_ISREG(opened.st_mode) or cls._identity(
-                opened
-            ) != cls._identity(path_state):
+            if not stat.S_ISREG(opened.st_mode) or cls._identity(opened) != cls._identity(
+                path_state
+            ):
                 raise OSError(errno.EAGAIN, "environment rollback file changed")
             digest = hashlib.sha256()
             while chunk := os.read(fd, 65536):
@@ -517,9 +514,7 @@ class PosixFilesystemMutationBackend:
         )
 
     @classmethod
-    def _exchange(
-        cls, parent_fd: int, env_name: str, private_fd: int, candidate_name: str
-    ) -> None:
+    def _exchange(cls, parent_fd: int, env_name: str, private_fd: int, candidate_name: str) -> None:
         cls._renameat2(
             parent_fd,
             env_name,
@@ -808,9 +803,7 @@ class PosixFilesystemMutationBackend:
             raise OSError(errno.EPERM, "invalid environment rollback material")
 
     @classmethod
-    def _restore_removed_if_env_absent(
-        cls, parent_fd: int, env_name: str, private_fd: int
-    ) -> None:
+    def _restore_removed_if_env_absent(cls, parent_fd: int, env_name: str, private_fd: int) -> None:
         if (
             cls._stat_at_optional(parent_fd, env_name) is None
             and cls._stat_at_optional(private_fd, _ENV_REMOVED_NAME) is not None
@@ -1110,9 +1103,7 @@ class PosixFilesystemMutationBackend:
             if rollback_state is None:
                 raise OSError(errno.EIO, "missing environment rollback state")
             private_fd = self._open_private_directory(parent_fd, private_name)
-            self._require_private_entries(
-                private_fd, {_ENV_CANDIDATE_NAME, _ENV_REMOVED_NAME}
-            )
+            self._require_private_entries(private_fd, {_ENV_CANDIDATE_NAME, _ENV_REMOVED_NAME})
             branch = rollback_state["branch"]
             if branch == "existing_before":
                 if backup is None:
@@ -1158,9 +1149,7 @@ def _filesystem_mutations(
     if backend is not None:
         return backend
     if os.name != "posix" or not sys.platform.startswith("linux"):
-        raise state.DeploymentStateError(
-            "secure filesystem mutation backend requires Linux"
-        )
+        raise state.DeploymentStateError("secure filesystem mutation backend requires Linux")
     return PosixFilesystemMutationBackend()
 
 
@@ -1187,9 +1176,7 @@ def _chmod(
     operation: Mapping[str, object],
 ) -> None:
     try:
-        _filesystem_mutations(backend).chmod(
-            path, mode, expected_source=expected_source
-        )
+        _filesystem_mutations(backend).chmod(path, mode, expected_source=expected_source)
     except (OSError, state.DeploymentStateError):
         raise _conflict(operation) from None
 
@@ -1346,9 +1333,7 @@ def _forward_file_snapshot(
     return after, digest
 
 
-def _forward_identity(
-    payload: Mapping[str, object], prefix: str
-) -> tuple[int, int] | None:
+def _forward_identity(payload: Mapping[str, object], prefix: str) -> tuple[int, int] | None:
     device = payload[f"{prefix}_device"]
     inode = payload[f"{prefix}_inode"]
     if device is None and inode is None:
@@ -1392,9 +1377,7 @@ def _resume_forward_environment(
     payload = journal.read_forward_environment_state()
     if payload is None:
         return
-    operations = {
-        operation["sequence"]: operation for operation in journal.read_operations()
-    }
+    operations = {operation["sequence"]: operation for operation in journal.read_operations()}
     operation = operations.get(payload["sequence"])
     if operation is None or operation.get("kind") != "env_replace":
         raise state.DeploymentStateError("invalid forward environment operation")
@@ -1559,13 +1542,11 @@ def _classify_intent(
         right = _lstat(right_path, operation)
         expected_type = operation.get("object_type")
         if left is not None and (
-            not _matches_type(left, expected_type)
-            or not _authority_matches(left, operation)
+            not _matches_type(left, expected_type) or not _authority_matches(left, operation)
         ):
             raise _conflict(operation)
         if right is not None and (
-            not _matches_type(right, expected_type)
-            or not _authority_matches(right, operation)
+            not _matches_type(right, expected_type) or not _authority_matches(right, operation)
         ):
             raise _conflict(operation)
         if left is not None and right is None:
@@ -1607,11 +1588,7 @@ def _classify_intent(
                 return "not_executed"
             raise _conflict(operation)
         digest = _regular_digest(path, operation)
-        if (
-            not before_absent
-            and isinstance(before_digest, str)
-            and digest == before_digest
-        ):
+        if not before_absent and isinstance(before_digest, str) and digest == before_digest:
             if not _authority_matches(
                 current,
                 operation,
@@ -1804,9 +1781,7 @@ def reverse_operation(
         return
     if kind == "mkdir":
         path = _path(operation, "path")
-        if operation.get("existed") is not False or not _directory_empty(
-            path, operation
-        ):
+        if operation.get("existed") is not False or not _directory_empty(path, operation):
             raise _conflict(operation)
         path.rmdir()
         state.fsync_directory(path.parent)
@@ -1821,11 +1796,7 @@ def reverse_operation(
         ):
             raise _conflict(operation)
         entry = entries[0]
-        if (
-            not entry.existed
-            or entry.backup_name is None
-            or journal.secret_companion_root is None
-        ):
+        if not entry.existed or entry.backup_name is None or journal.secret_companion_root is None:
             raise _conflict(operation)
         source = journal.secret_companion_root / "backup" / entry.backup_name
         if source.parent != journal.secret_companion_root / "backup":
@@ -1870,10 +1841,7 @@ def _reverse_state_is_safe(
     intent = dict(operation)
     intent["status"] = "intent"
     try:
-        return (
-            _classify_intent(intent, secret_validator=secret_validator)
-            == "not_executed"
-        )
+        return _classify_intent(intent, secret_validator=secret_validator) == "not_executed"
     except RecoveryConflict:
         return False
 
@@ -1968,9 +1936,7 @@ def _bootstrap_entry_expected_source(
     mode = entry.get("after_mode")
     owner_uid = entry.get("after_owner_uid")
     owner_gid = entry.get("after_owner_gid")
-    if not all(
-        type(value) is int for value in (device, inode, mode, owner_uid, owner_gid)
-    ):
+    if not all(type(value) is int for value in (device, inode, mode, owner_uid, owner_gid)):
         raise _BootstrapCleanupConflict("bootstrap cleanup identity is incomplete")
     return os.stat_result(
         (
@@ -2009,34 +1975,22 @@ def _finalize_bootstrap_rollback_cleanup(
         current = state._lstat_optional(path)
         if entry["cleanup_done"] is True:
             if entry["existed"] is True:
-                if current is None or not _bootstrap_entry_matches(
-                    entry, current, original=True
-                ):
-                    raise _BootstrapCleanupConflict(
-                        f"bootstrap cleanup conflict: {journal.root}"
-                    )
+                if current is None or not _bootstrap_entry_matches(entry, current, original=True):
+                    raise _BootstrapCleanupConflict(f"bootstrap cleanup conflict: {journal.root}")
             elif current is not None:
-                raise _BootstrapCleanupConflict(
-                    f"bootstrap cleanup conflict: {journal.root}"
-                )
+                raise _BootstrapCleanupConflict(f"bootstrap cleanup conflict: {journal.root}")
             continue
         if entry["existed"] is True:
             if current is None:
-                raise _BootstrapCleanupConflict(
-                    f"bootstrap cleanup conflict: {journal.root}"
-                )
+                raise _BootstrapCleanupConflict(f"bootstrap cleanup conflict: {journal.root}")
             portable_restore = (
                 os.name != "posix"
                 and entry["prepare_done"] is True
                 and entry["original_mode"] != entry["after_mode"]
             )
-            if portable_restore or not _bootstrap_entry_matches(
-                entry, current, original=True
-            ):
+            if portable_restore or not _bootstrap_entry_matches(entry, current, original=True):
                 if not _bootstrap_entry_matches(entry, current, original=False):
-                    raise _BootstrapCleanupConflict(
-                        f"bootstrap cleanup conflict: {journal.root}"
-                    )
+                    raise _BootstrapCleanupConflict(f"bootstrap cleanup conflict: {journal.root}")
                 try:
                     state._chmod_bootstrap_directory(
                         path,
@@ -2049,17 +2003,11 @@ def _finalize_bootstrap_rollback_cleanup(
                         f"bootstrap cleanup conflict: {journal.root}"
                     ) from None
                 restored = state._lstat_optional(path)
-                if restored is None or not _bootstrap_entry_matches(
-                    entry, restored, original=True
-                ):
-                    raise _BootstrapCleanupConflict(
-                        f"bootstrap cleanup conflict: {journal.root}"
-                    )
+                if restored is None or not _bootstrap_entry_matches(entry, restored, original=True):
+                    raise _BootstrapCleanupConflict(f"bootstrap cleanup conflict: {journal.root}")
         elif current is not None:
             if not _bootstrap_entry_matches(entry, current, original=False):
-                raise _BootstrapCleanupConflict(
-                    f"bootstrap cleanup conflict: {journal.root}"
-                )
+                raise _BootstrapCleanupConflict(f"bootstrap cleanup conflict: {journal.root}")
             try:
                 _filesystem_mutations(mutation_backend).rmdir_empty(
                     path,
@@ -2155,12 +2103,8 @@ def finalize_rollback_cleanup(
         state._remove_private_tree(tombstone)
         metadata_state = state._lstat_optional(metadata)
         if metadata_state is not None:
-            if state._is_symlink(metadata_state) or not stat.S_ISREG(
-                metadata_state.st_mode
-            ):
-                raise state.DeploymentStateError(
-                    f"unsafe rollback cleanup metadata: {metadata}"
-                )
+            if state._is_symlink(metadata_state) or not stat.S_ISREG(metadata_state.st_mode):
+                raise state.DeploymentStateError(f"unsafe rollback cleanup metadata: {metadata}")
             metadata.unlink()
             state.fsync_directory(metadata.parent)
     except Exception as exc:
@@ -2193,13 +2137,9 @@ def resume_transaction_rollback(
         return
     phase = journal.read_phase().phase
     if phase in {"committed", "committed_cleanup_required"}:
-        raise state.DeploymentStateError(
-            f"committed transaction requires cleanup: {journal.root}"
-        )
+        raise state.DeploymentStateError(f"committed transaction requires cleanup: {journal.root}")
     if phase == "rollback_failed":
-        raise state.DeploymentStateError(
-            f"rollback requires manual recovery: {journal.root}"
-        )
+        raise state.DeploymentStateError(f"rollback requires manual recovery: {journal.root}")
     if phase in {"rollback_complete", "rollback_cleanup_required"}:
         finalize_rollback_cleanup(journal, mutation_backend=mutation_backend)
         return
@@ -2213,16 +2153,11 @@ def resume_transaction_rollback(
         for operation in operations:
             sequence = operation["sequence"]
             if sequence in completed:
-                if not _reverse_state_is_safe(
-                    operation, secret_validator=secret_validator
-                ):
+                if not _reverse_state_is_safe(operation, secret_validator=secret_validator):
                     raise _conflict(operation)
                 continue
             has_rollback_intent = sequence in rollback_intents
-            if (
-                env_rollback_state is not None
-                and env_rollback_state["sequence"] == sequence
-            ):
+            if env_rollback_state is not None and env_rollback_state["sequence"] == sequence:
                 if not has_rollback_intent:
                     raise _conflict(operation)
                 try:
@@ -2252,9 +2187,7 @@ def resume_transaction_rollback(
                 completed.add(sequence)
                 rollback_intents.discard(sequence)
                 continue
-            classification = _classify_intent(
-                operation, secret_validator=secret_validator
-            )
+            classification = _classify_intent(operation, secret_validator=secret_validator)
             if classification == "not_executed":
                 if operation.get("status") == "done" or has_rollback_intent:
                     raise _conflict(operation)
@@ -2298,9 +2231,7 @@ def _cleanup_paths(journal: state.TransactionJournal) -> tuple[Path, Path]:
     )
 
 
-def _write_cleanup_metadata(
-    journal: state.TransactionJournal, cleanup_status: str
-) -> None:
+def _write_cleanup_metadata(journal: state.TransactionJournal, cleanup_status: str) -> None:
     tombstone, metadata = _cleanup_paths(journal)
     state.atomic_write_json(
         metadata,
@@ -2324,9 +2255,7 @@ def _write_cleanup_metadata(
 def _mark_receipt_complete(journal: state.TransactionJournal) -> None:
     receipt = journal.read_history_receipt()
     if receipt is None:
-        raise state.DeploymentStateError(
-            f"missing cleanup receipt: {journal.history_receipt_path}"
-        )
+        raise state.DeploymentStateError(f"missing cleanup receipt: {journal.history_receipt_path}")
     if receipt["cleanup_status"] == "complete":
         return
     payload = dict(receipt)
@@ -2381,12 +2310,9 @@ def finalize_committed_cleanup(
             phase = journal.read_phase().phase
             if phase not in {"committed", "committed_cleanup_required"} and (
                 receipt is None
-                or receipt["cleanup_status"]
-                not in {"committed_cleanup_pending", "complete"}
+                or receipt["cleanup_status"] not in {"committed_cleanup_pending", "complete"}
             ):
-                raise state.DeploymentStateError(
-                    f"transaction is not committed: {journal.root}"
-                )
+                raise state.DeploymentStateError(f"transaction is not committed: {journal.root}")
             if receipt is None:
                 journal.write_history_receipt("committed_cleanup_pending")
                 receipt = _read_receipt(journal)
@@ -2394,15 +2320,11 @@ def finalize_committed_cleanup(
             "committed_cleanup_pending",
             "complete",
         }:
-            raise state.DeploymentStateError(
-                f"transaction is not committed: {journal.root}"
-            )
+            raise state.DeploymentStateError(f"transaction is not committed: {journal.root}")
         if state._lstat_optional(metadata) is None:
             _write_cleanup_metadata(
                 journal,
-                "committed_cleanup_pending"
-                if receipt is None
-                else str(receipt["cleanup_status"]),
+                "committed_cleanup_pending" if receipt is None else str(receipt["cleanup_status"]),
             )
         else:
             state.TombstoneJournal.open_cleanup_metadata(
@@ -2424,9 +2346,7 @@ def finalize_committed_cleanup(
         state._remove_private_tree(tombstone)
         metadata_state = state._lstat_optional(metadata)
         if metadata_state is not None:
-            if state._is_symlink(metadata_state) or not stat.S_ISREG(
-                metadata_state.st_mode
-            ):
+            if state._is_symlink(metadata_state) or not stat.S_ISREG(metadata_state.st_mode):
                 raise state.DeploymentStateError(f"unsafe cleanup metadata: {metadata}")
             metadata.unlink()
             state.fsync_directory(metadata.parent)
@@ -2506,9 +2426,7 @@ def bootstrap_adoption_lock(paths: state.StatePaths, uid: int, gid: int) -> None
         except FileExistsError:
             pass
         except OSError:
-            raise state.DeploymentStateError(
-                "cannot create adoption state root"
-            ) from None
+            raise state.DeploymentStateError("cannot create adoption state root") from None
         state.fsync_directory(paths.root.parent)
     state._verify_directory(paths.root, "adoption state root", uid, gid)
 
@@ -2600,9 +2518,7 @@ def _control_details(command: str, details: Mapping[str, object]) -> dict[str, o
         try:
             state.DeploymentIdentity(**candidate)  # type: ignore[arg-type]
         except (state.DeploymentStateError, TypeError, ValueError):
-            raise state.DeploymentStateError(
-                "invalid adopt-existing control WAL"
-            ) from None
+            raise state.DeploymentStateError("invalid adopt-existing control WAL") from None
         if (
             result["runtime_initialized"] is not None
             and type(result["runtime_initialized"]) is not bool
@@ -2639,12 +2555,9 @@ def _control_details(command: str, details: Mapping[str, object]) -> dict[str, o
             device = result[f"{prefix}_device"]
             inode = result[f"{prefix}_inode"]
             if (device is None) != (inode is None) or (
-                device is not None
-                and (type(device) is not int or type(inode) is not int)
+                device is not None and (type(device) is not int or type(inode) is not int)
             ):
-                raise state.DeploymentStateError(
-                    "invalid acknowledge-repaired control WAL"
-                )
+                raise state.DeploymentStateError("invalid acknowledge-repaired control WAL")
         return result
     raise state.DeploymentStateError("invalid control WAL command")
 
@@ -2719,9 +2632,7 @@ class ControlJournal:
                 deployment_identity_hash=deployment_identity_hash,
             )
         except OSError:
-            raise state.DeploymentStateError(
-                "cannot create control transaction"
-            ) from None
+            raise state.DeploymentStateError("cannot create control transaction") from None
         state.fsync_directory(paths.control_transactions)
         try:
             state.atomic_write_json(journal.wal_path, journal._mapping())
@@ -2790,9 +2701,7 @@ class ControlJournal:
             raise state.DeploymentStateError("control WAL identity mismatch")
         return journal
 
-    def advance(
-        self, phase: str, *, details: Mapping[str, object] | None = None
-    ) -> None:
+    def advance(self, phase: str, *, details: Mapping[str, object] | None = None) -> None:
         phases = _CONTROL_PHASES[self.command]
         if phase not in phases:
             raise state.DeploymentStateError("invalid control WAL phase")
@@ -2824,22 +2733,16 @@ def _select_control_transaction_id(paths: state.StatePaths, command: str) -> str
         raise state.DeploymentStateError("invalid implicit control command")
     _verify_control_state_directories(paths)
     try:
-        entries = sorted(
-            os.scandir(paths.control_transactions), key=lambda item: item.name
-        )
+        entries = sorted(os.scandir(paths.control_transactions), key=lambda item: item.name)
     except OSError:
-        raise state.DeploymentStateError(
-            "cannot inspect control transaction state"
-        ) from None
+        raise state.DeploymentStateError("cannot inspect control transaction state") from None
     if not entries:
         return uuid.uuid4().hex
     if len(entries) != 1:
         raise state.DeploymentStateError("multiple unfinished control transactions")
     journal = ControlJournal.open(paths, entries[0].name)
     if journal.command != command:
-        raise state.DeploymentStateError(
-            "unfinished control transaction command mismatch"
-        )
+        raise state.DeploymentStateError("unfinished control transaction command mismatch")
     return journal.transaction_id
 
 
@@ -2860,11 +2763,7 @@ def _evidence_signature(observed: os.stat_result) -> tuple[int, ...]:
 def evidence_metadata(path: Path) -> dict[str, object]:
     evidence = state.normalize_absolute_root(path, "evidence")
     observed = state._lstat_optional(evidence)
-    if (
-        observed is None
-        or state._is_symlink(observed)
-        or not stat.S_ISREG(observed.st_mode)
-    ):
+    if observed is None or state._is_symlink(observed) or not stat.S_ISREG(observed.st_mode):
         raise state.DeploymentStateError("evidence must be a regular file")
     flags = os.O_RDONLY
     if hasattr(os, "O_BINARY"):
@@ -2941,12 +2840,8 @@ def _recovery_receipt(
         "final_phase": final_phase,
         "object_categories": list(object_categories),
         "evidence": None if evidence is None else dict(evidence),
-        "quarantine_device": (
-            None if quarantine_identity is None else quarantine_identity[0]
-        ),
-        "quarantine_inode": (
-            None if quarantine_identity is None else quarantine_identity[1]
-        ),
+        "quarantine_device": (None if quarantine_identity is None else quarantine_identity[0]),
+        "quarantine_inode": (None if quarantine_identity is None else quarantine_identity[1]),
     }
     path = _recovery_receipt_path(paths, transaction_id)
     existing = state._lstat_optional(path)
@@ -3018,10 +2913,7 @@ def _existing_recovery_receipt(
                 "quarantine_inode": payload["quarantine_inode"],
             },
         )
-    elif (
-        payload["quarantine_device"] is not None
-        or payload["quarantine_inode"] is not None
-    ):
+    elif payload["quarantine_device"] is not None or payload["quarantine_inode"] is not None:
         raise state.DeploymentStateError("invalid recovery receipt")
     return payload
 
@@ -3052,8 +2944,7 @@ def _write_adoption_supplemental_receipt(
             or type(current["schema_version"]) is not int
             or current["schema_version"] != state.SCHEMA_VERSION
             or not isinstance(current["completed_at"], str)
-            or state._RFC3339_MICROSECONDS_UTC.fullmatch(current["completed_at"])
-            is None
+            or state._RFC3339_MICROSECONDS_UTC.fullmatch(current["completed_at"]) is None
         ):
             raise state.DeploymentStateError("invalid supplemental recovery receipt")
         comparable = dict(payload)
@@ -3074,9 +2965,7 @@ def _target_journal(
     identity_hash = state.identity_digest(identity)
     root = paths.transactions / state._validate_uuid4_hex(transaction_id)
     if state._lstat_optional(root) is not None:
-        journal = state.TransactionJournal.open(
-            root, identity_hash, read_only=read_only
-        )
+        journal = state.TransactionJournal.open(root, identity_hash, read_only=read_only)
         expected_companion = identity.secret_root / ".dcagent-transactions"
         if journal.control or journal.secret_companion_parent != expected_companion:
             raise state.DeploymentStateError("transaction is outside this deployment")
@@ -3122,9 +3011,7 @@ def _assert_receipt_binding(
         raise state.DeploymentStateError("recovery receipt identity mismatch")
 
 
-def inspect_transaction(
-    paths: state.StatePaths, transaction_id: str
-) -> dict[str, object]:
+def inspect_transaction(paths: state.StatePaths, transaction_id: str) -> dict[str, object]:
     """Return the fixed, sanitized inspection projection without locking or writing."""
     identity = state.load_identity(paths)
     journal = _target_journal(paths, transaction_id, identity, read_only=True)
@@ -3132,11 +3019,7 @@ def inspect_transaction(
         phase = journal.read_phase().phase
     else:
         receipt = journal.read_history_receipt()
-        phase = (
-            "committed_cleanup_required"
-            if receipt is None
-            else str(receipt["final_phase"])
-        )
+        phase = "committed_cleanup_required" if receipt is None else str(receipt["final_phase"])
     action = (
         "finalize-cleanup"
         if phase
@@ -3173,10 +3056,7 @@ def _secure_env_candidate_impl(
     gid = int(offline_env.canonical_numeric_identity("current Linux GID", gid_text))
     values = offline_env._load_env_text(env_path.read_text(encoding="utf-8"))
     for name, expected in (("DCAGENT_UID", str(uid)), ("DCAGENT_GID", str(gid))):
-        if (
-            offline_env.canonical_numeric_identity(name, values.get(name, ""))
-            != expected
-        ):
+        if offline_env.canonical_numeric_identity(name, values.get(name, "")) != expected:
             raise state.DeploymentStateError("active environment owner does not match")
     allowed_environment = {
         name: value
@@ -3192,9 +3072,7 @@ def _secure_env_candidate_impl(
     model_root = offline_env._resolve_with_override(
         env_path, "MODEL_ROOT", values["MODEL_ROOT"], environ=allowed_environment
     )
-    secret_paths = offline_env._assert_managed_secret_paths(
-        repo_root, env_path, values, environ={}
-    )
+    secret_paths = offline_env._assert_managed_secret_paths(repo_root, env_path, values, environ={})
     secret_root = next(iter(secret_paths.values())).parent.resolve(strict=False)
     if state.derive_state_root(data_root) != paths.root:
         raise state.DeploymentStateError("active environment state root mismatch")
@@ -3233,18 +3111,14 @@ def _secure_env_candidate(
     except state.DeploymentStateError:
         raise
     except (offline_env.DeploymentError, OSError, UnicodeError, ValueError):
-        raise state.DeploymentStateError(
-            "active offline environment validation failed"
-        ) from None
+        raise state.DeploymentStateError("active offline environment validation failed") from None
 
 
 def _containers_exist(environ: Mapping[str, str] | None = None) -> bool:
     from tools import offline_env
 
     try:
-        return offline_env._dcagent_containers_exist(
-            os.environ if environ is None else environ
-        )
+        return offline_env._dcagent_containers_exist(os.environ if environ is None else environ)
     except (OSError, subprocess.SubprocessError):
         raise state.DeploymentStateError("cannot inspect DC-Agent containers") from None
 
@@ -3262,9 +3136,7 @@ def _postgres_initialized(data_root: Path) -> bool:
         with os.scandir(postgres) as entries:
             return next(entries, None) is not None
     except OSError:
-        raise state.DeploymentStateError(
-            "cannot inspect PostgreSQL data directory"
-        ) from None
+        raise state.DeploymentStateError("cannot inspect PostgreSQL data directory") from None
 
 
 def _verify_control_state_directories(paths: state.StatePaths) -> None:
@@ -3277,17 +3149,13 @@ def _verify_control_state_directories(paths: state.StatePaths) -> None:
         state._verify_directory(directory, description)
 
 
-def _assert_only_control_transaction(
-    paths: state.StatePaths, transaction_id: str
-) -> None:
+def _assert_only_control_transaction(paths: state.StatePaths, transaction_id: str) -> None:
     _verify_control_state_directories(paths)
     for directory in (paths.transactions, paths.control_transactions):
         try:
             entries = list(os.scandir(directory))
         except OSError:
-            raise state.DeploymentStateError(
-                "cannot inspect transaction state"
-            ) from None
+            raise state.DeploymentStateError("cannot inspect transaction state") from None
         for entry in entries:
             if directory == paths.control_transactions and entry.name == transaction_id:
                 continue
@@ -3313,16 +3181,9 @@ def _assert_clear_gates(
     containers_exist: Callable[[], bool] | None,
 ) -> None:
     _assert_only_control_transaction(paths, transaction_id)
-    if (
-        containers_exist()
-        if containers_exist is not None
-        else _containers_exist(environ)
-    ):
+    if containers_exist() if containers_exist is not None else _containers_exist(environ):
         raise state.DeploymentStateError("DC-Agent containers still exist")
-    if (
-        state._lstat_optional(identity.data_root / "postgres" / "PG_VERSION")
-        is not None
-    ):
+    if state._lstat_optional(identity.data_root / "postgres" / "PG_VERSION") is not None:
         raise state.DeploymentStateError("PostgreSQL is initialized")
     if _postgres_initialized(identity.data_root):
         raise state.DeploymentStateError("PostgreSQL data directory is not empty")
@@ -3336,9 +3197,7 @@ def _active_state_revalidated(
 ) -> dict[str, Path]:
     from tools import offline_env
 
-    candidate, _env_path, secret_paths, uid, gid = _secure_env_candidate(
-        paths, environ=environ
-    )
+    candidate, _env_path, secret_paths, uid, gid = _secure_env_candidate(paths, environ=environ)
     if (
         candidate.to_mapping() | {"deployment_uuid": identity.deployment_uuid}
         != identity.to_mapping()
@@ -3355,10 +3214,7 @@ def _active_state_revalidated(
             state._is_symlink(observed)
             or not stat.S_ISREG(observed.st_mode)
             or (os.name == "posix" and stat.S_IMODE(observed.st_mode) != 0o600)
-            or (
-                os.name == "posix"
-                and (observed.st_uid != uid or observed.st_gid != gid)
-            )
+            or (os.name == "posix" and (observed.st_uid != uid or observed.st_gid != gid))
         ):
             raise state.DeploymentStateError("unsafe active secret set")
     return secret_paths
@@ -3371,9 +3227,7 @@ def adopt_existing(
     environ: Mapping[str, str] | None = None,
     containers_exist: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
-    existing_receipt = _existing_recovery_receipt(
-        paths, transaction_id, "adopt-existing"
-    )
+    existing_receipt = _existing_recovery_receipt(paths, transaction_id, "adopt-existing")
     if existing_receipt is not None:
         identity = state.load_identity(paths)
         identity_hash = state.identity_digest(identity)
@@ -3398,13 +3252,10 @@ def adopt_existing(
             if candidate != identity:
                 raise state.DeploymentStateError("completed adoption identity mismatch")
             currently_initialized = (
-                containers_exist()
-                if containers_exist is not None
-                else _containers_exist(environ)
+                containers_exist() if containers_exist is not None else _containers_exist(environ)
             ) or _postgres_initialized(identity.data_root)
             marker_became_required = (
-                completed.details["runtime_initialized"] is not True
-                and currently_initialized
+                completed.details["runtime_initialized"] is not True and currently_initialized
             )
             if marker_became_required:
                 details = dict(completed.details)
@@ -3417,9 +3268,7 @@ def adopt_existing(
                     deployment_identity_hash=identity_hash,
                 )
             if marker_became_required:
-                _write_adoption_supplemental_receipt(
-                    paths, transaction_id, identity_hash
-                )
+                _write_adoption_supplemental_receipt(paths, transaction_id, identity_hash)
             completed.remove()
         return existing_receipt
     control_root = paths.control_transactions / transaction_id
@@ -3467,13 +3316,9 @@ def adopt_existing(
         "adoption_complete",
     }:
         currently_initialized = (
-            containers_exist()
-            if containers_exist is not None
-            else _containers_exist(environ)
+            containers_exist() if containers_exist is not None else _containers_exist(environ)
         ) or _postgres_initialized(candidate.data_root)
-        initialized = (
-            journal.details["runtime_initialized"] is True or currently_initialized
-        )
+        initialized = journal.details["runtime_initialized"] is True or currently_initialized
         details = dict(journal.details)
         details["runtime_initialized"] = initialized
         if journal.phase == "identity_created":
@@ -3504,10 +3349,7 @@ def adopt_existing(
         state.write_identity_exclusive(paths, candidate)
         journal.advance("adoption_complete")
         _after_control_step("adopt-existing", "adoption_complete")
-    if (
-        journal.phase == "adoption_complete"
-        and journal.details["runtime_initialized"] is True
-    ):
+    if journal.phase == "adoption_complete" and journal.details["runtime_initialized"] is True:
         state.create_start_marker(
             paths,
             operation="legacy_adoption",
@@ -3533,9 +3375,7 @@ def clear_start_marker(
     containers_exist: Callable[[], bool] | None = None,
     mutation_backend: FilesystemMutationBackend | None = None,
 ) -> dict[str, object]:
-    existing_receipt = _existing_recovery_receipt(
-        paths, transaction_id, "clear-start-marker"
-    )
+    existing_receipt = _existing_recovery_receipt(paths, transaction_id, "clear-start-marker")
     control_root = paths.control_transactions / transaction_id
     identity = state.load_identity(paths)
     identity_hash = state.identity_digest(identity)
@@ -3601,9 +3441,7 @@ def clear_start_marker(
                     journal.details["marker_inode"],
                 )
                 if (backup_state.st_dev, backup_state.st_ino) != expected_identity:
-                    raise state.DeploymentStateError(
-                        "start marker backup changed"
-                    ) from None
+                    raise state.DeploymentStateError("start marker backup changed") from None
                 try:
                     _filesystem_mutations(mutation_backend).rename_noreplace(
                         backup,
@@ -3611,16 +3449,12 @@ def clear_start_marker(
                         expected_source=backup_state,
                     )
                 except OSError:
-                    raise state.DeploymentStateError(
-                        "cannot safely restore start marker"
-                    ) from None
+                    raise state.DeploymentStateError("cannot safely restore start marker") from None
             journal.remove()
             raise
     if journal.phase == "runtime_checked":
         if state._lstat_optional(backup) is None:
-            marker_state = state._verify_regular_file(
-                paths.start_marker, "start marker"
-            )
+            marker_state = state._verify_regular_file(paths.start_marker, "start marker")
             expected_identity = (
                 journal.details["marker_device"],
                 journal.details["marker_inode"],
@@ -3637,9 +3471,7 @@ def clear_start_marker(
                     expected_source=marker_state,
                 )
             except OSError:
-                raise state.DeploymentStateError(
-                    "cannot safely back up start marker"
-                ) from None
+                raise state.DeploymentStateError("cannot safely back up start marker") from None
         else:
             backup_state = state._verify_regular_file(backup, "start marker backup")
             expected_identity = (
@@ -3663,9 +3495,7 @@ def clear_start_marker(
         journal.advance("receipt_written")
         _after_control_step("clear-start-marker", "receipt_written")
     else:
-        receipt = _existing_recovery_receipt(
-            paths, transaction_id, "clear-start-marker"
-        )
+        receipt = _existing_recovery_receipt(paths, transaction_id, "clear-start-marker")
     if journal.phase == "receipt_written":
         if state._lstat_optional(backup) is not None:
             backup_state = state._verify_regular_file(backup, "start marker backup")
@@ -3676,9 +3506,7 @@ def clear_start_marker(
             if (backup_state.st_dev, backup_state.st_ino) != expected_identity:
                 raise state.DeploymentStateError("start marker backup changed")
             try:
-                _filesystem_mutations(mutation_backend).unlink(
-                    backup, expected_source=backup_state
-                )
+                _filesystem_mutations(mutation_backend).unlink(backup, expected_source=backup_state)
             except OSError:
                 raise state.DeploymentStateError(
                     "cannot safely remove start marker backup"
@@ -3699,9 +3527,7 @@ def acknowledge_repaired(
     environ: Mapping[str, str] | None = None,
     mutation_backend: FilesystemMutationBackend | None = None,
 ) -> dict[str, object]:
-    existing_receipt = _existing_recovery_receipt(
-        paths, transaction_id, "acknowledge-repaired"
-    )
+    existing_receipt = _existing_recovery_receipt(paths, transaction_id, "acknowledge-repaired")
     control_root = paths.control_transactions / transaction_id
     identity = state.load_identity(paths)
     identity_hash = state.identity_digest(identity)
@@ -3813,9 +3639,7 @@ def acknowledge_repaired(
         journal.advance("receipt_written")
         _after_control_step("acknowledge-repaired", "receipt_written")
     else:
-        receipt = _existing_recovery_receipt(
-            paths, transaction_id, "acknowledge-repaired"
-        )
+        receipt = _existing_recovery_receipt(paths, transaction_id, "acknowledge-repaired")
     if journal.phase == "receipt_written":
         journal.advance("repair_acknowledgement_complete")
         _after_control_step("acknowledge-repaired", "repair_acknowledgement_complete")
@@ -3832,9 +3656,7 @@ def _repair_transaction(
     identity = state.load_identity(paths)
     identity_hash = state.identity_digest(identity)
     if existing is not None:
-        expected_phase = (
-            "rolled_back" if command == "resume-rollback" else existing["final_phase"]
-        )
+        expected_phase = "rolled_back" if command == "resume-rollback" else existing["final_phase"]
         if command == "finalize-cleanup" and expected_phase not in {
             "committed",
             "rolled_back",
@@ -3861,8 +3683,7 @@ def _repair_transaction(
     elif command == "finalize-cleanup":
         rollback_cleanup = isinstance(journal, state.RollbackTombstoneJournal) or (
             isinstance(journal, state.TransactionJournal)
-            and journal.read_phase().phase
-            in {"rollback_complete", "rollback_cleanup_required"}
+            and journal.read_phase().phase in {"rollback_complete", "rollback_cleanup_required"}
         )
         if rollback_cleanup:
             finalize_rollback_cleanup(journal)

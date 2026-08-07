@@ -67,11 +67,13 @@ class OfflineArtifactManifestTest(unittest.TestCase):
 
     def test_rejects_missing_empty_or_non_list_artifacts(self) -> None:
         for payload in ({}, {"artifacts": []}, {"artifacts": {}}, None):
-            with self.subTest(payload=payload):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(
                     ValueError, "^artifact manifest must contain a nonempty artifacts list$"
-                ):
-                    validate_artifact_manifest(payload)  # type: ignore[arg-type]
+                ),
+            ):
+                validate_artifact_manifest(payload)  # type: ignore[arg-type]
 
     def test_rejects_non_object_artifact_entries(self) -> None:
         for artifact in ("model", 1, None, []):

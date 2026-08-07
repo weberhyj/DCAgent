@@ -224,7 +224,7 @@ class SyncOllamaClient:
             digest_match = _MODEL_DIGEST_PATTERN.fullmatch(digest)
             if digest_match is None:
                 raise OllamaResponseError("Ollama model inventory response is invalid")
-            if model == name or model == model_name:
+            if model in (name, model_name):
                 matches.append(digest_match.group(1))
 
         if not matches:

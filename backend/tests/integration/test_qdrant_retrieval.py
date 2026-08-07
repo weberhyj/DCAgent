@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import unittest
 from uuid import uuid4
@@ -24,7 +25,7 @@ class QdrantRetrievalIntegrationTest(unittest.TestCase):
         self.gateway.create_collection(self.collection_name, dense_dimensions=2)
 
     def _cleanup(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self.client.update_collection_aliases(
                 change_aliases_operations=[
                     models.DeleteAliasOperation(
@@ -32,12 +33,8 @@ class QdrantRetrievalIntegrationTest(unittest.TestCase):
                     )
                 ]
             )
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             self.gateway.delete_collection(self.collection_name)
-        except Exception:
-            pass
         self.client.close()
 
     def test_permission_isolation_and_alias_activation(self) -> None:

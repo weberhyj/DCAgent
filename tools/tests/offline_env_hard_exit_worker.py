@@ -16,9 +16,7 @@ HARD_EXIT_CODE = 91
 
 
 class _HardExitAfterChmodBackend:
-    def __init__(
-        self, delegate: offline_env.PreparationFilesystemMutationBackend
-    ) -> None:
+    def __init__(self, delegate: offline_env.PreparationFilesystemMutationBackend) -> None:
         self.delegate = delegate
 
     def mkdir(

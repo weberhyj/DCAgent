@@ -186,9 +186,8 @@ class EmbeddingClientTest(unittest.IsolatedAsyncioTestCase):
         )
 
         for url in invalid_urls:
-            with self.subTest(url=url):
-                with self.assertRaises(ValueError):
-                    HttpEmbeddingClient(url)
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                HttpEmbeddingClient(url)
 
         private_client = HttpEmbeddingClient("http://10.20.30.40:8081", transport=FakeTransport())
         vectors = await private_client.embed(["one"], expected=metadata(), purpose="query")

@@ -291,9 +291,8 @@ class RerankerServiceTest(unittest.TestCase):
                     environ=production_environment(**{field: value}),
                     backend_loader=lambda values, pinned: loader_calls.append(values),
                 )
-                with self.assertRaisesRegex(ValueError, message):
-                    with TestClient(app):
-                        pass
+                with self.assertRaisesRegex(ValueError, message), TestClient(app):
+                    pass
                 self.assertEqual(loader_calls, [])
                 self.assertFalse(app.state.reranker_ready)
 
@@ -462,9 +461,8 @@ class RerankerServiceTest(unittest.TestCase):
                     environ=production_environment(RERANKER_BATCH_MAX_ITEMS=value),
                     backend_loader=lambda values, metadata: loader_calls.append(values),
                 )
-                with self.assertRaisesRegex(ValueError, message):
-                    with TestClient(app):
-                        pass
+                with self.assertRaisesRegex(ValueError, message), TestClient(app):
+                    pass
                 self.assertEqual(loader_calls, [])
 
     def test_production_rejects_queue_capacity_below_wire_contract_before_loader(self) -> None:
@@ -792,9 +790,11 @@ class RerankerServiceTest(unittest.TestCase):
         for backend in (AlwaysFailingBackend(), AlwaysMalformedBackend()):
             with self.subTest(backend=type(backend).__name__):
                 app = create_reranker_app(backend, metadata)
-                with self.assertRaisesRegex(
-                    RuntimeError, "reranker backend startup self-test failed"
+                with (
+                    self.assertRaisesRegex(
+                        RuntimeError, "reranker backend startup self-test failed"
+                    ),
+                    TestClient(app),
                 ):
-                    with TestClient(app):
-                        pass
+                    pass
                 self.assertFalse(app.state.reranker_ready)

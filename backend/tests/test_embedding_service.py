@@ -203,9 +203,8 @@ class EmbeddingContractsTest(unittest.TestCase):
             "protocol_version": "1",
         }
         for changes in invalid_values:
-            with self.subTest(changes=changes):
-                with self.assertRaises(ValueError):
-                    EmbeddingModelMetadata(**(base | changes))
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                EmbeddingModelMetadata(**(base | changes))
 
     def test_wire_dtos_use_camel_case_and_reject_malformed_vectors(self) -> None:
         metadata_payload = EmbeddingMetadataResponse.from_metadata(metadata())
@@ -416,9 +415,8 @@ class EmbeddingServiceTest(unittest.TestCase):
                     environ=environ,
                     backend_loader=lambda values, pinned: loader_calls.append(values),
                 )
-                with self.assertRaisesRegex(ValueError, field):
-                    with TestClient(app):
-                        pass
+                with self.assertRaisesRegex(ValueError, field), TestClient(app):
+                    pass
                 self.assertEqual(loader_calls, [])
                 self.assertFalse(app.state.embedding_ready)
 
@@ -440,9 +438,8 @@ class EmbeddingServiceTest(unittest.TestCase):
                     environ=production_environment(**{field: " \t "}),
                     backend_loader=lambda values, pinned: loader_calls.append(values),
                 )
-                with self.assertRaisesRegex(ValueError, field):
-                    with TestClient(app):
-                        pass
+                with self.assertRaisesRegex(ValueError, field), TestClient(app):
+                    pass
                 self.assertEqual(loader_calls, [])
                 self.assertFalse(app.state.embedding_ready)
 
@@ -464,9 +461,8 @@ class EmbeddingServiceTest(unittest.TestCase):
                     environ=production_environment(**{field: value}),
                     backend_loader=lambda values, pinned: loader_calls.append(values),
                 )
-                with self.assertRaisesRegex(ValueError, field):
-                    with TestClient(app):
-                        pass
+                with self.assertRaisesRegex(ValueError, field), TestClient(app):
+                    pass
                 self.assertEqual(loader_calls, [])
                 self.assertFalse(app.state.embedding_ready)
 
@@ -594,9 +590,8 @@ class EmbeddingServiceTest(unittest.TestCase):
                 else:
                     environ[field] = value
                 app = create_production_app(environ=environ)
-                with self.assertRaisesRegex(ValueError, message):
-                    with TestClient(app):
-                        pass
+                with self.assertRaisesRegex(ValueError, message), TestClient(app):
+                    pass
                 self.assertFalse(app.state.embedding_ready)
 
     def test_invalid_keep_alive_and_timeout_fail_before_client_construction(self) -> None:
@@ -620,9 +615,8 @@ class EmbeddingServiceTest(unittest.TestCase):
                     environ[field] = value
                 with patch("app.embedding_service.SyncOllamaClient") as client_type:
                     app = create_production_app(environ=environ)
-                    with self.assertRaises(ValueError):
-                        with TestClient(app):
-                            pass
+                    with self.assertRaises(ValueError), TestClient(app):
+                        pass
                 client_type.assert_not_called()
                 self.assertFalse(app.state.embedding_ready)
 
@@ -772,18 +766,20 @@ class EmbeddingServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "weights.bin").write_bytes(b"offline model weights")
-            with patch.object(
-                embedding_service,
-                "_read_model_metadata_manifest",
-                side_effect=AssertionError("manifest loader must not run"),
+            with (
+                patch.object(
+                    embedding_service,
+                    "_read_model_metadata_manifest",
+                    side_effect=AssertionError("manifest loader must not run"),
+                ),
+                self.assertRaisesRegex(ValueError, "checksum mismatch"),
             ):
-                with self.assertRaisesRegex(ValueError, "checksum mismatch"):
-                    embedding_service._load_pinned_model_configuration(
-                        {
-                            "EMBEDDING_MODEL_ROOT": str(root),
-                            "EMBEDDING_MODEL_SHA256": "b" * 64,
-                        }
-                    )
+                embedding_service._load_pinned_model_configuration(
+                    {
+                        "EMBEDDING_MODEL_ROOT": str(root),
+                        "EMBEDDING_MODEL_SHA256": "b" * 64,
+                    }
+                )
 
     def test_local_metadata_manifest_rejects_missing_invalid_and_wrong_fields(self) -> None:
         valid_payload = {

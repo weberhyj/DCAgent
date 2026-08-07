@@ -214,11 +214,10 @@ class RetrievalAuditRepositoryTest(unittest.TestCase):
         self.repository.mark_publication_validated(first.id, point_count=12)
         self.repository.mark_publication_validated(second.id, point_count=13)
 
-        with self.assertRaises(IntegrityError):
-            with self.database.session() as session:
-                session.get(RetrievalPublicationRecord, first.id).status = "active"
-                session.get(RetrievalPublicationRecord, second.id).status = "active"
-                session.flush()
+        with self.assertRaises(IntegrityError), self.database.session() as session:
+            session.get(RetrievalPublicationRecord, first.id).status = "active"
+            session.get(RetrievalPublicationRecord, second.id).status = "active"
+            session.flush()
 
         self.assertEqual(self.repository.get_publication(first.id).status, "validated")
         self.assertEqual(self.repository.get_publication(second.id).status, "validated")

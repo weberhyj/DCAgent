@@ -15,7 +15,6 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = (REPO_ROOT / "backend").resolve()
 if str(BACKEND_ROOT) not in sys.path:
@@ -59,11 +58,7 @@ class RetrievalScope:
         knowledge_base_id = self.knowledge_base_id.strip()
         permission_tags = tuple(tag.strip() for tag in self.permission_tags)
         publication_version = self.publication_version.strip()
-        if (
-            not knowledge_base_id
-            or not permission_tags
-            or any(not tag for tag in permission_tags)
-        ):
+        if not knowledge_base_id or not permission_tags or any(not tag for tag in permission_tags):
             raise ValueError("benchmark retrieval scope must be complete")
         if not publication_version:
             raise ValueError("benchmark retrieval scope must be complete")
@@ -168,31 +163,21 @@ def summarize_results(
     error_rate_limit: float,
     fallback_rate_limit: float,
 ) -> BenchmarkSummary:
-    p95_valid = bool(latencies) and all(
-        _finite_nonnegative(value) for value in latencies
-    )
+    p95_valid = bool(latencies) and all(_finite_nonnegative(value) for value in latencies)
     p95_seconds = _percentile(latencies, 0.95) if p95_valid else 0.0
-    requests_valid = (
-        not isinstance(requests, bool) and isinstance(requests, int) and requests > 0
-    )
+    requests_valid = not isinstance(requests, bool) and isinstance(requests, int) and requests > 0
     errors_valid = _valid_count(errors, requests)
     fallbacks_valid = _valid_count(fallbacks, requests)
     error_rate = round(errors / requests, 6) if requests_valid and errors_valid else 0.0
-    fallback_rate = (
-        round(fallbacks / requests, 6) if requests_valid and fallbacks_valid else 0.0
-    )
+    fallback_rate = round(fallbacks / requests, 6) if requests_valid and fallbacks_valid else 0.0
     limits_valid = all(
-        _finite_nonnegative(value)
-        for value in (p95_limit, error_rate_limit, fallback_rate_limit)
+        _finite_nonnegative(value) for value in (p95_limit, error_rate_limit, fallback_rate_limit)
     )
     gate_results = (
         ("p95_seconds", p95_valid and limits_valid and p95_seconds <= p95_limit),
         (
             "error_rate",
-            requests_valid
-            and errors_valid
-            and limits_valid
-            and error_rate <= error_rate_limit,
+            requests_valid and errors_valid and limits_valid and error_rate <= error_rate_limit,
         ),
         (
             "fallback_rate",
@@ -228,11 +213,7 @@ def run_benchmark(
     error_rate_limit: float,
     fallback_rate_limit: float,
 ) -> dict[str, object]:
-    if (
-        isinstance(concurrency, bool)
-        or not isinstance(concurrency, int)
-        or concurrency <= 0
-    ):
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency <= 0:
         raise ValueError("concurrency must be a positive integer")
     if isinstance(requests, bool) or not isinstance(requests, int) or requests < 0:
         raise ValueError("requests must be a non-negative integer")
@@ -265,9 +246,7 @@ def run_benchmark(
                     )
                 )
                 latency = _outcome_latency_seconds(outcome)
-                fallback_reason = _sanitize_fallback(
-                    getattr(outcome, "fallback_reason", None)
-                )
+                fallback_reason = _sanitize_fallback(getattr(outcome, "fallback_reason", None))
                 record = {
                     "caseId": question.case_id,
                     "chunkIds": _outcome_chunk_ids(outcome),
@@ -327,13 +306,9 @@ def load_questions(path: Path) -> list[BenchmarkQuestion]:
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError as error:
-                raise ValueError(
-                    f"invalid questions JSONL at line {line_number}"
-                ) from error
+                raise ValueError(f"invalid questions JSONL at line {line_number}") from error
             if not isinstance(payload, Mapping):
-                raise ValueError(
-                    f"questions JSONL line {line_number} must be an object"
-                )
+                raise ValueError(f"questions JSONL line {line_number} must be an object")
             case_id = payload.get("caseId", payload.get("case_id"))
             question = payload.get("question")
             if not isinstance(case_id, str) or not isinstance(question, str):
@@ -374,9 +349,7 @@ def build_production_runtime(
     environment = dict(os.environ if environ is None else environ)
     dependencies = _dependencies or _default_runtime_dependencies()
     settings = dependencies.settings_from_environ(environment)
-    mode = getattr(
-        getattr(settings, "mode", None), "value", getattr(settings, "mode", None)
-    )
+    mode = getattr(getattr(settings, "mode", None), "value", getattr(settings, "mode", None))
     if mode != "qwen3":
         raise ValueError("hybrid benchmark requires RETRIEVAL_MODE=qwen3")
     canary_percent = getattr(settings, "canary_percent", None)
@@ -390,9 +363,7 @@ def build_production_runtime(
     factory = dependencies.resource_factory()
     resources: list[object] = []
     try:
-        database = dependencies.database_factory(
-            dependencies.database_url_resolver(environment)
-        )
+        database = dependencies.database_factory(dependencies.database_url_resolver(environment))
         resources.append(database)
         permission_tags = tuple(settings.permission_tags)
         repository = dependencies.repository_factory(database, permission_tags)
@@ -488,16 +459,12 @@ def _outcome_latency_seconds(outcome: object) -> float:
 
 def _outcome_chunk_ids(outcome: object) -> list[str]:
     candidates = getattr(outcome, "candidates", ())
-    candidate_ids = [
-        str(item.chunk_id) for item in candidates if hasattr(item, "chunk_id")
-    ]
+    candidate_ids = [str(item.chunk_id) for item in candidates if hasattr(item, "chunk_id")]
     if candidate_ids:
         return candidate_ids
     hits = getattr(outcome, "hits", ())
     return [
-        str(item.chunk.id)
-        for item in hits
-        if hasattr(item, "chunk") and hasattr(item.chunk, "id")
+        str(item.chunk.id) for item in hits if hasattr(item, "chunk") and hasattr(item.chunk, "id")
     ]
 
 
@@ -578,11 +545,7 @@ def _safe_report(report: Mapping[str, object]) -> dict[str, object]:
     if isinstance(summary, Mapping):
         safe_summary["passed"] = summary.get("passed") is True
         requests = summary.get("requests")
-        if (
-            not isinstance(requests, bool)
-            and isinstance(requests, int)
-            and requests >= 0
-        ):
+        if not isinstance(requests, bool) and isinstance(requests, int) and requests >= 0:
             safe_summary["requests"] = requests
         for key in ("p95Seconds", "errorRate", "fallbackRate"):
             value = summary.get(key)
@@ -590,16 +553,10 @@ def _safe_report(report: Mapping[str, object]) -> dict[str, object]:
                 safe_summary[key] = float(value)
         for key in ("passedGates", "failedGates"):
             values = summary.get(key)
-            if isinstance(values, Sequence) and not isinstance(
-                values, (str, bytes, bytearray)
-            ):
-                safe_summary[key] = [
-                    str(value) for value in values if str(value) in _GATE_NAMES
-                ]
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
+                safe_summary[key] = [str(value) for value in values if str(value) in _GATE_NAMES]
     safe_records: list[dict[str, object]] = []
-    if isinstance(records, Sequence) and not isinstance(
-        records, (str, bytes, bytearray)
-    ):
+    if isinstance(records, Sequence) and not isinstance(records, (str, bytes, bytearray)):
         for record in records:
             if not isinstance(record, Mapping):
                 continue
@@ -628,18 +585,12 @@ def _safe_identifier(value: object) -> str:
 def _safe_identifiers(value: object) -> list[str]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return []
-    return [
-        identifier
-        for item in value
-        if (identifier := _safe_identifier(item)) != "redacted"
-    ]
+    return [identifier for item in value if (identifier := _safe_identifier(item)) != "redacted"]
 
 
 def _safe_mode(value: object) -> str:
     normalized = str(value)
-    return (
-        normalized if normalized in {"legacy", "shadow", "qwen3", "error"} else "error"
-    )
+    return normalized if normalized in {"legacy", "shadow", "qwen3", "error"} else "error"
 
 
 def _parser() -> argparse.ArgumentParser:

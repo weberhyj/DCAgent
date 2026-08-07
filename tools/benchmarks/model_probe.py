@@ -3,28 +3,27 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
 import errno
 import hashlib
 import hmac
 import json
 import math
 import os
-from pathlib import Path
 import re
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import textwrap
-import sys
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.benchmarks.report import CapacityResult
-
 
 EMBEDDING_CONCURRENCIES = (1, 5, 15)
 CONTEXT_LENGTHS = (512, 1024, 2048)
@@ -402,9 +401,7 @@ def evaluate_candidate_gate(
     """Evaluate only metrics that apply to this candidate kind."""
 
     applicable = {
-        "embedding-model": (
-            ("query_embedding_p95_ms", gate.max_query_embedding_p95_ms),
-        ),
+        "embedding-model": (("query_embedding_p95_ms", gate.max_query_embedding_p95_ms),),
         "generation-model": (
             ("queue_feedback_p95_ms", gate.max_queue_feedback_p95_ms),
             ("first_token_p95_ms", gate.max_first_token_p95_ms),
@@ -498,7 +495,7 @@ class ProbeMutex:
         self._handle = None
         self._identity: tuple[int, int] | None = None
 
-    def __enter__(self) -> "ProbeMutex":
+    def __enter__(self) -> ProbeMutex:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             existing = self.path.lstat()
@@ -518,9 +515,7 @@ class ProbeMutex:
             descriptor = os.open(self.path, flags, 0o600)
         except OSError as exc:
             if getattr(exc, "errno", None) == errno.ELOOP:
-                raise ValueError(
-                    "model probe lock must not be a symbolic link"
-                ) from exc
+                raise ValueError("model probe lock must not be a symbolic link") from exc
             raise
         try:
             opened = os.fstat(descriptor)
@@ -549,9 +544,7 @@ class ProbeMutex:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             handle.close()
-            raise RuntimeError(
-                "another model candidate probe is already running"
-            ) from exc
+            raise RuntimeError("another model candidate probe is already running") from exc
         self._handle = handle
         self._identity = (opened.st_dev, opened.st_ino)
         return self
@@ -580,8 +573,7 @@ class ProbeMutex:
             except FileNotFoundError:
                 current = None
             if current is not None and (
-                identity == (current.st_dev, current.st_ino)
-                and stat.S_ISREG(current.st_mode)
+                identity == (current.st_dev, current.st_ino) and stat.S_ISREG(current.st_mode)
             ):
                 self.path.unlink(missing_ok=True)
 
@@ -605,9 +597,7 @@ def _artifact_fingerprint(path: Path) -> ArtifactFingerprint:
         entries_seen = 0
 
         def reject_walk_error(error: OSError) -> None:
-            raise ValueError(
-                "candidate artifact tree could not be fully inspected"
-            ) from error
+            raise ValueError("candidate artifact tree could not be fully inspected") from error
 
         for root, directory_names, file_names in os.walk(
             artifact, followlinks=False, onerror=reject_walk_error
@@ -623,13 +613,9 @@ def _artifact_fingerprint(path: Path) -> ArtifactFingerprint:
                 try:
                     child_details = child.lstat()
                 except OSError as exc:
-                    raise ValueError(
-                        "candidate artifact tree changed during validation"
-                    ) from exc
+                    raise ValueError("candidate artifact tree changed during validation") from exc
                 if stat.S_ISLNK(child_details.st_mode):
-                    raise ValueError(
-                        "candidate artifact tree must not contain symbolic links"
-                    )
+                    raise ValueError("candidate artifact tree must not contain symbolic links")
                 if not stat.S_ISDIR(child_details.st_mode):
                     raise ValueError(
                         "candidate artifact tree must contain only directories and regular files"
@@ -639,15 +625,9 @@ def _artifact_fingerprint(path: Path) -> ArtifactFingerprint:
                 try:
                     child_details = child.lstat()
                 except OSError as exc:
-                    raise ValueError(
-                        "candidate artifact tree changed during validation"
-                    ) from exc
-                if stat.S_ISLNK(child_details.st_mode) or not stat.S_ISREG(
-                    child_details.st_mode
-                ):
-                    raise ValueError(
-                        "candidate artifact tree must contain only regular files"
-                    )
+                    raise ValueError("candidate artifact tree changed during validation") from exc
+                if stat.S_ISLNK(child_details.st_mode) or not stat.S_ISREG(child_details.st_mode):
+                    raise ValueError("candidate artifact tree must contain only regular files")
                 members.append(
                     ArtifactMemberFingerprint(
                         relative_path=child.relative_to(artifact).as_posix(),
@@ -682,18 +662,13 @@ def _verify_artifact_stable(
     after = _artifact_fingerprint(path)
     if after != before or after != expected_fingerprint:
         raise ValueError("candidate artifact changed while hashing")
-    if (
-        not isinstance(actual_checksum, str)
-        or SHA256_PATTERN.fullmatch(actual_checksum) is None
-    ):
+    if not isinstance(actual_checksum, str) or SHA256_PATTERN.fullmatch(actual_checksum) is None:
         raise ValueError("artifact hasher returned an invalid sha256")
     if not hmac.compare_digest(actual_checksum, expected_checksum):
         raise ValueError("candidate artifact checksum mismatch")
 
 
-def _verify_candidate_stable(
-    candidate: CandidateArtifact, artifact_hasher: ArtifactHasher
-) -> None:
+def _verify_candidate_stable(candidate: CandidateArtifact, artifact_hasher: ArtifactHasher) -> None:
     _verify_artifact_stable(
         candidate.path,
         candidate.sha256,
@@ -725,17 +700,11 @@ def sha256_artifact(path: Path) -> str:
         for name in directory_names:
             child = directory / name
             if child.is_symlink():
-                raise ValueError(
-                    "candidate artifact tree must not contain symbolic links"
-                )
+                raise ValueError("candidate artifact tree must not contain symbolic links")
         for name in file_names:
             child = directory / name
-            if child.is_symlink() or not stat.S_ISREG(
-                child.stat(follow_symlinks=False).st_mode
-            ):
-                raise ValueError(
-                    "candidate artifact tree must contain only regular files"
-                )
+            if child.is_symlink() or not stat.S_ISREG(child.stat(follow_symlinks=False).st_mode):
+                raise ValueError("candidate artifact tree must contain only regular files")
             files.append(child)
 
     files.sort(key=lambda item: item.relative_to(artifact).as_posix().encode("utf-8"))
@@ -916,9 +885,7 @@ def _load_embedding_metadata(path: Path) -> dict[str, object]:
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            "embedding candidate requires valid embedding-metadata.json"
-        ) from exc
+        raise ValueError("embedding candidate requires valid embedding-metadata.json") from exc
     if not isinstance(payload, dict):
         raise ValueError("embedding-metadata.json must be an object")
     for field in ("modelName", "modelVersion", "dimensions"):
@@ -944,9 +911,7 @@ def load_candidate_artifact(
     if not isinstance(entry, Mapping):
         raise ValueError("candidate artifact-lock entry must be an object")
     if set(entry) != set(ARTIFACT_FIELDS):
-        raise ValueError(
-            "candidate artifact-lock entry must contain exactly the lock fields"
-        )
+        raise ValueError("candidate artifact-lock entry must contain exactly the lock fields")
     values: dict[str, str] = {}
     for field in ARTIFACT_FIELDS:
         value = entry[field]
@@ -956,9 +921,7 @@ def load_candidate_artifact(
     if values["kind"] not in SUPPORTED_KINDS:
         raise ValueError("candidate artifact kind is not probeable")
     if SHA256_PATTERN.fullmatch(values["sha256"]) is None:
-        raise ValueError(
-            "candidate sha256 must be exactly 64 lowercase hexadecimal characters"
-        )
+        raise ValueError("candidate sha256 must be exactly 64 lowercase hexadecimal characters")
 
     raw_path = values["localPath"]
     if raw_path.startswith(("\\\\", "//")) or (
@@ -970,18 +933,14 @@ def load_candidate_artifact(
         raise ValueError("artifact_root must not contain symbolic links")
     root = root_input.resolve(strict=True)
     unresolved = Path(raw_path)
-    is_absolute = (
-        unresolved.is_absolute() or WINDOWS_ABSOLUTE.match(raw_path) is not None
-    )
+    is_absolute = unresolved.is_absolute() or WINDOWS_ABSOLUTE.match(raw_path) is not None
     path = unresolved if is_absolute else root / unresolved
     if _path_contains_symlink(path):
         raise ValueError("candidate localPath must not contain symbolic links")
     try:
         path = path.resolve(strict=True)
     except OSError as exc:
-        raise ValueError(
-            "candidate localPath must point to an existing artifact"
-        ) from exc
+        raise ValueError("candidate localPath must point to an existing artifact") from exc
     if not is_absolute:
         try:
             path.relative_to(root)
@@ -1009,20 +968,14 @@ def load_candidate_artifact(
             candidate_metadata.get("modelName") != values["name"]
             or candidate_metadata.get("modelVersion") != values["version"]
         ):
-            raise ValueError(
-                "embedding lock identity does not match embedding metadata"
-            )
+            raise ValueError("embedding lock identity does not match embedding metadata")
     elif values["kind"] == "generation-model":
         candidate_metadata = read_gguf_metadata(path)
         architecture = candidate_metadata.get("general.architecture")
         size_label = candidate_metadata.get("general.size_label")
         file_type = candidate_metadata.get("general.file_type")
-        quantization = (
-            GGUF_FILE_TYPES.get(file_type) if isinstance(file_type, int) else None
-        )
-        if not isinstance(architecture, str) or not architecture.casefold().startswith(
-            "qwen"
-        ):
+        quantization = GGUF_FILE_TYPES.get(file_type) if isinstance(file_type, int) else None
+        if not isinstance(architecture, str) or not architecture.casefold().startswith("qwen"):
             raise ValueError("generation GGUF architecture must be Qwen-family")
         if size_label not in ("1.5B", "3B"):
             raise ValueError("generation GGUF size label must be 1.5B or 3B")
@@ -1101,10 +1054,7 @@ def _validated_argv(command: Sequence[str]) -> list[str]:
     if isinstance(command, (str, bytes)) or not command:
         raise ValueError("command must be a non-empty argument vector")
     arguments = list(command)
-    if any(
-        not isinstance(value, str) or not value or "\x00" in value
-        for value in arguments
-    ):
+    if any(not isinstance(value, str) or not value or "\x00" in value for value in arguments):
         raise ValueError("command arguments must be non-empty strings")
     return arguments
 
@@ -1129,9 +1079,7 @@ def _public_network_attempted(payload: Mapping[str, object]) -> bool:
     if payload.get("publicNetworkAttempted") is True:
         return True
     attempts = payload.get("publicNetworkAttempts")
-    if _finite_number(attempts) and float(attempts) > 0:
-        return True
-    return False
+    return bool(_finite_number(attempts) and float(attempts) > 0)
 
 
 def _required_number(
@@ -1160,9 +1108,7 @@ def _embedding_metrics(
     failures: list[str] = []
     model_metadata = payload.get("modelMetadata")
     model_name = (
-        str(model_metadata.get("modelName", ""))
-        if isinstance(model_metadata, Mapping)
-        else ""
+        str(model_metadata.get("modelName", "")) if isinstance(model_metadata, Mapping) else ""
     )
     if payload.get("family") != "BGE" or "bge" not in model_name.casefold():
         failures.append("embedding_family")
@@ -1173,10 +1119,7 @@ def _embedding_metrics(
     if (
         not isinstance(token_range, list)
         or len(token_range) != 2
-        or any(
-            isinstance(value, bool) or not isinstance(value, int)
-            for value in token_range
-        )
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in token_range)
         or token_range[0] < 300
         or token_range[1] > 800
         or token_range[0] > token_range[1]
@@ -1210,9 +1153,7 @@ def _embedding_metrics(
     if not isinstance(concurrency_payload, Mapping):
         failures.append("query_embedding")
     else:
-        if set(concurrency_payload) != {
-            str(value) for value in EMBEDDING_CONCURRENCIES
-        }:
+        if set(concurrency_payload) != {str(value) for value in EMBEDDING_CONCURRENCIES}:
             failures.append("query_embedding_concurrencies")
         for concurrency in EMBEDDING_CONCURRENCIES:
             timings = concurrency_payload.get(str(concurrency))
@@ -1332,8 +1273,7 @@ def _generation_metrics(
             if (
                 "availableFirstTokenP50Ms" in numbers
                 and "availableFirstTokenP95Ms" in numbers
-                and numbers["availableFirstTokenP95Ms"]
-                < numbers["availableFirstTokenP50Ms"]
+                and numbers["availableFirstTokenP95Ms"] < numbers["availableFirstTokenP50Ms"]
             ):
                 failures.append(f"context_{context}_available_first_token_percentiles")
             if (
@@ -1438,9 +1378,7 @@ def _write_report(path: Path, payload: Mapping[str, object]) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def _candidate_environment(
-    candidate: CandidateArtifact, discovery_label: str
-) -> dict[str, str]:
+def _candidate_environment(candidate: CandidateArtifact, discovery_label: str) -> dict[str, str]:
     return {
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
@@ -1535,7 +1473,7 @@ def _build_candidate_override(
 
 
 def _write_candidate_override(directory: Path, payload: Mapping[str, object]) -> Path:
-    handle = tempfile.NamedTemporaryFile(
+    with tempfile.NamedTemporaryFile(
         "w",
         encoding="utf-8",
         newline="\n",
@@ -1543,16 +1481,17 @@ def _write_candidate_override(directory: Path, payload: Mapping[str, object]) ->
         prefix=".model-probe.",
         suffix=".override.json",
         delete=False,
-    )
-    path = Path(handle.name)
-    try:
-        with handle:
-            json.dump(
-                payload, handle, ensure_ascii=False, sort_keys=True, allow_nan=False
-            )
+    ) as handle:
+        path = Path(handle.name)
+        try:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, allow_nan=False)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+    try:
         os.chmod(path, 0o600)
         return path
     except BaseException:
@@ -1669,9 +1608,7 @@ def _validate_candidate_injection(
         "MODEL_PROBE_CANDIDATE_VERSION": candidate.version,
         "MODEL_PROBE_CANDIDATE_SHA256": candidate.sha256,
     }
-    if any(
-        environment.get(name) != value for name, value in expected_environment.items()
-    ):
+    if any(environment.get(name) != value for name, value in expected_environment.items()):
         return False
     if not _python_helper_command(helper):
         return False
@@ -1756,13 +1693,9 @@ def run_model_probe(
         artifact_hasher=artifact_hasher,
     )
     project_name = probe_project_name(compose)
-    required_services = (
-        (llama, embedding) if candidate.kind == "generation-model" else (embedding,)
-    )
+    required_services = (llama, embedding) if candidate.kind == "generation-model" else (embedding,)
     helper_service = embedding
-    profile_arguments = (
-        ["--profile", "generation"] if candidate.kind == "generation-model" else []
-    )
+    profile_arguments = ["--profile", "generation"] if candidate.kind == "generation-model" else []
     metadata_script, benchmark_script = _probe_scripts(candidate.kind)
     _validate_local_docker_environment()
     clean_environment = _clean_compose_environment(env_path)
@@ -1896,9 +1829,7 @@ def run_model_probe(
                             operational_failures.append("command:metadata")
                         else:
                             try:
-                                metadata = _json_object(
-                                    metadata_result.stdout, "metadata"
-                                )
+                                metadata = _json_object(metadata_result.stdout, "metadata")
                             except ValueError:
                                 operational_failures.append("metadata_payload")
 
@@ -1911,9 +1842,7 @@ def run_model_probe(
                         if benchmark_result.exit_code != 0:
                             operational_failures.append("command:benchmark")
                         try:
-                            raw_metrics = _json_object(
-                                benchmark_result.stdout, "benchmark"
-                            )
+                            raw_metrics = _json_object(benchmark_result.stdout, "benchmark")
                         except ValueError:
                             operational_failures.append("benchmark_payload")
                         _verify_candidate_stable(candidate, artifact_hasher)
@@ -1946,8 +1875,7 @@ def run_model_probe(
                         raise
                     if hasattr(active_exception, "add_note"):
                         active_exception.add_note(
-                            "model probe override cleanup also failed: "
-                            f"{cleanup_exception}"
+                            f"model probe override cleanup also failed: {cleanup_exception}"
                         )
 
     metadata_checksum = metadata.get("modelChecksum")
@@ -1957,10 +1885,7 @@ def run_model_probe(
         or not hmac.compare_digest(metadata_checksum, candidate.sha256)
     ):
         operational_failures.append("metadata_checksum")
-    if (
-        metadata.get("name") != candidate.name
-        or metadata.get("version") != candidate.version
-    ):
+    if metadata.get("name") != candidate.name or metadata.get("version") != candidate.version:
         operational_failures.append("metadata_identity")
     if _public_network_attempted(metadata) or _public_network_attempted(raw_metrics):
         operational_failures.append("public_network_attempt")
@@ -1987,8 +1912,7 @@ def run_model_probe(
         if (
             not isinstance(actual_metadata, Mapping)
             or actual_metadata.get("modelName") != expected_metadata.get("modelName")
-            or actual_metadata.get("modelVersion")
-            != expected_metadata.get("modelVersion")
+            or actual_metadata.get("modelVersion") != expected_metadata.get("modelVersion")
             or actual_metadata.get("dimensions") != expected_metadata.get("dimensions")
         ):
             metric_failures.append("embedding_metadata_identity")
@@ -2003,9 +1927,7 @@ def run_model_probe(
         if actual_metadata != expected_metadata:
             metric_failures.append("generation_metadata_identity")
     else:
-        gate_metrics, metric_failures, reranker = _reranker_metrics(
-            raw_metrics, candidate.sha256
-        )
+        gate_metrics, metric_failures, reranker = _reranker_metrics(raw_metrics, candidate.sha256)
     gate_evaluation = evaluate_candidate_gate(candidate.kind, gate, gate_metrics)
     failures = list(
         dict.fromkeys(
@@ -2070,9 +1992,7 @@ def _load_candidate_lock(
     if candidate_name is not None:
         selected = [item for item in candidates if item.get("name") == candidate_name]
         if len(selected) != 1:
-            raise ValueError(
-                "candidate-name must select exactly one probeable candidate"
-            )
+            raise ValueError("candidate-name must select exactly one probeable candidate")
         return selected[0], lock_path.parent
     if len(candidates) != 1:
         raise ValueError(

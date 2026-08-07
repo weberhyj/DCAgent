@@ -241,9 +241,7 @@ def _lstat(path: Path, description: str) -> os.stat_result:
     try:
         return os.lstat(path)
     except OSError as exc:
-        raise DeploymentStateError(
-            f"cannot safely inspect {description}: {path}"
-        ) from exc
+        raise DeploymentStateError(f"cannot safely inspect {description}: {path}") from exc
 
 
 def _require_owner_and_mode(
@@ -284,9 +282,7 @@ def _verify_directory(
         if exact_mode and mode != 0o700:
             raise DeploymentStateError(f"unsafe mode on {description}: {path}")
         if not exact_mode and mode & 0o022:
-            raise DeploymentStateError(
-                f"unsafe writable ancestor for {description}: {path}"
-            )
+            raise DeploymentStateError(f"unsafe writable ancestor for {description}: {path}")
     return st
 
 
@@ -305,9 +301,7 @@ def _verify_regular_file(
     return st
 
 
-def _open_verified_regular_file(
-    path: Path, flags: int, description: str, mode: int = 0o600
-) -> int:
+def _open_verified_regular_file(path: Path, flags: int, description: str, mode: int = 0o600) -> int:
     before = _verify_regular_file(path, description, mode)
     safe_flags = flags
     if hasattr(os, "O_NOFOLLOW"):
@@ -337,9 +331,7 @@ def _read_secure_regular_file(path: Path, description: str, mode: int = 0o600) -
             try:
                 chunk = os.read(fd, 65536)
             except OSError as exc:
-                raise DeploymentStateError(
-                    f"cannot safely read {description}: {path}"
-                ) from exc
+                raise DeploymentStateError(f"cannot safely read {description}: {path}") from exc
             if not chunk:
                 return b"".join(chunks)
             chunks.append(chunk)
@@ -384,9 +376,7 @@ def normalize_absolute_root(raw: str | Path, name: str) -> Path:
         normalized_components = suffix[1:].split("/")
     else:
         if os.name == "nt":
-            raise DeploymentStateError(
-                f"{name} must be a drive-qualified absolute path"
-            )
+            raise DeploymentStateError(f"{name} must be a drive-qualified absolute path")
         if not lexical.startswith("/"):
             raise DeploymentStateError(f"{name} must be an absolute path")
         raw_components = lexical[1:].split("/")
@@ -406,9 +396,7 @@ def normalize_absolute_root(raw: str | Path, name: str) -> Path:
         except FileNotFoundError:
             break
         except OSError as exc:
-            raise DeploymentStateError(
-                f"cannot safely inspect {name}: {cursor}"
-            ) from exc
+            raise DeploymentStateError(f"cannot safely inspect {name}: {cursor}") from exc
         if _is_symlink(entry):
             raise DeploymentStateError(f"{name} traverses a symlink: {cursor}")
     return Path(normalized)
@@ -428,10 +416,7 @@ class DeploymentIdentity:
     secret_root: Path
 
     def __post_init__(self) -> None:
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != SCHEMA_VERSION
-        ):
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
             raise DeploymentStateError("unsupported deployment identity schema")
         if not isinstance(self.deployment_uuid, str) or not _UUID4_HEX.fullmatch(
             self.deployment_uuid
@@ -448,9 +433,7 @@ class DeploymentIdentity:
             normalized = normalize_absolute_root(getattr(self, field_name), field_name)
             object.__setattr__(self, field_name, normalized)
         if self.state_root.as_posix() != derive_state_root(self.data_root).as_posix():
-            raise DeploymentStateError(
-                "state_root must be data_root/.dcagent-deployment-state"
-            )
+            raise DeploymentStateError("state_root must be data_root/.dcagent-deployment-state")
 
     @classmethod
     def new(
@@ -464,9 +447,7 @@ class DeploymentIdentity:
     ) -> DeploymentIdentity:
         return cls(
             schema_version=SCHEMA_VERSION,
-            deployment_uuid=uuid.uuid4().hex
-            if deployment_uuid is None
-            else deployment_uuid,
+            deployment_uuid=uuid.uuid4().hex if deployment_uuid is None else deployment_uuid,
             state_root=Path(state_root),
             data_root=Path(data_root),
             model_root=Path(model_root),
@@ -496,9 +477,7 @@ def identity_digest(identity: DeploymentIdentity) -> str:
     return hashlib.sha256(_canonical_json_bytes(identity.to_mapping())).hexdigest()
 
 
-def _identity_mappings_match(
-    first: DeploymentIdentity, second: DeploymentIdentity
-) -> bool:
+def _identity_mappings_match(first: DeploymentIdentity, second: DeploymentIdentity) -> bool:
     return first.to_mapping() == second.to_mapping()
 
 
@@ -552,9 +531,7 @@ class StatePaths:
             missing.append(nearest)
             parent = nearest.parent
             if parent == nearest:
-                raise DeploymentStateError(
-                    f"no existing ancestor for state root: {self.root}"
-                )
+                raise DeploymentStateError(f"no existing ancestor for state root: {self.root}")
             nearest = parent
 
         for directory in reversed(missing):
@@ -578,9 +555,7 @@ class StatePaths:
         except FileExistsError:
             pass
         except OSError as exc:
-            raise DeploymentStateError(
-                f"cannot create state directory: {directory}"
-            ) from exc
+            raise DeploymentStateError(f"cannot create state directory: {directory}") from exc
         _verify_directory(directory, "state directory", uid, gid)
         fsync_directory(directory.parent)
 
@@ -594,9 +569,7 @@ class StatePaths:
             _verify_regular_file(self.lock, "deployment lock", uid=uid, gid=gid)
             return
         except OSError as exc:
-            raise DeploymentStateError(
-                f"cannot create deployment lock: {self.lock}"
-            ) from exc
+            raise DeploymentStateError(f"cannot create deployment lock: {self.lock}") from exc
         try:
             if _is_posix():
                 os.fchmod(fd, 0o600)
@@ -613,9 +586,7 @@ def _validate_uuid4_hex(value: object, description: str = "transaction id") -> s
     try:
         parsed = uuid.UUID(hex=value)
     except ValueError as exc:
-        raise DeploymentStateError(
-            f"{description} must be lowercase UUIDv4 hex"
-        ) from exc
+        raise DeploymentStateError(f"{description} must be lowercase UUIDv4 hex") from exc
     if parsed.version != 4 or parsed.variant != uuid.RFC_4122:
         raise DeploymentStateError(f"{description} must be UUIDv4 RFC4122")
     return value
@@ -823,10 +794,7 @@ class PhaseRecord:
     object_categories: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != SCHEMA_VERSION
-        ):
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
             raise DeploymentStateError("invalid transaction phase schema")
         _validate_uuid4_hex(self.transaction_id)
         if self.phase not in TRANSACTION_PHASES:
@@ -846,9 +814,7 @@ class PhaseRecord:
         }
 
     @classmethod
-    def from_mapping(
-        cls, payload: object, expected_hash: str | None = None
-    ) -> PhaseRecord:
+    def from_mapping(cls, payload: object, expected_hash: str | None = None) -> PhaseRecord:
         if not isinstance(payload, Mapping) or set(payload) != {
             "schema_version",
             "transaction_id",
@@ -867,10 +833,7 @@ class PhaseRecord:
             deployment_identity_hash=payload["deployment_identity_hash"],  # type: ignore[arg-type]
             object_categories=categories,
         )
-        if (
-            expected_hash is not None
-            and record.deployment_identity_hash != expected_hash
-        ):
+        if expected_hash is not None and record.deployment_identity_hash != expected_hash:
             raise DeploymentStateError("transaction identity mismatch")
         return record
 
@@ -906,8 +869,7 @@ class UndoEntry:
             self, "owner_gid", _validate_optional_int(self.owner_gid, "undo owner gid")
         )
         if self.backup_name is not None and (
-            not isinstance(self.backup_name, str)
-            or not _SAFE_NAME.fullmatch(self.backup_name)
+            not isinstance(self.backup_name, str) or not _SAFE_NAME.fullmatch(self.backup_name)
         ):
             raise DeploymentStateError("invalid undo backup name")
         if self.expected_action not in OPERATION_KINDS:
@@ -928,11 +890,7 @@ class UndoEntry:
         )
         absent = {"exists": False, "object_type": self.object_type}
         if self.existed:
-            if (
-                self.original_mode is None
-                or self.owner_uid is None
-                or self.owner_gid is None
-            ):
+            if self.original_mode is None or self.owner_uid is None or self.owner_gid is None:
                 raise DeploymentStateError("existing undo object requires authority")
             before = {
                 "exists": True,
@@ -1008,10 +966,7 @@ class UndoEntry:
         if self.after.get("exists") is True:
             _validate_mode(self.after.get("mode"), "undo after mode")
             for field in ("owner_uid", "owner_gid"):
-                if (
-                    _validate_optional_int(self.after.get(field), f"undo after {field}")
-                    is None
-                ):
+                if _validate_optional_int(self.after.get(field), f"undo after {field}") is None:
                     raise DeploymentStateError("undo after authority is required")
 
     def to_mapping(self) -> dict[str, object]:
@@ -1046,9 +1001,7 @@ class UndoEntry:
         }
         if not isinstance(payload, Mapping) or set(payload) != required:
             raise DeploymentStateError("invalid undo manifest entry")
-        if not isinstance(payload["before"], Mapping) or not isinstance(
-            payload["after"], Mapping
-        ):
+        if not isinstance(payload["before"], Mapping) or not isinstance(payload["after"], Mapping):
             raise DeploymentStateError("invalid undo manifest metadata")
         return cls(
             sequence=payload["sequence"],
@@ -1081,10 +1034,7 @@ def _validate_operation_mapping(
     }
     if not common <= set(payload):
         raise DeploymentStateError("invalid transaction operation")
-    if (
-        type(payload["schema_version"]) is not int
-        or payload["schema_version"] != SCHEMA_VERSION
-    ):
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != SCHEMA_VERSION:
         raise DeploymentStateError("invalid transaction operation")
     transaction_id = _validate_uuid4_hex(payload["transaction_id"])
     if expected_id is not None and transaction_id != expected_id:
@@ -1093,18 +1043,12 @@ def _validate_operation_mapping(
         raise DeploymentStateError("invalid transaction operation sequence")
     kind = payload["kind"]
     status = payload["status"]
-    if (
-        not isinstance(kind, str)
-        or kind not in OPERATION_KINDS
-        or status not in {"intent", "done"}
-    ):
+    if not isinstance(kind, str) or kind not in OPERATION_KINDS or status not in {"intent", "done"}:
         raise DeploymentStateError("invalid transaction operation")
     category = payload["object_category"]
     if not isinstance(category, str) or not category:
         raise DeploymentStateError("invalid transaction object category")
-    digest = _validate_identity_hash(
-        payload["deployment_identity_hash"], "operation identity hash"
-    )
+    digest = _validate_identity_hash(payload["deployment_identity_hash"], "operation identity hash")
     if expected_hash is not None and digest != expected_hash:
         raise DeploymentStateError("transaction identity mismatch")
     required, optional = _OPERATION_FIELDS[kind]
@@ -1130,9 +1074,7 @@ def _validate_operation_mapping(
     elif kind in {"active_to_backup", "staging_to_active"}:
         for field in ("active_path", "backup_path", "staging_path"):
             if field in result:
-                result[field] = _validate_abs_path(
-                    result[field], f"operation {field}"
-                ).as_posix()
+                result[field] = _validate_abs_path(result[field], f"operation {field}").as_posix()
         result["mode"] = _validate_mode(result["mode"], "operation mode")
         for field in ("owner_uid", "owner_gid"):
             result[field] = _validate_optional_int(result[field], f"operation {field}")
@@ -1156,14 +1098,10 @@ def _validate_operation_mapping(
         ):
             raise DeploymentStateError("invalid unlink backup name")
     elif kind == "env_replace":
-        result["env_path"] = _validate_abs_path(
-            result["env_path"], "operation env path"
-        ).as_posix()
+        result["env_path"] = _validate_abs_path(result["env_path"], "operation env path").as_posix()
         for field in ("before_digest", "after_digest"):
             value = result[field]
-            if value is not None and (
-                not isinstance(value, str) or not _HEX_64.fullmatch(value)
-            ):
+            if value is not None and (not isinstance(value, str) or not _HEX_64.fullmatch(value)):
                 raise DeploymentStateError("invalid environment digest")
         if type(result["before_absent"]) is not bool:
             raise DeploymentStateError("invalid environment absent flag")
@@ -1177,9 +1115,7 @@ def _validate_operation_mapping(
             raise DeploymentStateError("environment replacement must change content")
         if result["object_type"] != "environment":
             raise DeploymentStateError("invalid environment object type")
-        result["after_mode"] = _validate_mode(
-            result["after_mode"], "operation after_mode"
-        )
+        result["after_mode"] = _validate_mode(result["after_mode"], "operation after_mode")
         for field in ("after_owner_uid", "after_owner_gid"):
             result[field] = _validate_optional_int(result[field], f"operation {field}")
             if result[field] is None:
@@ -1191,22 +1127,15 @@ def _validate_operation_mapping(
         )
         if result["before_absent"]:
             if before_authority != (None, None, None):
-                raise DeploymentStateError(
-                    "absent environment cannot have before authority"
-                )
+                raise DeploymentStateError("absent environment cannot have before authority")
         else:
-            result["before_mode"] = _validate_mode(
-                result["before_mode"], "operation before_mode"
-            )
+            result["before_mode"] = _validate_mode(result["before_mode"], "operation before_mode")
             for field in ("before_owner_uid", "before_owner_gid"):
-                result[field] = _validate_optional_int(
-                    result[field], f"operation {field}"
-                )
+                result[field] = _validate_optional_int(result[field], f"operation {field}")
                 if result[field] is None:
                     raise DeploymentStateError(f"operation {field} is required")
     if "object_type" in result and (
-        not isinstance(result["object_type"], str)
-        or result["object_type"] not in OBJECT_TYPES
+        not isinstance(result["object_type"], str) or result["object_type"] not in OBJECT_TYPES
     ):
         raise DeploymentStateError("invalid operation object type")
     return result
@@ -1376,26 +1305,16 @@ def _validate_bootstrap_entry(
         if _validate_optional_int(result[field], f"bootstrap {field}") is None:
             raise DeploymentStateError("invalid transaction bootstrap directory entry")
     if result["existed"]:
-        if (
-            _validate_optional_int(result["original_mode"], "bootstrap original mode")
-            is None
-        ):
+        if _validate_optional_int(result["original_mode"], "bootstrap original mode") is None:
             raise DeploymentStateError("invalid transaction bootstrap directory entry")
         _validate_mode(result["original_mode"], "bootstrap original mode")
         for field in ("owner_uid", "owner_gid"):
             if _validate_optional_int(result[field], f"bootstrap {field}") is None:
-                raise DeploymentStateError(
-                    "invalid transaction bootstrap directory entry"
-                )
+                raise DeploymentStateError("invalid transaction bootstrap directory entry")
         for field in ("device", "inode"):
             if _validate_optional_int(result[field], f"bootstrap {field}") is None:
-                raise DeploymentStateError(
-                    "invalid transaction bootstrap directory entry"
-                )
-    elif any(
-        result[field] is not None
-        for field in ("original_mode", "owner_uid", "owner_gid")
-    ):
+                raise DeploymentStateError("invalid transaction bootstrap directory entry")
+    elif any(result[field] is not None for field in ("original_mode", "owner_uid", "owner_gid")):
         raise DeploymentStateError("invalid transaction bootstrap directory entry")
     else:
         identity = tuple(
@@ -1447,25 +1366,15 @@ def _validate_bootstrap_entry_v1(
     if None in after_owner:
         raise DeploymentStateError("invalid v1 transaction bootstrap directory entry")
     if result["existed"]:
-        if (
-            _validate_optional_int(result["original_mode"], "bootstrap original mode")
-            != 0o700
-        ):
-            raise DeploymentStateError(
-                "invalid v1 transaction bootstrap directory entry"
-            )
+        if _validate_optional_int(result["original_mode"], "bootstrap original mode") != 0o700:
+            raise DeploymentStateError("invalid v1 transaction bootstrap directory entry")
         original_owner = tuple(
             _validate_optional_int(result[field], f"bootstrap {field}")
             for field in ("owner_uid", "owner_gid")
         )
         if None in original_owner or original_owner != after_owner:
-            raise DeploymentStateError(
-                "invalid v1 transaction bootstrap directory entry"
-            )
-    elif any(
-        result[field] is not None
-        for field in ("original_mode", "owner_uid", "owner_gid")
-    ):
+            raise DeploymentStateError("invalid v1 transaction bootstrap directory entry")
+    elif any(result[field] is not None for field in ("original_mode", "owner_uid", "owner_gid")):
         raise DeploymentStateError("invalid v1 transaction bootstrap directory entry")
     return result
 
@@ -1498,9 +1407,7 @@ class TransactionJournal:
     def __post_init__(self) -> None:
         self.root = Path(self.root)
         self.transaction_id = _validate_uuid4_hex(self.transaction_id)
-        self.deployment_identity_hash = _validate_identity_hash(
-            self.deployment_identity_hash
-        )
+        self.deployment_identity_hash = _validate_identity_hash(self.deployment_identity_hash)
         self.object_categories = _validate_categories(self.object_categories)
         self.metadata_path = self.root / "journal.json"
         self.phase_path = self.root / "phase.json"
@@ -1525,11 +1432,7 @@ class TransactionJournal:
 
     @property
     def secret_companion_parent(self) -> Path | None:
-        return (
-            None
-            if self.secret_companion_root is None
-            else self.secret_companion_root.parent
-        )
+        return None if self.secret_companion_root is None else self.secret_companion_root.parent
 
     @classmethod
     def create(
@@ -1546,9 +1449,7 @@ class TransactionJournal:
         _verify_directory(paths.transactions, "transaction directory")
         _verify_directory(paths.control_transactions, "control transaction directory")
         identity_hash = _validate_identity_hash(deployment_identity_hash)
-        txid = _validate_uuid4_hex(
-            uuid.uuid4().hex if transaction_id is None else transaction_id
-        )
+        txid = _validate_uuid4_hex(uuid.uuid4().hex if transaction_id is None else transaction_id)
         categories = _validate_categories(object_categories)
         parent = paths.control_transactions if control else paths.transactions
         root = parent / txid
@@ -1557,13 +1458,9 @@ class TransactionJournal:
         companion: Path | None = None
         bootstrap_entries: list[dict[str, object]] = []
         if not control:
-            companion_parent = _validate_abs_path(
-                secret_companion_root, "secret companion root"
-            )
+            companion_parent = _validate_abs_path(secret_companion_root, "secret companion root")
             if companion_parent.name != ".dcagent-transactions":
-                raise DeploymentStateError(
-                    "secret companion root must be .dcagent-transactions"
-                )
+                raise DeploymentStateError("secret companion root must be .dcagent-transactions")
             secret_root = companion_parent.parent
             _verify_directory(
                 secret_root.parent,
@@ -1620,9 +1517,7 @@ class TransactionJournal:
                 for index, entry in enumerate(bootstrap_entries):
                     path = Path(str(entry["path"]))
                     if entry["existed"] is False:
-                        create_bootstrap_directory(
-                            path, f"transaction bootstrap {entry['role']}"
-                        )
+                        create_bootstrap_directory(path, f"transaction bootstrap {entry['role']}")
                     repair_mode = (
                         entry["role"] == "secret_root"
                         and entry["existed"] is True
@@ -1634,15 +1529,12 @@ class TransactionJournal:
                         exact_mode=not repair_mode,
                     )
                     if entry["existed"] is True and (
-                        (current.st_dev, current.st_ino)
-                        != (entry["device"], entry["inode"])
+                        (current.st_dev, current.st_ino) != (entry["device"], entry["inode"])
                         or current.st_uid != entry["owner_uid"]
                         or current.st_gid != entry["owner_gid"]
                         or stat.S_IMODE(current.st_mode) != entry["original_mode"]
                     ):
-                        raise DeploymentStateError(
-                            f"transaction bootstrap target changed: {path}"
-                        )
+                        raise DeploymentStateError(f"transaction bootstrap target changed: {path}")
                     if repair_mode:
                         current = _chmod_bootstrap_directory(
                             path,
@@ -1701,9 +1593,7 @@ class TransactionJournal:
         _require_owner_and_mode(root, st, 0o700, "transaction journal")
         parent_name = root.parent.name
         tombstone_match = (
-            _CLEANUP_TOMBSTONE.fullmatch(root.name)
-            if parent_name == "history"
-            else None
+            _CLEANUP_TOMBSTONE.fullmatch(root.name) if parent_name == "history" else None
         )
         if tombstone_match is not None:
             transaction_id = _validate_uuid4_hex(tombstone_match.group(1))
@@ -1711,10 +1601,7 @@ class TransactionJournal:
         else:
             transaction_id = _validate_uuid4_hex(root.name)
             tombstone = False
-        if (
-            parent_name not in {"transactions", "control-transactions"}
-            and not tombstone
-        ):
+        if parent_name not in {"transactions", "control-transactions"} and not tombstone:
             raise DeploymentStateError(f"unsafe transaction journal: {root}")
         metadata_path = root / "journal.json"
         metadata = _read_json_value(metadata_path, "transaction metadata")
@@ -1727,9 +1614,7 @@ class TransactionJournal:
             "secret_companion_root",
         }
         required = legacy_required | {"bootstrap_protocol"}
-        metadata_fields = (
-            frozenset(metadata) if isinstance(metadata, Mapping) else frozenset()
-        )
+        metadata_fields = frozenset(metadata) if isinstance(metadata, Mapping) else frozenset()
         if (
             not isinstance(metadata, Mapping)
             or metadata_fields not in {frozenset(legacy_required), frozenset(required)}
@@ -1754,19 +1639,12 @@ class TransactionJournal:
         companion_value = metadata["secret_companion_root"]
         if control:
             if companion_value is not None:
-                raise DeploymentStateError(
-                    f"invalid transaction metadata: {metadata_path}"
-                )
+                raise DeploymentStateError(f"invalid transaction metadata: {metadata_path}")
             companion = None
         else:
             companion = _validate_abs_path(companion_value, "secret companion root")
-            if (
-                companion.name != transaction_id
-                or companion.parent.name != ".dcagent-transactions"
-            ):
-                raise DeploymentStateError(
-                    f"invalid transaction metadata: {metadata_path}"
-                )
+            if companion.name != transaction_id or companion.parent.name != ".dcagent-transactions":
+                raise DeploymentStateError(f"invalid transaction metadata: {metadata_path}")
         journal = cls(
             root,
             transaction_id,
@@ -1778,18 +1656,14 @@ class TransactionJournal:
         )
         phase = journal.read_phase()
         if phase.object_categories != journal.object_categories:
-            raise DeploymentStateError(
-                f"transaction metadata mismatch: {metadata_path}"
-            )
+            raise DeploymentStateError(f"transaction metadata mismatch: {metadata_path}")
         journal.object_categories = phase.object_categories
         undo_entries = journal._read_undo_manifest()
         operations = journal._read_operations_internal()
         try:
             journal._validate_manifest_operations(undo_entries, operations)
         except DeploymentStateError:
-            prefix = journal._trailing_manifest_prefix(
-                undo_entries, operations, phase.phase
-            )
+            prefix = journal._trailing_manifest_prefix(undo_entries, operations, phase.phase)
             if prefix is None:
                 raise
             if read_only:
@@ -1839,15 +1713,13 @@ class TransactionJournal:
         if tombstone and (
             phase.phase not in {"committed", "committed_cleanup_required"}
             or receipt is None
-            or receipt["cleanup_status"]
-            not in {"committed_cleanup_pending", "complete"}
+            or receipt["cleanup_status"] not in {"committed_cleanup_pending", "complete"}
         ):
             raise DeploymentStateError(f"invalid cleanup tombstone: {root}")
         allow_partial_companion = (
             (
                 receipt is not None
-                and receipt["cleanup_status"]
-                in {"committed_cleanup_pending", "complete"}
+                and receipt["cleanup_status"] in {"committed_cleanup_pending", "complete"}
             )
             or (
                 phase.phase
@@ -1856,8 +1728,7 @@ class TransactionJournal:
                     "rollback_complete",
                     "rollback_cleanup_required",
                 }
-                and {operation["sequence"] for operation in operations}
-                <= set(rollback_done)
+                and {operation["sequence"] for operation in operations} <= set(rollback_done)
             )
             or (
                 bootstrap_record is not None
@@ -1873,9 +1744,7 @@ class TransactionJournal:
                 raise DeploymentStateError("control transaction has a companion")
             return
         if self.secret_companion_root is None:
-            raise DeploymentStateError(
-                "normal transaction is missing companion metadata"
-            )
+            raise DeploymentStateError("normal transaction is missing companion metadata")
         root_state = _lstat_optional(self.secret_companion_root)
         if root_state is None:
             if allow_partial:
@@ -1886,8 +1755,7 @@ class TransactionJournal:
         _verify_directory(self.secret_companion_root, "secret transaction companion")
         try:
             children = {
-                entry.name: Path(entry.path)
-                for entry in os.scandir(self.secret_companion_root)
+                entry.name: Path(entry.path) for entry in os.scandir(self.secret_companion_root)
             }
         except OSError as exc:
             raise DeploymentStateError(
@@ -1928,9 +1796,7 @@ class TransactionJournal:
         try:
             entries = list(os.scandir(self.root))
         except OSError as exc:
-            raise DeploymentStateError(
-                f"cannot inspect transaction journal: {self.root}"
-            ) from exc
+            raise DeploymentStateError(f"cannot inspect transaction journal: {self.root}") from exc
         for entry in entries:
             target = _atomic_temp_target(entry.name)
             if target is None:
@@ -1938,22 +1804,14 @@ class TransactionJournal:
             if target not in allowed_temp_targets:
                 raise DeploymentStateError(f"invalid transaction journal: {self.root}")
             if read_only:
-                _verify_regular_file(
-                    Path(entry.path), "transaction journal atomic temp"
-                )
+                _verify_regular_file(Path(entry.path), "transaction journal atomic temp")
             else:
-                _remove_verified_atomic_temp(
-                    Path(entry.path), "transaction journal atomic temp"
-                )
+                _remove_verified_atomic_temp(Path(entry.path), "transaction journal atomic temp")
         try:
             entries = list(os.scandir(self.root))
         except OSError as exc:
-            raise DeploymentStateError(
-                f"cannot inspect transaction journal: {self.root}"
-            ) from exc
-        actual = {
-            entry.name for entry in entries if _atomic_temp_target(entry.name) is None
-        }
+            raise DeploymentStateError(f"cannot inspect transaction journal: {self.root}") from exc
+        actual = {entry.name for entry in entries if _atomic_temp_target(entry.name) is None}
         if not expected <= actual or actual - expected - optional:
             raise DeploymentStateError(f"invalid transaction journal: {self.root}")
         for entry in entries:
@@ -1978,9 +1836,7 @@ class TransactionJournal:
         if self.control:
             return ()
         if self.secret_companion_root is None:
-            raise DeploymentStateError(
-                "normal transaction is missing companion metadata"
-            )
+            raise DeploymentStateError("normal transaction is missing companion metadata")
         companion_parent = self.secret_companion_root.parent
         return (
             ("secret_root", companion_parent.parent),
@@ -2052,22 +1908,14 @@ class TransactionJournal:
             path = Path(str(entry["path"]))
             current = _lstat_optional(path)
             if entry["existed"] is True:
-                if (
-                    current is None
-                    or _is_symlink(current)
-                    or not stat.S_ISDIR(current.st_mode)
-                ):
-                    raise DeploymentStateError(
-                        f"unsafe v1 transaction bootstrap target: {path}"
-                    )
+                if current is None or _is_symlink(current) or not stat.S_ISDIR(current.st_mode):
+                    raise DeploymentStateError(f"unsafe v1 transaction bootstrap target: {path}")
                 if _is_posix() and (
                     stat.S_IMODE(current.st_mode) != entry["original_mode"]
                     or current.st_uid != entry["owner_uid"]
                     or current.st_gid != entry["owner_gid"]
                 ):
-                    raise DeploymentStateError(
-                        f"unsafe v1 transaction bootstrap target: {path}"
-                    )
+                    raise DeploymentStateError(f"unsafe v1 transaction bootstrap target: {path}")
                 prepare_done = True
             elif current is None:
                 prepare_done = False
@@ -2083,9 +1931,7 @@ class TransactionJournal:
                         or current.st_gid != entry["after_owner_gid"]
                     )
                 ):
-                    raise DeploymentStateError(
-                        f"unsafe v1 transaction bootstrap target: {path}"
-                    )
+                    raise DeploymentStateError(f"unsafe v1 transaction bootstrap target: {path}")
                 prepare_done = True
             entry["device"] = None if current is None else current.st_dev
             entry["inode"] = None if current is None else current.st_ino
@@ -2094,9 +1940,7 @@ class TransactionJournal:
         return converted
 
     def _migrate_bootstrap_protocol_v1(self) -> None:
-        payload = _read_json_value(
-            self.bootstrap_directories_path, "transaction bootstrap record"
-        )
+        payload = _read_json_value(self.bootstrap_directories_path, "transaction bootstrap record")
         protocol = payload.get("protocol") if isinstance(payload, Mapping) else None
         if protocol == BOOTSTRAP_PROTOCOL_V1:
             v1_record = self._read_bootstrap_directories_v1()
@@ -2130,17 +1974,13 @@ class TransactionJournal:
                     "entries": [entry for entry, _progress in v1_entries],
                 }
             )
-            for migrated, (_entry, stored_progress) in zip(
-                snapshot, v1_entries, strict=True
-            ):
+            for migrated, (_entry, stored_progress) in zip(snapshot, v1_entries, strict=True):
                 if (
                     migrated["device"],
                     migrated["inode"],
                     migrated["prepare_done"],
                 ) != stored_progress:
-                    raise DeploymentStateError(
-                        "invalid interrupted v1 bootstrap migration"
-                    )
+                    raise DeploymentStateError("invalid interrupted v1 bootstrap migration")
         else:
             raise DeploymentStateError(
                 f"invalid v1 transaction bootstrap record: {self.bootstrap_directories_path}"
@@ -2153,10 +1993,7 @@ class TransactionJournal:
         state: str,
         entries: Sequence[Mapping[str, object]],
     ) -> None:
-        if (
-            self.bootstrap_protocol != BOOTSTRAP_PROTOCOL
-            or state not in BOOTSTRAP_STATES
-        ):
+        if self.bootstrap_protocol != BOOTSTRAP_PROTOCOL or state not in BOOTSTRAP_STATES:
             raise DeploymentStateError("invalid transaction bootstrap record")
         expected = self._expected_bootstrap_directories()
         if len(entries) != len(expected):
@@ -2197,9 +2034,7 @@ class TransactionJournal:
     def read_bootstrap_directories(self) -> dict[str, object]:
         if self.bootstrap_protocol is None:
             raise DeploymentStateError("legacy transaction has no bootstrap record")
-        payload = _read_json_value(
-            self.bootstrap_directories_path, "transaction bootstrap record"
-        )
+        payload = _read_json_value(self.bootstrap_directories_path, "transaction bootstrap record")
         required = {"schema_version", "transaction_id", "protocol", "state", "entries"}
         if (
             not isinstance(payload, Mapping)
@@ -2291,9 +2126,7 @@ class TransactionJournal:
             record.transaction_id != self.transaction_id
             or record.object_categories != self.object_categories
         ):
-            raise DeploymentStateError(
-                f"transaction phase identity mismatch: {self.phase_path}"
-            )
+            raise DeploymentStateError(f"transaction phase identity mismatch: {self.phase_path}")
         return record
 
     def write_undo_manifest(self, entries: Sequence[UndoEntry]) -> None:
@@ -2325,14 +2158,10 @@ class TransactionJournal:
             or payload["transaction_id"] != self.transaction_id
             or not isinstance(payload["entries"], list)
         ):
-            raise DeploymentStateError(
-                f"invalid undo manifest: {self.undo_manifest_path}"
-            )
+            raise DeploymentStateError(f"invalid undo manifest: {self.undo_manifest_path}")
         entries = [UndoEntry.from_mapping(entry) for entry in payload["entries"]]
         if [entry.sequence for entry in entries] != list(range(1, len(entries) + 1)):
-            raise DeploymentStateError(
-                f"invalid undo manifest sequence: {self.undo_manifest_path}"
-            )
+            raise DeploymentStateError(f"invalid undo manifest sequence: {self.undo_manifest_path}")
         return entries
 
     def _undo_entry_for_operation(self, operation: Mapping[str, object]) -> UndoEntry:
@@ -2558,9 +2387,7 @@ class TransactionJournal:
             or payload["transaction_id"] != self.transaction_id
             or not isinstance(payload["records"], list)
         ):
-            raise DeploymentStateError(
-                f"invalid transaction operations: {self.operations_path}"
-            )
+            raise DeploymentStateError(f"invalid transaction operations: {self.operations_path}")
         records: list[dict[str, object]] = []
         for record in payload["records"]:
             validated = _validate_operation_mapping(
@@ -2586,16 +2413,12 @@ class TransactionJournal:
             backup = Path(operation["backup_path"])
             expected = self.secret_companion_root / "backup"
             if not backup.is_relative_to(expected) or backup == expected:
-                raise DeploymentStateError(
-                    "operation backup path escapes transaction companion"
-                )
+                raise DeploymentStateError("operation backup path escapes transaction companion")
         elif kind == "staging_to_active":
             staging = Path(operation["staging_path"])
             expected = self.secret_companion_root / "staging"
             if not staging.is_relative_to(expected) or staging == expected:
-                raise DeploymentStateError(
-                    "operation staging path escapes transaction companion"
-                )
+                raise DeploymentStateError("operation staging path escapes transaction companion")
 
     def read_operations(self) -> tuple[dict[str, object], ...]:
         operations = self._read_operations_internal()
@@ -2649,9 +2472,7 @@ class TransactionJournal:
         entries = self._read_undo_manifest()
         self._validate_manifest_operations(entries, records)
         if sequence != len(records) + 1:
-            raise DeploymentStateError(
-                "transaction operation sequence must be contiguous"
-            )
+            raise DeploymentStateError("transaction operation sequence must be contiguous")
         entries.append(self._undo_entry_for_operation(validated))
         self.write_undo_manifest(entries)
         records.append(validated)
@@ -2711,22 +2532,16 @@ class TransactionJournal:
             or payload["schema_version"] != SCHEMA_VERSION
             or payload["transaction_id"] != self.transaction_id
             or not isinstance(payload["sequences"], list)
-            or any(
-                type(value) is not int or value <= 0 for value in payload["sequences"]
-            )
+            or any(type(value) is not int or value <= 0 for value in payload["sequences"])
             or len(set(payload["sequences"])) != len(payload["sequences"])
         ):
-            raise DeploymentStateError(
-                f"invalid rollback intents: {self.rollback_intents_path}"
-            )
+            raise DeploymentStateError(f"invalid rollback intents: {self.rollback_intents_path}")
         return list(payload["sequences"])
 
     def record_rollback_intent(self, sequence: int) -> None:
         if type(sequence) is not int or sequence <= 0:
             raise DeploymentStateError("invalid rollback sequence")
-        operation_sequences = {
-            record["sequence"] for record in self._read_operations_internal()
-        }
+        operation_sequences = {record["sequence"] for record in self._read_operations_internal()}
         if sequence not in operation_sequences:
             raise DeploymentStateError("unknown rollback operation sequence")
         if sequence in self._read_rollback_done():
@@ -2740,18 +2555,13 @@ class TransactionJournal:
         payload = _read_json_value(self.rollback_path, "rollback record")
         if (
             not isinstance(payload, Mapping)
-            or set(payload)
-            != {"schema_version", "transaction_id", "completed_sequences"}
+            or set(payload) != {"schema_version", "transaction_id", "completed_sequences"}
             or type(payload["schema_version"]) is not int
             or payload["schema_version"] != SCHEMA_VERSION
             or payload["transaction_id"] != self.transaction_id
             or not isinstance(payload["completed_sequences"], list)
-            or any(
-                type(value) is not int or value <= 0
-                for value in payload["completed_sequences"]
-            )
-            or len(set(payload["completed_sequences"]))
-            != len(payload["completed_sequences"])
+            or any(type(value) is not int or value <= 0 for value in payload["completed_sequences"])
+            or len(set(payload["completed_sequences"])) != len(payload["completed_sequences"])
         ):
             raise DeploymentStateError(f"invalid rollback record: {self.rollback_path}")
         return list(payload["completed_sequences"])
@@ -2762,16 +2572,11 @@ class TransactionJournal:
     def record_rollback_done(self, sequence: int) -> None:
         if type(sequence) is not int or sequence <= 0:
             raise DeploymentStateError("invalid rollback sequence")
-        operation_sequences = {
-            record["sequence"] for record in self._read_operations_internal()
-        }
+        operation_sequences = {record["sequence"] for record in self._read_operations_internal()}
         if sequence not in operation_sequences:
             raise DeploymentStateError("unknown rollback operation sequence")
         env_rollback_state = self.read_env_rollback_state()
-        if (
-            env_rollback_state is not None
-            and env_rollback_state["sequence"] == sequence
-        ):
+        if env_rollback_state is not None and env_rollback_state["sequence"] == sequence:
             raise DeploymentStateError(
                 "environment rollback must finish before recording completion"
             )
@@ -2806,9 +2611,7 @@ class TransactionJournal:
 
     @staticmethod
     def _env_rollback_branch(operation: Mapping[str, object]) -> str:
-        return (
-            "absent_before" if operation["before_absent"] is True else "existing_before"
-        )
+        return "absent_before" if operation["before_absent"] is True else "existing_before"
 
     def _env_rollback_operation(
         self,
@@ -2842,12 +2645,8 @@ class TransactionJournal:
             )
         if phase not in ENV_ROLLBACK_PHASES:
             raise DeploymentStateError("invalid environment rollback phase")
-        source_device, source_inode = self._env_rollback_identity_fields(
-            source_identity
-        )
-        candidate_device, candidate_inode = self._env_rollback_identity_fields(
-            candidate_identity
-        )
+        source_device, source_inode = self._env_rollback_identity_fields(source_identity)
+        candidate_device, candidate_inode = self._env_rollback_identity_fields(candidate_identity)
         payload = {
             "schema_version": SCHEMA_VERSION,
             "transaction_id": self.transaction_id,
@@ -2892,12 +2691,7 @@ class TransactionJournal:
             (device is None) != (inode is None)
             or (
                 device is not None
-                and (
-                    type(device) is not int
-                    or type(inode) is not int
-                    or device < 0
-                    or inode <= 0
-                )
+                and (type(device) is not int or type(inode) is not int or device < 0 or inode <= 0)
             )
             for device, inode in (
                 (payload["source_device"], payload["source_inode"]),
@@ -2912,16 +2706,18 @@ class TransactionJournal:
         )
         any_identity_present = any(value is not None for value in identity_values)
         all_identities_present = all(value is not None for value in identity_values)
-        invalid_phase_identity = (
-            payload["phase"] == "preparing" and any_identity_present
-        ) or (payload["phase"] != "preparing" and not all_identities_present)
+        invalid_phase_identity = (payload["phase"] == "preparing" and any_identity_present) or (
+            payload["phase"] != "preparing" and not all_identities_present
+        )
         duplicate_identity = all_identities_present and (
             payload["source_device"],
             payload["source_inode"],
         ) == (payload["candidate_device"], payload["candidate_inode"])
-        invalid_branch_phase = payload["branch"] == "existing_before" and payload[
-            "phase"
-        ] not in ("preparing", "exchange_pending", "applied")
+        invalid_branch_phase = payload["branch"] == "existing_before" and payload["phase"] not in (
+            "preparing",
+            "exchange_pending",
+            "applied",
+        )
         if (
             type(payload["schema_version"]) is not int
             or payload["schema_version"] != SCHEMA_VERSION
@@ -2966,9 +2762,7 @@ class TransactionJournal:
         existing = _lstat_optional(self.env_rollback_state_path)
         if existing is None:
             return None
-        payload = _read_json_value(
-            self.env_rollback_state_path, "environment rollback state"
-        )
+        payload = _read_json_value(self.env_rollback_state_path, "environment rollback state")
         return self._validate_env_rollback_payload(payload, operations)
 
     def read_env_rollback_state(self) -> dict[str, object] | None:
@@ -2990,13 +2784,9 @@ class TransactionJournal:
         sequence = operation.get("sequence")
         if type(sequence) is not int or sequence <= 0:
             raise DeploymentStateError("invalid forward environment sequence")
-        return env_path.with_name(
-            f".{env_path.name}.dcagent-forward-{transaction_id}-{sequence}"
-        )
+        return env_path.with_name(f".{env_path.name}.dcagent-forward-{transaction_id}-{sequence}")
 
-    def forward_environment_candidate_path(
-        self, operation: Mapping[str, object]
-    ) -> Path:
+    def forward_environment_candidate_path(self, operation: Mapping[str, object]) -> Path:
         persisted = self._env_rollback_operation(
             operation.get("sequence"), self._read_operations_internal()
         )
@@ -3022,12 +2812,8 @@ class TransactionJournal:
             )
         if phase not in FORWARD_ENVIRONMENT_PHASES:
             raise DeploymentStateError("invalid forward environment phase")
-        source_device, source_inode = self._env_rollback_identity_fields(
-            source_identity
-        )
-        candidate_device, candidate_inode = self._env_rollback_identity_fields(
-            candidate_identity
-        )
+        source_device, source_inode = self._env_rollback_identity_fields(source_identity)
+        candidate_device, candidate_inode = self._env_rollback_identity_fields(candidate_identity)
         payload = {
             "schema_version": SCHEMA_VERSION,
             "transaction_id": self.transaction_id,
@@ -3076,12 +2862,7 @@ class TransactionJournal:
             (device is None) != (inode is None)
             or (
                 device is not None
-                and (
-                    type(device) is not int
-                    or type(inode) is not int
-                    or device < 0
-                    or inode <= 0
-                )
+                and (type(device) is not int or type(inode) is not int or device < 0 or inode <= 0)
             )
             for device, inode in (
                 (payload["source_device"], payload["source_inode"]),
@@ -3093,15 +2874,11 @@ class TransactionJournal:
         preparing = payload["phase"] == "preparing"
         invalid_phase_identity = (
             preparing
-            and (
-                candidate_present
-                or (payload["branch"] == "existing_before") != source_present
-            )
+            and (candidate_present or (payload["branch"] == "existing_before") != source_present)
         ) or (
             not preparing
             and (
-                not candidate_present
-                or (payload["branch"] == "existing_before") != source_present
+                not candidate_present or (payload["branch"] == "existing_before") != source_present
             )
         )
         duplicate_identity = (
@@ -3161,9 +2938,7 @@ class TransactionJournal:
         existing = _lstat_optional(self.forward_environment_state_path)
         if existing is None:
             return None
-        payload = _read_json_value(
-            self.forward_environment_state_path, "forward environment state"
-        )
+        payload = _read_json_value(self.forward_environment_state_path, "forward environment state")
         return self._validate_forward_environment_payload(payload, operations)
 
     def read_forward_environment_state(self) -> dict[str, object] | None:
@@ -3173,9 +2948,7 @@ class TransactionJournal:
         existing = _lstat_optional(self.forward_environment_state_path)
         if existing is None:
             return
-        _verify_regular_file(
-            self.forward_environment_state_path, "forward environment state"
-        )
+        _verify_regular_file(self.forward_environment_state_path, "forward environment state")
         self.forward_environment_state_path.unlink()
         fsync_directory(self.root)
 
@@ -3210,15 +2983,11 @@ class TransactionJournal:
             return
         if _is_symlink(existing) or not stat.S_ISREG(existing.st_mode):
             raise DeploymentStateError("unsafe environment backup")
-        _require_owner_and_mode(
-            self.env_backup_path, existing, 0o600, "environment backup"
-        )
+        _require_owner_and_mode(self.env_backup_path, existing, 0o600, "environment backup")
         self.env_backup_path.unlink()
         fsync_directory(self.root)
 
-    def _write_env_backup_meta(
-        self, *, state: str, absent: bool, digest: str | None
-    ) -> None:
+    def _write_env_backup_meta(self, *, state: str, absent: bool, digest: str | None) -> None:
         if state not in {"preparing", "ready"}:
             raise DeploymentStateError("invalid environment backup state")
         if absent != (digest is None):
@@ -3235,13 +3004,10 @@ class TransactionJournal:
         )
 
     def _read_env_backup_meta(self, *, read_only: bool = False) -> bool:
-        payload = _read_json_value(
-            self.env_backup_meta_path, "environment backup metadata"
-        )
+        payload = _read_json_value(self.env_backup_meta_path, "environment backup metadata")
         if (
             not isinstance(payload, Mapping)
-            or set(payload)
-            != {"schema_version", "transaction_id", "state", "absent", "digest"}
+            or set(payload) != {"schema_version", "transaction_id", "state", "absent", "digest"}
             or type(payload["schema_version"]) is not int
             or payload["schema_version"] != SCHEMA_VERSION
             or payload["transaction_id"] != self.transaction_id
@@ -3268,20 +3034,15 @@ class TransactionJournal:
                     return True
                 if backup is None:
                     return True
-                data = _read_secure_regular_file(
-                    self.env_backup_path, "environment backup"
-                )
+                data = _read_secure_regular_file(self.env_backup_path, "environment backup")
                 if hashlib.sha256(data).hexdigest() != payload["digest"]:
                     raise DeploymentStateError(
-                        "environment backup digest mismatch: "
-                        f"{self.env_backup_meta_path}"
+                        f"environment backup digest mismatch: {self.env_backup_meta_path}"
                     )
                 return False
             if payload["absent"]:
                 if backup is not None:
-                    _remove_verified_atomic_temp(
-                        self.env_backup_path, "environment backup"
-                    )
+                    _remove_verified_atomic_temp(self.env_backup_path, "environment backup")
                 self._write_env_backup_meta(state="ready", absent=True, digest=None)
                 return True
             if backup is None:
@@ -3292,9 +3053,7 @@ class TransactionJournal:
                 raise DeploymentStateError(
                     f"environment backup digest mismatch: {self.env_backup_meta_path}"
                 )
-            self._write_env_backup_meta(
-                state="ready", absent=False, digest=payload["digest"]
-            )
+            self._write_env_backup_meta(state="ready", absent=False, digest=payload["digest"])
             return False
         if payload["absent"]:
             if backup is not None:
@@ -3316,9 +3075,7 @@ class TransactionJournal:
             else _read_secure_regular_file(self.env_backup_path, "environment backup")
         )
 
-    def validate_env_backup_for_operation(
-        self, operation: Mapping[str, object]
-    ) -> bytes | None:
+    def validate_env_backup_for_operation(self, operation: Mapping[str, object]) -> bytes | None:
         if operation.get("kind") != "env_replace":
             raise DeploymentStateError("operation is not an environment replacement")
         before_absent = operation.get("before_absent")
@@ -3385,8 +3142,7 @@ class TransactionJournal:
             or payload["transaction_id"] != self.transaction_id
             or payload["deployment_identity_hash"] != self.deployment_identity_hash
             or payload["object_categories"] != list(self.object_categories)
-            or payload["cleanup_status"]
-            not in {"committed_cleanup_pending", "complete"}
+            or payload["cleanup_status"] not in {"committed_cleanup_pending", "complete"}
             or payload["final_phase"] not in {"committed", "committed_cleanup_required"}
             or not isinstance(payload["completed_at"], str)
             or not _RFC3339_MICROSECONDS_UTC.fullmatch(payload["completed_at"])
@@ -3442,8 +3198,7 @@ class TombstoneJournal(TransactionJournal):
             or payload["transaction_id"] != transaction_id
             or payload["deployment_identity_hash"] != expected_hash
             or not isinstance(payload["object_categories"], list)
-            or payload["cleanup_status"]
-            not in {"committed_cleanup_pending", "complete"}
+            or payload["cleanup_status"] not in {"committed_cleanup_pending", "complete"}
             or type(payload["control"]) is not bool
         ):
             raise DeploymentStateError(f"invalid cleanup metadata: {path}")
@@ -3465,9 +3220,7 @@ class TombstoneJournal(TransactionJournal):
             )
             if companion_parent.name != ".dcagent-transactions":
                 raise DeploymentStateError("invalid cleanup companion parent")
-            companion = _validate_abs_path(
-                companion_value, "cleanup secret companion root"
-            )
+            companion = _validate_abs_path(companion_value, "cleanup secret companion root")
             if (
                 companion.name != transaction_id
                 or companion.parent.name != ".dcagent-transactions"
@@ -3487,13 +3240,9 @@ class TombstoneJournal(TransactionJournal):
             raise DeploymentStateError(f"cleanup metadata has no receipt: {path}")
         tombstone_state = _lstat_optional(tombstone)
         if tombstone_state is not None:
-            if _is_symlink(tombstone_state) or not stat.S_ISDIR(
-                tombstone_state.st_mode
-            ):
+            if _is_symlink(tombstone_state) or not stat.S_ISDIR(tombstone_state.st_mode):
                 raise DeploymentStateError(f"unsafe cleanup tombstone: {tombstone}")
-            _require_owner_and_mode(
-                tombstone, tombstone_state, 0o700, "cleanup tombstone"
-            )
+            _require_owner_and_mode(tombstone, tombstone_state, 0o700, "cleanup tombstone")
         return journal
 
 
@@ -3547,9 +3296,7 @@ class RollbackTombstoneJournal(TransactionJournal):
             or type(payload["control"]) is not bool
         ):
             raise DeploymentStateError(f"invalid rollback cleanup metadata: {path}")
-        tombstone = _validate_abs_path(
-            payload["tombstone_path"], "rollback cleanup tombstone"
-        )
+        tombstone = _validate_abs_path(payload["tombstone_path"], "rollback cleanup tombstone")
         expected_tombstone = path.parent / f".{transaction_id}.rollback-cleanup"
         if tombstone != expected_tombstone:
             raise DeploymentStateError(f"invalid rollback cleanup metadata: {path}")
@@ -3567,9 +3314,7 @@ class RollbackTombstoneJournal(TransactionJournal):
             )
             if companion_parent.name != ".dcagent-transactions":
                 raise DeploymentStateError("invalid rollback companion parent")
-            companion = _validate_abs_path(
-                companion_value, "rollback secret companion root"
-            )
+            companion = _validate_abs_path(companion_value, "rollback secret companion root")
             if (
                 companion.name != transaction_id
                 or companion.parent.name != ".dcagent-transactions"
@@ -3586,24 +3331,14 @@ class RollbackTombstoneJournal(TransactionJournal):
         )
         tombstone_state = _lstat_optional(tombstone)
         if tombstone_state is not None:
-            if _is_symlink(tombstone_state) or not stat.S_ISDIR(
-                tombstone_state.st_mode
-            ):
-                raise DeploymentStateError(
-                    f"unsafe rollback cleanup tombstone: {tombstone}"
-                )
-            _require_owner_and_mode(
-                tombstone, tombstone_state, 0o700, "rollback cleanup tombstone"
-            )
+            if _is_symlink(tombstone_state) or not stat.S_ISDIR(tombstone_state.st_mode):
+                raise DeploymentStateError(f"unsafe rollback cleanup tombstone: {tombstone}")
+            _require_owner_and_mode(tombstone, tombstone_state, 0o700, "rollback cleanup tombstone")
         return journal
 
 
 def utc_now() -> str:
-    return (
-        dt.datetime.now(dt.UTC)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
-    )
+    return dt.datetime.now(dt.UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def fsync_directory(path: str | Path) -> None:
@@ -3764,9 +3499,7 @@ def _exclusive_write_json(path: Path, payload: object, description: str) -> bool
     try:
         existing = _lstat_optional(path)
     except OSError:
-        raise DeploymentStateError(
-            f"cannot safely inspect {description}: {path}"
-        ) from None
+        raise DeploymentStateError(f"cannot safely inspect {description}: {path}") from None
     if existing is not None:
         return False
     fd: int | None = None
@@ -3825,31 +3558,21 @@ def load_identity(paths: StatePaths) -> DeploymentIdentity:
     try:
         identity = DeploymentIdentity(**payload)  # type: ignore[arg-type]
     except (DeploymentStateError, TypeError, ValueError) as exc:
-        raise DeploymentStateError(
-            f"invalid deployment identity: {paths.identity}"
-        ) from exc
+        raise DeploymentStateError(f"invalid deployment identity: {paths.identity}") from exc
     if identity.state_root.as_posix() != paths.root.as_posix():
-        raise DeploymentStateError(
-            f"identity state root does not match: {paths.identity}"
-        )
+        raise DeploymentStateError(f"identity state root does not match: {paths.identity}")
     return identity
 
 
 def write_identity_exclusive(paths: StatePaths, identity: DeploymentIdentity) -> None:
     if identity.state_root.as_posix() != paths.root.as_posix():
         raise DeploymentStateError("identity state_root does not match StatePaths root")
-    created = _exclusive_write_json(
-        paths.identity, identity.to_mapping(), "deployment identity"
-    )
+    created = _exclusive_write_json(paths.identity, identity.to_mapping(), "deployment identity")
     if not created and not _identity_mappings_match(load_identity(paths), identity):
-        raise DeploymentStateError(
-            f"existing deployment identity differs: {paths.identity}"
-        )
+        raise DeploymentStateError(f"existing deployment identity differs: {paths.identity}")
 
 
-def assert_identity_matches(
-    paths: StatePaths, expected: DeploymentIdentity
-) -> DeploymentIdentity:
+def assert_identity_matches(paths: StatePaths, expected: DeploymentIdentity) -> DeploymentIdentity:
     actual = load_identity(paths)
     if not _identity_mappings_match(actual, expected):
         raise DeploymentStateError(
@@ -3910,9 +3633,7 @@ def acquire_deployment_lock(
     try:
         normalized_timeout = float(timeout_seconds)
     except OverflowError:
-        raise DeploymentStateError(
-            "lock timeout must be a finite non-negative number"
-        ) from None
+        raise DeploymentStateError("lock timeout must be a finite non-negative number") from None
     if not math.isfinite(normalized_timeout) or normalized_timeout < 0:
         raise DeploymentStateError("lock timeout must be a finite non-negative number")
     _verify_state_root(paths)
@@ -3956,9 +3677,7 @@ def acquire_deployment_lock(
                 raise DeploymentStateError(message) from None
 
 
-def _validate_marker(
-    payload: dict[str, object], expected_hash: str, path: Path
-) -> None:
+def _validate_marker(payload: dict[str, object], expected_hash: str, path: Path) -> None:
     required = {
         "schema_version",
         "created_at",
@@ -4020,26 +3739,20 @@ def create_start_marker(
         )
         _validate_marker(payload, deployment_identity_hash, paths.start_marker)
     except DeploymentStateError:
-        raise DeploymentStateError(
-            f"deployment already started: {paths.start_marker}"
-        ) from None
+        raise DeploymentStateError(f"deployment already started: {paths.start_marker}") from None
 
 
 def assert_start_marker_absent(paths: StatePaths) -> None:
     try:
         _verify_state_root(paths)
     except DeploymentStateError:
-        raise DeploymentStateError(
-            f"deployment already started: {paths.start_marker}"
-        ) from None
+        raise DeploymentStateError(f"deployment already started: {paths.start_marker}") from None
     try:
         os.lstat(paths.start_marker)
     except FileNotFoundError:
         return
     except OSError:
-        raise DeploymentStateError(
-            f"deployment already started: {paths.start_marker}"
-        ) from None
+        raise DeploymentStateError(f"deployment already started: {paths.start_marker}") from None
     raise DeploymentStateError(f"deployment already started: {paths.start_marker}")
 
 
@@ -4051,16 +3764,10 @@ def scan_transaction_journals(
     """Validate both journal namespaces and normal companion links fail-closed."""
     _verify_state_root(paths)
     expected_hash = _validate_identity_hash(expected_identity_hash)
-    companion_parent = _validate_abs_path(
-        secret_companion_root, "secret companion root"
-    )
+    companion_parent = _validate_abs_path(secret_companion_root, "secret companion root")
     if companion_parent.name != ".dcagent-transactions":
-        raise DeploymentStateError(
-            "secret companion root must be .dcagent-transactions"
-        )
-    journals: list[
-        TransactionJournal | TombstoneJournal | RollbackTombstoneJournal
-    ] = []
+        raise DeploymentStateError("secret companion root must be .dcagent-transactions")
+    journals: list[TransactionJournal | TombstoneJournal | RollbackTombstoneJournal] = []
     normal_ids: set[str] = set()
     seen_ids: set[str] = set()
     for directory, control in (
@@ -4077,20 +3784,14 @@ def scan_transaction_journals(
         for entry in entries:
             journal = TransactionJournal.open(entry.path, expected_hash)
             if journal.control != control:
-                raise DeploymentStateError(
-                    f"invalid transaction namespace: {entry.path}"
-                )
+                raise DeploymentStateError(f"invalid transaction namespace: {entry.path}")
             if not control:
                 companion = companion_parent / journal.transaction_id
                 if journal.secret_companion_root != companion:
-                    raise DeploymentStateError(
-                        f"secret companion root mismatch: {journal.root}"
-                    )
+                    raise DeploymentStateError(f"secret companion root mismatch: {journal.root}")
                 normal_ids.add(journal.transaction_id)
             if journal.transaction_id in seen_ids:
-                raise DeploymentStateError(
-                    f"duplicate transaction state: {journal.root}"
-                )
+                raise DeploymentStateError(f"duplicate transaction state: {journal.root}")
             seen_ids.add(journal.transaction_id)
             journals.append(journal)
 
@@ -4098,9 +3799,7 @@ def scan_transaction_journals(
     try:
         history_entries = list(os.scandir(paths.history))
     except OSError as exc:
-        raise DeploymentStateError(
-            f"cannot inspect history directory: {paths.history}"
-        ) from exc
+        raise DeploymentStateError(f"cannot inspect history directory: {paths.history}") from exc
     recoverable_ids = set(seen_ids)
     for entry in history_entries:
         for pattern in (
@@ -4119,15 +3818,11 @@ def scan_transaction_journals(
         target = _atomic_temp_target(entry.name)
         if target is None:
             if entry.name.endswith(".tmp"):
-                raise DeploymentStateError(
-                    f"invalid history atomic temp: {Path(entry.path)}"
-                )
+                raise DeploymentStateError(f"invalid history atomic temp: {Path(entry.path)}")
             continue
         transaction_id = _history_temp_transaction_id(target)
         if transaction_id is None or transaction_id not in recoverable_ids:
-            raise DeploymentStateError(
-                f"orphan history atomic temp: {Path(entry.path)}"
-            )
+            raise DeploymentStateError(f"orphan history atomic temp: {Path(entry.path)}")
         _remove_verified_atomic_temp(Path(entry.path), "history atomic temp")
         removed_temp = True
     if removed_temp:
@@ -4147,14 +3842,10 @@ def scan_transaction_journals(
         )
         transaction_id = journal.transaction_id
         if transaction_id in rollback_metadata:
-            raise DeploymentStateError(
-                f"duplicate rollback cleanup metadata: {journal.root}"
-            )
+            raise DeploymentStateError(f"duplicate rollback cleanup metadata: {journal.root}")
         rollback_metadata[transaction_id] = journal
         if transaction_id in seen_ids:
-            active = next(
-                item for item in journals if item.transaction_id == transaction_id
-            )
+            active = next(item for item in journals if item.transaction_id == transaction_id)
             if (
                 active.deployment_identity_hash != journal.deployment_identity_hash
                 or active.object_categories != journal.object_categories
@@ -4165,9 +3856,7 @@ def scan_transaction_journals(
                 or active.read_phase().phase
                 not in {"rollback_complete", "rollback_cleanup_required"}
             ):
-                raise DeploymentStateError(
-                    f"duplicate rollback transaction state: {journal.root}"
-                )
+                raise DeploymentStateError(f"duplicate rollback transaction state: {journal.root}")
             continue
         seen_ids.add(transaction_id)
         if not journal.control:
@@ -4188,9 +3877,7 @@ def scan_transaction_journals(
             raise DeploymentStateError(f"duplicate cleanup metadata: {journal.root}")
         cleanup_metadata[transaction_id] = journal
         if transaction_id in seen_ids:
-            active = next(
-                item for item in journals if item.transaction_id == transaction_id
-            )
+            active = next(item for item in journals if item.transaction_id == transaction_id)
             if (
                 active.deployment_identity_hash != journal.deployment_identity_hash
                 or active.object_categories != journal.object_categories
@@ -4198,9 +3885,7 @@ def scan_transaction_journals(
                 or active.secret_companion_root != journal.secret_companion_root
                 or _lstat_optional(journal.root) is not None
             ):
-                raise DeploymentStateError(
-                    f"duplicate transaction state: {journal.root}"
-                )
+                raise DeploymentStateError(f"duplicate transaction state: {journal.root}")
             continue
         seen_ids.add(transaction_id)
         if not journal.control:
@@ -4220,16 +3905,11 @@ def scan_transaction_journals(
         if match is None:
             if (
                 entry.name.startswith(".")
-                and (
-                    ".journal-cleanup" in entry.name
-                    or ".rollback-cleanup" in entry.name
-                )
+                and (".journal-cleanup" in entry.name or ".rollback-cleanup" in entry.name)
                 and _CLEANUP_TOMBSTONE_METADATA.fullmatch(entry.name) is None
                 and _ROLLBACK_TOMBSTONE_METADATA.fullmatch(entry.name) is None
             ):
-                raise DeploymentStateError(
-                    f"invalid cleanup tombstone: {Path(entry.path)}"
-                )
+                raise DeploymentStateError(f"invalid cleanup tombstone: {Path(entry.path)}")
             continue
         transaction_id = _validate_uuid4_hex(match.group(1))
         if transaction_id in cleanup_metadata:
@@ -4257,9 +3937,7 @@ def scan_transaction_journals(
         companion = Path(entry.path)
         _verify_directory(companion, "secret transaction companion")
         if transaction_id not in normal_ids:
-            raise DeploymentStateError(
-                f"orphan secret transaction companion: {companion}"
-            )
+            raise DeploymentStateError(f"orphan secret transaction companion: {companion}")
     return tuple(journals)
 
 
@@ -4274,9 +3952,7 @@ def assert_no_incomplete_transactions(
             raise DeploymentStateError(
                 "full transaction validation requires identity and secret root"
             )
-        journals = scan_transaction_journals(
-            paths, secret_companion_root, expected_identity_hash
-        )
+        journals = scan_transaction_journals(paths, secret_companion_root, expected_identity_hash)
         if journals:
             raise DeploymentStateError(f"incomplete transaction: {journals[0].root}")
         return
@@ -4302,9 +3978,7 @@ def assert_no_incomplete_transactions(
     try:
         history_entries = list(os.scandir(paths.history))
     except OSError as exc:
-        raise DeploymentStateError(
-            f"cannot inspect history directory: {paths.history}"
-        ) from exc
+        raise DeploymentStateError(f"cannot inspect history directory: {paths.history}") from exc
     for entry in history_entries:
         if entry.name.startswith(".") and (
             entry.name.endswith(".journal-cleanup")
@@ -4313,6 +3987,4 @@ def assert_no_incomplete_transactions(
             or entry.name.endswith(".rollback-cleanup.json")
             or entry.name.endswith(".tmp")
         ):
-            raise DeploymentStateError(
-                f"incomplete transaction cleanup: {Path(entry.path)}"
-            )
+            raise DeploymentStateError(f"incomplete transaction cleanup: {Path(entry.path)}")

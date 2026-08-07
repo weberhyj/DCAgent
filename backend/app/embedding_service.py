@@ -10,7 +10,7 @@ import math
 import os
 import stat
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, Protocol
@@ -286,7 +286,7 @@ def _materialize_vectors(
             raise TypeError("each vector must be a numeric sequence")
         materialized: list[float] = []
         for coordinate in vector:
-            if isinstance(coordinate, bool) or isinstance(coordinate, (str, bytes, bytearray)):
+            if isinstance(coordinate, (bool, str, bytes, bytearray)):
                 raise TypeError("vector coordinates must be numbers")
             try:
                 numeric_coordinate = float(coordinate)
@@ -368,17 +368,13 @@ def create_production_app(
             app.state.embedding_backend = None
             app.state.embedding_metadata = None
             if batchers is not None:
-                try:
+                with suppress(Exception):
                     await _close_embedding_batchers(batchers)
-                except Exception:
-                    pass
             if backend is not None:
                 close = getattr(backend, "close", None)
                 if callable(close):
-                    try:
+                    with suppress(Exception):
                         await run_in_threadpool(close)
-                    except Exception:
-                        pass
 
     return _build_embedding_app(lifespan=lifespan)
 
@@ -510,10 +506,8 @@ def _load_ollama_embedding_backend(
             query_profile=query_profile,
         )
     except Exception:
-        try:
+        with suppress(Exception):
             client.close()
-        except Exception:
-            pass
         raise
 
 

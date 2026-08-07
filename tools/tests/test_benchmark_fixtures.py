@@ -22,9 +22,8 @@ class BenchmarkFixtureTest(unittest.TestCase):
             {"total": 1, "dimensions": 4, "batch_size": 0, "seed": 1},
             {"total": True, "dimensions": 4, "batch_size": 2, "seed": 1},
         ):
-            with self.subTest(kwargs=kwargs):
-                with self.assertRaises(ValueError):
-                    list(iter_qdrant_points(**kwargs))
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                list(iter_qdrant_points(**kwargs))
 
     def test_clickhouse_fixture_uses_server_side_numbers(self) -> None:
         sql = clickhouse_numbers_sql(30_000_000)

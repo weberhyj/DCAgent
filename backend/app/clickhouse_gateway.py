@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -192,10 +193,8 @@ class ClickHouseGateway:
                 self._validate_table(target, target.physical_table_name, statistics)
             except Exception as recovery_error:
                 raise promotion_error from recovery_error
-            try:
+            with contextlib.suppress(Exception):
                 self.discard_publication(target)
-            except Exception:
-                pass
         return target.physical_table_name
 
     def _validate_table(

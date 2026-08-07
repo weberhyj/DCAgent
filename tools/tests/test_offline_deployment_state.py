@@ -121,9 +121,7 @@ class DeploymentStateTests(unittest.TestCase):
                 }
             )
         self.assertNotEqual(stored.to_mapping(), expected.to_mapping())
-        self.assertNotEqual(
-            state.identity_digest(stored), state.identity_digest(expected)
-        )
+        self.assertNotEqual(state.identity_digest(stored), state.identity_digest(expected))
         return paths, stored, expected
 
     def ensure_layout(self) -> None:
@@ -156,9 +154,7 @@ class DeploymentStateTests(unittest.TestCase):
     def test_normalize_is_lexical_and_allows_nonexistent_tail(self) -> None:
         raw = self.base.as_posix() + "/missing/./child///"
         expected = (self.base / "missing" / "child").as_posix()
-        self.assertEqual(
-            state.normalize_absolute_root(raw, "root").as_posix(), expected
-        )
+        self.assertEqual(state.normalize_absolute_root(raw, "root").as_posix(), expected)
 
     def test_normalize_rejects_symlink_component(self) -> None:
         target = self.base / "target"
@@ -197,9 +193,7 @@ class DeploymentStateTests(unittest.TestCase):
         }
         for attribute, basename in expected.items():
             with self.subTest(attribute=attribute):
-                self.assertEqual(
-                    getattr(self.paths, attribute), self.paths.root / basename
-                )
+                self.assertEqual(getattr(self.paths, attribute), self.paths.root / basename)
         self.assertEqual(self.paths.started_marker, self.paths.start_marker)
 
     def test_identity_mapping_digest_and_new_uuid_are_canonical(self) -> None:
@@ -234,9 +228,7 @@ class DeploymentStateTests(unittest.TestCase):
             ensure_ascii=False,
             allow_nan=False,
         ).encode("utf-8")
-        self.assertEqual(
-            state.identity_digest(identity), hashlib.sha256(canonical).hexdigest()
-        )
+        self.assertEqual(state.identity_digest(identity), hashlib.sha256(canonical).hexdigest())
         self.assertNotIn("checkout", json.dumps(mapping))
         with self.assertRaises(state.DeploymentStateError):
             state.DeploymentIdentity.new(
@@ -265,9 +257,7 @@ class DeploymentStateTests(unittest.TestCase):
                     **{**mapping, "deployment_uuid": deployment_uuid}  # type: ignore[arg-type]
                 )
         with self.assertRaises(state.DeploymentStateError):
-            state.DeploymentIdentity(
-                **{**mapping, "state_root": self.base / "wrong-state"}
-            )
+            state.DeploymentIdentity(**{**mapping, "state_root": self.base / "wrong-state"})
         with self.assertRaises(state.DeploymentStateError):
             state.DeploymentIdentity(
                 **{
@@ -313,9 +303,7 @@ class DeploymentStateTests(unittest.TestCase):
         self.assertEqual(self.paths.identity.read_bytes(), identity_bytes)
 
         digest = state.identity_digest(identity)
-        state.create_start_marker(
-            self.paths, operation="up", deployment_identity_hash=digest
-        )
+        state.create_start_marker(self.paths, operation="up", deployment_identity_hash=digest)
         marker_bytes = self.paths.start_marker.read_bytes()
         with mock.patch.object(
             state.tempfile,
@@ -384,27 +372,19 @@ class DeploymentStateTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 73, completed.stderr)
         if self.paths.identity.exists():
-            self.fail(
-                f"partial final identity remained: {self.paths.identity.read_bytes()!r}"
-            )
+            self.fail(f"partial final identity remained: {self.paths.identity.read_bytes()!r}")
         state.write_identity_exclusive(self.paths, identity)
-        self.assertEqual(
-            state.load_identity(self.paths).to_mapping(), identity.to_mapping()
-        )
+        self.assertEqual(state.load_identity(self.paths).to_mapping(), identity.to_mapping())
 
     def test_exclusive_identity_write_error_cleans_temporary_file(self) -> None:
         self.ensure_layout()
         with (
-            mock.patch.object(
-                state, "_write_all", side_effect=OSError("interrupted write")
-            ),
+            mock.patch.object(state, "_write_all", side_effect=OSError("interrupted write")),
             self.assertRaises(state.DeploymentStateError),
         ):
             state.write_identity_exclusive(self.paths, self.make_identity())
         self.assertFalse(self.paths.identity.exists())
-        self.assertEqual(
-            list(self.paths.root.glob(f".{self.paths.identity.name}.*.tmp")), []
-        )
+        self.assertEqual(list(self.paths.root.glob(f".{self.paths.identity.name}.*.tmp")), [])
 
     def test_write_identity_compares_canonical_mapping(self) -> None:
         paths, stored, expected = self.make_canonical_identity_collision()
@@ -605,9 +585,7 @@ class DeploymentStateTests(unittest.TestCase):
     def test_marker_has_fixed_schema_and_same_hash_is_idempotent(self) -> None:
         self.ensure_layout()
         digest = "a" * 64
-        state.create_start_marker(
-            self.paths, operation="up", deployment_identity_hash=digest
-        )
+        state.create_start_marker(self.paths, operation="up", deployment_identity_hash=digest)
         original_bytes = self.paths.start_marker.read_bytes()
         original = json.loads(original_bytes)
         self.assertEqual(
@@ -619,9 +597,7 @@ class DeploymentStateTests(unittest.TestCase):
                 "deployment_identity_hash",
             },
         )
-        state.create_start_marker(
-            self.paths, operation="exec", deployment_identity_hash=digest
-        )
+        state.create_start_marker(self.paths, operation="exec", deployment_identity_hash=digest)
         self.assertEqual(self.paths.start_marker.read_bytes(), original_bytes)
         self.assertEqual(json.loads(original_bytes)["operation"], "up")
 
@@ -680,14 +656,10 @@ class DeploymentStateTests(unittest.TestCase):
         ]
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
-                self.paths.start_marker.write_text(
-                    json.dumps(payload), encoding="utf-8"
-                )
+                self.paths.start_marker.write_text(json.dumps(payload), encoding="utf-8")
                 if os.name == "posix":
                     os.chmod(self.paths.start_marker, 0o600)
-                with self.assertRaisesRegex(
-                    state.DeploymentStateError, "already started"
-                ):
+                with self.assertRaisesRegex(state.DeploymentStateError, "already started"):
                     state.create_start_marker(
                         self.paths,
                         operation="up",
@@ -700,9 +672,7 @@ class DeploymentStateTests(unittest.TestCase):
         digest = "a" * 64
         self.paths.start_marker.mkdir()
         with self.assertRaisesRegex(state.DeploymentStateError, "already started"):
-            state.create_start_marker(
-                self.paths, operation="up", deployment_identity_hash=digest
-            )
+            state.create_start_marker(self.paths, operation="up", deployment_identity_hash=digest)
         self.paths.start_marker.rmdir()
 
         for target in (self.paths.root / "valid-target", self.paths.root / "missing"):
@@ -740,9 +710,7 @@ class DeploymentStateTests(unittest.TestCase):
     ) -> None:
         self.ensure_layout()
         digest = "a" * 64
-        state.create_start_marker(
-            self.paths, operation="up", deployment_identity_hash=digest
-        )
+        state.create_start_marker(self.paths, operation="up", deployment_identity_hash=digest)
         sensitive = "SENSITIVE_MARKER_READ_DETAIL"
         original_open = state.os.open
 
@@ -834,9 +802,7 @@ class DeploymentStateTests(unittest.TestCase):
         state.atomic_write_json(destination, {"z": 1, "a": [2]})
         self.assertEqual(destination.read_bytes(), b'{"a":[2],"z":1}')
         with (
-            mock.patch.object(
-                state.os, "replace", side_effect=OSError("replace failed")
-            ),
+            mock.patch.object(state.os, "replace", side_effect=OSError("replace failed")),
             self.assertRaises(OSError),
         ):
             state.atomic_write_json(self.paths.root / "broken.json", {"a": 1})

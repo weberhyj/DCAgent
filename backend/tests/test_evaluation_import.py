@@ -1152,9 +1152,8 @@ class EvaluationImportSqlRepositoryTest(unittest.TestCase):
 
     def test_database_marks_memory_sqlite_and_exposes_reentrant_write_lock(self) -> None:
         self.assertTrue(self.database.is_sqlite_memory)
-        with self.database.write_lock:
-            with self.database.write_lock:
-                pass
+        with self.database.write_lock, self.database.write_lock:
+            pass
 
     def test_create_evaluation_cases_signature_drops_preview_duplicate_count(self) -> None:
         for method in (

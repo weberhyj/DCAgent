@@ -6,24 +6,21 @@ so ordinary tools tests do not require Locust.
 
 from __future__ import annotations
 
-from collections import deque
 import itertools
 import json
 import math
 import os
-from pathlib import Path
 import tempfile
 import time
+from collections import deque
+from pathlib import Path
 from typing import Any
 
 from tools.benchmarks.manifest import BenchmarkManifest
 
-
 try:
     from locust import HttpUser, between, events, task
-except (
-    ModuleNotFoundError
-):  # pragma: no cover - exercised by environments without Locust
+except ModuleNotFoundError:  # pragma: no cover - exercised by environments without Locust
 
     class _Hook:
         def add_listener(self, function):
@@ -109,18 +106,14 @@ def record_stream_timings(
     )
     if not has_full_stream_ms:
         full_stream_ms = response_time
-    if not isinstance(full_stream_ms, (int, float)) or not math.isfinite(
-        float(full_stream_ms)
-    ):
+    if not isinstance(full_stream_ms, (int, float)) or not math.isfinite(float(full_stream_ms)):
         full_stream_ms = 0.0
     failed = (
         exception is not None
         or (context is not None and context.get("failed") is True)
         or not has_full_stream_ms
     )
-    if isinstance(full_stream_ms, (int, float)) and math.isfinite(
-        float(full_stream_ms)
-    ):
+    if isinstance(full_stream_ms, (int, float)) and math.isfinite(float(full_stream_ms)):
         record: dict[str, object] = {
             "request_kind": request_kind,
             "full_stream_ms": float(full_stream_ms),
@@ -187,7 +180,7 @@ def record_sse_timings(
 ) -> None:
     """Record first response feedback and first generated token once."""
 
-    for stream_event, elapsed in zip(stream_events, elapsed_ms):
+    for stream_event, elapsed in zip(stream_events, elapsed_ms, strict=False):
         event_name = stream_event.get("event")
         if event_name in ("accepted", "queued"):
             context.setdefault("queue_feedback_ms", float(elapsed))
@@ -235,8 +228,7 @@ def build_metrics(records) -> dict[str, float]:
     if successful:
         for name in ("queue_feedback_ms", "first_token_ms"):
             if all(
-                isinstance(record.get(name), (int, float))
-                and math.isfinite(float(record[name]))
+                isinstance(record.get(name), (int, float)) and math.isfinite(float(record[name]))
                 for record in successful
             ):
                 value = _percentile_95([float(record[name]) for record in successful])
@@ -244,12 +236,10 @@ def build_metrics(records) -> dict[str, float]:
                     metrics[f"{name.removesuffix('_ms')}_p95_ms"] = value
 
     if samples:
-        metrics["error_rate"] = sum(
-            1 for record in samples if record.get("failed") is True
-        ) / len(samples)
-    if successful and all(
-        isinstance(record.get("cache_hit"), bool) for record in successful
-    ):
+        metrics["error_rate"] = sum(1 for record in samples if record.get("failed") is True) / len(
+            samples
+        )
+    if successful and all(isinstance(record.get("cache_hit"), bool) for record in successful):
         cache_samples = [record["cache_hit"] for record in successful]
         metrics["warm_cache_hit_rate"] = sum(cache_samples) / len(cache_samples)
     return metrics
@@ -335,9 +325,7 @@ class CapacityUser(HttpUser):
                 for stream_event in parse_sse_events(response.iter_lines()):
                     stream_events.append(stream_event)
                     elapsed_ms = (time.perf_counter() - started) * 1_000
-                    record_sse_timings(
-                        (stream_event,), timing_context, elapsed_ms=(elapsed_ms,)
-                    )
+                    record_sse_timings((stream_event,), timing_context, elapsed_ms=(elapsed_ms,))
                     data = stream_event.get("data")
                     if isinstance(data, dict):
                         cache_hit = data.get("cacheHit", data.get("cache_hit"))
@@ -354,6 +342,4 @@ class CapacityUser(HttpUser):
                 timing_context["failed"] = True
                 response.failure(f"stream_error:{type(exc).__name__}")
             finally:
-                timing_context["full_stream_ms"] = (
-                    time.perf_counter() - started
-                ) * 1_000
+                timing_context["full_stream_ms"] = (time.perf_counter() - started) * 1_000

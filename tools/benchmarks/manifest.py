@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
 import json
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
@@ -42,7 +42,7 @@ class BenchmarkManifest:
         self._validate()
 
     @classmethod
-    def load(cls, path: str | Path) -> "BenchmarkManifest":
+    def load(cls, path: str | Path) -> BenchmarkManifest:
         manifest_path = Path(path)
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
@@ -112,9 +112,7 @@ class BenchmarkManifest:
             raise ValueError("filter_selectivity must not be empty")
         for value in self.filter_selectivity:
             if not _is_finite_number(value) or not 0 < float(value) <= 1:
-                raise ValueError(
-                    "filter_selectivity values must be finite and in (0, 1]"
-                )
+                raise ValueError("filter_selectivity values must be finite and in (0, 1]")
 
         if not isinstance(self.include_sparse_vectors, bool):
             raise ValueError("include_sparse_vectors must be a boolean")

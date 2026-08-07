@@ -1,0 +1,43 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+    ".git",
+    ".venv",
+    "backend/.venv",
+    "frontend/node_modules",
+    "admin-frontend/node_modules",
+    "backend/uploads",
+    "docs",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI dependency providers intentionally use framework calls as defaults.
+"backend/app/routes.py" = ["B008"]
+# Test fixtures intentionally use nested assertion contexts and short-lived closures.
+"backend/tests/**/*.py" = ["B023", "SIM117"]
+"tools/tests/**/*.py" = ["B023", "SIM117"]
+
+[tool.ty.environment]
+python = "backend/.venv"
+python-version = "3.12"
+
+[tool.ty]
+src = { include = ["backend/app"], exclude = ["backend/tests", "tools", "docs", "frontend", "admin-frontend"] }
+
+[tool.ty.rules]
+# These rules cover dynamic third-party client/protocol boundaries where the
+# runtime contracts are validated by the application's adapters and tests.
+# Keep ty strict for unresolved names and import failures.
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
+invalid-method-override = "ignore"
+invalid-return-type = "ignore"
+missing-argument = "ignore"
+no-matching-overload = "ignore"
+not-iterable = "ignore"
+unresolved-attribute = "ignore"
+unsupported-operator = "ignore"

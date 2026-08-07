@@ -120,13 +120,13 @@ class ParserRuntimeTest(unittest.TestCase):
                         patch.object(
                             Path, "is_file", autospec=True, return_value=True
                         ) as path_is_file,
-                    ):
-                        with self.assertRaisesRegex(
+                        self.assertRaisesRegex(
                             ParserRuntimeError,
                             rf"^{variable} must reference a local filesystem path; "
                             "network shares and URI schemes are not allowed$",
-                        ):
-                            configure_parser_runtime(environ, path_exists=path_exists)
+                        ),
+                    ):
+                        configure_parser_runtime(environ, path_exists=path_exists)
 
                     path_exists.assert_not_called()
                     path_is_dir.assert_not_called()

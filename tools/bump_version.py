@@ -7,9 +7,7 @@ import json
 import re
 from pathlib import Path
 
-_VERSION_RE = re.compile(
-    r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)$"
-)
+_VERSION_RE = re.compile(r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)$")
 _PYTHON_VERSION_RE = re.compile(
     r'(?m)^(?P<prefix>__version__\s*=\s*["\'])(?P<version>[^"\']+)(?P<suffix>["\'])'
 )
@@ -18,9 +16,7 @@ _COMPONENTS = ("backend", "frontend", "admin-frontend")
 
 def _validate_version(value: object) -> str:
     if not isinstance(value, str):
-        raise TypeError(
-            f"semantic version must be a string, got {type(value).__name__}"
-        )
+        raise TypeError(f"semantic version must be a string, got {type(value).__name__}")
     if _VERSION_RE.fullmatch(value) is None:
         raise ValueError(f"invalid semantic version: {value!r}; expected X.Y.Z")
     return value
@@ -37,9 +33,7 @@ def read_version(root: Path, component: str) -> str:
             raise ValueError("backend/app/__init__.py does not define __version__")
         return _validate_version(match.group("version"))
     if component in {"frontend", "admin-frontend"}:
-        data = json.loads(
-            (root / component / "package.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((root / component / "package.json").read_text(encoding="utf-8"))
         return _validate_version(data["version"])
     raise ValueError(f"unknown component: {component!r}")
 
@@ -50,9 +44,7 @@ def _next_version(current: str, bump: str) -> str:
     match = _VERSION_RE.fullmatch(current)
     if match is None:
         raise ValueError(f"invalid current semantic version: {current!r}")
-    major, minor, patch = (
-        int(match.group(name)) for name in ("major", "minor", "patch")
-    )
+    major, minor, patch = (int(match.group(name)) for name in ("major", "minor", "patch"))
     if bump == "patch":
         patch += 1
     elif bump == "minor":
@@ -68,19 +60,13 @@ def _next_version(current: str, bump: str) -> str:
 def _write_backend_version(root: Path, version: str) -> None:
     path = root / "backend" / "app" / "__init__.py"
     text = path.read_text(encoding="utf-8")
-    updated, count = _PYTHON_VERSION_RE.subn(
-        rf"\g<prefix>{version}\g<suffix>", text, count=1
-    )
+    updated, count = _PYTHON_VERSION_RE.subn(rf"\g<prefix>{version}\g<suffix>", text, count=1)
     if count != 1:
-        raise ValueError(
-            "backend/app/__init__.py must contain one __version__ assignment"
-        )
+        raise ValueError("backend/app/__init__.py must contain one __version__ assignment")
     path.write_text(updated, encoding="utf-8")
 
 
-def _load_package_data(
-    path: Path, *, require_root_lock: bool = False
-) -> dict[str, object]:
+def _load_package_data(path: Path, *, require_root_lock: bool = False) -> dict[str, object]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise TypeError(f"{path} must contain a JSON object")
@@ -99,9 +85,7 @@ def _write_package_version(path: Path, data: dict[str, object], version: str) ->
         root_package = data.get("packages", {}).get("")
         assert isinstance(root_package, dict)
         root_package["version"] = version
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def bump_component(root: Path, component: str, bump: str) -> tuple[str, str]:
@@ -127,12 +111,8 @@ def bump_component(root: Path, component: str, bump: str) -> tuple[str, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("component", choices=_COMPONENTS)
-    parser.add_argument(
-        "bump", help="patch, minor, major, or an explicit X.Y.Z version"
-    )
-    parser.add_argument(
-        "--root", type=Path, default=Path(__file__).resolve().parents[1]
-    )
+    parser.add_argument("bump", help="patch, minor, major, or an explicit X.Y.Z version")
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
     current, target = bump_component(args.root.resolve(), args.component, args.bump)
     print(f"{args.component} version: {current} -> {target}")

@@ -170,10 +170,9 @@ def collect_physoc_response(
 
     response_parts: list[str] = []
     response_chars = 0
-    event_count = 0
-
-    for data in iter_message_data(lines, max_event_chars=max_event_chars):
-        event_count += 1
+    for event_count, data in enumerate(
+        iter_message_data(lines, max_event_chars=max_event_chars), start=1
+    ):
         if event_count > max_events:
             raise PhysocStreamError("Physoc events exceed limit")
         payload = _decode_payload(data)

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 import random
 import re
+from collections.abc import Iterator
 
-
-_CLICKHOUSE_IDENTIFIER = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?"
-)
+_CLICKHOUSE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?")
 
 
 def iter_qdrant_points(
@@ -34,9 +31,7 @@ def iter_qdrant_points(
                 {
                     "id": point_id,
                     "vector": {
-                        "dense": [
-                            randomizer.uniform(-1.0, 1.0) for _ in range(dimensions)
-                        ],
+                        "dense": [randomizer.uniform(-1.0, 1.0) for _ in range(dimensions)],
                         "bm25": {
                             "indices": [point_id % 257, (point_id + 17) % 257],
                             "values": [1.0, 0.5],

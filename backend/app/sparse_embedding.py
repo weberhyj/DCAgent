@@ -296,7 +296,7 @@ def _canonical_sparse_vector(raw_vector: object) -> SparseVector:
             raise TypeError("sparse vector indices must be integers") from error
         if index < 0:
             raise ValueError("sparse vector indices must not be negative")
-        if isinstance(raw_value, bool) or isinstance(raw_value, (str, bytes, bytearray)):
+        if isinstance(raw_value, (bool, str, bytes, bytearray)):
             raise TypeError("sparse vector values must be numeric")
         try:
             value = float(raw_value)

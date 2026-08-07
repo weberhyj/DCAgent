@@ -2,11 +2,10 @@ import json
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
-from types import MappingProxyType
 from pathlib import Path
+from types import MappingProxyType
 
 from tools.benchmarks.manifest import BenchmarkManifest
-
 
 ROOT = Path(__file__).parents[1]
 
@@ -33,9 +32,7 @@ class BenchmarkManifestTest(unittest.TestCase):
         }
 
     def test_acceptance_manifest_matches_approved_capacity_profile(self) -> None:
-        manifest = BenchmarkManifest.load(
-            ROOT / "benchmarks/manifests/acceptance-30m-5m.json"
-        )
+        manifest = BenchmarkManifest.load(ROOT / "benchmarks/manifests/acceptance-30m-5m.json")
 
         self.assertEqual(manifest.clickhouse_rows, 30_000_000)
         self.assertEqual(manifest.qdrant_points, 5_000_000)
@@ -43,9 +40,7 @@ class BenchmarkManifestTest(unittest.TestCase):
         self.assertEqual(manifest.virtual_users, 15)
         self.assertEqual(manifest.think_time_seconds, 5)
         self.assertEqual(manifest.duration_seconds, 1_800)
-        self.assertEqual(
-            manifest.request_mix, {"structured": 40, "document": 40, "mixed": 20}
-        )
+        self.assertEqual(manifest.request_mix, {"structured": 40, "document": 40, "mixed": 20})
         self.assertEqual(manifest.filter_selectivity, (0.01, 0.1, 0.5))
         self.assertEqual(manifest.dense_candidates, 50)
         self.assertEqual(manifest.sparse_candidates, 50)
@@ -67,16 +62,10 @@ class BenchmarkManifestTest(unittest.TestCase):
         for profile_name in ("online-cold", "online-warm"):
             gates = manifest.gate_profiles[profile_name]
             self.assertTrue(
-                any(
-                    g["metric"] == "queue_feedback_p95_ms" and g["lte"] <= 2_000
-                    for g in gates
-                )
+                any(g["metric"] == "queue_feedback_p95_ms" and g["lte"] <= 2_000 for g in gates)
             )
             self.assertTrue(
-                any(
-                    g["metric"] == "first_token_p95_ms" and g["lte"] <= 10_000
-                    for g in gates
-                )
+                any(g["metric"] == "first_token_p95_ms" and g["lte"] <= 10_000 for g in gates)
             )
         for profile_name in ("batch-initial", "batch-daily", "batch-weekly"):
             gates = manifest.gate_profiles[profile_name]
@@ -108,9 +97,7 @@ class BenchmarkManifestTest(unittest.TestCase):
         self.assertFalse(hasattr(manifest, "__dict__"))
         self.assertIsInstance(manifest.request_mix, MappingProxyType)
         self.assertIsInstance(manifest.gate_profiles, MappingProxyType)
-        self.assertIsInstance(
-            manifest.gate_profiles["service-round-trip"][0], MappingProxyType
-        )
+        self.assertIsInstance(manifest.gate_profiles["service-round-trip"][0], MappingProxyType)
         with self.assertRaises(FrozenInstanceError):
             manifest.virtual_users = 4  # type: ignore[misc]
         with self.assertRaises(TypeError):
@@ -158,9 +145,7 @@ class BenchmarkManifestTest(unittest.TestCase):
         manifest = BenchmarkManifest.load(ROOT / "benchmarks/manifests/smoke.json")
         payload = manifest.to_dict()
         self.assertEqual(json.loads(json.dumps(payload)), payload)
-        self.assertEqual(
-            payload["request_mix"], {"structured": 40, "document": 40, "mixed": 20}
-        )
+        self.assertEqual(payload["request_mix"], {"structured": 40, "document": 40, "mixed": 20})
         self.assertIsInstance(payload["gate_profiles"]["service-round-trip"][0], dict)
 
     def test_direct_constructor_also_validates_and_deep_freezes(self) -> None:
@@ -199,9 +184,7 @@ class BenchmarkManifestTest(unittest.TestCase):
             "context_tokens": 1,
             "output_tokens": 1,
             "include_sparse_vectors": True,
-            "gate_profiles": {
-                "smoke": [{"metric": "service_round_trip_ms", "lte": 100}]
-            },
+            "gate_profiles": {"smoke": [{"metric": "service_round_trip_ms", "lte": 100}]},
         }
         cases = [
             ("request_mix", {"structured": 99}),

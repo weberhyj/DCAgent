@@ -67,7 +67,7 @@ def normalize_vector(vector: list[float]) -> list[float]:
 def cosine_similarity(left: list[float] | None, right: list[float] | None) -> float:
     if not left or not right:
         return 0.0
-    return sum(a * b for a, b in zip(left, right))
+    return sum(a * b for a, b in zip(left, right, strict=False))
 
 
 DEFAULT_EMBEDDING_PROVIDER = HashingEmbeddingProvider()

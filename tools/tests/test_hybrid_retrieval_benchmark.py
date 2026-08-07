@@ -70,18 +70,18 @@ class _GatewayResource(_ClosingResource):
 
 
 def _production_runtime_probe(results) -> None:
-    from tools.hybrid_retrieval_benchmark import (
-        BenchmarkQuestion,
-        build_production_runtime,
-        run_benchmark,
-    )
-
     from app.database import Database
     from app.llm import PhysocDeepSeekLLMProvider, TemplateLLMProvider
     from app.models import KnowledgeChunkModel
     from app.retrieval_models import RetrievalMode
     from app.retrieval_router import RetrievalRouter
     from app.sql_repository import SqlChatRepository
+
+    from tools.hybrid_retrieval_benchmark import (
+        BenchmarkQuestion,
+        build_production_runtime,
+        run_benchmark,
+    )
 
     try:
         database = Database("sqlite+pysqlite:///:memory:")
@@ -289,9 +289,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
 
         self.assertTrue(report.passed)
         self.assertEqual(report.failed_gates, ())
-        self.assertEqual(
-            report.passed_gates, ("p95_seconds", "error_rate", "fallback_rate")
-        )
+        self.assertEqual(report.passed_gates, ("p95_seconds", "error_rate", "fallback_rate"))
 
     def test_zero_requests_and_non_finite_latencies_fail_closed(self) -> None:
         from tools.hybrid_retrieval_benchmark import summarize_results
@@ -346,9 +344,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
         self.assertTrue(report["summary"]["passed"])
         self.assertEqual(report["summary"]["requests"], 7)
         self.assertEqual(len(retriever.queries), 7)
-        self.assertEqual(
-            {item["caseId"] for item in report["records"]}, {"case-a", "case-b"}
-        )
+        self.assertEqual({item["caseId"] for item in report["records"]}, {"case-a", "case-b"})
         serialized = json.dumps(report, ensure_ascii=False)
         self.assertNotIn("sensitive question", serialized)
 
@@ -549,9 +545,7 @@ class HybridRetrievalBenchmarkTest(unittest.TestCase):
                     )
 
                 failure_index = (
-                    resource_order.index(stage)
-                    if stage != "alias"
-                    else len(resource_order)
+                    resource_order.index(stage) if stage != "alias" else len(resource_order)
                 )
                 expected = list(reversed(resource_order[:failure_index]))
                 self.assertEqual(events, expected)

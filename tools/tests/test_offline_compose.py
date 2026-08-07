@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import dataclasses
+import json
 import os
 import subprocess
 import tempfile
@@ -11,6 +11,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
+from tools import offline_deployment_state as deployment_state
 from tools.offline_compose import (
     ALLOWED_PROCESS_ENV,
     ALLOWED_VERBS,
@@ -21,8 +22,6 @@ from tools.offline_compose import (
     run_compose,
     validate_compose_arguments,
 )
-from tools import offline_deployment_state as deployment_state
-
 
 REQUIRED_SERVICES = (
     "postgres",
@@ -43,12 +42,8 @@ def environment_fixture(root: Path) -> dict[str, str]:
     return {
         "DATA_ROOT": str(root / "artifacts" / "data"),
         "MODEL_ROOT": str(root / "artifacts" / "models"),
-        "POSTGRES_PASSWORD_FILE": str(
-            root / "artifacts" / "secrets" / "postgres-password"
-        ),
-        "DATABASE_URL_SECRET_FILE": str(
-            root / "artifacts" / "secrets" / "database-url"
-        ),
+        "POSTGRES_PASSWORD_FILE": str(root / "artifacts" / "secrets" / "postgres-password"),
+        "DATABASE_URL_SECRET_FILE": str(root / "artifacts" / "secrets" / "database-url"),
         "CLICKHOUSE_QUERY_PASSWORD_FILE": str(
             root / "artifacts" / "secrets" / "clickhouse-query-password"
         ),
@@ -133,12 +128,8 @@ def rendered_fixture(root: Path) -> dict[str, object]:
         "secrets": {
             "postgres_password": {"file": str(secrets / "postgres-password")},
             "database_url": {"file": str(secrets / "database-url")},
-            "clickhouse_query_password": {
-                "file": str(secrets / "clickhouse-query-password")
-            },
-            "clickhouse_ingest_password": {
-                "file": str(secrets / "clickhouse-ingest-password")
-            },
+            "clickhouse_query_password": {"file": str(secrets / "clickhouse-query-password")},
+            "clickhouse_ingest_password": {"file": str(secrets / "clickhouse-ingest-password")},
         },
     }
 
@@ -161,9 +152,7 @@ def initialized_compose_repo(root: Path) -> tuple[Path, dict[str, str]]:
         f"CLICKHOUSE_INGEST_PASSWORD_FILE={secret_root / 'clickhouse-ingest-password'}\n",
         encoding="utf-8",
     )
-    (env_path.parent / "compose.yaml").write_text(
-        "name: dc-agent-offline\n", encoding="utf-8"
-    )
+    (env_path.parent / "compose.yaml").write_text("name: dc-agent-offline\n", encoding="utf-8")
     paths = deployment_state.StatePaths(deployment_state.derive_state_root(data_root))
     paths.ensure_layout(0, 0)
     identity = deployment_state.DeploymentIdentity.new(
@@ -187,9 +176,7 @@ def approved_runner(
     *,
     result: int = 0,
 ):
-    def runner(
-        command: list[str], **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append((command, kwargs))
         if command[:3] == ["docker", "context", "inspect"]:
             return subprocess.CompletedProcess(
@@ -232,9 +219,8 @@ class OfflineComposeArgumentTests(unittest.TestCase):
             "ps",
             "version",
         ):
-            with self.subTest(verb=verb):
-                with self.assertRaises(DeploymentError):
-                    validate_compose_arguments([verb])
+            with self.subTest(verb=verb), self.assertRaises(DeploymentError):
+                validate_compose_arguments([verb])
 
     def test_illegal_verb_is_rejected_before_env_or_state_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -257,9 +243,8 @@ class OfflineComposeArgumentTests(unittest.TestCase):
             "COMPOSE_FILE",
             "COMPOSE_PROFILES",
         ):
-            with self.subTest(name=name):
-                with self.assertRaises(DeploymentError):
-                    assert_local_docker_environment({name: "unsafe"})
+            with self.subTest(name=name), self.assertRaises(DeploymentError):
+                assert_local_docker_environment({name: "unsafe"})
 
     def test_rejects_project_file_and_environment_overrides(self) -> None:
         for arguments in (
@@ -268,9 +253,8 @@ class OfflineComposeArgumentTests(unittest.TestCase):
             ["--project-name", "other", "up"],
             ["-pother", "up"],
         ):
-            with self.subTest(arguments=arguments):
-                with self.assertRaises(DeploymentError):
-                    validate_compose_arguments(arguments)
+            with self.subTest(arguments=arguments), self.assertRaises(DeploymentError):
+                validate_compose_arguments(arguments)
 
     def test_rejects_lifecycle_and_build_bypasses(self) -> None:
         for arguments in (
@@ -282,9 +266,8 @@ class OfflineComposeArgumentTests(unittest.TestCase):
             ["build", "--build-arg", "TOKEN=x"],
             ["build", "--secret=id=x,src=y"],
         ):
-            with self.subTest(arguments=arguments):
-                with self.assertRaises(DeploymentError):
-                    validate_compose_arguments(arguments)
+            with self.subTest(arguments=arguments), self.assertRaises(DeploymentError):
+                validate_compose_arguments(arguments)
 
     def test_accepts_supported_profiles_and_commands(self) -> None:
         for arguments in (
@@ -302,9 +285,8 @@ class OfflineComposeArgumentTests(unittest.TestCase):
             {"DOCKER_HOST": "tcp://docker.internal:2375"},
             {"DOCKER_CONTEXT": "remote"},
         ):
-            with self.subTest(environ=environ):
-                with self.assertRaises(DeploymentError):
-                    assert_local_docker_environment(environ)
+            with self.subTest(environ=environ), self.assertRaises(DeploymentError):
+                assert_local_docker_environment(environ)
 
 
 class OfflineComposeRenderedTests(unittest.TestCase):
@@ -414,9 +396,9 @@ class OfflineComposeRenderedTests(unittest.TestCase):
             env_path = root / "deploy" / "offline" / ".env"
             env_text = env_path.read_text(encoding="utf-8")
             env_path.write_text(
-                env_text.replace(
-                    "DATA_ROOT=${HOST_DATA_ROOT}", f"DATA_ROOT={data_root}"
-                ).replace("MODEL_ROOT=${HOST_MODEL_ROOT}", f"MODEL_ROOT={model_root}"),
+                env_text.replace("DATA_ROOT=${HOST_DATA_ROOT}", f"DATA_ROOT={data_root}").replace(
+                    "MODEL_ROOT=${HOST_MODEL_ROOT}", f"MODEL_ROOT={model_root}"
+                ),
                 encoding="utf-8",
             )
             caller_environ.pop("HOST_DATA_ROOT")
@@ -446,9 +428,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _, caller_environ = initialized_compose_repo(root)
-            caller_environ.update(
-                {name: f"process-{name}" for name in ALLOWED_PROCESS_ENV}
-            )
+            caller_environ.update({name: f"process-{name}" for name in ALLOWED_PROCESS_ENV})
             env_path = root / "deploy" / "offline" / ".env"
             env_path.write_text(
                 "DATA_ROOT=${HOST_DATA_ROOT}\n"
@@ -505,9 +485,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                     held = False
                     events.append("lock-exit")
 
-            def runner(
-                command: list[str], **kwargs: object
-            ) -> subprocess.CompletedProcess[str]:
+            def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
                 self.assertTrue(held)
                 events.append("docker")
                 return approved_runner(root, [])(command, **kwargs)
@@ -524,9 +502,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     0,
-                    run_compose(
-                        ["config"], root, environ=caller_environ, runner=runner
-                    ),
+                    run_compose(["config"], root, environ=caller_environ, runner=runner),
                 )
             self.assertEqual(["identity", "lock-enter", "identity"], events[:3])
             self.assertEqual(2, events.count("identity"))
@@ -557,9 +533,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaises(DeploymentError):
-                run_compose(
-                    ["config"], root, environ=caller_environ, runner=mock.Mock()
-                )
+                run_compose(["config"], root, environ=caller_environ, runner=mock.Mock())
 
     def test_different_checkout_secret_root_fails_before_docker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -578,17 +552,19 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                 "name: dc-agent-offline\n", encoding="utf-8"
             )
             calls: list[tuple[list[str], dict[str, object]]] = []
-            with mock.patch(
-                "tools.offline_compose.deployment_state.acquire_deployment_lock",
-                unlocked_deployment_lock,
+            with (
+                mock.patch(
+                    "tools.offline_compose.deployment_state.acquire_deployment_lock",
+                    unlocked_deployment_lock,
+                ),
+                self.assertRaises(DeploymentError),
             ):
-                with self.assertRaises(DeploymentError):
-                    run_compose(
-                        ["config"],
-                        checkout_b,
-                        environ=caller_environ,
-                        runner=approved_runner(checkout_b, calls),
-                    )
+                run_compose(
+                    ["config"],
+                    checkout_b,
+                    environ=caller_environ,
+                    runner=approved_runner(checkout_b, calls),
+                )
             self.assertEqual([], calls)
 
     def test_checkout_secret_symlink_is_rejected_before_docker(self) -> None:
@@ -647,14 +623,14 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                     "tools.offline_compose.deployment_state.assert_identity_matches",
                     return_value=replaced_identity,
                 ),
+                self.assertRaises(DeploymentError),
             ):
-                with self.assertRaises(DeploymentError):
-                    run_compose(
-                        ["config"],
-                        root,
-                        environ=caller_environ,
-                        runner=approved_runner(root, calls),
-                    )
+                run_compose(
+                    ["config"],
+                    root,
+                    environ=caller_environ,
+                    runner=approved_runner(root, calls),
+                )
             self.assertEqual([], calls)
 
     def test_mutating_verbs_write_marker_before_docker_and_keep_it_on_failure(
@@ -674,9 +650,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                     command: list[str], **kwargs: object
                 ) -> subprocess.CompletedProcess[str]:
                     if command[-len(arguments) :] == arguments:
-                        self.assertTrue(
-                            (state_root / "deployment-started.json").is_file()
-                        )
+                        self.assertTrue((state_root / "deployment-started.json").is_file())
                     return approved_runner(root, calls, result=19)(command, **kwargs)
 
                 with mock.patch(
@@ -695,9 +669,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
 
                 marker = state_root / "deployment-started.json"
                 self.assertTrue(marker.is_file())
-                self.assertEqual(
-                    verb, json.loads(marker.read_text(encoding="utf-8"))["operation"]
-                )
+                self.assertEqual(verb, json.loads(marker.read_text(encoding="utf-8"))["operation"])
                 self.assertEqual(arguments, calls[-1][0][-len(arguments) :])
 
     def test_matching_existing_marker_is_idempotent(self) -> None:
@@ -757,9 +729,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                 finally:
                     held = False
 
-            def runner(
-                command: list[str], **kwargs: object
-            ) -> subprocess.CompletedProcess[str]:
+            def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
                 self.assertTrue(held)
                 return approved_runner(root, [])(command, **kwargs)
 
@@ -769,9 +739,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     0,
-                    run_compose(
-                        ["config"], root, environ=caller_environ, runner=runner
-                    ),
+                    run_compose(["config"], root, environ=caller_environ, runner=runner),
                 )
             self.assertFalse(held)
 
@@ -802,9 +770,7 @@ class OfflineComposeRenderedTests(unittest.TestCase):
                         ),
                     ):
                         with self.assertRaisesRegex(DeploymentError, phase):
-                            run_compose(
-                                [verb], root, environ=caller_environ, runner=runner
-                            )
+                            run_compose([verb], root, environ=caller_environ, runner=runner)
                     runner.assert_not_called()
 
 

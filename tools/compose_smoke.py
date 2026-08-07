@@ -7,6 +7,7 @@ offline wrapper.  It never reads or forwards the deployment environment file.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -82,7 +83,7 @@ def _windows_startupinfo():
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
     if os.name == "nt":
-        try:
+        with contextlib.suppress(FileNotFoundError, OSError, subprocess.TimeoutExpired):
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 shell=False,
@@ -94,8 +95,6 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 startupinfo=_windows_startupinfo(),
             )
-        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-            pass
         if process.poll() is None:
             process.kill()
         return
@@ -104,14 +103,10 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
 
 
 def _drain_terminated_process(process: subprocess.Popen[str], partial_output: object) -> str:
@@ -123,10 +118,8 @@ def _drain_terminated_process(process: subprocess.Popen[str], partial_output: ob
             process.kill()
         if process.stdout is not None:
             process.stdout.close()
-        try:
+        with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=PROCESS_DRAIN_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
     finally:
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()

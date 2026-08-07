@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from loguru import logger as loguru_logger
 
 from app.agent import GREETING_REPLY, AgentRunResult
@@ -267,7 +268,7 @@ class SqlRepositoryTest(unittest.TestCase):
 
         self.assertEqual(deleted.file_path, "delete-me.txt")
         self.assertNotIn("kb-delete", [source.id for source in sources])
-        with self.assertRaises(Exception):
+        with self.assertRaises(HTTPException):
             self.repository.list_knowledge_chunks("kb-delete")
 
     def test_send_message_uses_indexed_knowledge_chunks_for_citations(self) -> None:
@@ -681,12 +682,14 @@ class SqlRepositoryTest(unittest.TestCase):
         )
 
         for name, construct in cases:
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
                     ValueError,
                     "retrieval_router and retrieval_scope must be configured together",
-                ):
-                    construct()
+                ),
+            ):
+                construct()
 
     def test_repositories_preserve_both_none_legacy_configuration(self) -> None:
         memory = InMemoryChatRepository(build_seed_state())

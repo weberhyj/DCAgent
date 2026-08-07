@@ -69,12 +69,8 @@ def install_legacy_record_intent(
         elif kind == "chmod":
             current.update(
                 {
-                    "owner_uid": observed_authority(Path(current["path"]), 0o600)[
-                        "owner_uid"
-                    ],
-                    "owner_gid": observed_authority(Path(current["path"]), 0o600)[
-                        "owner_gid"
-                    ],
+                    "owner_uid": observed_authority(Path(current["path"]), 0o600)["owner_uid"],
+                    "owner_gid": observed_authority(Path(current["path"]), 0o600)["owner_gid"],
                 }
             )
         elif kind == "active_to_backup":
@@ -268,9 +264,7 @@ class TransactionJournalTests(unittest.TestCase):
         metadata["bootstrap_protocol"] = "directory-undo-v1"
         state.atomic_write_json(journal.metadata_path, metadata)
 
-        bootstrap = json.loads(
-            journal.bootstrap_directories_path.read_text(encoding="utf-8")
-        )
+        bootstrap = json.loads(journal.bootstrap_directories_path.read_text(encoding="utf-8"))
         bootstrap["protocol"] = "directory-undo-v1"
         bootstrap["state"] = bootstrap_state
         for entry in bootstrap["entries"]:
@@ -396,9 +390,7 @@ class TransactionJournalTests(unittest.TestCase):
         tampered_operations = self.make_journal()
         tampered_operations.record_intent(1, payload("operations-one"))
         tampered_operations.record_intent(2, payload("operations-two"))
-        operations = json.loads(
-            tampered_operations.operations_path.read_text(encoding="utf-8")
-        )
+        operations = json.loads(tampered_operations.operations_path.read_text(encoding="utf-8"))
         operations["records"][1]["sequence"] = 3
         state.atomic_write_json(tampered_operations.operations_path, operations)
         with self.assertRaises(state.DeploymentStateError):
@@ -409,9 +401,7 @@ class TransactionJournalTests(unittest.TestCase):
         tampered_manifest = self.make_journal()
         tampered_manifest.record_intent(1, payload("manifest-one"))
         tampered_manifest.record_intent(2, payload("manifest-two"))
-        manifest = json.loads(
-            tampered_manifest.undo_manifest_path.read_text(encoding="utf-8")
-        )
+        manifest = json.loads(tampered_manifest.undo_manifest_path.read_text(encoding="utf-8"))
         manifest["entries"][1]["sequence"] = 3
         state.atomic_write_json(tampered_manifest.undo_manifest_path, manifest)
         with self.assertRaises(state.DeploymentStateError):
@@ -441,9 +431,7 @@ class TransactionJournalTests(unittest.TestCase):
         ):
             before_operations.record_intent(1, payload)
 
-        repaired = state.TransactionJournal.open(
-            before_operations.root, self.identity_hash
-        )
+        repaired = state.TransactionJournal.open(before_operations.root, self.identity_hash)
         self.assertEqual(repaired.read_operations(), ())
         self.assertEqual(repaired.read_undo_manifest(), ())
 
@@ -457,13 +445,9 @@ class TransactionJournalTests(unittest.TestCase):
             ),
             self.assertRaises(SystemExit),
         ):
-            after_prefix.record_intent(
-                2, dict(payload, path=str(self.base / "prefix-two"))
-            )
+            after_prefix.record_intent(2, dict(payload, path=str(self.base / "prefix-two")))
 
-        repaired_prefix = state.TransactionJournal.open(
-            after_prefix.root, self.identity_hash
-        )
+        repaired_prefix = state.TransactionJournal.open(after_prefix.root, self.identity_hash)
         self.assertEqual(
             [operation["sequence"] for operation in repaired_prefix.read_operations()],
             [1],
@@ -481,16 +465,12 @@ class TransactionJournalTests(unittest.TestCase):
             raise SystemExit("simulated SIGKILL after operation publish")
 
         with (
-            mock.patch.object(
-                after_operations, "_write_operations", side_effect=publish_then_die
-            ),
+            mock.patch.object(after_operations, "_write_operations", side_effect=publish_then_die),
             self.assertRaises(SystemExit),
         ):
             after_operations.record_intent(1, payload)
 
-        durable = state.TransactionJournal.open(
-            after_operations.root, self.identity_hash
-        )
+        durable = state.TransactionJournal.open(after_operations.root, self.identity_hash)
         self.assertEqual(len(durable.read_operations()), 1)
         self.assertEqual(len(durable.read_undo_manifest()), 1)
 
@@ -504,9 +484,7 @@ class TransactionJournalTests(unittest.TestCase):
 
     def test_strict_schema_rejects_sensitive_extra_and_identity(self) -> None:
         journal = self.make_journal()
-        journal.phase_path.write_text(
-            json.dumps({"secret": "CANARY"}), encoding="utf-8"
-        )
+        journal.phase_path.write_text(json.dumps({"secret": "CANARY"}), encoding="utf-8")
         if os.name == "posix":
             os.chmod(journal.phase_path, 0o600)
         with self.assertRaises(state.DeploymentStateError):
@@ -558,9 +536,7 @@ class TransactionJournalTests(unittest.TestCase):
         reopened = state.TransactionJournal.open(complete.root, self.identity_hash)
         self.assertEqual(reopened.read_env_backup(), data)
         self.assertEqual(
-            json.loads(reopened.env_backup_meta_path.read_text(encoding="utf-8"))[
-                "state"
-            ],
+            json.loads(reopened.env_backup_meta_path.read_text(encoding="utf-8"))["state"],
             "ready",
         )
 
@@ -840,18 +816,14 @@ class TransactionJournalTests(unittest.TestCase):
         if os.name == "posix":
             os.chmod(journal_temp, 0o600)
 
-        history_temp = self.paths.history / (
-            f".{journal.transaction_id}.json.deadbeef.tmp"
-        )
+        history_temp = self.paths.history / (f".{journal.transaction_id}.json.deadbeef.tmp")
         history_temp.write_bytes(b"partial")
         if os.name == "posix":
             os.chmod(history_temp, 0o600)
 
         reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
         self.assertFalse(journal_temp.exists())
-        found = state.scan_transaction_journals(
-            self.paths, self.secret_root, self.identity_hash
-        )
+        found = state.scan_transaction_journals(self.paths, self.secret_root, self.identity_hash)
         self.assertIn(reopened.transaction_id, {item.transaction_id for item in found})
         self.assertFalse(history_temp.exists())
 
@@ -860,9 +832,7 @@ class TransactionJournalTests(unittest.TestCase):
         if os.name == "posix":
             os.chmod(unsafe_history_temp, 0o600)
         with self.assertRaises(state.DeploymentStateError):
-            state.scan_transaction_journals(
-                self.paths, self.secret_root, self.identity_hash
-            )
+            state.scan_transaction_journals(self.paths, self.secret_root, self.identity_hash)
         unsafe_history_temp.unlink()
 
         unsafe = self.make_journal()
@@ -944,26 +914,22 @@ class TransactionJournalTests(unittest.TestCase):
     def test_bidirectional_scan_rejects_missing_and_orphan_companions(self) -> None:
         journal = self.make_journal()
         self.assertEqual(
-            state.scan_transaction_journals(
-                self.paths, self.secret_root, self.identity_hash
-            )[0].transaction_id,
+            state.scan_transaction_journals(self.paths, self.secret_root, self.identity_hash)[
+                0
+            ].transaction_id,
             journal.transaction_id,
         )
         assert journal.secret_companion_root is not None
         state._remove_private_tree(journal.secret_companion_root)
         with self.assertRaises(state.DeploymentStateError):
-            state.scan_transaction_journals(
-                self.paths, self.secret_root, self.identity_hash
-            )
+            state.scan_transaction_journals(self.paths, self.secret_root, self.identity_hash)
 
         state._remove_private_tree(journal.root)
         orphan = self.secret_root / uuid.uuid4().hex
         (orphan / "staging").mkdir(parents=True, mode=0o700)
         (orphan / "backup").mkdir(mode=0o700)
         with self.assertRaises(state.DeploymentStateError):
-            state.scan_transaction_journals(
-                self.paths, self.secret_root, self.identity_hash
-            )
+            state.scan_transaction_journals(self.paths, self.secret_root, self.identity_hash)
 
     def test_open_rejects_identity_bool_and_extra_operation_fields(self) -> None:
         journal = self.make_journal()
@@ -1160,9 +1126,7 @@ class TransactionJournalTests(unittest.TestCase):
             [self.secret_root.parent.as_posix(), self.secret_root.as_posix()],
             [entry["path"] for entry in bootstrap["entries"]],
         )
-        self.assertTrue(
-            all(entry["existed"] is False for entry in bootstrap["entries"])
-        )
+        self.assertTrue(all(entry["existed"] is False for entry in bootstrap["entries"]))
 
     def test_v1_ready_bootstrap_is_strictly_migrated_to_v2(self) -> None:
         journal = self.make_journal()
@@ -1174,9 +1138,7 @@ class TransactionJournalTests(unittest.TestCase):
         bootstrap = reopened.read_bootstrap_directories()
         self.assertEqual("directory-undo-v2", bootstrap["protocol"])
         self.assertTrue(all(entry["prepare_done"] for entry in bootstrap["entries"]))
-        self.assertTrue(
-            all(type(entry["device"]) is int for entry in bootstrap["entries"])
-        )
+        self.assertTrue(all(type(entry["device"]) is int for entry in bootstrap["entries"]))
         metadata = json.loads(reopened.metadata_path.read_text(encoding="utf-8"))
         self.assertEqual("directory-undo-v2", metadata["bootstrap_protocol"])
 
@@ -1189,9 +1151,7 @@ class TransactionJournalTests(unittest.TestCase):
             if path.is_file()
         }
 
-        reopened = state.TransactionJournal.open(
-            journal.root, self.identity_hash, read_only=True
-        )
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash, read_only=True)
 
         self.assertEqual(reopened.bootstrap_protocol, "directory-undo-v1")
         after = {
@@ -1225,9 +1185,7 @@ class TransactionJournalTests(unittest.TestCase):
             if path.is_file()
         }
 
-        reopened = state.TransactionJournal.open(
-            journal.root, self.identity_hash, read_only=True
-        )
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash, read_only=True)
 
         self.assertEqual(reopened.read_operations(), ())
         self.assertEqual(reopened.read_undo_manifest(), ())
@@ -1245,9 +1203,7 @@ class TransactionJournalTests(unittest.TestCase):
         if os.name == "posix":
             os.chmod(journal_temp, 0o600)
 
-        reopened = state.TransactionJournal.open(
-            journal.root, self.identity_hash, read_only=True
-        )
+        reopened = state.TransactionJournal.open(journal.root, self.identity_hash, read_only=True)
 
         self.assertEqual(reopened.read_phase().phase, "planned")
         self.assertEqual(journal_temp.read_bytes(), b"partial")
@@ -1338,18 +1294,14 @@ class TransactionJournalTests(unittest.TestCase):
         reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
 
         self.assertEqual("directory-undo-v2", reopened.bootstrap_protocol)
-        migrated_metadata = json.loads(
-            reopened.metadata_path.read_text(encoding="utf-8")
-        )
+        migrated_metadata = json.loads(reopened.metadata_path.read_text(encoding="utf-8"))
         self.assertEqual("directory-undo-v2", migrated_metadata["bootstrap_protocol"])
 
     def test_v2_bootstrap_directory_reader_rejects_boolean_schema_version(
         self,
     ) -> None:
         v2 = self.make_journal()
-        v2_payload = json.loads(
-            v2.bootstrap_directories_path.read_text(encoding="utf-8")
-        )
+        v2_payload = json.loads(v2.bootstrap_directories_path.read_text(encoding="utf-8"))
         v2_payload["schema_version"] = True
         state.atomic_write_json(v2.bootstrap_directories_path, v2_payload)
         with self.assertRaises(state.DeploymentStateError):
@@ -1623,9 +1575,7 @@ class TransactionJournalTests(unittest.TestCase):
 
     def test_bootstrap_progress_rejects_nonprefix_preparation(self) -> None:
         journal = self.make_journal()
-        payload = json.loads(
-            journal.bootstrap_directories_path.read_text(encoding="utf-8")
-        )
+        payload = json.loads(journal.bootstrap_directories_path.read_text(encoding="utf-8"))
         payload["state"] = "preparing"
         payload["entries"][0]["prepare_done"] = False
         payload["entries"][1]["prepare_done"] = True
@@ -1706,9 +1656,7 @@ class TransactionJournalTests(unittest.TestCase):
     ) -> None:
         for exception_type in (KeyboardInterrupt, SystemExit):
             with self.subTest(exception_type=exception_type.__name__):
-                original_error = exception_type(
-                    f"SENSITIVE-{exception_type.__name__}-CANARY"
-                )
+                original_error = exception_type(f"SENSITIVE-{exception_type.__name__}-CANARY")
 
                 class FailingCompanionBackend(RecordingBootstrapBackend):
                     def mkdir(
@@ -1815,15 +1763,11 @@ class RecoveryClassificationTests(unittest.TestCase):
         elif kind == "active_to_backup":
             active = Path(payload["active_path"])
             backup = Path(payload["backup_path"])
-            payload.update(
-                observed_authority(active if active.exists() else backup, 0o600)
-            )
+            payload.update(observed_authority(active if active.exists() else backup, 0o600))
         elif kind == "staging_to_active":
             staging = Path(payload["staging_path"])
             active = Path(payload["active_path"])
-            payload.update(
-                observed_authority(staging if staging.exists() else active, 0o600)
-            )
+            payload.update(observed_authority(staging if staging.exists() else active, 0o600))
         elif kind == "env_replace":
             env_path = Path(payload["env_path"])
             before_absent = bool(payload["before_absent"])
@@ -1832,12 +1776,8 @@ class RecoveryClassificationTests(unittest.TestCase):
                 {
                     "object_type": "environment",
                     "before_mode": None if before_absent else current["mode"],
-                    "before_owner_uid": (
-                        None if before_absent else current["owner_uid"]
-                    ),
-                    "before_owner_gid": (
-                        None if before_absent else current["owner_gid"]
-                    ),
+                    "before_owner_uid": (None if before_absent else current["owner_uid"]),
+                    "before_owner_gid": (None if before_absent else current["owner_gid"]),
                     "after_mode": current["mode"],
                     "after_owner_uid": current["owner_uid"],
                     "after_owner_gid": current["owner_gid"],
@@ -1861,9 +1801,7 @@ class RecoveryClassificationTests(unittest.TestCase):
 
         file_path = self.base / "file"
         file_path.write_text("x", encoding="utf-8")
-        before_mode = (
-            0o600 if os.name == "posix" else stat.S_IMODE(os.lstat(file_path).st_mode)
-        )
+        before_mode = 0o600 if os.name == "posix" else stat.S_IMODE(os.lstat(file_path).st_mode)
         chmod = self.op(
             "chmod",
             path=str(file_path),
@@ -1939,9 +1877,7 @@ class RecoveryClassificationTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryConflict):
             recovery.classify_operation(publish)
         self.assertEqual(
-            recovery.classify_operation(
-                publish, secret_validator=lambda _path, _operation: True
-            ),
+            recovery.classify_operation(publish, secret_validator=lambda _path, _operation: True),
             "not_executed",
         )
         staging.replace(active)
@@ -1952,9 +1888,7 @@ class RecoveryClassificationTests(unittest.TestCase):
             "executed",
         )
         with self.assertRaises(recovery.RecoveryConflict):
-            recovery.classify_operation(
-                publish, secret_validator=lambda _path, _op: False
-            )
+            recovery.classify_operation(publish, secret_validator=lambda _path, _op: False)
 
     def test_symlink_and_wrong_type_are_conflicts(self) -> None:
         target = self.base / "target"
@@ -1965,9 +1899,7 @@ class RecoveryClassificationTests(unittest.TestCase):
         except OSError as exc:
             self.skipTest(f"symlink creation unavailable: {exc}")
         with self.assertRaises(recovery.RecoveryConflict):
-            recovery.classify_operation(
-                self.op("unlink", path=str(link), object_type="file")
-            )
+            recovery.classify_operation(self.op("unlink", path=str(link), object_type="file"))
 
     def test_chmod_and_unlink_complete_three_state_matrix(self) -> None:
         file_path = self.base / "matrix-file"
@@ -2136,15 +2068,9 @@ class RecoveryClassificationTests(unittest.TestCase):
             expected_mode = int(operation[mode_field])
             expected_uid = int(operation[uid_field])
             expected_gid = int(operation[gid_field])
-            validator = (
-                (lambda _path, _operation: True)
-                if kind == "staging_to_active"
-                else None
-            )
+            validator = (lambda _path, _operation: True) if kind == "staging_to_active" else None
             object_mode = (
-                stat.S_IFDIR
-                if operation.get("object_type") == "directory"
-                else stat.S_IFREG
+                stat.S_IFDIR if operation.get("object_type") == "directory" else stat.S_IFREG
             )
             for mismatch in ("mode", "owner"):
                 with self.subTest(kind=kind, mismatch=mismatch):
@@ -2380,15 +2306,13 @@ class PosixEnvironmentCandidateRecoveryLogicTests(unittest.TestCase):
                 return_value=rebuilt,
             ),
         ):
-            result = (
-                recovery.PosixFilesystemMutationBackend._create_or_verify_private_file(
-                    23,
-                    "candidate",
-                    b"complete",
-                    mode=self.mode,
-                    owner_uid=self.observed.st_uid,
-                    owner_gid=self.observed.st_gid,
-                )
+            result = recovery.PosixFilesystemMutationBackend._create_or_verify_private_file(
+                23,
+                "candidate",
+                b"complete",
+                mode=self.mode,
+                owner_uid=self.observed.st_uid,
+                owner_gid=self.observed.st_gid,
             )
 
         self.assertIs(result, rebuilt)
@@ -2510,9 +2434,7 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
                 "kind": "env_replace",
                 "object_category": "env",
                 "env_path": str(env),
-                "before_digest": (
-                    None if before is None else hashlib.sha256(before).hexdigest()
-                ),
+                "before_digest": (None if before is None else hashlib.sha256(before).hexdigest()),
                 "after_digest": hashlib.sha256(after).hexdigest(),
                 "before_absent": before is None,
             },
@@ -2607,9 +2529,7 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
                     raise SystemExit("simulated interruption")
 
         with self.assertRaises(SystemExit):
-            recovery.resume_transaction_rollback(
-                journal, mutation_backend=InterruptingBackend()
-            )
+            recovery.resume_transaction_rollback(journal, mutation_backend=InterruptingBackend())
 
         self.assertEqual(env.read_bytes(), b"A=before\n")
         self.assertIsNotNone(journal.read_env_rollback_state())
@@ -2633,9 +2553,7 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
                     raise SystemExit("simulated interruption")
 
         with self.assertRaises(SystemExit):
-            recovery.resume_transaction_rollback(
-                journal, mutation_backend=InterruptingBackend()
-            )
+            recovery.resume_transaction_rollback(journal, mutation_backend=InterruptingBackend())
 
         self.assertTrue(env.exists())
         self.assertIsNotNone(journal.read_env_rollback_state())
@@ -2657,9 +2575,7 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
                     raise SystemExit("simulated interruption")
 
         with self.assertRaises(SystemExit):
-            recovery.resume_transaction_rollback(
-                journal, mutation_backend=InterruptingBackend()
-            )
+            recovery.resume_transaction_rollback(journal, mutation_backend=InterruptingBackend())
 
         self.assertFalse(env.exists())
         self.assertIsNotNone(journal.read_env_rollback_state())
@@ -2679,12 +2595,8 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
                 expected = b"" if before is None else before
                 self.prepare_environment_candidate(journal, env, expected)
 
-                reopened = state.TransactionJournal.open(
-                    journal.root, self.identity_hash
-                )
-                recovery.resume_transaction_rollback(
-                    reopened, mutation_backend=self.backend
-                )
+                reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+                recovery.resume_transaction_rollback(reopened, mutation_backend=self.backend)
 
                 if before is None:
                     self.assertFalse(env.exists())
@@ -2702,12 +2614,8 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
                 partial = b"A=part" if before is not None else b"not-empty"
                 self.prepare_environment_candidate(journal, env, partial)
 
-                reopened = state.TransactionJournal.open(
-                    journal.root, self.identity_hash
-                )
-                recovery.resume_transaction_rollback(
-                    reopened, mutation_backend=self.backend
-                )
+                reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
+                recovery.resume_transaction_rollback(reopened, mutation_backend=self.backend)
 
                 if before is None:
                     self.assertFalse(env.exists())
@@ -2719,13 +2627,9 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
     def test_preparing_environment_preserves_unsafe_unrecorded_candidate(self) -> None:
         for before in (b"A=before\n", None):
             for unsafe_kind in ("directory", "symlink", "mode"):
-                with self.subTest(
-                    before_absent=before is None, unsafe_kind=unsafe_kind
-                ):
+                with self.subTest(before_absent=before is None, unsafe_kind=unsafe_kind):
                     journal, env, _after = self.executed_environment(before)
-                    candidate = self.prepare_environment_candidate(
-                        journal, env, b"unsafe"
-                    )
+                    candidate = self.prepare_environment_candidate(journal, env, b"unsafe")
                     if unsafe_kind == "directory":
                         candidate.unlink()
                         candidate.mkdir(mode=0o700)
@@ -2737,9 +2641,7 @@ class PosixFilesystemMutationBackendTests(unittest.TestCase):
                     else:
                         os.chmod(candidate, 0o640)
 
-                    reopened = state.TransactionJournal.open(
-                        journal.root, self.identity_hash
-                    )
+                    reopened = state.TransactionJournal.open(journal.root, self.identity_hash)
                     with self.assertRaises(state.DeploymentStateError):
                         recovery.resume_transaction_rollback(
                             reopened, mutation_backend=self.backend
@@ -2845,9 +2747,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                 original_resume(
                     journal,
                     secret_validator=secret_validator,
-                    mutation_backend=(
-                        backend if mutation_backend is None else mutation_backend
-                    ),
+                    mutation_backend=(backend if mutation_backend is None else mutation_backend),
                 )
 
             patcher = mock.patch.object(
@@ -2916,22 +2816,16 @@ class RecoveryExecutionTests(unittest.TestCase):
         return journal, env, candidate, before, after
 
     def test_forward_environment_recovery_removes_unpublished_candidate(self) -> None:
-        journal, env, candidate, before, _after = self._forward_environment_case(
-            "unpublished"
-        )
+        journal, env, candidate, before, _after = self._forward_environment_case("unpublished")
 
-        recovery.resume_transaction_rollback(
-            journal, mutation_backend=PortableMutationBackend()
-        )
+        recovery.resume_transaction_rollback(journal, mutation_backend=PortableMutationBackend())
 
         self.assertEqual(before, env.read_bytes())
         self.assertFalse(candidate.exists())
         self.assertFalse(journal.root.exists())
 
     def test_forward_environment_recovery_removes_exchanged_source(self) -> None:
-        journal, env, candidate, before, after = self._forward_environment_case(
-            "published"
-        )
+        journal, env, candidate, before, after = self._forward_environment_case("published")
         temporary = self.base / "forward-exchange"
         os.replace(env, temporary)
         os.replace(candidate, env)
@@ -2939,9 +2833,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         self.assertEqual(after, env.read_bytes())
         self.assertEqual(before, candidate.read_bytes())
 
-        recovery.resume_transaction_rollback(
-            journal, mutation_backend=PortableMutationBackend()
-        )
+        recovery.resume_transaction_rollback(journal, mutation_backend=PortableMutationBackend())
 
         self.assertEqual(before, env.read_bytes())
         self.assertFalse(candidate.exists())
@@ -2952,9 +2844,7 @@ class RecoveryExecutionTests(unittest.TestCase):
     ) -> None:
         for wal_phase in ("preparing", "candidate_ready", "applied"):
             with self.subTest(phase=wal_phase):
-                journal, env, candidate, before, after = self._forward_environment_case(
-                    wal_phase
-                )
+                journal, env, candidate, before, after = self._forward_environment_case(wal_phase)
                 operation = journal.read_operations()[0]
                 if wal_phase == "preparing":
                     journal.write_forward_environment_state(
@@ -2992,9 +2882,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                 self.assertFalse(journal.root.exists())
 
     def test_forward_environment_recovery_preserves_tampered_candidate(self) -> None:
-        journal, env, candidate, before, _after = self._forward_environment_case(
-            "tampered"
-        )
+        journal, env, candidate, before, _after = self._forward_environment_case("tampered")
         operation = journal.read_operations()[0]
         journal.write_forward_environment_state(
             operation,
@@ -3068,9 +2956,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                     self.identity_hash,
                     ["secret", "env"],
                     self.secret_parent,
-                    bootstrap_backend=(
-                        RecordingBootstrapBackend() if os.name != "posix" else None
-                    ),
+                    bootstrap_backend=(RecordingBootstrapBackend() if os.name != "posix" else None),
                 )
                 current = dict(payload)
                 if current["kind"] == "active_to_backup":
@@ -3113,9 +2999,7 @@ class RecoveryExecutionTests(unittest.TestCase):
 
     def executed_rollback_case(
         self, kind: str
-    ) -> tuple[
-        state.TransactionJournal, Callable[[], object], recovery.SecretValidator | None
-    ]:
+    ) -> tuple[state.TransactionJournal, Callable[[], object], recovery.SecretValidator | None]:
         journal = self.journal()
         suffix = journal.transaction_id
         validator = None
@@ -3254,9 +3138,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         return journal, restore_before, validator
 
     def test_reverse_operation_uses_injected_mutation_backend(self) -> None:
-        journal, _restore_before, _validator = self.executed_rollback_case(
-            "active_to_backup"
-        )
+        journal, _restore_before, _validator = self.executed_rollback_case("active_to_backup")
         operation = journal.read_operations()[0]
         source = Path(operation["backup_path"])
         target = Path(operation["active_path"])
@@ -3339,9 +3221,7 @@ class RecoveryExecutionTests(unittest.TestCase):
 
         with (
             mock.patch.object(recovery, "classify_operation", return_value="executed"),
-            mock.patch.object(
-                recovery, "_revalidate_chmod_source", return_value=expected
-            ),
+            mock.patch.object(recovery, "_revalidate_chmod_source", return_value=expected),
         ):
             recovery.reverse_operation(
                 journal,
@@ -3356,9 +3236,7 @@ class RecoveryExecutionTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "posix", "non-POSIX backend selection only")
     def test_non_posix_rollback_requires_injected_mutation_backend(self) -> None:
-        journal, _restore_before, _validator = self.executed_rollback_case(
-            "active_to_backup"
-        )
+        journal, _restore_before, _validator = self.executed_rollback_case("active_to_backup")
         operation = journal.read_operations()[0]
         source = Path(operation["backup_path"])
         target = Path(operation["active_path"])
@@ -3370,9 +3248,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         self.assertFalse(target.exists())
 
     def test_mutation_backend_errors_are_sanitized_as_recovery_conflicts(self) -> None:
-        journal, _restore_before, _validator = self.executed_rollback_case(
-            "active_to_backup"
-        )
+        journal, _restore_before, _validator = self.executed_rollback_case("active_to_backup")
         operation = journal.read_operations()[0]
 
         class FailingBackend:
@@ -3403,9 +3279,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         self.assertNotIn("CANARY", str(caught.exception))
 
     def test_rename_source_identity_is_bound_before_classification(self) -> None:
-        journal, _restore_before, _validator = self.executed_rollback_case(
-            "staging_to_active"
-        )
+        journal, _restore_before, _validator = self.executed_rollback_case("staging_to_active")
         operation = journal.read_operations()[0]
         active = Path(operation["active_path"])
         staging = Path(operation["staging_path"])
@@ -3442,9 +3316,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                 restore_before()
 
                 with self.assertRaises(recovery.RecoveryConflict):
-                    recovery.resume_transaction_rollback(
-                        journal, secret_validator=validator
-                    )
+                    recovery.resume_transaction_rollback(journal, secret_validator=validator)
 
                 self.assertEqual(journal.read_phase().phase, "rollback_failed")
                 self.assertEqual(journal.read_rollback_intents(), ())
@@ -3479,12 +3351,8 @@ class RecoveryExecutionTests(unittest.TestCase):
                         mutation_backend=mutation_backend,
                     )
 
-                with mock.patch.object(
-                    recovery, "reverse_operation", side_effect=checked_reverse
-                ):
-                    recovery.resume_transaction_rollback(
-                        journal, secret_validator=validator
-                    )
+                with mock.patch.object(recovery, "reverse_operation", side_effect=checked_reverse):
+                    recovery.resume_transaction_rollback(journal, secret_validator=validator)
                 self.assertTrue(saw_intent)
                 self.assertFalse(journal.root.exists())
 
@@ -3498,23 +3366,17 @@ class RecoveryExecutionTests(unittest.TestCase):
         )
         for validator in validators:
             with self.subTest(validator=validator):
-                journal, restore_before, _valid = self.executed_rollback_case(
-                    "staging_to_active"
-                )
+                journal, restore_before, _valid = self.executed_rollback_case("staging_to_active")
                 journal.record_rollback_intent(1)
                 restore_before()
 
                 with self.assertRaises(recovery.RecoveryConflict):
-                    recovery.resume_transaction_rollback(
-                        journal, secret_validator=validator
-                    )
+                    recovery.resume_transaction_rollback(journal, secret_validator=validator)
 
                 self.assertEqual(journal.read_phase().phase, "rollback_failed")
 
     def test_staging_reverse_state_rejects_authority_mismatch(self) -> None:
-        journal, restore_before, validator = self.executed_rollback_case(
-            "staging_to_active"
-        )
+        journal, restore_before, validator = self.executed_rollback_case("staging_to_active")
         restore_before()
         operation = journal.read_operations()[0]
         staging = Path(operation["staging_path"])
@@ -3548,9 +3410,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                     mock.patch.object(recovery.os, "name", "posix"),
                 ):
                     self.assertFalse(
-                        recovery._reverse_state_is_safe(
-                            operation, secret_validator=validator
-                        )
+                        recovery._reverse_state_is_safe(operation, secret_validator=validator)
                     )
 
     def test_env_rollback_uses_persisted_backup_and_removes_journal(self) -> None:
@@ -3577,9 +3437,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         recovery.resume_transaction_rollback(journal)
         self.assertEqual(env.read_bytes(), before)
         self.assertFalse(journal.root.exists())
-        self.assertFalse(
-            journal.secret_companion_root and journal.secret_companion_root.exists()
-        )
+        self.assertFalse(journal.secret_companion_root and journal.secret_companion_root.exists())
 
     def test_env_rollback_wal_is_resumed_before_reverse_state_shortcut(self) -> None:
         observed: list[tuple[int, os.stat_result | None]] = []
@@ -3613,9 +3471,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                         "object_category": "env",
                         "env_path": str(env),
                         "before_digest": (
-                            None
-                            if before is None
-                            else hashlib.sha256(before).hexdigest()
+                            None if before is None else hashlib.sha256(before).hexdigest()
                         ),
                         "after_digest": hashlib.sha256(after).hexdigest(),
                         "before_absent": before is None,
@@ -3841,9 +3697,7 @@ class RecoveryExecutionTests(unittest.TestCase):
                 journal.record_done(1)
 
                 with self.assertRaises(recovery.RecoveryConflict):
-                    recovery.resume_transaction_rollback(
-                        journal, secret_validator=validator
-                    )
+                    recovery.resume_transaction_rollback(journal, secret_validator=validator)
 
                 self.assertTrue(active.exists())
                 self.assertEqual(active.read_text(encoding="utf-8"), "candidate")
@@ -3970,18 +3824,14 @@ class RecoveryExecutionTests(unittest.TestCase):
                     target.replace(backup)
                 journal.record_done(1)
                 if case in {"wrong_action", "duplicate"}:
-                    manifest = json.loads(
-                        journal.undo_manifest_path.read_text(encoding="utf-8")
-                    )
+                    manifest = json.loads(journal.undo_manifest_path.read_text(encoding="utf-8"))
                     if case == "wrong_action":
                         manifest["entries"][0]["expected_action"] = "chmod"
                     else:
                         manifest["entries"].append(dict(manifest["entries"][0]))
                     state.atomic_write_json(journal.undo_manifest_path, manifest)
 
-                with self.assertRaises(
-                    (recovery.RecoveryConflict, state.DeploymentStateError)
-                ):
+                with self.assertRaises((recovery.RecoveryConflict, state.DeploymentStateError)):
                     recovery.resume_transaction_rollback(journal)
 
                 self.assertFalse(target.exists())
@@ -3992,8 +3842,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         phases = [
             phase
             for phase in state.TRANSACTION_PHASES
-            if phase
-            not in {"committed", "committed_cleanup_required", "rollback_failed"}
+            if phase not in {"committed", "committed_cleanup_required", "rollback_failed"}
         ]
         for phase in phases:
             with self.subTest(phase=phase):
@@ -4036,8 +3885,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         state._remove_private_tree(renamed.secret_companion_root)
         renamed.write_history_receipt("complete")
         tombstone = (
-            renamed.history_receipt_path.parent
-            / f".{renamed.transaction_id}.journal-cleanup"
+            renamed.history_receipt_path.parent / f".{renamed.transaction_id}.journal-cleanup"
         )
         renamed.root.replace(tombstone)
         recovery.finalize_committed_cleanup(renamed)
@@ -4144,9 +3992,7 @@ class RecoveryExecutionTests(unittest.TestCase):
             original_remove(root)
 
         with (
-            mock.patch.object(
-                state, "_remove_private_tree", side_effect=interrupt_after_companion
-            ),
+            mock.patch.object(state, "_remove_private_tree", side_effect=interrupt_after_companion),
             self.assertRaises(state.DeploymentStateError),
         ):
             recovery.resume_transaction_rollback(journal, secret_validator=validator)
@@ -4155,16 +4001,10 @@ class RecoveryExecutionTests(unittest.TestCase):
             journal.read_phase().phase,
             {"rollback_complete", "rollback_cleanup_required"},
         )
-        metadata = self.paths.history / (
-            f".{journal.transaction_id}.rollback-cleanup.json"
-        )
+        metadata = self.paths.history / (f".{journal.transaction_id}.rollback-cleanup.json")
         self.assertTrue(metadata.exists())
-        found = state.scan_transaction_journals(
-            self.paths, self.secret_parent, self.identity_hash
-        )
-        reopened = next(
-            item for item in found if item.transaction_id == journal.transaction_id
-        )
+        found = state.scan_transaction_journals(self.paths, self.secret_parent, self.identity_hash)
+        reopened = next(item for item in found if item.transaction_id == journal.transaction_id)
         recovery.resume_transaction_rollback(reopened, secret_validator=validator)
         self.assertFalse(journal.root.exists())
         self.assertFalse(metadata.exists())
@@ -4180,9 +4020,7 @@ class RecoveryExecutionTests(unittest.TestCase):
             original_remove(root)
 
         with (
-            mock.patch.object(
-                state, "_remove_private_tree", side_effect=interrupt_after_rename
-            ),
+            mock.patch.object(state, "_remove_private_tree", side_effect=interrupt_after_rename),
             self.assertRaises(state.DeploymentStateError),
         ):
             recovery.resume_transaction_rollback(journal, secret_validator=validator)
@@ -4191,12 +4029,8 @@ class RecoveryExecutionTests(unittest.TestCase):
         metadata = self.paths.history / f"{tombstone_name}.json"
         self.assertTrue(tombstone.exists())
         self.assertTrue(metadata.exists())
-        found = state.scan_transaction_journals(
-            self.paths, self.secret_parent, self.identity_hash
-        )
-        reopened = next(
-            item for item in found if item.transaction_id == journal.transaction_id
-        )
+        found = state.scan_transaction_journals(self.paths, self.secret_parent, self.identity_hash)
+        reopened = next(item for item in found if item.transaction_id == journal.transaction_id)
         recovery.resume_transaction_rollback(reopened, secret_validator=validator)
         self.assertFalse(tombstone.exists())
         self.assertFalse(metadata.exists())
@@ -4222,9 +4056,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         recovery._write_cleanup_metadata(journal, "complete")
 
         with self.assertRaises(state.DeploymentStateError):
-            state.scan_transaction_journals(
-                self.paths, self.secret_parent, self.identity_hash
-            )
+            state.scan_transaction_journals(self.paths, self.secret_parent, self.identity_hash)
 
     def test_partial_rollback_tombstone_cleanup_is_resumable(self) -> None:
         journal, _restore_before, validator = self.executed_rollback_case("mkdir")
@@ -4250,12 +4082,8 @@ class RecoveryExecutionTests(unittest.TestCase):
         metadata = self.paths.history / f"{tombstone_name}.json"
         self.assertTrue(tombstone.exists())
         self.assertTrue(metadata.exists())
-        found = state.scan_transaction_journals(
-            self.paths, self.secret_parent, self.identity_hash
-        )
-        reopened = next(
-            item for item in found if item.transaction_id == journal.transaction_id
-        )
+        found = state.scan_transaction_journals(self.paths, self.secret_parent, self.identity_hash)
+        reopened = next(item for item in found if item.transaction_id == journal.transaction_id)
         recovery.resume_transaction_rollback(reopened, secret_validator=validator)
         self.assertFalse(tombstone.exists())
         self.assertFalse(metadata.exists())
@@ -4279,12 +4107,8 @@ class RecoveryExecutionTests(unittest.TestCase):
         self.assertFalse(journal.root.exists())
         self.assertFalse(tombstone.exists())
         self.assertTrue(metadata.exists())
-        found = state.scan_transaction_journals(
-            self.paths, self.secret_parent, self.identity_hash
-        )
-        reopened = next(
-            item for item in found if item.transaction_id == journal.transaction_id
-        )
+        found = state.scan_transaction_journals(self.paths, self.secret_parent, self.identity_hash)
+        reopened = next(item for item in found if item.transaction_id == journal.transaction_id)
         recovery.resume_transaction_rollback(reopened, secret_validator=validator)
         self.assertFalse(metadata.exists())
 
@@ -4301,9 +4125,7 @@ class RecoveryExecutionTests(unittest.TestCase):
             original_remove(root)
 
         with (
-            mock.patch.object(
-                state, "_remove_private_tree", side_effect=interrupt_after_rename
-            ),
+            mock.patch.object(state, "_remove_private_tree", side_effect=interrupt_after_rename),
             self.assertRaises(state.DeploymentStateError),
         ):
             recovery.resume_transaction_rollback(journal, secret_validator=validator)
@@ -4320,9 +4142,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         state.atomic_write_json(metadata, payload)
 
         with self.assertRaises(state.DeploymentStateError):
-            state.scan_transaction_journals(
-                self.paths, self.secret_parent, self.identity_hash
-            )
+            state.scan_transaction_journals(self.paths, self.secret_parent, self.identity_hash)
         self.assertTrue(canary.exists())
 
     def test_rollback_intent_recovery_accepts_before_state_for_all_kinds(self) -> None:
@@ -4553,9 +4373,7 @@ class RecoveryExecutionTests(unittest.TestCase):
             original_remove(root)
 
         with (
-            mock.patch.object(
-                state, "_remove_private_tree", side_effect=interrupt_after_rename
-            ),
+            mock.patch.object(state, "_remove_private_tree", side_effect=interrupt_after_rename),
             self.assertRaises(state.DeploymentStateError),
         ):
             recovery.finalize_committed_cleanup(journal)
@@ -4619,9 +4437,7 @@ class RecoveryExecutionTests(unittest.TestCase):
             original_remove(root)
 
         with (
-            mock.patch.object(
-                state, "_remove_private_tree", side_effect=interrupt_after_rename
-            ),
+            mock.patch.object(state, "_remove_private_tree", side_effect=interrupt_after_rename),
             self.assertRaises(state.DeploymentStateError),
         ):
             recovery.finalize_committed_cleanup(journal)
@@ -4656,15 +4472,11 @@ class RecoveryExecutionTests(unittest.TestCase):
             self.assertFalse(current.secret_companion_root.exists())
             original_mark(current)
 
-        with mock.patch.object(
-            recovery, "_mark_receipt_complete", side_effect=checked_mark
-        ):
+        with mock.patch.object(recovery, "_mark_receipt_complete", side_effect=checked_mark):
             recovery.finalize_committed_cleanup(journal)
 
         self.assertEqual(
-            json.loads(journal.history_receipt_path.read_text(encoding="utf-8"))[
-                "cleanup_status"
-            ],
+            json.loads(journal.history_receipt_path.read_text(encoding="utf-8"))["cleanup_status"],
             "complete",
         )
 
@@ -4689,16 +4501,13 @@ class RecoveryExecutionTests(unittest.TestCase):
 
         self.assertTrue(journal.root.exists())
         self.assertFalse(
-            journal.secret_companion_root is not None
-            and journal.secret_companion_root.exists()
+            journal.secret_companion_root is not None and journal.secret_companion_root.exists()
         )
         found = state.scan_transaction_journals(
             state.StatePaths(self.paths.root), self.secret_parent, self.identity_hash
         )
         recovery.finalize_committed_cleanup(
-            next(
-                item for item in found if item.transaction_id == journal.transaction_id
-            )
+            next(item for item in found if item.transaction_id == journal.transaction_id)
         )
         self.assertFalse(journal.root.exists())
 
@@ -4716,9 +4525,7 @@ class RecoveryExecutionTests(unittest.TestCase):
             original_remove(root)
 
         with (
-            mock.patch.object(
-                state, "_remove_private_tree", side_effect=interrupt_after_rename
-            ),
+            mock.patch.object(state, "_remove_private_tree", side_effect=interrupt_after_rename),
             self.assertRaises(state.DeploymentStateError),
         ):
             recovery.finalize_committed_cleanup(journal)
@@ -4730,9 +4537,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         found = state.scan_transaction_journals(
             state.StatePaths(self.paths.root), self.secret_parent, self.identity_hash
         )
-        cleanup = [
-            item for item in found if item.transaction_id == journal.transaction_id
-        ]
+        cleanup = [item for item in found if item.transaction_id == journal.transaction_id]
         self.assertEqual(len(cleanup), 1)
 
         recovery.finalize_committed_cleanup(cleanup[0])
@@ -4767,9 +4572,7 @@ class RecoveryExecutionTests(unittest.TestCase):
         found = state.scan_transaction_journals(
             state.StatePaths(self.paths.root), self.secret_parent, self.identity_hash
         )
-        cleanup = [
-            item for item in found if item.transaction_id == journal.transaction_id
-        ]
+        cleanup = [item for item in found if item.transaction_id == journal.transaction_id]
         self.assertEqual(len(cleanup), 1)
 
         recovery.finalize_committed_cleanup(cleanup[0])
@@ -4787,9 +4590,7 @@ class RecoveryExecutionTests(unittest.TestCase):
             original_remove(root)
 
         with (
-            mock.patch.object(
-                state, "_remove_private_tree", side_effect=interrupt_after_rename
-            ),
+            mock.patch.object(state, "_remove_private_tree", side_effect=interrupt_after_rename),
             self.assertRaises(state.DeploymentStateError),
         ):
             recovery.finalize_committed_cleanup(journal)
@@ -4875,9 +4676,7 @@ class RecoveryCliTests(unittest.TestCase):
             )
         for command in ("clear-start-marker", "adopt-existing"):
             with self.subTest(command=command):
-                parsed = parser.parse_args(
-                    [command, "--state-root", str(self.paths.root)]
-                )
+                parsed = parser.parse_args([command, "--state-root", str(self.paths.root)])
                 self.assertEqual(parsed.command, command)
                 self.assertFalse(hasattr(parsed, "transaction"))
                 with self.assertRaises(SystemExit):
@@ -4932,9 +4731,7 @@ class RecoveryCliTests(unittest.TestCase):
             "quarantine",
         ):
             with self.subTest(name=name):
-                paths = state.StatePaths(
-                    state.derive_state_root(self.base / f"unsafe-{name}-data")
-                )
+                paths = state.StatePaths(state.derive_state_root(self.base / f"unsafe-{name}-data"))
                 paths.root.parent.mkdir(mode=0o700)
                 paths.ensure_layout(*recovery._current_owner())
                 parent = getattr(paths, name)
@@ -4987,9 +4784,7 @@ class RecoveryCliTests(unittest.TestCase):
                         details={"marker_digest": None},
                     )
 
-                self.assertFalse(
-                    (paths.control_transactions / self.transaction_id).exists()
-                )
+                self.assertFalse((paths.control_transactions / self.transaction_id).exists())
 
     @unittest.skipUnless(os.name == "posix", "POSIX modes and owners require POSIX")
     def test_control_wal_creation_rejects_unsafe_parent_mode_and_owner(self) -> None:
@@ -5016,9 +4811,7 @@ class RecoveryCliTests(unittest.TestCase):
                         phase="clear_planned",
                         details={"marker_digest": None},
                     )
-                self.assertFalse(
-                    (paths.control_transactions / self.transaction_id).exists()
-                )
+                self.assertFalse((paths.control_transactions / self.transaction_id).exists())
 
             with self.subTest(name=name, defect="owner"):
                 paths = state.StatePaths(
@@ -5042,9 +4835,7 @@ class RecoveryCliTests(unittest.TestCase):
                             phase="clear_planned",
                             details={"marker_digest": None},
                         )
-                    self.assertFalse(
-                        (paths.control_transactions / self.transaction_id).exists()
-                    )
+                    self.assertFalse((paths.control_transactions / self.transaction_id).exists())
                 finally:
                     os.chown(parent, uid, gid)
 
@@ -5077,9 +4868,7 @@ class RecoveryCliTests(unittest.TestCase):
 
         recovery.bootstrap_adoption_lock(paths, *recovery._current_owner())
 
-        self.assertEqual(
-            {entry.name for entry in paths.root.iterdir()}, {paths.lock.name}
-        )
+        self.assertEqual({entry.name for entry in paths.root.iterdir()}, {paths.lock.name})
         if os.name == "posix":
             self.assertEqual(stat.S_IMODE(os.lstat(paths.root).st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(os.lstat(paths.lock).st_mode), 0o600)
@@ -5131,9 +4920,7 @@ class RecoveryCliTests(unittest.TestCase):
         def lock(actual: state.StatePaths):
             nonlocal locked
             self.assertEqual(actual.root, paths.root)
-            self.assertEqual(
-                {entry.name for entry in paths.root.iterdir()}, {paths.lock.name}
-            )
+            self.assertEqual({entry.name for entry in paths.root.iterdir()}, {paths.lock.name})
             locked = True
             try:
                 yield
@@ -5171,11 +4958,7 @@ class RecoveryCliTests(unittest.TestCase):
             ["env", "secret"],
             self.secrets / ".dcagent-transactions",
             transaction_id=self.transaction_id,
-            **(
-                {}
-                if os.name == "posix"
-                else {"bootstrap_backend": RecordingBootstrapBackend()}
-            ),
+            **({} if os.name == "posix" else {"bootstrap_backend": RecordingBootstrapBackend()}),
         )
         before = {
             path.relative_to(self.paths.root).as_posix(): path.read_bytes()
@@ -5253,9 +5036,7 @@ class RecoveryCliTests(unittest.TestCase):
         payload["details"]["runtime_initialized"] = 1
         state.atomic_write_json(journal.wal_path, payload)
         with self.assertRaises(state.DeploymentStateError):
-            recovery.ControlJournal.open(
-                self.paths, self.transaction_id, command="adopt-existing"
-            )
+            recovery.ControlJournal.open(self.paths, self.transaction_id, command="adopt-existing")
 
     def test_control_wal_and_receipt_reject_boolean_schema_version(self) -> None:
         journal = recovery.ControlJournal.create(
@@ -5387,9 +5168,7 @@ class RecoveryCliTests(unittest.TestCase):
                         raise OSError("simulated hard exit")
 
                 with (
-                    mock.patch.object(
-                        recovery, "_after_control_step", side_effect=interrupt
-                    ),
+                    mock.patch.object(recovery, "_after_control_step", side_effect=interrupt),
                     self.assertRaises(OSError),
                 ):
                     recovery.clear_start_marker(
@@ -5406,17 +5185,13 @@ class RecoveryCliTests(unittest.TestCase):
                 )
                 self.assertEqual(receipt["command"], "clear-start-marker")
                 self.assertFalse(self.paths.start_marker.exists())
-                self.assertFalse(
-                    (self.paths.control_transactions / transaction_id).exists()
-                )
+                self.assertFalse((self.paths.control_transactions / transaction_id).exists())
 
     def test_clear_start_marker_backup_collision_preserves_both_files(self) -> None:
         self.create_marker()
         marker_before = self.paths.start_marker.read_bytes()
         transaction_id = uuid.uuid4().hex
-        backup = (
-            self.paths.control_transactions / transaction_id / "start-marker.backup"
-        )
+        backup = self.paths.control_transactions / transaction_id / "start-marker.backup"
         occupied = b"operator-owned-backup"
 
         class OccupyBackupBackend(PortableMutationBackend):
@@ -5471,9 +5246,7 @@ class RecoveryCliTests(unittest.TestCase):
                 containers_exist=lambda: False,
                 mutation_backend=PortableMutationBackend(),
             )
-        backup = (
-            self.paths.control_transactions / transaction_id / "start-marker.backup"
-        )
+        backup = self.paths.control_transactions / transaction_id / "start-marker.backup"
         self.assertTrue(backup.is_file())
         state.create_start_marker(
             self.paths,
@@ -5515,9 +5288,7 @@ class RecoveryCliTests(unittest.TestCase):
                 containers_exist=lambda: False,
                 mutation_backend=PortableMutationBackend(),
             )
-        backup = (
-            self.paths.control_transactions / transaction_id / "start-marker.backup"
-        )
+        backup = self.paths.control_transactions / transaction_id / "start-marker.backup"
         raw = backup.read_bytes()
         backup.unlink()
         backup.write_bytes(raw)
@@ -5540,14 +5311,10 @@ class RecoveryCliTests(unittest.TestCase):
         transaction_id = uuid.uuid4().hex
         original_write = state.write_identity_exclusive
 
-        def checked_write(
-            paths: state.StatePaths, identity: state.DeploymentIdentity
-        ) -> None:
+        def checked_write(paths: state.StatePaths, identity: state.DeploymentIdentity) -> None:
             self.assertTrue(paths.start_marker.is_file())
             marker = json.loads(paths.start_marker.read_text(encoding="utf-8"))
-            self.assertEqual(
-                marker["deployment_identity_hash"], state.identity_digest(identity)
-            )
+            self.assertEqual(marker["deployment_identity_hash"], state.identity_digest(identity))
             original_write(paths, identity)
 
         with (
@@ -5556,9 +5323,7 @@ class RecoveryCliTests(unittest.TestCase):
                 "_secure_env_candidate",
                 return_value=(candidate, self.base / ".env", {}, 0, 0),
             ),
-            mock.patch.object(
-                state, "write_identity_exclusive", side_effect=checked_write
-            ),
+            mock.patch.object(state, "write_identity_exclusive", side_effect=checked_write),
         ):
             recovery.adopt_existing(
                 self.paths,
@@ -5612,9 +5377,7 @@ class RecoveryCliTests(unittest.TestCase):
                         "_secure_env_candidate",
                         return_value=candidate_result,
                     ),
-                    mock.patch.object(
-                        recovery, "_after_control_step", side_effect=interrupt
-                    ),
+                    mock.patch.object(recovery, "_after_control_step", side_effect=interrupt),
                     self.assertRaises(OSError),
                 ):
                     recovery.adopt_existing(
@@ -5853,9 +5616,7 @@ class RecoveryCliTests(unittest.TestCase):
 
                 with (
                     mock.patch.object(recovery, "_active_state_revalidated"),
-                    mock.patch.object(
-                        recovery, "_after_control_step", side_effect=interrupt
-                    ),
+                    mock.patch.object(recovery, "_after_control_step", side_effect=interrupt),
                     self.assertRaises(OSError),
                 ):
                     recovery.acknowledge_repaired(
@@ -5871,13 +5632,9 @@ class RecoveryCliTests(unittest.TestCase):
                         evidence,
                         mutation_backend=PortableMutationBackend(),
                     )
-                self.assertEqual(
-                    receipt["final_phase"], "repair_acknowledgement_complete"
-                )
+                self.assertEqual(receipt["final_phase"], "repair_acknowledgement_complete")
                 self.assertTrue((self.paths.quarantine / transaction_id).is_dir())
-                self.assertFalse(
-                    (self.paths.control_transactions / transaction_id).exists()
-                )
+                self.assertFalse((self.paths.control_transactions / transaction_id).exists())
 
     def test_acknowledge_repaired_revalidates_active_state_before_receipt_wal_cleanup(
         self,
@@ -5922,9 +5679,7 @@ class RecoveryCliTests(unittest.TestCase):
                     mock.patch.object(
                         recovery,
                         "_active_state_revalidated",
-                        side_effect=state.DeploymentStateError(
-                            f"unsafe active {tampering}"
-                        ),
+                        side_effect=state.DeploymentStateError(f"unsafe active {tampering}"),
                     ),
                     self.assertRaises(state.DeploymentStateError),
                 ):
@@ -5934,9 +5689,7 @@ class RecoveryCliTests(unittest.TestCase):
                         evidence,
                         mutation_backend=PortableMutationBackend(),
                     )
-                self.assertTrue(
-                    (self.paths.control_transactions / transaction_id).is_dir()
-                )
+                self.assertTrue((self.paths.control_transactions / transaction_id).is_dir())
 
     def test_completed_acknowledgement_receipt_does_not_revalidate_without_wal(
         self,
@@ -5974,18 +5727,12 @@ class RecoveryCliTests(unittest.TestCase):
                 raise OSError("hard exit")
 
         with (
-            mock.patch.object(
-                recovery, "_after_control_step", side_effect=stop_at_runtime
-            ),
+            mock.patch.object(recovery, "_after_control_step", side_effect=stop_at_runtime),
             self.assertRaises(OSError),
         ):
-            recovery.clear_start_marker(
-                self.paths, clear_id, containers_exist=lambda: False
-            )
+            recovery.clear_start_marker(self.paths, clear_id, containers_exist=lambda: False)
         with self.assertRaises(state.DeploymentStateError):
-            recovery.clear_start_marker(
-                self.paths, clear_id, containers_exist=lambda: True
-            )
+            recovery.clear_start_marker(self.paths, clear_id, containers_exist=lambda: True)
         self.assertTrue(self.paths.start_marker.is_file())
         self.assertFalse((self.paths.control_transactions / clear_id).exists())
 
@@ -5999,9 +5746,7 @@ class RecoveryCliTests(unittest.TestCase):
                 raise OSError("hard exit")
 
         with (
-            mock.patch.object(
-                recovery, "_secure_env_candidate", return_value=candidate_result
-            ),
+            mock.patch.object(recovery, "_secure_env_candidate", return_value=candidate_result),
             mock.patch.object(
                 recovery,
                 "_after_control_step",
@@ -6009,12 +5754,8 @@ class RecoveryCliTests(unittest.TestCase):
             ),
             self.assertRaises(OSError),
         ):
-            recovery.adopt_existing(
-                self.paths, adopt_id, containers_exist=lambda: False
-            )
-        with mock.patch.object(
-            recovery, "_secure_env_candidate", return_value=candidate_result
-        ):
+            recovery.adopt_existing(self.paths, adopt_id, containers_exist=lambda: False)
+        with mock.patch.object(recovery, "_secure_env_candidate", return_value=candidate_result):
             recovery.adopt_existing(self.paths, adopt_id, containers_exist=lambda: True)
         self.assertTrue(self.paths.start_marker.is_file())
 
@@ -6038,9 +5779,7 @@ class RecoveryCliTests(unittest.TestCase):
 
         with (
             mock.patch.object(recovery, "_active_state_revalidated"),
-            mock.patch.object(
-                recovery.ControlJournal, "advance", new=fail_quarantine_phase
-            ),
+            mock.patch.object(recovery.ControlJournal, "advance", new=fail_quarantine_phase),
             self.assertRaises(OSError),
         ):
             recovery.acknowledge_repaired(
@@ -6088,11 +5827,7 @@ class RecoveryCliTests(unittest.TestCase):
             ["env"],
             self.secrets / ".dcagent-transactions",
             transaction_id=self.transaction_id,
-            **(
-                {}
-                if os.name == "posix"
-                else {"bootstrap_backend": RecordingBootstrapBackend()}
-            ),
+            **({} if os.name == "posix" else {"bootstrap_backend": RecordingBootstrapBackend()}),
         )
         journal.write_phase("committed")
         journal.write_history_receipt("complete")
@@ -6109,21 +5844,13 @@ class RecoveryCliTests(unittest.TestCase):
         transaction_id = uuid.uuid4().hex
         candidate_result = (self.identity, self.base / ".env", {}, 0, 0)
         with (
-            mock.patch.object(
-                recovery, "_secure_env_candidate", return_value=candidate_result
-            ),
-            mock.patch.object(
-                recovery.ControlJournal, "remove", side_effect=OSError("hard exit")
-            ),
+            mock.patch.object(recovery, "_secure_env_candidate", return_value=candidate_result),
+            mock.patch.object(recovery.ControlJournal, "remove", side_effect=OSError("hard exit")),
             self.assertRaises(OSError),
         ):
-            recovery.adopt_existing(
-                self.paths, transaction_id, containers_exist=lambda: True
-            )
+            recovery.adopt_existing(self.paths, transaction_id, containers_exist=lambda: True)
         self.assertTrue((self.paths.control_transactions / transaction_id).exists())
-        receipt = recovery.adopt_existing(
-            self.paths, transaction_id, containers_exist=lambda: True
-        )
+        receipt = recovery.adopt_existing(self.paths, transaction_id, containers_exist=lambda: True)
         self.assertEqual(receipt["final_phase"], "adoption_complete")
         self.assertFalse((self.paths.control_transactions / transaction_id).exists())
 
@@ -6139,17 +5866,11 @@ class RecoveryCliTests(unittest.TestCase):
             return False
 
         with (
-            mock.patch.object(
-                recovery, "_secure_env_candidate", return_value=candidate_result
-            ),
-            mock.patch.object(
-                recovery.ControlJournal, "remove", side_effect=OSError("hard exit")
-            ),
+            mock.patch.object(recovery, "_secure_env_candidate", return_value=candidate_result),
+            mock.patch.object(recovery.ControlJournal, "remove", side_effect=OSError("hard exit")),
             self.assertRaises(OSError),
         ):
-            recovery.adopt_existing(
-                self.paths, transaction_id, containers_exist=stopped_runtime
-            )
+            recovery.adopt_existing(self.paths, transaction_id, containers_exist=stopped_runtime)
         self.assertFalse(self.paths.start_marker.exists())
 
         def started_runtime() -> bool:
@@ -6163,9 +5884,7 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertGreaterEqual(runtime_checks, 2)
         self.assertTrue(self.paths.start_marker.is_file())
         self.assertEqual(receipt["final_phase"], "adoption_complete")
-        supplemental = (
-            self.paths.history / f"recovery-{transaction_id}-supplemental.json"
-        )
+        supplemental = self.paths.history / f"recovery-{transaction_id}-supplemental.json"
         self.assertTrue(supplemental.is_file())
 
     def test_main_holds_one_lock_through_mutation_and_receipt(self) -> None:
@@ -6181,17 +5900,13 @@ class RecoveryCliTests(unittest.TestCase):
             finally:
                 locked = False
 
-        def checked_clear(
-            _paths: state.StatePaths, _transaction_id: str
-        ) -> dict[str, object]:
+        def checked_clear(_paths: state.StatePaths, _transaction_id: str) -> dict[str, object]:
             self.assertTrue(locked)
             return {"command": "clear-start-marker"}
 
         with (
             mock.patch.object(state, "acquire_deployment_lock", side_effect=lock),
-            mock.patch.object(
-                recovery, "clear_start_marker", side_effect=checked_clear
-            ),
+            mock.patch.object(recovery, "clear_start_marker", side_effect=checked_clear),
             mock.patch("builtins.print"),
         ):
             result = recovery.main(

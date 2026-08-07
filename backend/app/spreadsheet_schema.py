@@ -319,14 +319,12 @@ def _infer_dataset(
     header_row_number: int | None = None
     header_values: tuple[Any, ...] = ()
     header_formulas: tuple[Any, ...] = ()
-    leading_empty_rows = 0
-    for row_number, values, formulas in iterator:
+    for leading_empty_rows, (row_number, values, formulas) in enumerate(iterator, start=1):
         if _row_has_value(values, formulas):
             header_row_number = row_number
             header_values = values
             header_formulas = formulas
             break
-        leading_empty_rows += 1
         if leading_empty_rows > MAX_LEADING_EMPTY_ROWS:
             _add_diagnostic(
                 diagnostics,

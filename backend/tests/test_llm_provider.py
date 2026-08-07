@@ -392,18 +392,21 @@ class LLMProviderTest(unittest.TestCase):
             model="dc-agent-test-model",
         )
 
-        with patch(
-            "app.llm.httpx.Client", side_effect=httpx.TimeoutException("secret upstream timeout")
+        with (
+            patch(
+                "app.llm.httpx.Client",
+                side_effect=httpx.TimeoutException("secret upstream timeout"),
+            ),
+            self.assertRaises(LLMProviderError) as error,
         ):
-            with self.assertRaises(LLMProviderError) as error:
-                provider.generate_reply(
-                    LLMRequest(
-                        content="请分析现金流风险",
-                        mode="source",
-                        knowledge_hits=[indexed_hit()],
-                        previous_messages=[],
-                    )
+            provider.generate_reply(
+                LLMRequest(
+                    content="请分析现金流风险",
+                    mode="source",
+                    knowledge_hits=[indexed_hit()],
+                    previous_messages=[],
                 )
+            )
 
         self.assertIn("大模型响应超时", str(error.exception))
         self.assertNotIn("secret upstream timeout", str(error.exception))
@@ -642,15 +645,15 @@ class LLMProviderTest(unittest.TestCase):
                 "generate_reply",
                 side_effect=AssertionError("template fallback must not run"),
             ) as template_reply,
+            self.assertRaises(LLMProviderError) as error,
         ):
-            with self.assertRaises(LLMProviderError) as error:
-                provider.generate_reply(
-                    LLMRequest(
-                        content="请分析现金流风险",
-                        mode="source",
-                        knowledge_hits=[indexed_hit()],
-                    )
+            provider.generate_reply(
+                LLMRequest(
+                    content="请分析现金流风险",
+                    mode="source",
+                    knowledge_hits=[indexed_hit()],
                 )
+            )
 
         template_reply.assert_not_called()
         message = str(error.exception)

@@ -24,8 +24,7 @@ class UbuntuDeploymentEntrypointTests(unittest.TestCase):
                 self.assertTrue(text.startswith("#!/usr/bin/env bash\n"))
                 self.assertIn("set -Eeuo pipefail", text)
                 self.assertIn(
-                    'SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" '
-                    '&& pwd -P)"',
+                    'SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"',
                     text,
                 )
                 self.assertIn(f'exec python3 "$SCRIPT_DIR/{helper}" "$@"', text)

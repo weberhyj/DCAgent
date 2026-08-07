@@ -750,43 +750,40 @@ class SqlChatRepository:
             import_batch_id=import_batch_id,
         )
         dedup_key = evaluation_case_dedup_key(question, external_key)
-        with self._database.write_lock:
-            with self._database.session() as session:
-                self._lock_evaluation_case_dedup_keys(session, [dedup_key])
-                existing_records = session.scalars(select(EvaluationCaseRecord)).all()
-                existing_dedup_keys = {
-                    key
-                    for existing_record in existing_records
-                    for key in evaluation_case_lookup_keys(
-                        existing_record.question,
-                        existing_record.external_key,
-                    )
-                }
-                if dedup_key in existing_dedup_keys:
-                    raise EvaluationCaseDuplicateError("评测用例已存在，请勿重复创建")
+        with self._database.write_lock, self._database.session() as session:
+            self._lock_evaluation_case_dedup_keys(session, [dedup_key])
+            existing_records = session.scalars(select(EvaluationCaseRecord)).all()
+            existing_dedup_keys = {
+                key
+                for existing_record in existing_records
+                for key in evaluation_case_lookup_keys(
+                    existing_record.question,
+                    existing_record.external_key,
+                )
+            }
+            if dedup_key in existing_dedup_keys:
+                raise EvaluationCaseDuplicateError("评测用例已存在，请勿重复创建")
 
-                timestamp = now_label()
-                record = EvaluationCaseRecord(
-                    id=f"eval-case-{uuid4().hex[:12]}",
-                    question=question.strip(),
-                    expected_source_ids=normalized_unique(expected_source_ids),
-                    expected_terms=normalized_unique(expected_terms),
-                    expect_answer=expect_answer,
-                    top_k=top_k,
-                    created_at=timestamp,
-                    updated_at=timestamp,
-                    category=category,
-                    tags=tags,
-                    external_key=external_key,
-                    import_batch_id=import_batch_id,
-                    sort_order=0,
-                )
-                session.execute(
-                    update(EvaluationCaseRecord).values(
-                        sort_order=EvaluationCaseRecord.sort_order + 1
-                    )
-                )
-                session.add(record)
+            timestamp = now_label()
+            record = EvaluationCaseRecord(
+                id=f"eval-case-{uuid4().hex[:12]}",
+                question=question.strip(),
+                expected_source_ids=normalized_unique(expected_source_ids),
+                expected_terms=normalized_unique(expected_terms),
+                expect_answer=expect_answer,
+                top_k=top_k,
+                created_at=timestamp,
+                updated_at=timestamp,
+                category=category,
+                tags=tags,
+                external_key=external_key,
+                import_batch_id=import_batch_id,
+                sort_order=0,
+            )
+            session.execute(
+                update(EvaluationCaseRecord).values(sort_order=EvaluationCaseRecord.sort_order + 1)
+            )
+            session.add(record)
         return evaluation_case_from_record(record)
 
     def create_evaluation_cases(
@@ -804,79 +801,78 @@ class SqlChatRepository:
         final_duplicate_count = 0
 
         dedup_keys = [evaluation_case_dedup_key(row.question, row.external_key) for row in rows]
-        with self._database.write_lock:
-            with self._database.session() as session:
-                self._lock_evaluation_case_dedup_keys(session, dedup_keys)
-                existing_records = session.scalars(select(EvaluationCaseRecord)).all()
-                existing_dedup_keys = {
-                    key
-                    for existing_record in existing_records
-                    for key in evaluation_case_lookup_keys(
-                        existing_record.question,
-                        existing_record.external_key,
-                    )
-                }
+        with self._database.write_lock, self._database.session() as session:
+            self._lock_evaluation_case_dedup_keys(session, dedup_keys)
+            existing_records = session.scalars(select(EvaluationCaseRecord)).all()
+            existing_dedup_keys = {
+                key
+                for existing_record in existing_records
+                for key in evaluation_case_lookup_keys(
+                    existing_record.question,
+                    existing_record.external_key,
+                )
+            }
 
-                for row in rows:
-                    dedup_key = evaluation_case_dedup_key(
-                        row.question,
-                        row.external_key,
-                    )
-                    if dedup_key in existing_dedup_keys:
-                        final_duplicate_count += 1
-                        continue
+            for row in rows:
+                dedup_key = evaluation_case_dedup_key(
+                    row.question,
+                    row.external_key,
+                )
+                if dedup_key in existing_dedup_keys:
+                    final_duplicate_count += 1
+                    continue
 
-                    category, tags, external_key, normalized_batch_id = (
-                        normalize_evaluation_case_metadata(
-                            category=row.category,
-                            tags=row.tags,
-                            external_key=row.external_key,
-                            import_batch_id=import_batch_id,
-                        )
-                    )
-                    record = EvaluationCaseRecord(
-                        id=f"eval-case-{uuid4().hex[:12]}",
-                        question=row.question.strip(),
-                        expected_source_ids=normalized_unique(row.expected_source_ids),
-                        expected_terms=normalized_unique(row.expected_terms),
-                        expect_answer=row.expect_answer,
-                        top_k=row.top_k,
-                        created_at=timestamp,
-                        updated_at=timestamp,
-                        category=category,
-                        tags=tags,
-                        external_key=external_key,
-                        import_batch_id=normalized_batch_id,
-                        sort_order=len(created_records),
-                    )
-                    created_records.append(record)
-                    existing_dedup_keys.update(
-                        evaluation_case_lookup_keys(
-                            record.question,
-                            record.external_key,
-                        )
-                    )
-
-                session.add(
-                    EvaluationImportBatchRecord(
-                        id=import_batch_id,
-                        file_name=file_name,
-                        status="completed",
-                        total_rows=total_rows,
-                        valid_rows=valid_rows,
-                        invalid_rows=invalid_rows,
-                        duplicate_rows=final_duplicate_count,
-                        created_at=timestamp,
-                        completed_at=completed_at,
+                category, tags, external_key, normalized_batch_id = (
+                    normalize_evaluation_case_metadata(
+                        category=row.category,
+                        tags=row.tags,
+                        external_key=row.external_key,
+                        import_batch_id=import_batch_id,
                     )
                 )
-                if created_records:
-                    session.execute(
-                        update(EvaluationCaseRecord).values(
-                            sort_order=(EvaluationCaseRecord.sort_order + len(created_records))
-                        )
+                record = EvaluationCaseRecord(
+                    id=f"eval-case-{uuid4().hex[:12]}",
+                    question=row.question.strip(),
+                    expected_source_ids=normalized_unique(row.expected_source_ids),
+                    expected_terms=normalized_unique(row.expected_terms),
+                    expect_answer=row.expect_answer,
+                    top_k=row.top_k,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    category=category,
+                    tags=tags,
+                    external_key=external_key,
+                    import_batch_id=normalized_batch_id,
+                    sort_order=len(created_records),
+                )
+                created_records.append(record)
+                existing_dedup_keys.update(
+                    evaluation_case_lookup_keys(
+                        record.question,
+                        record.external_key,
                     )
-                    session.add_all(created_records)
+                )
+
+            session.add(
+                EvaluationImportBatchRecord(
+                    id=import_batch_id,
+                    file_name=file_name,
+                    status="completed",
+                    total_rows=total_rows,
+                    valid_rows=valid_rows,
+                    invalid_rows=invalid_rows,
+                    duplicate_rows=final_duplicate_count,
+                    created_at=timestamp,
+                    completed_at=completed_at,
+                )
+            )
+            if created_records:
+                session.execute(
+                    update(EvaluationCaseRecord).values(
+                        sort_order=(EvaluationCaseRecord.sort_order + len(created_records))
+                    )
+                )
+                session.add_all(created_records)
 
         batch = EvaluationImportBatchModel(
             id=import_batch_id,

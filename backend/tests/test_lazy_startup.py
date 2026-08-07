@@ -10,6 +10,9 @@ from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+from sqlalchemy.engine import make_url
+
 from app.database import Database
 from app.infra.health import (
     DependencyCheck,
@@ -23,8 +26,6 @@ from app.main import _database_url_with_connect_timeout, create_app
 from app.offline_settings import OfflineSettings
 from app.qdrant_retrieval import QdrantRetrievalGateway
 from app.retrieval_settings import RetrievalSettings
-from fastapi.testclient import TestClient
-from sqlalchemy.engine import make_url
 
 
 class ClosableFake:
@@ -301,12 +302,14 @@ class LazyStartupTest(unittest.TestCase):
             llm_provider_factory=lambda _environment: calls.append("llm"),
         )
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "Production runtime requires a real LLM provider",
+        with (
+            self.assertRaisesRegex(
+                ValueError,
+                "Production runtime requires a real LLM provider",
+            ),
+            TestClient(app),
         ):
-            with TestClient(app):
-                pass
+            pass
 
         self.assertEqual(calls, [])
 
@@ -612,9 +615,8 @@ class LazyStartupTest(unittest.TestCase):
             llm_provider_factory=lambda _environment: ClosableFake("llm"),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "failed at reranker"):
-            with TestClient(app):
-                pass
+        with self.assertRaisesRegex(RuntimeError, "failed at reranker"), TestClient(app):
+            pass
 
         self.assertEqual(resources.closed, ["embedding", "qdrant"])
 
@@ -825,18 +827,20 @@ class LazyStartupTest(unittest.TestCase):
                 postgres_health_engine_factory=build_health_engine,
             )
 
-            with patch(
-                "app.infra.health.socket.create_connection",
-                return_value=FakeClamAVSocket(),
+            with (
+                patch(
+                    "app.infra.health.socket.create_connection",
+                    return_value=FakeClamAVSocket(),
+                ),
+                TestClient(app) as client,
             ):
-                with TestClient(app) as client:
-                    self.assertEqual(http_factory_calls, 1)
-                    self.assertEqual(redis_factory_calls, 1)
-                    self.assertEqual(health_engine_factory_calls, 1)
-                    self.assertEqual(client.get("/api/readyz").status_code, 200)
-                    self.assertEqual(client.get("/api/readyz").status_code, 200)
-                    self.assertEqual(len(http_client.get_calls), 3)
-                    self.assertEqual(redis_client.ping_calls, 1)
+                self.assertEqual(http_factory_calls, 1)
+                self.assertEqual(redis_factory_calls, 1)
+                self.assertEqual(health_engine_factory_calls, 1)
+                self.assertEqual(client.get("/api/readyz").status_code, 200)
+                self.assertEqual(client.get("/api/readyz").status_code, 200)
+                self.assertEqual(len(http_client.get_calls), 3)
+                self.assertEqual(redis_client.ping_calls, 1)
 
             self.assertEqual(http_client.close_calls, 1)
             self.assertEqual(redis_client.close_calls, 1)

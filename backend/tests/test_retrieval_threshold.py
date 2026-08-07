@@ -16,9 +16,8 @@ class RetrievalThresholdTest(unittest.TestCase):
         self.assertEqual(resolve_hybrid_evidence_limit(20, final_top_k=8), 8)
         self.assertEqual(resolve_hybrid_evidence_limit(3, final_top_k=8), 3)
         for value in (0, -1, True):
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    resolve_hybrid_evidence_limit(value, final_top_k=8)
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                resolve_hybrid_evidence_limit(value, final_top_k=8)
 
     def test_resolves_configurable_minimum_retrieval_score(self) -> None:
         self.assertEqual(resolve_retrieval_min_score({}), 2.2)

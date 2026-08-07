@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+import contextlib
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import platform
 import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 from tools.benchmarks.manifest import BenchmarkManifest
@@ -24,7 +25,6 @@ from tools.benchmarks.report import (
     evaluate_capacity,
     write_report,
 )
-
 
 MODES = ("phase1-smoke", "phase4-online", "phase4-batch")
 _AUTO_PSUTIL = object()
@@ -88,9 +88,7 @@ def select_profile(
     return SelectedProfile(profile_name, mode, tuple(gates))
 
 
-def validate_metrics(
-    gates: tuple[MetricGate, ...], metrics: Mapping[str, object]
-) -> list[str]:
+def validate_metrics(gates: tuple[MetricGate, ...], metrics: Mapping[str, object]) -> list[str]:
     """Return missing or invalid gated metrics in stable gate order."""
 
     return [gate.name for gate in gates if not _finite_number(metrics.get(gate.name))]
@@ -104,9 +102,7 @@ def derive_benchmark_timeout_seconds(
 
     duration_limits = [float(manifest.duration_seconds)]
     for gate in profile.gates:
-        is_duration_gate = gate.name == "elapsed_seconds" or gate.name.endswith(
-            "_duration_seconds"
-        )
+        is_duration_gate = gate.name == "elapsed_seconds" or gate.name.endswith("_duration_seconds")
         if gate.operator == "lte" and is_duration_gate:
             duration_limits.append(float(gate.limit))
     return math.ceil(max(duration_limits)) + 300
@@ -236,9 +232,7 @@ def _validated_command(command: Sequence[str]) -> list[str]:
     if isinstance(command, (str, bytes)) or not command:
         raise ValueError("command must be a non-empty argument vector")
     arguments = list(command)
-    if any(
-        not isinstance(item, str) or not item or "\x00" in item for item in arguments
-    ):
+    if any(not isinstance(item, str) or not item or "\x00" in item for item in arguments):
         raise ValueError("command arguments must be non-empty strings")
     return arguments
 
@@ -266,10 +260,8 @@ def terminate_process_tree(process: Any) -> None:
         else:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     except (OSError, subprocess.SubprocessError):
-        try:
+        with contextlib.suppress(OSError):
             process.kill()
-        except OSError:
-            pass
 
 
 def _execute_process(
@@ -309,10 +301,8 @@ def _execute_process(
         return int(process.wait(timeout=timeout_seconds))
     except subprocess.TimeoutExpired:
         (kill_strategy or terminate_process_tree)(process)
-        try:
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
             process.wait(timeout=10)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
         return 124
 
 
@@ -383,11 +373,7 @@ def create_report(
     _validate_run_labels(profile_name, mode, cache_label)
     if vector_dimension not in manifest.vector_dimension_candidates:
         raise ValueError("selected vector dimension is not allowed by the manifest")
-    if (
-        isinstance(model_slots, bool)
-        or not isinstance(model_slots, int)
-        or model_slots <= 0
-    ):
+    if isinstance(model_slots, bool) or not isinstance(model_slots, int) or model_slots <= 0:
         raise ValueError("model slots must be a positive integer")
 
     if benchmark_timeout_seconds is None:
@@ -424,8 +410,7 @@ def create_report(
         failures.append("benchmark_command")
     result = CapacityResult(passed=not failures, failures=failures)
     report_metrics = {
-        name: value if _finite_number(value) else "not_available"
-        for name, value in metrics.items()
+        name: value if _finite_number(value) else "not_available" for name, value in metrics.items()
     }
     for gate in selected.gates:
         value = metrics.get(gate.name)

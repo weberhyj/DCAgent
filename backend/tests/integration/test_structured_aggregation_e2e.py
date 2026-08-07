@@ -523,9 +523,12 @@ def _target_host_missing_configuration() -> tuple[str, ...]:
     missing = []
     for name in required:
         value = os.getenv(name, "").strip()
-        if not value or (name == "RUN_OFFLINE_INTEGRATION" and value != "1"):
-            missing.append(name)
-        elif name.endswith("_FILE") and not Path(value).is_file():
+        if (
+            not value
+            or (name == "RUN_OFFLINE_INTEGRATION" and value != "1")
+            or name.endswith("_FILE")
+            and not Path(value).is_file()
+        ):
             missing.append(name)
     return tuple(missing)
 

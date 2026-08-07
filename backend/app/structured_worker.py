@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import socket
@@ -193,15 +194,13 @@ class StructuredIngestionWorker:
                     )
         except Exception as error:
             if not lease_lost.is_set():
-                try:
+                with contextlib.suppress(StructuredLeaseError):
                     self._repository.fail_publication(
                         job.id,
                         lease_token,
                         str(error) or error.__class__.__name__,
                         retry_delay_seconds=self._retry_delay_seconds,
                     )
-                except StructuredLeaseError:
-                    pass
         finally:
             heartbeat_stop.set()
             heartbeat.join(timeout=max(1.0, self._lease_seconds / 2))
@@ -345,10 +344,8 @@ def _close_clients(clients: tuple[object, ...]) -> None:
         closed_ids.add(id(client))
         close = getattr(client, "close", None)
         if callable(close):
-            try:
+            with contextlib.suppress(Exception):
                 close()
-            except Exception:
-                pass
 
 
 def main() -> None:

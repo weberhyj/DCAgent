@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
+import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, Lock
-import tempfile
-import unittest
 
 
 class StructuredAggregationBenchmarkTest(unittest.TestCase):
@@ -137,8 +137,8 @@ class StructuredAggregationBenchmarkTest(unittest.TestCase):
         self,
     ) -> None:
         from tools.structured_aggregation_benchmark import (
-            BenchmarkConfig,
             MEBIBYTE,
+            BenchmarkConfig,
             execute_workload,
         )
 

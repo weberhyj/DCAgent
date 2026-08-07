@@ -120,12 +120,11 @@ class SparseEmbeddingTest(unittest.TestCase):
             r"\\server\share\Qdrant-bm25",
             "//server/share/Qdrant-bm25",
         ):
-            with self.subTest(root=root):
-                with self.assertRaisesRegex(ValueError, "local"):
-                    LocalBm25Encoder.from_environ(
-                        {"SPARSE_MODEL_ROOT": root},
-                        model_factory=lambda **kwargs: factory_calls.append(kwargs),
-                    )
+            with self.subTest(root=root), self.assertRaisesRegex(ValueError, "local"):
+                LocalBm25Encoder.from_environ(
+                    {"SPARSE_MODEL_ROOT": root},
+                    model_factory=lambda **kwargs: factory_calls.append(kwargs),
+                )
         self.assertEqual(factory_calls, [])
 
     def test_rejects_real_root_and_nested_symlinks(self) -> None:

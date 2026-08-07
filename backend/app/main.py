@@ -267,6 +267,13 @@ def _build_app(*, lifespan: Any | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+
+    # Keep the conventional FastAPI schema URL available for local tooling and
+    # existing clients while the versioned URL remains the canonical endpoint.
+    @app.get("/openapi.json", include_in_schema=False)
+    async def _legacy_openapi() -> dict[str, Any]:
+        return app.openapi()
+
     app.state.health_checks_active = False
 
     app.add_middleware(

@@ -9,7 +9,7 @@ import math
 import os
 import stat
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 
@@ -253,17 +253,13 @@ def create_production_app(
             app.state.reranker_backend = None
             app.state.reranker_metadata = None
             if batcher is not None:
-                try:
+                with suppress(Exception):
                     await batcher.close()
-                except Exception:
-                    pass
             if backend is not None:
                 close = getattr(backend, "close", None)
                 if callable(close):
-                    try:
+                    with suppress(Exception):
                         await run_in_threadpool(close)
-                    except Exception:
-                        pass
 
     return _build_reranker_app(lifespan=lifespan)
 
@@ -338,10 +334,8 @@ def _load_ollama_reranker_backend(
             batch_max_items=batch_max_items,
         )
     except Exception:
-        try:
+        with suppress(Exception):
             client.close()
-        except Exception:
-            pass
         raise
 
 
@@ -374,7 +368,7 @@ def _materialize_scores(raw_scores: Sequence[float]) -> list[float]:
         raise TypeError("scores must be numeric")
     scores: list[float] = []
     for score in raw_scores:
-        if isinstance(score, bool) or isinstance(score, (str, bytes, bytearray)):
+        if isinstance(score, (bool, str, bytes, bytearray)):
             raise TypeError("scores must be numeric")
         value = float(score)
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:

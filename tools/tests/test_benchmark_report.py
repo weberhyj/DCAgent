@@ -2,11 +2,10 @@ import hashlib
 import importlib
 import json
 import math
-from pathlib import Path
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
-
+from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 
@@ -152,9 +151,7 @@ class CapacityRunnerTest(unittest.TestCase):
         self.assertEqual(profile.name, "service-round-trip")
         self.assertEqual(profile.gates[0].name, "postgresql_round_trip_ms")
 
-        acceptance = BenchmarkManifest.load(
-            ROOT / "benchmarks/manifests/acceptance-30m-5m.json"
-        )
+        acceptance = BenchmarkManifest.load(ROOT / "benchmarks/manifests/acceptance-30m-5m.json")
         warm = select_profile(acceptance, "online-warm", "phase4-online")
         self.assertEqual(warm.gates[-1].name, "error_rate")
         with self.assertRaises(ValueError):
@@ -191,9 +188,7 @@ class CapacityRunnerTest(unittest.TestCase):
             root = Path(directory)
             metrics_path = root / "metrics.json"
             report_path = root / "report.json"
-            metrics_path.write_text(
-                '{"postgresql_round_trip_ms": NaN}', encoding="utf-8"
-            )
+            metrics_path.write_text('{"postgresql_round_trip_ms": NaN}', encoding="utf-8")
 
             passed = create_report(
                 manifest_path=ROOT / "benchmarks/manifests/smoke.json",
@@ -213,9 +208,7 @@ class CapacityRunnerTest(unittest.TestCase):
 
             self.assertFalse(passed)
             payload = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                payload["metrics"]["postgresql_round_trip_ms"], "not_available"
-            )
+            self.assertEqual(payload["metrics"]["postgresql_round_trip_ms"], "not_available")
             self.assertEqual(
                 set(payload["metrics"]),
                 {
@@ -227,9 +220,7 @@ class CapacityRunnerTest(unittest.TestCase):
                     "embedding_round_trip_ms",
                 },
             )
-            self.assertTrue(
-                all(value == "not_available" for value in payload["metrics"].values())
-            )
+            self.assertTrue(all(value == "not_available" for value in payload["metrics"].values()))
             self.assertFalse(payload["gateResult"]["passed"])
 
     def test_create_report_ignores_stale_metrics_and_requires_fresh_generation(
@@ -271,9 +262,7 @@ class CapacityRunnerTest(unittest.TestCase):
             )
             payload = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertFalse(passed)
-            self.assertTrue(
-                all(value == "not_available" for value in payload["metrics"].values())
-            )
+            self.assertTrue(all(value == "not_available" for value in payload["metrics"].values()))
 
     def test_create_report_accepts_only_metrics_generated_at_injected_path(
         self,
@@ -295,9 +284,7 @@ class CapacityRunnerTest(unittest.TestCase):
 
             def popen(_command, **kwargs):
                 generated_path = Path(kwargs["env"]["BENCHMARK_METRICS_PATH"])
-                generated_path.write_text(
-                    json.dumps(expected_metrics), encoding="utf-8"
-                )
+                generated_path.write_text(json.dumps(expected_metrics), encoding="utf-8")
                 self.assertEqual(
                     kwargs["env"]["BENCHMARK_MANIFEST"],
                     str((ROOT / "benchmarks/manifests/smoke.json").resolve()),
@@ -357,9 +344,7 @@ class CapacityRunnerTest(unittest.TestCase):
             def processor():
                 return "Offline CPU"
 
-        hardware = collect_hardware(
-            Path("C:/data"), psutil_module=Psutil, platform_module=Platform
-        )
+        hardware = collect_hardware(Path("C:/data"), psutil_module=Psutil, platform_module=Platform)
         self.assertEqual(hardware["cpuModel"], "Offline CPU")
         self.assertEqual(hardware["physicalCores"], 8)
         self.assertEqual(hardware["logicalCores"], 16)
@@ -425,9 +410,7 @@ class CapacityRunnerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             run_fixed_command("tool --version", popen_factory=popen)  # type: ignore[arg-type]
 
-        self.assertEqual(
-            run_benchmark_command(("benchmark", "--run"), popen_factory=popen), 0
-        )
+        self.assertEqual(run_benchmark_command(("benchmark", "--run"), popen_factory=popen), 0)
         self.assertEqual(calls[1][0], ["benchmark", "--run"])
         self.assertIs(calls[1][1]["shell"], False)
         self.assertIs(calls[1][1]["stdout"], __import__("subprocess").DEVNULL)
@@ -508,9 +491,7 @@ class CapacityRunnerTest(unittest.TestCase):
                 hardware_collector=lambda _path: {},
                 version_collector=lambda: ({}, {}),
                 benchmark_command=("benchmark", "--run"),
-                benchmark_popen_factory=lambda _command, **_kwargs: _ImmediateProcess(
-                    9
-                ),
+                benchmark_popen_factory=lambda _command, **_kwargs: _ImmediateProcess(9),
             )
             payload = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertFalse(passed)
@@ -602,9 +583,7 @@ class CapacityRunnerTest(unittest.TestCase):
                 ]
             )
         )
-        self.assertEqual(
-            [item["event"] for item in events], ["accepted", "queued", "delta"]
-        )
+        self.assertEqual([item["event"] for item in events], ["accepted", "queued", "delta"])
         multiline = list(
             parse_sse_events(
                 [
@@ -628,9 +607,7 @@ class CapacityRunnerTest(unittest.TestCase):
             stream_failure_reason([{"event": "accepted", "data": {}}], 200),
             "missing_terminal_event",
         )
-        self.assertEqual(
-            stream_failure_reason([{"event": "error", "data": {}}], 200), "sse_error"
-        )
+        self.assertEqual(stream_failure_reason([{"event": "error", "data": {}}], 200), "sse_error")
 
     def test_locust_metrics_are_atomically_persisted_from_full_stream_contexts(
         self,
@@ -731,9 +708,7 @@ class CapacityRunnerTest(unittest.TestCase):
         self.assertNotIn("first_token_p95_ms", metrics)
         self.assertNotIn("warm_cache_hit_rate", metrics)
         module = importlib.import_module("tools.benchmarks.locustfile")
-        self.assertEqual(
-            module.REQUEST_WEIGHTS, {"structured": 4, "document": 4, "mixed": 2}
-        )
+        self.assertEqual(module.REQUEST_WEIGHTS, {"structured": 4, "document": 4, "mixed": 2})
 
 
 if __name__ == "__main__":

@@ -410,10 +410,7 @@ def _inspect_http_response(
 
     body = bytearray()
     raw_iterator = getattr(response, "iter_raw", None)
-    if callable(raw_iterator):
-        iterator = iter(raw_iterator())
-    else:
-        iterator = iter(response.iter_bytes())
+    iterator = iter(raw_iterator()) if callable(raw_iterator) else iter(response.iter_bytes())
     while True:
         if deadline - monotonic() <= 0:
             return False, "unavailable"

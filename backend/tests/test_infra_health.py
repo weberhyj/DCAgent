@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+from fastapi.testclient import TestClient
+
 from app.infra import health as health_module
 from app.infra.health import DependencyCheck, DependencyHealthRegistry, build_dependency_checks
 from app.main import create_app
@@ -22,7 +24,6 @@ from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.retrieval_settings import RetrievalSettings
 from app.routes import router as app_router
 from app.seed import build_seed_state
-from fastapi.testclient import TestClient
 
 
 def retrieval_health_environment(mode: str = "qwen3") -> dict[str, str]:
@@ -739,27 +740,29 @@ class InfraHealthTest(unittest.TestCase):
         self,
     ) -> None:
         registry = DependencyHealthRegistry([DependencyCheck("redis", lambda: (True, "ready"))])
-        with patch.object(
-            health_module,
-            "_SHARED_EXECUTOR",
-            None,
-            create=True,
-        ):
-            with patch.object(
+        with (
+            patch.object(
+                health_module,
+                "_SHARED_EXECUTOR",
+                None,
+                create=True,
+            ),
+            patch.object(
                 health_module,
                 "ThreadPoolExecutor",
                 side_effect=RealThreadPoolExecutor,
-            ) as constructor:
-                registry.report()
-                first_executor = health_module._SHARED_EXECUTOR
-                registry.close()
-                self.assertIsNone(health_module._SHARED_EXECUTOR)
+            ) as constructor,
+        ):
+            registry.report()
+            first_executor = health_module._SHARED_EXECUTOR
+            registry.close()
+            self.assertIsNone(health_module._SHARED_EXECUTOR)
 
-                registry.report()
-                second_executor = health_module._SHARED_EXECUTOR
-                self.assertIsNot(first_executor, second_executor)
-                self.assertEqual(constructor.call_count, 2)
-                registry.close()
+            registry.report()
+            second_executor = health_module._SHARED_EXECUTOR
+            self.assertIsNot(first_executor, second_executor)
+            self.assertEqual(constructor.call_count, 2)
+            registry.close()
 
     def test_registry_single_flights_overlapping_reports_without_waiting(
         self,

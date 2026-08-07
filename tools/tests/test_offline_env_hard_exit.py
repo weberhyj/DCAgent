@@ -139,9 +139,7 @@ class OfflineEnvironmentHardExitTests(unittest.TestCase):
         )
 
         with self.assertRaises(recovery.RecoveryConflict):
-            recovery.resume_transaction_rollback(
-                journal, mutation_backend=self.recovery_backend()
-            )
+            recovery.resume_transaction_rollback(journal, mutation_backend=self.recovery_backend())
 
         self.assertTrue(target.exists())
         self.assertTrue(journal.root.exists())

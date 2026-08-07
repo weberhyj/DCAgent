@@ -23,11 +23,13 @@ class LLMRuntimeTest(unittest.TestCase):
             {"LLM_PROVIDER": "  TeMpLaTe  "},
             {"LLM_PROVIDER": "  MoCk  "},
         ):
-            with self.subTest(environ=environ):
-                with self.assertRaisesRegex(
+            with (
+                self.subTest(environ=environ),
+                self.assertRaisesRegex(
                     ValueError, "Production runtime requires a real LLM provider"
-                ):
-                    validate_production_llm_provider(environ)
+                ),
+            ):
+                validate_production_llm_provider(environ)
 
     def test_production_accepts_real_providers(self) -> None:
         cases = (

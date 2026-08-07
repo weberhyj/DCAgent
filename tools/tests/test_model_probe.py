@@ -4,13 +4,13 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -26,9 +26,7 @@ class FakeRunner:
 
         self.calls.append((list(command), shell))
         override_paths = [
-            Path(command[index + 1])
-            for index, value in enumerate(command[:-1])
-            if value == "-f"
+            Path(command[index + 1]) for index, value in enumerate(command[:-1]) if value == "-f"
         ]
         if len(override_paths) > 1 and override_paths[-1].exists():
             self.override_snapshots.append(
@@ -43,11 +41,7 @@ class FakeRunner:
         if isinstance(outcome, CommandResult):
             return outcome
         exit_code, payload = outcome
-        if (
-            isinstance(payload, dict)
-            and "--project-name" in command
-            and "config" in command
-        ):
+        if isinstance(payload, dict) and "--project-name" in command and "config" in command:
             payload = dict(payload)
             payload["name"] = command[command.index("--project-name") + 1]
         stdout = payload if isinstance(payload, str) else json.dumps(payload)
@@ -256,9 +250,9 @@ class ModelProbeTest(unittest.TestCase):
         self.assertIn("--candidate-lock", completed.stdout)
 
     def test_probe_source_does_not_reference_an_unshipped_executable(self) -> None:
-        source = (
-            Path(__file__).resolve().parents[1] / "benchmarks" / "model_probe.py"
-        ).read_text(encoding="utf-8")
+        source = (Path(__file__).resolve().parents[1] / "benchmarks" / "model_probe.py").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("dc-agent-model-probe", source)
 
     def test_fixed_python_helpers_compile_and_generation_measures_throughput(
@@ -295,9 +289,7 @@ class ModelProbeTest(unittest.TestCase):
         self.assertIn("AutoTokenizer", model_probe.EMBEDDING_BENCHMARK_SCRIPT)
         self.assertIn("timed_post", model_probe.EMBEDDING_BENCHMARK_SCRIPT)
         self.assertNotIn('"family": "BGE"', model_probe.EMBEDDING_BENCHMARK_SCRIPT)
-        self.assertNotIn(
-            '"variant": os.environ', model_probe.EMBEDDING_BENCHMARK_SCRIPT
-        )
+        self.assertNotIn('"variant": os.environ', model_probe.EMBEDDING_BENCHMARK_SCRIPT)
         self.assertIn("actualTokenRange", model_probe.EMBEDDING_BENCHMARK_SCRIPT)
 
     def test_generation_helper_uses_real_tokenizer_and_fifteen_way_concurrency(
@@ -590,9 +582,7 @@ class ModelProbeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifact = root / "candidate.gguf"
-            write_minimal_gguf(
-                artifact, name="local-candidate", irrelevant_value="original"
-            )
+            write_minimal_gguf(artifact, name="local-candidate", irrelevant_value="original")
             original_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
 
             def replacing_hasher(path: Path) -> str:
@@ -801,9 +791,7 @@ class ModelProbeTest(unittest.TestCase):
             self.assertIn("python", runner.calls[2][0])
             self.assertIn("-c", runner.calls[2][0])
             self.assertNotIn("dc-agent-model-probe", runner.calls[2][0])
-            self.assertEqual(
-                runner.calls[-1][0][-2:], ["--remove-orphans", "--volumes"]
-            )
+            self.assertEqual(runner.calls[-1][0][-2:], ["--remove-orphans", "--volumes"])
             self.assertTrue(all(shell is False for _, shell in runner.calls))
 
             with self.assertRaises(ValueError):
@@ -985,9 +973,7 @@ class ModelProbeTest(unittest.TestCase):
                 if kind == "reranker-model":
                     metrics = {**metrics, "modelChecksum": fixture["checksum"]}
                 runner = FakeRunner(
-                    probe_outcomes(
-                        kind, fixture["checksum"], fixture["artifact"], metrics
-                    )
+                    probe_outcomes(kind, fixture["checksum"], fixture["artifact"], metrics)
                 )
                 run_model_probe(
                     compose_file=fixture["compose"],
@@ -1001,9 +987,7 @@ class ModelProbeTest(unittest.TestCase):
                 )
                 self.assertTrue(runner.override_snapshots)
                 if os.name != "nt":
-                    self.assertTrue(
-                        all(mode & 0o077 == 0 for mode in runner.override_modes)
-                    )
+                    self.assertTrue(all(mode & 0o077 == 0 for mode in runner.override_modes))
                 override = runner.override_snapshots[0]
                 encoded = json.dumps(override, sort_keys=True)
                 sources = {
@@ -1036,9 +1020,7 @@ class ModelProbeTest(unittest.TestCase):
             {
                 "name": "dc-agent-offline-probe",
                 "networks": {"offline": {"internal": False}},
-                "services": {
-                    "embedding-service": {"networks": {"offline": {}}, "ports": []}
-                },
+                "services": {"embedding-service": {"networks": {"offline": {}}, "ports": []}},
             },
             {
                 "name": "dc-agent-offline-probe",
@@ -1098,9 +1080,7 @@ class ModelProbeTest(unittest.TestCase):
 
         with (
             self._probe_files("embedding-model") as fixture,
-            patch.dict(
-                os.environ, {"DOCKER_HOST": "tcp://public.example:2375"}, clear=False
-            ),
+            patch.dict(os.environ, {"DOCKER_HOST": "tcp://public.example:2375"}, clear=False),
         ):
             with self.assertRaisesRegex(ValueError, "local Docker"):
                 run_model_probe(
@@ -1173,9 +1153,7 @@ class ModelProbeTest(unittest.TestCase):
         self.assertTrue(generation.result.passed)
         self.assertEqual(generation.metrics["query_embedding_p95_ms"], "not_applicable")
         self.assertTrue(reranker.result.passed)
-        self.assertTrue(
-            all(value == "not_applicable" for value in reranker.metrics.values())
-        )
+        self.assertTrue(all(value == "not_applicable" for value in reranker.metrics.values()))
 
     def test_candidate_service_is_stopped_in_finally_after_probe_exception(
         self,
@@ -1213,15 +1191,12 @@ class ModelProbeTest(unittest.TestCase):
             commands = [call[0] for call in runner.calls]
             self.assertIn("config", commands[0])
             self.assertIn("down", commands[-1])
-            self.assertNotIn(
-                "llama", [item for command in commands for item in command]
-            )
+            self.assertNotIn("llama", [item for command in commands for item in command])
             override_paths = [
                 Path(command[index + 1])
                 for command in commands
                 for index, value in enumerate(command[:-1])
-                if value == "-f"
-                and command[index + 1] != str(fixture["compose"].resolve())
+                if value == "-f" and command[index + 1] != str(fixture["compose"].resolve())
             ]
             self.assertTrue(override_paths)
             self.assertTrue(all(not path.exists() for path in override_paths))
@@ -1289,9 +1264,7 @@ class ModelProbeTest(unittest.TestCase):
                 ]
             )
             with patch.object(Path, "unlink", selective_unlink):
-                with self.assertRaisesRegex(
-                    RuntimeError, "ORIGINAL probe failure"
-                ) as caught:
+                with self.assertRaisesRegex(RuntimeError, "ORIGINAL probe failure") as caught:
                     run_model_probe(
                         compose_file=fixture["compose"],
                         embedding_service="embedding-service",
@@ -1319,9 +1292,7 @@ class ModelProbeTest(unittest.TestCase):
         ):
             with (
                 self.subTest(expected_failure=expected_failure),
-                self._probe_files(
-                    "embedding-model", forced_checksum="a" * 64
-                ) as fixture,
+                self._probe_files("embedding-model", forced_checksum="a" * 64) as fixture,
             ):
                 runner = FakeRunner(
                     probe_outcomes(
@@ -1388,9 +1359,7 @@ class ModelProbeTest(unittest.TestCase):
         with self._probe_files("reranker-model") as fixture:
             metrics["modelChecksum"] = fixture["checksum"]
             runner = FakeRunner(
-                probe_outcomes(
-                    "reranker-model", fixture["checksum"], fixture["artifact"], metrics
-                )
+                probe_outcomes("reranker-model", fixture["checksum"], fixture["artifact"], metrics)
             )
             result = run_model_probe(
                 compose_file=fixture["compose"],
@@ -1630,9 +1599,7 @@ class ModelProbeTest(unittest.TestCase):
                 )
                 actual = sha256_artifact(self.artifact)
             self.checksum = forced_checksum or actual
-            candidate_name = (
-                "bge-small" if kind == "embedding-model" else "local-candidate"
-            )
+            candidate_name = "bge-small" if kind == "embedding-model" else "local-candidate"
             self.values = {
                 "root": self.root,
                 "artifact": self.artifact,

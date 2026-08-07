@@ -426,9 +426,7 @@ def _is_default_dialect_index_option(name: str, value: Any) -> bool:
     normalized_name = name.lower()
     if not _has_semantic_value(value):
         return True
-    if normalized_name.endswith("_using") and str(value).lower() == "btree":
-        return True
-    return False
+    return bool(normalized_name.endswith("_using") and str(value).lower() == "btree")
 
 
 def _normalize_index(index: Any) -> IndexSignature:
@@ -1452,19 +1450,18 @@ def run_migrations(
     try:
         with engine.connect() as connection:
             config.attributes["connection"] = connection
-            with _postgres_migration_lock(connection):
-                with connection.begin():
-                    action = _classify_and_validate(connection, config)
-                    if action == "stamp":
-                        command.stamp(config, BASELINE_REVISION)
-                    command.upgrade(config, "head")
-                    if connection.dialect.name == "postgresql":
-                        post_action = _classify_and_validate(connection, config)
-                        if post_action != "upgrade":
-                            raise RuntimeError(
-                                "PostgreSQL post-migration validation did not reach "
-                                "the managed upgrade state"
-                            )
+            with _postgres_migration_lock(connection), connection.begin():
+                action = _classify_and_validate(connection, config)
+                if action == "stamp":
+                    command.stamp(config, BASELINE_REVISION)
+                command.upgrade(config, "head")
+                if connection.dialect.name == "postgresql":
+                    post_action = _classify_and_validate(connection, config)
+                    if post_action != "upgrade":
+                        raise RuntimeError(
+                            "PostgreSQL post-migration validation did not reach "
+                            "the managed upgrade state"
+                        )
     finally:
         engine.dispose()
 

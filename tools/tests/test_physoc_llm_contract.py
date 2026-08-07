@@ -33,9 +33,7 @@ SENSITIVE_ASSIGNMENT = re.compile(
 
 
 def physoc_env_block(text: str) -> str:
-    match = re.search(
-        rf"(?ms)^{re.escape(PHYSOC_BEGIN)}.*?^{re.escape(PHYSOC_END)}\s*$", text
-    )
+    match = re.search(rf"(?ms)^{re.escape(PHYSOC_BEGIN)}.*?^{re.escape(PHYSOC_END)}\s*$", text)
     return "" if match is None else match.group(0)
 
 
@@ -125,9 +123,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
     ) -> None:
         for path in ENV_EXAMPLES[:2]:
             text = path.read_text(encoding="utf-8")
-            active_providers = re.findall(
-                r"(?m)^\s*LLM_PROVIDER\s*=\s*([^#\s]+)\s*$", text
-            )
+            active_providers = re.findall(r"(?m)^\s*LLM_PROVIDER\s*=\s*([^#\s]+)\s*$", text)
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertEqual(["template"], active_providers)
                 self.assertIn("development only", text.casefold())
@@ -164,19 +160,14 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         readme_path = REPO_ROOT / "README.md"
         offline_runbook_path = REPO_ROOT / "deploy" / "offline" / "README.md"
         documented_sections = [
-            *(
-                (path, physoc_env_block(path.read_text(encoding="utf-8")))
-                for path in ENV_EXAMPLES
-            ),
+            *((path, physoc_env_block(path.read_text(encoding="utf-8"))) for path in ENV_EXAMPLES),
             (
                 readme_path,
                 physoc_readme_section(readme_path.read_text(encoding="utf-8")),
             ),
             (
                 offline_runbook_path,
-                physoc_offline_runbook_section(
-                    offline_runbook_path.read_text(encoding="utf-8")
-                ),
+                physoc_offline_runbook_section(offline_runbook_path.read_text(encoding="utf-8")),
             ),
         ]
 
@@ -268,9 +259,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
         )
 
     def test_offline_runbook_documents_physoc_cutover_and_rollback(self) -> None:
-        runbook = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(
-            encoding="utf-8"
-        )
+        runbook = (REPO_ROOT / "deploy" / "offline" / "README.md").read_text(encoding="utf-8")
         section = physoc_offline_runbook_section(runbook)
         self.assertTrue(section)
 
@@ -330,9 +319,7 @@ class PhysocLlmDocumentationContractTests(unittest.TestCase):
             with self.subTest(required_text=required_text):
                 self.assertIn(required_text, section)
 
-        self.assertGreaterEqual(
-            section.count("./tools/invoke_offline_compose.sh exec -T api"), 2
-        )
+        self.assertGreaterEqual(section.count("./tools/invoke_offline_compose.sh exec -T api"), 2)
         self.assertNotIn("cp deploy/offline/.env.example deploy/offline/.env", section)
         for forbidden in (".ps1", "$LASTEXITCODE", "New-Item"):
             self.assertNotIn(forbidden, section)

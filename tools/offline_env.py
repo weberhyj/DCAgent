@@ -44,12 +44,8 @@ CLICKHOUSE_SECRET_NAMES = (
     "clickhouse-ingest-password",
 )
 CLICKHOUSE_ENV_DEFAULTS = {
-    "CLICKHOUSE_QUERY_PASSWORD_FILE": (
-        "../../artifacts/secrets/clickhouse-query-password"
-    ),
-    "CLICKHOUSE_INGEST_PASSWORD_FILE": (
-        "../../artifacts/secrets/clickhouse-ingest-password"
-    ),
+    "CLICKHOUSE_QUERY_PASSWORD_FILE": ("../../artifacts/secrets/clickhouse-query-password"),
+    "CLICKHOUSE_INGEST_PASSWORD_FILE": ("../../artifacts/secrets/clickhouse-ingest-password"),
 }
 
 
@@ -171,9 +167,7 @@ class _PortablePreparationFilesystemMutationBackend:
     @staticmethod
     def _verify_source(path: Path, expected: os.stat_result) -> os.stat_result:
         current = os.lstat(path)
-        if not _same_identity(current, expected) or deployment_state._is_symlink(
-            current
-        ):
+        if not _same_identity(current, expected) or deployment_state._is_symlink(current):
             raise OSError("forward mutation source changed")
         return current
 
@@ -518,10 +512,7 @@ class _PosixPreparationFilesystemMutationBackend:
                 owner_gid=after_gid,
             )
             if before_absent:
-                if (
-                    self._trusted._stat_at_optional(parent_fd, env_path.name)
-                    is not None
-                ):
+                if self._trusted._stat_at_optional(parent_fd, env_path.name) is not None:
                     raise OSError("forward environment target changed")
                 self._trusted._renameat2(
                     parent_fd,
@@ -610,9 +601,7 @@ def _load_env_text(text: str) -> OrderedDict[str, str]:
         if ENV_KEY.fullmatch(key) is None:
             continue
         if key in values:
-            raise DeploymentError(
-                f"Offline environment key {key} must appear exactly once"
-            )
+            raise DeploymentError(f"Offline environment key {key} must appear exactly once")
         values[key] = value.strip()
     return values
 
@@ -629,9 +618,7 @@ def _render_env_values(text: str, updates: Mapping[str, str]) -> str:
         pattern = re.compile(rf"^\s*{re.escape(name)}\s*=")
         indexes = [index for index, line in enumerate(lines) if pattern.match(line)]
         if len(indexes) > 1:
-            raise DeploymentError(
-                f"Offline environment key {name} must appear exactly once"
-            )
+            raise DeploymentError(f"Offline environment key {name} must appear exactly once")
         replacement = f"{name}={value}"
         if indexes:
             lines[indexes[0]] = replacement
@@ -648,9 +635,7 @@ def _atomic_write_text(
     mode: int | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(
@@ -692,9 +677,7 @@ def _assert_no_symbolic_link_ancestors(path: Path, name: str) -> None:
     current = path.absolute()
     while True:
         if current.is_symlink():
-            raise DeploymentError(
-                f"{name} path ancestors must not be symbolic links: {current}"
-            )
+            raise DeploymentError(f"{name} path ancestors must not be symbolic links: {current}")
         if current.parent == current:
             break
         current = current.parent
@@ -741,9 +724,7 @@ def _current_identity() -> tuple[str, str]:
 def _assert_local_deployment_environment(environ: Mapping[str, str]) -> None:
     docker_host = environ.get("DOCKER_HOST", "")
     if docker_host and docker_host != "unix:///var/run/docker.sock":
-        raise DeploymentError(
-            "Only local rootful Docker at /var/run/docker.sock is supported"
-        )
+        raise DeploymentError("Only local rootful Docker at /var/run/docker.sock is supported")
     docker_context = environ.get("DOCKER_CONTEXT", "")
     if docker_context and docker_context != "default":
         raise DeploymentError("Only the local default Docker context is supported")
@@ -802,9 +783,7 @@ def _assert_managed_secret_paths(
         )
         expected = paths[secret_name].resolve(strict=False)
         if configured != expected:
-            raise DeploymentError(
-                f"{env_name} must use the repository-managed secret path"
-            )
+            raise DeploymentError(f"{env_name} must use the repository-managed secret path")
     return paths
 
 
@@ -876,9 +855,7 @@ def _planned_directory_source(mutation: DirectoryMutation) -> os.stat_result:
         or mutation.owner_gid is None
         or mutation.object_type != "directory"
     ):
-        raise DeploymentError(
-            f"Offline managed directory plan is incomplete: {mutation.path}"
-        )
+        raise DeploymentError(f"Offline managed directory plan is incomplete: {mutation.path}")
     return os.stat_result(
         (
             stat.S_IFDIR | mutation.original_mode,
@@ -915,9 +892,7 @@ def _revalidate_planned_directory(
         or current.st_uid != expected.st_uid
         or current.st_gid != expected.st_gid
     ):
-        raise DeploymentError(
-            f"Offline managed directory changed after planning: {mutation.path}"
-        )
+        raise DeploymentError(f"Offline managed directory changed after planning: {mutation.path}")
     return current
 
 
@@ -930,11 +905,7 @@ def _assert_posix_metadata(
     context: str,
 ) -> None:
     metadata = path.stat()
-    if (
-        metadata.st_uid != uid
-        or metadata.st_gid != gid
-        or metadata.st_mode & 0o777 != mode
-    ):
+    if metadata.st_uid != uid or metadata.st_gid != gid or metadata.st_mode & 0o777 != mode:
         raise DeploymentError(f"{context} owner or mode is unsafe: {path}")
 
 
@@ -958,9 +929,7 @@ def _read_managed_secret_ascii(path: Path) -> str:
     try:
         return path.read_text(encoding="ascii")
     except UnicodeError:
-        raise DeploymentError(
-            "Managed offline secret content is not valid ASCII"
-        ) from None
+        raise DeploymentError("Managed offline secret content is not valid ASCII") from None
 
 
 def _validate_postgres_secret_pair(paths: Mapping[str, Path]) -> None:
@@ -972,9 +941,7 @@ def _validate_postgres_secret_pair(paths: Mapping[str, Path]) -> None:
         f"postgresql+psycopg://dc_agent:{postgres_password}@postgres:5432/dc_agent"
     )
     if database_url != expected_database_url:
-        raise DeploymentError(
-            "Offline database URL must match the managed PostgreSQL password"
-        )
+        raise DeploymentError("Offline database URL must match the managed PostgreSQL password")
 
 
 def _validate_clickhouse_secret_pair(paths: Mapping[str, Path]) -> None:
@@ -1098,9 +1065,7 @@ def _directory_plan(
         while not _path_exists(current):
             missing.append(current)
             if current.parent == current:
-                raise DeploymentError(
-                    f"No existing ancestor for managed path: {target}"
-                )
+                raise DeploymentError(f"No existing ancestor for managed path: {target}")
             current = current.parent
         ancestor_mode = _inspect_directory(
             current,
@@ -1109,15 +1074,8 @@ def _directory_plan(
             context="Offline managed ancestor",
             verify_posix_metadata=verify_posix_metadata,
         )
-        if (
-            missing
-            and verify_posix_metadata
-            and os.name == "posix"
-            and ancestor_mode & 0o022
-        ):
-            raise DeploymentError(
-                f"Offline managed ancestor is group/other writable: {current}"
-            )
+        if missing and verify_posix_metadata and os.name == "posix" and ancestor_mode & 0o022:
+            raise DeploymentError(f"Offline managed ancestor is group/other writable: {current}")
         for path in reversed(missing):
             mutations.setdefault(
                 path,
@@ -1180,9 +1138,7 @@ def _resolve_state_root(
         raise DeploymentError("DEPLOYMENT_STATE_ROOT must be one absolute direct path")
     state_root = Path(raw)
     _assert_no_symbolic_link_ancestors(state_root, "DEPLOYMENT_STATE_ROOT")
-    normalized = deployment_state.normalize_absolute_root(
-        state_root, "DEPLOYMENT_STATE_ROOT"
-    )
+    normalized = deployment_state.normalize_absolute_root(state_root, "DEPLOYMENT_STATE_ROOT")
     expected = deployment_state.derive_state_root(data_root)
     if normalized != expected:
         raise DeploymentError("DEPLOYMENT_STATE_ROOT must match DATA_ROOT")
@@ -1245,12 +1201,8 @@ def build_preparation_plan(
     env_mode_before = None if created_env else _mode(env_path)
 
     raw_uid, raw_gid = _current_identity()
-    uid_text = canonical_numeric_identity(
-        "current Linux UID", raw_uid, reject_root=True
-    )
-    gid_text = canonical_numeric_identity(
-        "current Linux GID", raw_gid, reject_root=True
-    )
+    uid_text = canonical_numeric_identity("current Linux UID", raw_uid, reject_root=True)
+    gid_text = canonical_numeric_identity("current Linux GID", raw_gid, reject_root=True)
     uid = int(uid_text)
     gid = int(gid_text)
     values = _load_env_text(env_text)
@@ -1266,22 +1218,16 @@ def build_preparation_plan(
             "MODEL_ROOT": "HOST_MODEL_ROOT",
         }
         supplied_host_roots = {
-            host_name
-            for host_name in host_root_names.values()
-            if host_name in effective_environ
+            host_name for host_name in host_root_names.values() if host_name in effective_environ
         }
         if supplied_host_roots and supplied_host_roots != set(host_root_names.values()):
-            raise DeploymentError(
-                "HOST_DATA_ROOT and HOST_MODEL_ROOT must be supplied together"
-            )
+            raise DeploymentError("HOST_DATA_ROOT and HOST_MODEL_ROOT must be supplied together")
         for configured_name, host_name in host_root_names.items():
             if host_name not in supplied_host_roots:
                 continue
             raw_root = effective_environ[host_name]
             try:
-                normalized_root = deployment_state.normalize_absolute_root(
-                    raw_root, host_name
-                )
+                normalized_root = deployment_state.normalize_absolute_root(raw_root, host_name)
             except deployment_state.DeploymentStateError as exc:
                 raise DeploymentError(str(exc)) from exc
             env_updates[configured_name] = normalized_root.as_posix()
@@ -1293,20 +1239,14 @@ def build_preparation_plan(
             raise DeploymentError(f"{name} must be explicitly defined")
         actual = canonical_numeric_identity(name, actual_value, reject_root=True)
         if actual != expected:
-            raise DeploymentError(
-                f"{name} must match the current Linux deployment account"
-            )
+            raise DeploymentError(f"{name} must match the current Linux deployment account")
         override = effective_environ.get(name)
         if (
             override is not None
-            and canonical_numeric_identity(
-                f"{name} shell override", override, reject_root=True
-            )
+            and canonical_numeric_identity(f"{name} shell override", override, reject_root=True)
             != actual
         ):
-            raise DeploymentError(
-                f"{name} shell override must match deploy/offline/.env"
-            )
+            raise DeploymentError(f"{name} shell override must match deploy/offline/.env")
 
     for required_name in ("DATA_ROOT", "MODEL_ROOT"):
         if required_name not in values:
@@ -1352,8 +1292,7 @@ def build_preparation_plan(
         data_mode != _expected_mode(0o700) or model_mode != _expected_mode(0o700)
     ):
         raise DeploymentError(
-            "DATA_ROOT and MODEL_ROOT must already use mode 0700 before "
-            "--initialize-state"
+            "DATA_ROOT and MODEL_ROOT must already use mode 0700 before --initialize-state"
         )
 
     # Existing deployments before the ClickHouse pair was introduced are
@@ -1364,9 +1303,7 @@ def build_preparation_plan(
         env_text = _render_env_values(env_text, env_updates)
         values = _load_env_text(env_text)
     elif not all(clickhouse_keys_present.values()):
-        raise DeploymentError(
-            "Both ClickHouse password file paths must be configured together"
-        )
+        raise DeploymentError("Both ClickHouse password file paths must be configured together")
 
     paths = _assert_managed_secret_paths(
         repo_root,
@@ -1378,16 +1315,10 @@ def build_preparation_plan(
 
     postgres_paths = {name: paths[name] for name in POSTGRES_SECRET_NAMES}
     clickhouse_paths = {name: paths[name] for name in CLICKHOUSE_SECRET_NAMES}
-    postgres_present = {
-        name for name, path in postgres_paths.items() if _path_exists(path)
-    }
-    clickhouse_present = {
-        name for name, path in clickhouse_paths.items() if _path_exists(path)
-    }
+    postgres_present = {name for name, path in postgres_paths.items() if _path_exists(path)}
+    clickhouse_present = {name for name, path in clickhouse_paths.items() if _path_exists(path)}
     if postgres_present and postgres_present != set(postgres_paths):
-        raise DeploymentError(
-            "Managed offline PostgreSQL secrets must exist as one complete set"
-        )
+        raise DeploymentError("Managed offline PostgreSQL secrets must exist as one complete set")
     if clickhouse_present and clickhouse_present != set(clickhouse_paths):
         raise DeploymentError("ClickHouse password files must exist together")
     if postgres_present:
@@ -1487,9 +1418,7 @@ def build_preparation_plan(
         identity=identity,
         directory_mutations=directory_mutations,
         managed_secret_paths=MappingProxyType(dict(paths)),
-        publish_secret_names=tuple(
-            name for name in MANAGED_SECRET_NAMES if name in publish_names
-        ),
+        publish_secret_names=tuple(name for name in MANAGED_SECRET_NAMES if name in publish_names),
         rotate_secrets=rotate_secrets,
     )
     _assert_rotation_allowed(plan)
@@ -1735,9 +1664,7 @@ def _lock_backend() -> deployment_state.LockBackend | None:
     return None if os.name == "posix" else _PortableLockBackend()
 
 
-def _ensure_state_bootstrap(
-    paths: deployment_state.StatePaths, uid: int, gid: int
-) -> None:
+def _ensure_state_bootstrap(paths: deployment_state.StatePaths, uid: int, gid: int) -> None:
     try:
         os.mkdir(paths.root, 0o700)
     except FileExistsError:
@@ -1797,9 +1724,7 @@ def execute_preparation_plan(
             journal = exc.journal
             creation_error = exc
             raise
-        journal.persist_env_backup(
-            plan.env_path if plan.env_before is not None else None
-        )
+        journal.persist_env_backup(plan.env_path if plan.env_before is not None else None)
 
         journal.write_phase("staging")
         if plan.publish_secret_names:
@@ -1815,9 +1740,7 @@ def execute_preparation_plan(
                     owner_uid=owner_uid,
                     owner_gid=owner_gid,
                 )
-            _validate_secret_set(
-                {name: staging / name for name in plan.publish_secret_names}
-            )
+            _validate_secret_set({name: staging / name for name in plan.publish_secret_names})
         journal.write_phase("staged")
 
         if before_mutation is not None:
@@ -1980,15 +1903,11 @@ def execute_preparation_plan(
                     context="Offline managed directory",
                 )
             elif _mode(mutation.path) != _expected_mode(0o700):
-                raise DeploymentError(
-                    f"Offline managed directory mode is unsafe: {mutation.path}"
-                )
+                raise DeploymentError(f"Offline managed directory mode is unsafe: {mutation.path}")
         journal.write_phase("verified")
 
         journal.write_phase("env_committing")
-        current_metadata = (
-            os.lstat(plan.env_path) if _path_exists(plan.env_path) else None
-        )
+        current_metadata = os.lstat(plan.env_path) if _path_exists(plan.env_path) else None
         if current_metadata is not None:
             _assert_regular_non_link(plan.env_path, "Offline environment")
         current_bytes = None if current_metadata is None else plan.env_path.read_bytes()
@@ -1996,9 +1915,7 @@ def execute_preparation_plan(
         if current_bytes != after_bytes:
             before_path = plan.env_path if current_bytes is not None else None
             before_mode, before_uid, before_gid = _env_authority(before_path, plan)
-            after_mode = (
-                before_mode if before_path is not None else _expected_mode(0o600)
-            )
+            after_mode = before_mode if before_path is not None else _expected_mode(0o600)
             owner_uid, owner_gid = _operation_authority(plan)
             journal.record_intent(
                 sequence,
@@ -2034,9 +1951,7 @@ def execute_preparation_plan(
         committed_values = load_env(plan.env_path)
         for name, value in plan.env_updates.items():
             if committed_values.get(name) != value:
-                raise DeploymentError(
-                    f"Offline environment key {name} was not committed"
-                )
+                raise DeploymentError(f"Offline environment key {name} was not committed")
         journal.write_phase("env_committed")
         journal.write_phase("committed")
         committed = True
@@ -2067,7 +1982,7 @@ def execute_preparation_plan(
                     f"completed; transaction retained at {journal.root} phase={phase}"
                 ) from rollback_error
         if creation_error is not None:
-            raise creation_error.original_error
+            raise creation_error.original_error from creation_error
         raise
 
 
@@ -2090,9 +2005,7 @@ def _dcagent_containers_exist(environ: Mapping[str, str]) -> bool:
     return bool(process.stdout.strip())
 
 
-def _assert_initialization_gates(
-    plan: PreparationPlan, environ: Mapping[str, str]
-) -> None:
+def _assert_initialization_gates(plan: PreparationPlan, environ: Mapping[str, str]) -> None:
     if _path_exists(plan.state_paths.start_marker):
         raise DeploymentError("Cannot initialize state after deployment has started")
     pg_version = plan.data_root / "postgres" / "PG_VERSION"
@@ -2109,9 +2022,7 @@ def _assert_initialization_gates(
     allowed = {plan.state_paths.root.name}
     try:
         unexpected = [
-            entry.name
-            for entry in os.scandir(plan.data_root)
-            if entry.name not in allowed
+            entry.name for entry in os.scandir(plan.data_root) if entry.name not in allowed
         ]
     except OSError as exc:
         raise DeploymentError("Cannot inspect DATA_ROOT for initialization") from exc
@@ -2247,9 +2158,7 @@ def prepare_environment(
             if initialize_state:
                 _initialize_identity(bootstrap, environ=effective_environ)
             else:
-                deployment_state.assert_identity_matches(
-                    bootstrap.state_paths, bootstrap.identity
-                )
+                deployment_state.assert_identity_matches(bootstrap.state_paths, bootstrap.identity)
             identity_hash = deployment_state.identity_digest(
                 deployment_state.load_identity(bootstrap.state_paths)
             )

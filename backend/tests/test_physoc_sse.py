@@ -152,9 +152,8 @@ class PhysocSseTests(unittest.TestCase):
         }
 
         for label, lines in invalid_streams.items():
-            with self.subTest(label=label):
-                with self.assertRaises(PhysocStreamError):
-                    collect_physoc_response(lines, expected_model="physoc-v1")
+            with self.subTest(label=label), self.assertRaises(PhysocStreamError):
+                collect_physoc_response(lines, expected_model="physoc-v1")
 
     def test_rejects_responses_over_the_character_limit(self) -> None:
         lines = [
@@ -173,15 +172,14 @@ class PhysocSseTests(unittest.TestCase):
 
     def test_rejects_nonstandard_json_constants(self) -> None:
         for constant in ("NaN", "Infinity", "-Infinity"):
-            with self.subTest(constant=constant):
-                with self.assertRaises(PhysocStreamError):
-                    collect_physoc_response(
-                        [
-                            f'data: {{"response":"ok","done":true,"extra":{constant}}}\n',
-                            "\n",
-                        ],
-                        expected_model="physoc-v1",
-                    )
+            with self.subTest(constant=constant), self.assertRaises(PhysocStreamError):
+                collect_physoc_response(
+                    [
+                        f'data: {{"response":"ok","done":true,"extra":{constant}}}\n',
+                        "\n",
+                    ],
+                    expected_model="physoc-v1",
+                )
 
     def test_rejects_oversized_event_metadata(self) -> None:
         lines = [
@@ -304,9 +302,8 @@ class PhysocSseTests(unittest.TestCase):
             ],
         ]
         for lines in invalid_bom_streams:
-            with self.subTest(lines=lines):
-                with self.assertRaises(PhysocStreamError):
-                    collect_physoc_response(lines, expected_model="physoc-v1")
+            with self.subTest(lines=lines), self.assertRaises(PhysocStreamError):
+                collect_physoc_response(lines, expected_model="physoc-v1")
 
     def test_rejects_invalid_event_and_response_limits(self) -> None:
         invalid_limits = (0, -1, True, 1.5, "10")
@@ -381,13 +378,12 @@ class PhysocSseTests(unittest.TestCase):
             yield ""
 
         for limit in (0, -1, True, 1.5, "10"):
-            with self.subTest(limit=limit):
-                with self.assertRaises(PhysocStreamError):
-                    collect_physoc_response(
-                        unreadable_lines(),
-                        expected_model="physoc-v1",
-                        max_events=limit,
-                    )
+            with self.subTest(limit=limit), self.assertRaises(PhysocStreamError):
+                collect_physoc_response(
+                    unreadable_lines(),
+                    expected_model="physoc-v1",
+                    max_events=limit,
+                )
 
 
 if __name__ == "__main__":
