@@ -117,7 +117,8 @@ class ClickHouseGatewayTest(unittest.TestCase):
         self.assertEqual(settings["max_execution_time"], 30)
         self.assertEqual(settings["max_memory_usage"], 512 * 1024 * 1024)
         self.assertEqual(settings["max_result_rows"], 10_000)
-        self.assertEqual(settings["overflow_mode"], "break")
+        self.assertEqual(settings["result_overflow_mode"], "break")
+        self.assertNotIn("overflow_mode", settings)
 
     def test_each_publication_attempt_uses_an_isolated_staging_table(self) -> None:
         ingest = RecordingIngestClient()
@@ -605,7 +606,8 @@ class ClickHouseGatewayTest(unittest.TestCase):
         self.assertIn("content_sum_0", validation_statement)
         self.assertIn("content_xor_3", validation_statement)
         for _, settings in query.queries:
-            self.assertEqual(settings["overflow_mode"], "break")
+            self.assertEqual(settings["result_overflow_mode"], "break")
+            self.assertNotIn("overflow_mode", settings)
             self.assertEqual(settings["readonly"], 1)
 
 

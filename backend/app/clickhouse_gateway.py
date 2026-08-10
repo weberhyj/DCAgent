@@ -70,7 +70,7 @@ class ClickHouseGateway:
             "max_execution_time": max_execution_time,
             "max_memory_usage": max_memory_usage,
             "max_result_rows": max_result_rows,
-            "overflow_mode": "break",
+            "result_overflow_mode": "break",
         }
         self._query_settings = {**self._settings, "readonly": 1}
 

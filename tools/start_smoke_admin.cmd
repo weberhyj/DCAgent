@@ -1,4 +1,4 @@
 @echo off
-cd /d "%~dp0..\admin-frontend"
+cd /d "%~dp0.."
 set VITE_API_PROXY_TARGET=http://127.0.0.1:8015
-npm.cmd run dev -- --port 5178
+pnpm.cmd --filter dc-agent-admin-frontend dev -- --port 5178

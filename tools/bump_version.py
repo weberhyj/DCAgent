@@ -66,25 +66,16 @@ def _write_backend_version(root: Path, version: str) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
-def _load_package_data(path: Path, *, require_root_lock: bool = False) -> dict[str, object]:
+def _load_package_data(path: Path) -> dict[str, object]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise TypeError(f"{path} must contain a JSON object")
     _validate_version(data.get("version"))
-    if require_root_lock:
-        root_package = data.get("packages", {}).get("")
-        if not isinstance(root_package, dict):
-            raise ValueError(f"{path} does not contain the root package lock entry")
-        _validate_version(root_package.get("version"))
     return data
 
 
 def _write_package_version(path: Path, data: dict[str, object], version: str) -> None:
     data["version"] = version
-    if path.name == "package-lock.json":
-        root_package = data.get("packages", {}).get("")
-        assert isinstance(root_package, dict)
-        root_package["version"] = version
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -98,13 +89,8 @@ def bump_component(root: Path, component: str, bump: str) -> tuple[str, str]:
         _write_backend_version(root, target)
     else:
         manifest_path = root / component / "package.json"
-        lock_path = root / component / "package-lock.json"
         manifest = _load_package_data(manifest_path)
-        lock = _load_package_data(lock_path, require_root_lock=True)
-        if lock["version"] != current or lock["packages"][""]["version"] != current:
-            raise ValueError(f"{lock_path} version does not match {manifest_path}")
         _write_package_version(manifest_path, manifest, target)
-        _write_package_version(lock_path, lock, target)
     return current, target
 
 

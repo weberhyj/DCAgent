@@ -22,14 +22,19 @@ def test_repository_versions_are_independently_valid() -> None:
         "path": "app/__init__.py",
     }
 
+    root_manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+    assert re.fullmatch(r"pnpm@\d+\.\d+\.\d+", root_manifest["packageManager"])
+
+    workspace = (ROOT / "pnpm-workspace.yaml").read_text(encoding="utf-8")
+    lock = (ROOT / "pnpm-lock.yaml").read_text(encoding="utf-8")
     for component in ("frontend", "admin-frontend"):
         manifest_version = json.loads(
             (ROOT / component / "package.json").read_text(encoding="utf-8")
         )["version"]
-        lock = json.loads((ROOT / component / "package-lock.json").read_text(encoding="utf-8"))
         assert re.fullmatch(r"\d+\.\d+\.\d+", manifest_version)
-        assert lock["version"] == manifest_version
-        assert lock["packages"][""]["version"] == manifest_version
+        assert f"  - {component}" in workspace
+        assert f"  {component}:" in lock
+        assert not (ROOT / component / "package-lock.json").exists()
 
     backend_gitignore = (ROOT / "backend" / ".gitignore").read_text(encoding="utf-8")
     assert "*.swp" in backend_gitignore.splitlines()
@@ -45,10 +50,6 @@ def test_backend_bump_does_not_change_frontend_versions(tmp_path: Path) -> None:
     for directory in ("frontend", "admin-frontend"):
         (tmp_path / directory / "package.json").write_text(
             '{\n  "name": "test",\n  "version": "0.1.0"\n}\n', encoding="utf-8"
-        )
-        (tmp_path / directory / "package-lock.json").write_text(
-            '{\n  "version": "0.1.0",\n  "packages": {\n    "": {\n      "version": "0.1.0"\n    }\n  }\n}\n',
-            encoding="utf-8",
         )
 
     result = subprocess.run(
@@ -69,9 +70,7 @@ def test_backend_bump_does_not_change_frontend_versions(tmp_path: Path) -> None:
     assert '__version__ = "0.1.1"' in (tmp_path / "backend" / "app" / "__init__.py").read_text(
         encoding="utf-8"
     )
-    assert '"version": "0.1.0"' in (tmp_path / "frontend" / "package-lock.json").read_text(
-        encoding="utf-8"
-    )
+    assert json.loads((tmp_path / "frontend" / "package.json").read_text())["version"] == "0.1.0"
 
 
 def test_frontend_bump_does_not_change_backend_or_admin_versions(
@@ -86,10 +85,6 @@ def test_frontend_bump_does_not_change_backend_or_admin_versions(
     for directory in ("frontend", "admin-frontend"):
         (tmp_path / directory / "package.json").write_text(
             '{\n  "name": "test",\n  "version": "0.1.0"\n}\n', encoding="utf-8"
-        )
-        (tmp_path / directory / "package-lock.json").write_text(
-            '{\n  "version": "0.1.0",\n  "packages": {\n    "": {\n      "version": "0.1.0"\n    }\n  }\n}\n',
-            encoding="utf-8",
         )
 
     result = subprocess.run(
@@ -116,14 +111,13 @@ def test_frontend_bump_does_not_change_backend_or_admin_versions(
     )
 
 
-def test_invalid_frontend_lock_does_not_partially_update_manifest(
+def test_invalid_frontend_manifest_does_not_get_rewritten(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "frontend").mkdir()
     manifest = tmp_path / "frontend" / "package.json"
-    manifest.write_text('{\n  "name": "test",\n  "version": "0.1.0"\n}\n', encoding="utf-8")
-    (tmp_path / "frontend" / "package-lock.json").write_text(
-        '{\n  "version": "0.1.0",\n  "packages": {}\n}\n', encoding="utf-8"
+    manifest.write_text(
+        '{\n  "name": "test",\n  "version": "not-semver"\n}\n', encoding="utf-8"
     )
 
     result = subprocess.run(
@@ -141,4 +135,4 @@ def test_invalid_frontend_lock_does_not_partially_update_manifest(
     )
 
     assert result.returncode != 0
-    assert json.loads(manifest.read_text(encoding="utf-8"))["version"] == "0.1.0"
+    assert json.loads(manifest.read_text(encoding="utf-8"))["version"] == "not-semver"

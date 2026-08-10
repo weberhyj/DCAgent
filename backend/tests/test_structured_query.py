@@ -1219,7 +1219,7 @@ class StructuredQueryExecutorTest(unittest.TestCase):
                 "max_execution_time": 4,
                 "max_memory_usage": 1024,
                 "max_result_rows": 1,
-                "overflow_mode": "break",
+                "result_overflow_mode": "break",
                 "readonly": 1,
             },
         )

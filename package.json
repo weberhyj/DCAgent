@@ -1,0 +1,14 @@
+{
+  "name": "dc-agent-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.16.0",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev:frontend": "pnpm --filter dc-agent-frontend dev",
+    "dev:admin": "pnpm --filter dc-agent-admin-frontend dev",
+    "build": "pnpm --recursive run build",
+    "test": "pnpm --recursive run test:run"
+  }
+}
