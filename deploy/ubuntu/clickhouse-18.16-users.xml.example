@@ -10,7 +10,8 @@
   <profiles>
     <!-- ClickHouse 18.16 applies readonly through profiles, not user elements. -->
     <dc_agent_query>
-      <readonly>1</readonly>
+      <!-- readonly=2 denies writes while allowing bounded per-query settings. -->
+      <readonly>2</readonly>
     </dc_agent_query>
     <dc_agent_ingest>
       <readonly>0</readonly>

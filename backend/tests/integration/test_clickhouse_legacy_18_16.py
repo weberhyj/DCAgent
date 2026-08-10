@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib
 import os
 import re
 import tempfile
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -29,7 +30,7 @@ from app.offline_settings import OfflineSettingsError, read_secret_file, require
 
 _LEGACY_MODE = "legacy_18_16"
 _SAFE_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
-_TARGET_SERVER_VERSION = re.compile(r"^18\.16\.1(?:[.-][0-9A-Za-z][0-9A-Za-z.-]*)?$")
+_TARGET_SERVER_VERSION = re.compile(r"^18\.16\.1$")
 _CREATE_TABLE = re.compile(r"^CREATE TABLE ([a-z0-9_]+)\s*\(")
 _RENAME_TABLE = re.compile(r"^RENAME TABLE ([a-z0-9_]+) TO ([a-z0-9_]+)$")
 
@@ -124,6 +125,9 @@ def _password_from_file(environ: Mapping[str, str], name: str) -> str:
 
 
 def _target_skip_reason(environ: Mapping[str, str]) -> str | None:
+    if environ.get("RUN_CLICKHOUSE_18_16", "").strip() == "1":
+        _validate_target_environment(environ)
+        return None
     try:
         _validate_target_environment(environ)
     except TargetConfigurationError as error:
@@ -134,11 +138,8 @@ def _target_skip_reason(environ: Mapping[str, str]) -> str | None:
 def _require_18_16_1_version(version: str) -> str:
     normalized = version.strip()
     if not _TARGET_SERVER_VERSION.fullmatch(normalized):
-        raise AssertionError("ClickHouse target must be exactly 18.16.1 or its valid build suffix")
+        raise AssertionError("ClickHouse target must be exactly 18.16.1")
     return normalized
-
-
-_TARGET_SKIP_REASON = _target_skip_reason(os.environ)
 
 
 class TestLegacy18EnvironmentValidation:
@@ -228,16 +229,43 @@ class TestLegacy18EnvironmentValidation:
 
 
 class TestLegacy1816AcceptanceGuards:
+    def test_opted_in_invalid_target_fails_collection_guard_instead_of_skipping(self) -> None:
+        with pytest.raises(TargetConfigurationError, match="CLICKHOUSE_COMPATIBILITY_MODE"):
+            _acceptance_collection_guard({"RUN_CLICKHOUSE_18_16": "1"})
+
+    def test_opted_in_missing_dependency_fails_collection_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ingest_password = root / "ingest-password"
+            query_password = root / "query-password"
+            ingest_password.write_text("ingest-secret", encoding="utf-8")
+            query_password.write_text("query-secret", encoding="utf-8")
+            environ = {
+                "RUN_CLICKHOUSE_18_16": "1",
+                "CLICKHOUSE_COMPATIBILITY_MODE": _LEGACY_MODE,
+                "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+                "CLICKHOUSE_INGEST_USER": "ingest-user",
+                "CLICKHOUSE_QUERY_USER": "query-user",
+                "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+                "CLICKHOUSE_QUERY_PASSWORD_FILE": str(query_password),
+            }
+
+            def missing_dependency(name: str) -> object:
+                raise ModuleNotFoundError(name)
+
+            with pytest.raises(TargetConfigurationError, match="pyarrow"):
+                _acceptance_collection_guard(environ, missing_dependency)
+
     @pytest.mark.parametrize(
         "version",
-        ("18.16.1", "18.16.1.42", "18.16.1-stable"),
+        ("18.16.1",),
     )
-    def test_accepts_only_18_16_1_with_an_optional_valid_suffix(self, version: str) -> None:
+    def test_accepts_only_exact_18_16_1(self, version: str) -> None:
         assert _require_18_16_1_version(version) == version
 
     @pytest.mark.parametrize(
         "version",
-        ("18.16.2", "18.16.10", "18.16.1-", "18.16.1+build", "v18.16.1"),
+        ("18.16.2", "18.16.10", "18.16.1.42", "18.16.1-stable", "18.16.1-", "18.16.1+build", "v18.16.1"),
     )
     def test_rejects_non_target_server_versions(self, version: str) -> None:
         with pytest.raises(AssertionError, match="18.16.1"):
@@ -370,13 +398,35 @@ class _RecordingIngestClient:
         return self._client.close()
 
 
-def _require_acceptance_dependencies() -> object:
-    pytest.importorskip(
-        "pyarrow",
-        reason="requires pyarrow; install the locked offline dependency group on the target",
-    )
-    pytest.importorskip("openpyxl", reason="requires openpyxl on the target")
-    return pytest.importorskip("clickhouse_connect", reason="requires clickhouse-connect==1.6.0")
+def _require_acceptance_dependencies(
+    import_module: Callable[[str], object] = importlib.import_module,
+) -> object:
+    for dependency in ("pyarrow", "openpyxl"):
+        try:
+            import_module(dependency)
+        except ModuleNotFoundError as error:
+            raise TargetConfigurationError(
+                f"{dependency} is required when RUN_CLICKHOUSE_18_16=1"
+            ) from error
+    try:
+        return import_module("clickhouse_connect")
+    except ModuleNotFoundError as error:
+        raise TargetConfigurationError(
+            "clickhouse_connect is required when RUN_CLICKHOUSE_18_16=1"
+        ) from error
+
+
+def _acceptance_collection_guard(
+    environ: Mapping[str, str],
+    import_module: Callable[[str], object] = importlib.import_module,
+) -> str | None:
+    reason = _target_skip_reason(environ)
+    if reason is None:
+        _require_acceptance_dependencies(import_module)
+    return reason
+
+
+_TARGET_SKIP_REASON = _acceptance_collection_guard(os.environ)
 
 
 @contextlib.contextmanager
@@ -533,7 +583,10 @@ def _result_rows(result: object) -> list[tuple[object, ...]]:
     return [tuple(row) for row in result.result_rows]
 
 
-@pytest.mark.skipif(_TARGET_SKIP_REASON is not None, reason=_TARGET_SKIP_REASON or "")
+@pytest.mark.skipif(
+    os.environ.get("RUN_CLICKHOUSE_18_16", "").strip() != "1",
+    reason="set RUN_CLICKHOUSE_18_16=1 for an explicit ClickHouse 18.16.1 target",
+)
 class TestClickHouseLegacy1816Acceptance:
     def test_server_is_18_16_and_legacy_preflight_passes(self) -> None:
         with _legacy_gateway() as (gateway, _tracking_ingest):
@@ -565,7 +618,7 @@ class TestClickHouseLegacy1816Acceptance:
             (
                 "中文一",
                 7,
-                "10.000000001",
+                "1",
                 date(2026, 1, 1),
                 datetime(2026, 1, 1, 9, 30, 45, 654321),
                 True,
@@ -573,7 +626,7 @@ class TestClickHouseLegacy1816Acceptance:
             (
                 "中文二",
                 3,
-                "20.123456789",
+                "1.2",
                 date(2026, 1, 2),
                 datetime(2026, 1, 2, 9, 30, 45, 123456),
                 False,
@@ -633,14 +686,16 @@ class TestClickHouseLegacy1816Acceptance:
             assert digest == [(1, result.content_hash)]
             stored = _result_rows(
                 gateway.query(
-                    f"SELECT label, amount, occurred_at FROM {result.physical_table_name} "
+                    f"SELECT label, amount, toString(amount), occurred_at "
+                    f"FROM {result.physical_table_name} "
                     "ORDER BY _row_number"
                 )
             )
             assert stored[0][0] == "中文一"
             assert stored[1][0] == "中文二"
-            assert stored[0][1] == Decimal("10.000000001")
-            assert stored[0][2] == datetime(2026, 1, 1, 9, 30, 45)
+            assert stored[0][1:3] == (Decimal("1.000000000"), "1.000000000")
+            assert stored[1][1:3] == (Decimal("1.200000000"), "1.200000000")
+            assert stored[0][3] == datetime(2026, 1, 1, 9, 30, 45)
 
             catalog, publication = _catalog_for_publication(schema, result)
             planner = StructuredQueryPlanner(catalog, compatibility=profile)
@@ -662,14 +717,55 @@ class TestClickHouseLegacy1816Acceptance:
                 range_result.null_count,
             ) == (1, 1, 0)
 
+            equality_result = executor.execute(
+                planner.plan(
+                    StructuredIntent(
+                        dataset_id,
+                        "count",
+                        None,
+                        (StructuredFilter("label", "eq", "中文二"),),
+                    ),
+                    publication,
+                )
+            )
+            assert equality_result.value == 1
+
+            comparison_cases = (
+                ("gt", "1", 1),
+                ("gte", "1.2", 1),
+                ("lt", "1.2", 1),
+                ("lte", "1", 1),
+            )
+            for operator, threshold, expected_count in comparison_cases:
+                comparison_result = executor.execute(
+                    planner.plan(
+                        StructuredIntent(
+                            dataset_id,
+                            "count",
+                            None,
+                            (StructuredFilter("amount", operator, threshold),),
+                        ),
+                        publication,
+                    )
+                )
+                assert comparison_result.value == expected_count
+
             sum_result = executor.execute(
                 planner.plan(StructuredIntent(dataset_id, "sum", "amount", ()), publication)
             )
             average_result = executor.execute(
                 planner.plan(StructuredIntent(dataset_id, "avg", "amount", ()), publication)
             )
-            assert sum_result.value == Decimal("30.123456790")
-            assert average_result.value == Decimal("15.061728395")
+            minimum_result = executor.execute(
+                planner.plan(StructuredIntent(dataset_id, "min", "amount", ()), publication)
+            )
+            maximum_result = executor.execute(
+                planner.plan(StructuredIntent(dataset_id, "max", "amount", ()), publication)
+            )
+            assert sum_result.value == Decimal("2.200000000")
+            assert average_result.value == Decimal("1.100000000")
+            assert minimum_result.value == Decimal("1.000000000")
+            assert maximum_result.value == Decimal("1.200000000")
             assert (
                 sum_result.total_count,
                 sum_result.valid_count,

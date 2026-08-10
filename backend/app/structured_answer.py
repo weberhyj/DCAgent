@@ -192,7 +192,7 @@ class StructuredAnswerService:
                 mode,
                 "结构化查询服务不可用：数据集没有有效的活动发布版本。",
                 "active publication unavailable",
-        )
+            )
         try:
             plan = StructuredQueryPlanner(catalog, self._compatibility).plan(
                 resolution, publication

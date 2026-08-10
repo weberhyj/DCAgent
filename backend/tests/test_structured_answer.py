@@ -369,6 +369,9 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 if args and args[0] == "SELECT version()":
                     self.statements.append("SELECT version()")
                     return {"value": "18.16.1"}
+                if args and args[0] == "SELECT toString(toDecimal64(1, 9))":
+                    self.statements.append("SELECT toString(toDecimal64(1, 9))")
+                    return {"value": "1.000000000"}
                 return super().query(*args, **kwargs)
 
         def build_client(**_kwargs: object) -> LifecycleClickHouseClient:

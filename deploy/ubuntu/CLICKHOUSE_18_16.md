@@ -14,9 +14,15 @@ with `sudo`; review every target before running it.
 apt-cache policy clickhouse-server
 clickhouse-server --version
 sudo systemctl status clickhouse-server --no-pager
+server_version=$(clickhouse-client --query 'SELECT version()')
+test "$server_version" = "18.16.1" || {
+  printf 'Expected ClickHouse 18.16.1, got %s\n' "$server_version" >&2
+  exit 1
+}
 ```
 
-Continue only when the server reports `18.16.x` (the supported target is 18.16.1).
+Continue only when the server reports exactly `18.16.1`. Patch releases such as
+`18.16.2` and build/patch suffixes are not accepted by this production rollout.
 Record the current service state and make a backup before editing configuration:
 
 ```bash
@@ -30,8 +36,10 @@ file with `sudoedit`, review the example at
 `deploy/ubuntu/clickhouse-18.16-users.xml.example`, and manually merge its two
 profile entries into the existing `<profiles>` element and its two user entries
 into the existing `<users>` element. The profiles carry the legacy `readonly`
-controls: `dc_agent_query` is `readonly=1` and `dc_agent_ingest` is
-`readonly=0`. Keep the operator's existing profiles, quotas, and includes.
+controls: `dc_agent_query` is `readonly=2` and `dc_agent_ingest` is
+`readonly=0`. On ClickHouse 18.16, `readonly=2` still denies data and schema
+writes but allows the gateway to apply its bounded query settings. Keep the
+operator's existing profiles, quotas, and includes.
 Restrict `<networks>` to the actual loopback/private subnet(s); never add a
 public or `0.0.0.0/0` network.
 
@@ -48,7 +56,7 @@ unset password
 ```
 
 Do not commit the digest or plaintext password to this repository. The query
-profile must remain read-only (`readonly=1`); the ingest profile is writable only
+profile must remain read-only (`readonly=2`); the ingest profile is writable only
 within the allow-listed `default` database under the legacy access model.
 
 After saving the manually reviewed XML, validate and restart the service. A

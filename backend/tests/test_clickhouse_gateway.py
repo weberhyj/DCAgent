@@ -103,7 +103,7 @@ def empty_content_observation() -> tuple[str, dict[str, int]]:
 class ClickHouseGatewayTest(unittest.TestCase):
     def test_legacy_gateway_uses_datetime_and_never_emits_forbidden_tokens(self) -> None:
         ingest = RecordingIngestClient()
-        query = RecordingQueryClient([[('18.16.1',)], [(1,)], [('1',)]])
+        query = RecordingQueryClient([[('18.16.1',)], [(1,)], [('1.000000000',)]])
         gateway = ClickHouseGateway(
             ingest,
             query_client=query,
@@ -123,6 +123,8 @@ class ClickHouseGatewayTest(unittest.TestCase):
         ddl = "\n".join(statement for statement, _settings in ingest.ddl)
         self.assertIn("Nullable(DateTime)", ddl)
         self.assertNotIn("DateTime64", ddl)
+        self.assertEqual(query.queries[0][1]["readonly"], 2)
+        self.assertEqual(query.queries[1][1]["readonly"], 2)
         validation = _validation_query(
             ClickHousePublicationTarget(schema, "structured_sales_staging", "structured_sales", "a" * 64),
             "structured_sales",
@@ -141,6 +143,20 @@ class ClickHouseGatewayTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(StructuredStorageError, "18.16"):
             gateway.preflight()
+
+    def test_legacy_preflight_requires_exact_scale_nine_decimal_rendering(self) -> None:
+        query = RecordingQueryClient([[('18.16.1',)], [(1,)], [('1',)]])
+        gateway = ClickHouseGateway(
+            RecordingIngestClient(),
+            query_client=query,
+            compatibility=ClickHouseCompatibilityProfile.for_mode(
+                ClickHouseCompatibilityMode.LEGACY_18_16
+            ),
+        )
+
+        with self.assertRaisesRegex(StructuredStorageError, "Decimal canonical rendering"):
+            gateway.preflight()
+
     def test_gateway_rejects_untrusted_identifiers(self) -> None:
         gateway = ClickHouseGateway(RecordingIngestClient())
 

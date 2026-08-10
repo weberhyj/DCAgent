@@ -104,7 +104,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         profiles = root.find("profiles")
         self.assertIsNotNone(profiles)
         assert profiles is not None
-        self.assertEqual(profiles.findtext("dc_agent_query/readonly"), "1")
+        self.assertEqual(profiles.findtext("dc_agent_query/readonly"), "2")
         self.assertEqual(profiles.findtext("dc_agent_ingest/readonly"), "0")
         for username in ("dc_agent_query", "dc_agent_ingest"):
             with self.subTest(username=username):
@@ -120,6 +120,8 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertNotIn("0.0.0.0/0", xml)
         self.assertNotRegex(xml, r"(?i)\b(?:CREATE|ALTER|GRANT|REVOKE)\s+(?:USER|ROLE|TABLE|SELECT|INSERT)")
         self.assertRegex(xml, r'<password_sha256_hex>[A-Z0-9_{}-]+</password_sha256_hex>')
+        self.assertIn('test "$server_version" = "18.16.1"', guide)
+        self.assertNotIn("Continue only when the server reports `18.16.x`", guide)
         self.assertIn("CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16", guide)
         self.assertRegex(guide, r"(?is)api.*?CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16")
         self.assertRegex(guide, r"(?is)worker.*?CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16")

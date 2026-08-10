@@ -81,7 +81,16 @@ class ClickHouseGateway:
             "max_result_rows": max_result_rows,
             "result_overflow_mode": "break",
         }
-        self._query_settings = {**self._compatibility.query_settings(), **self._settings, "readonly": 1}
+        query_readonly = (
+            2
+            if self._compatibility.mode is ClickHouseCompatibilityMode.LEGACY_18_16
+            else 1
+        )
+        self._query_settings = {
+            **self._compatibility.query_settings(),
+            **self._settings,
+            "readonly": query_readonly,
+        }
 
     def preflight(self) -> str:
         """Verify server capabilities before any worker can claim a job."""
@@ -102,7 +111,14 @@ class ClickHouseGateway:
             expression = self._compatibility.canonical_value_expression(
                 "toDecimal64(1, 9)", StructuredColumnType.DECIMAL
             )
-            self._query(f"SELECT {expression}")
+            decimal_result = self._query(f"SELECT {expression}")
+            if (
+                self._compatibility.mode is ClickHouseCompatibilityMode.LEGACY_18_16
+                and _first_scalar(decimal_result) != "1.000000000"
+            ):
+                raise StructuredStorageError(
+                    "ClickHouse Decimal canonical rendering preflight failed"
+                )
         except StructuredStorageError:
             raise
         except Exception as error:

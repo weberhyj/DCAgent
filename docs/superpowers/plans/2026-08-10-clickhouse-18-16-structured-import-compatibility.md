@@ -190,7 +190,7 @@ existing safe identifier checks and staging logic unchanged. `preflight()` must:
 6. raise `StructuredStorageError` with a sanitized capability name on failure.
 
 Use the profile's `command_settings()` for command/insert calls and `query_settings()` plus
-`readonly=1` for read-only validation and query calls. Update `_validation_query` to receive the
+`readonly=2` for legacy read-only validation/query calls (`readonly=1` remains modern). Update `_validation_query` to receive the
 profile so its digest expression matches the ingest profile.
 
 - [ ] **Step 4: Run gateway tests and inspect generated SQL.**
@@ -410,7 +410,7 @@ omitted.
 
 - [ ] **Step 5: Add the legacy users XML example.**
 
-Provide two users under `<users>`: query with `readonly=1` and database allow-list for `default`,
+Provide two users under `<users>`: query with `readonly=2` and database allow-list for `default`,
 and ingest with `readonly=0` and the same database allow-list. Include profile/quota defaults and a
 clearly marked hash replacement instruction; do not include plaintext secrets or SQL RBAC commands.
 
