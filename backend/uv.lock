@@ -556,6 +556,7 @@ benchmark = [
 ]
 dev = [
     { name = "fastapi-cli" },
+    { name = "pytest" },
 ]
 offline = [
     { name = "docling" },
@@ -623,7 +624,10 @@ benchmark = [
     { name = "torch", specifier = ">=2.7" },
     { name = "transformers", specifier = ">=4.53" },
 ]
-dev = [{ name = "fastapi-cli", specifier = ">=0.0.32" }]
+dev = [
+    { name = "fastapi-cli", specifier = ">=0.0.32" },
+    { name = "pytest", specifier = ">=9.1,<10" },
+]
 offline = [
     { name = "docling", specifier = ">=2.40" },
     { name = "fastembed", specifier = ">=0.7" },

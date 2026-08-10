@@ -48,6 +48,7 @@ offline = [
 benchmark = [{ include-group = "offline" }, "locust>=2.37"]
 dev = [
     "fastapi-cli>=0.0.32",
+    "pytest>=9.1,<10",
 ]
 
 [tool.uv]

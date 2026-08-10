@@ -29,7 +29,8 @@ from app.offline_settings import OfflineSettingsError, read_secret_file, require
 
 _LEGACY_MODE = "legacy_18_16"
 _SAFE_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
-_CREATE_TABLE = re.compile(r"^CREATE TABLE ([a-z0-9_]+) ")
+_TARGET_SERVER_VERSION = re.compile(r"^18\.16\.1(?:[.-][0-9A-Za-z][0-9A-Za-z.-]*)?$")
+_CREATE_TABLE = re.compile(r"^CREATE TABLE ([a-z0-9_]+)\s*\(")
 _RENAME_TABLE = re.compile(r"^RENAME TABLE ([a-z0-9_]+) TO ([a-z0-9_]+)$")
 
 
@@ -130,6 +131,13 @@ def _target_skip_reason(environ: Mapping[str, str]) -> str | None:
     return None
 
 
+def _require_18_16_1_version(version: str) -> str:
+    normalized = version.strip()
+    if not _TARGET_SERVER_VERSION.fullmatch(normalized):
+        raise AssertionError("ClickHouse target must be exactly 18.16.1 or its valid build suffix")
+    return normalized
+
+
 _TARGET_SKIP_REASON = _target_skip_reason(os.environ)
 
 
@@ -219,6 +227,119 @@ class TestLegacy18EnvironmentValidation:
         assert "query-secret" not in repr(target)
 
 
+class TestLegacy1816AcceptanceGuards:
+    @pytest.mark.parametrize(
+        "version",
+        ("18.16.1", "18.16.1.42", "18.16.1-stable"),
+    )
+    def test_accepts_only_18_16_1_with_an_optional_valid_suffix(self, version: str) -> None:
+        assert _require_18_16_1_version(version) == version
+
+    @pytest.mark.parametrize(
+        "version",
+        ("18.16.2", "18.16.10", "18.16.1-", "18.16.1+build", "v18.16.1"),
+    )
+    def test_rejects_non_target_server_versions(self, version: str) -> None:
+        with pytest.raises(AssertionError, match="18.16.1"):
+            _require_18_16_1_version(version)
+
+    def test_tracks_generated_staging_table_from_production_gateway_ddl(self) -> None:
+        from app.clickhouse_compatibility import (
+            ClickHouseCompatibilityMode,
+            ClickHouseCompatibilityProfile,
+        )
+        from app.clickhouse_gateway import ClickHouseGateway
+
+        client = _DdlClient()
+        tracking = _RecordingIngestClient(client)
+        gateway = ClickHouseGateway(
+            tracking,
+            compatibility=ClickHouseCompatibilityProfile.for_mode(
+                ClickHouseCompatibilityMode.LEGACY_18_16
+            ),
+        )
+        schema = _legacy_schema(
+            "it18_16_tracking_gateway",
+            (("amount", "decimal", True),),
+        )
+
+        target = gateway.prepare_publication(schema, "tracking-publication", "a" * 64)
+
+        assert target.staging_table in tracking.created_tables
+        assert any(
+            statement.startswith(f"CREATE TABLE {target.staging_table} (")
+            for statement in client.commands
+        )
+
+    def test_retains_create_candidate_when_server_executes_then_raises(self) -> None:
+        from app.clickhouse_compatibility import (
+            ClickHouseCompatibilityMode,
+            ClickHouseCompatibilityProfile,
+        )
+        from app.clickhouse_gateway import ClickHouseGateway
+
+        client = _DdlClient(raise_after_create=True)
+        tracking = _RecordingIngestClient(client)
+        gateway = ClickHouseGateway(
+            tracking,
+            compatibility=ClickHouseCompatibilityProfile.for_mode(
+                ClickHouseCompatibilityMode.LEGACY_18_16
+            ),
+        )
+        schema = _legacy_schema(
+            "it18_16_tracking_failure",
+            (("amount", "decimal", True),),
+        )
+
+        with pytest.raises(ConnectionError, match="after execution"):
+            gateway.prepare_publication(schema, "tracking-publication", "b" * 64)
+
+        created_statement = next(
+            statement for statement in client.commands if statement.startswith("CREATE TABLE ")
+        )
+        created_table = created_statement.split()[2]
+        assert tracking.created_tables == {created_table}
+        assert _cleanup_target_clients(tracking, None) is None
+        assert f"DROP TABLE IF EXISTS {created_table}" in client.commands
+
+    def test_retains_rename_source_and_target_when_server_executes_then_raises(self) -> None:
+        source = "structured_it18_16_rename_source"
+        target = "structured_it18_16_rename_target"
+        client = _DdlClient(raise_after_rename=True)
+        tracking = _RecordingIngestClient(client)
+        tracking.created_tables.add(source)
+
+        with pytest.raises(ConnectionError, match="after execution"):
+            tracking.command(f"RENAME TABLE {source} TO {target}")
+
+        assert tracking.created_tables == {source, target}
+        assert _cleanup_target_clients(tracking, None) is None
+        assert f"DROP TABLE IF EXISTS {source}" in client.commands
+        assert f"DROP TABLE IF EXISTS {target}" in client.commands
+
+
+class _DdlClient:
+    def __init__(
+        self,
+        *,
+        raise_after_create: bool = False,
+        raise_after_rename: bool = False,
+    ) -> None:
+        self.commands: list[str] = []
+        self.raise_after_create = raise_after_create
+        self.raise_after_rename = raise_after_rename
+
+    def command(self, statement: str, **_kwargs: object) -> None:
+        self.commands.append(statement)
+        if statement.startswith("CREATE TABLE ") and self.raise_after_create:
+            raise ConnectionError("server executed CREATE before connection failed")
+        if statement.startswith("RENAME TABLE ") and self.raise_after_rename:
+            raise ConnectionError("server executed RENAME before connection failed")
+
+    def close(self) -> None:
+        return None
+
+
 class _RecordingIngestClient:
     """Delegate every production client operation while tracking only tables this test creates."""
 
@@ -228,13 +349,18 @@ class _RecordingIngestClient:
         self.created_tables: set[str] = set()
 
     def command(self, statement: str, **kwargs: object) -> object:
-        result = self._client.command(statement, **kwargs)
-        if match := _CREATE_TABLE.fullmatch(statement):
-            self.created_tables.add(match.group(1))
+        self._reserve_owned_ddl_candidates(statement)
+        return self._client.command(statement, **kwargs)
+
+    def _reserve_owned_ddl_candidates(self, statement: str) -> None:
+        if match := _CREATE_TABLE.match(statement):
+            table_name = match.group(1)
+            if _is_owned_test_table(table_name):
+                self.created_tables.add(table_name)
         elif match := _RENAME_TABLE.fullmatch(statement):
-            self.created_tables.discard(match.group(1))
-            self.created_tables.add(match.group(2))
-        return result
+            source, target = match.groups()
+            if source in self.created_tables and _is_owned_test_table(target):
+                self.created_tables.update((source, target))
 
     def insert_arrow(self, table: str, batch: object, **kwargs: object) -> object:
         self.batch_sizes.append(int(getattr(batch, "num_rows")))
@@ -309,10 +435,7 @@ def _cleanup_target_clients(
     """Drop only exact generated names observed after this test successfully created them."""
     failures: list[BaseException] = []
     for table_name in sorted(ingest.created_tables):
-        if not (
-            _SAFE_IDENTIFIER.fullmatch(table_name)
-            and table_name.startswith("structured_it18_16_")
-        ):
+        if not _is_owned_test_table(table_name):
             failures.append(RuntimeError("refusing to clean an unowned ClickHouse test table"))
             continue
         try:
@@ -327,6 +450,12 @@ def _cleanup_target_clients(
         except BaseException as error:
             failures.append(error)
     return failures[0] if failures else None
+
+
+def _is_owned_test_table(table_name: str) -> bool:
+    return bool(
+        _SAFE_IDENTIFIER.fullmatch(table_name) and table_name.startswith("structured_it18_16_")
+    )
 
 
 def _legacy_schema(dataset_id: str, columns: tuple[tuple[str, str, bool], ...]) -> object:
@@ -408,7 +537,7 @@ def _result_rows(result: object) -> list[tuple[object, ...]]:
 class TestClickHouseLegacy1816Acceptance:
     def test_server_is_18_16_and_legacy_preflight_passes(self) -> None:
         with _legacy_gateway() as (gateway, _tracking_ingest):
-            assert gateway.preflight().startswith("18.16.")
+            assert _require_18_16_1_version(gateway.preflight())
 
     def test_publishes_supported_types_and_queries_datetime_and_decimals(self) -> None:
         _require_acceptance_dependencies()
@@ -461,7 +590,7 @@ class TestClickHouseLegacy1816Acceptance:
                 tuple(column[0] for column in schema.columns),
                 iter(rows),
             )
-            assert gateway.preflight().startswith("18.16.")
+            assert _require_18_16_1_version(gateway.preflight())
             result = SpreadsheetPublisher(
                 sink=ArrowParquetSink(root / "parquet"),
                 clickhouse=gateway,
@@ -579,7 +708,7 @@ class TestClickHouseLegacy1816Acceptance:
                 tuple(column[0] for column in schema.columns),
                 generated_rows(),
             )
-            assert gateway.preflight().startswith("18.16.")
+            assert _require_18_16_1_version(gateway.preflight())
             result = SpreadsheetPublisher(
                 sink=ArrowParquetSink(root / "parquet"),
                 clickhouse=gateway,
