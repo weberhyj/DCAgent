@@ -7,6 +7,16 @@
   example is documentation and is never installed automatically.
 -->
 <clickhouse>
+  <profiles>
+    <!-- ClickHouse 18.16 applies readonly through profiles, not user elements. -->
+    <dc_agent_query>
+      <readonly>1</readonly>
+    </dc_agent_query>
+    <dc_agent_ingest>
+      <readonly>0</readonly>
+    </dc_agent_ingest>
+  </profiles>
+
   <users>
     <dc_agent_query>
       <password_sha256_hex>REPLACE_WITH_SHA256_HEX_QUERY_PASSWORD</password_sha256_hex>
@@ -18,9 +28,8 @@
         <ip>172.16.0.0/12</ip>
         <ip>192.168.0.0/16</ip>
       </networks>
-      <profile>default</profile>
+      <profile>dc_agent_query</profile>
       <quota>default</quota>
-      <readonly>1</readonly>
       <allow_databases>
         <database>default</database>
       </allow_databases>
@@ -36,9 +45,8 @@
         <ip>172.16.0.0/12</ip>
         <ip>192.168.0.0/16</ip>
       </networks>
-      <profile>default</profile>
+      <profile>dc_agent_ingest</profile>
       <quota>default</quota>
-      <readonly>0</readonly>
       <allow_databases>
         <database>default</database>
       </allow_databases>

@@ -27,10 +27,13 @@ sudo cp --preserve=mode,ownership,timestamps \
 
 The repository does not overwrite `/etc/clickhouse-server/users.xml`. Open that
 file with `sudoedit`, review the example at
-`deploy/ubuntu/clickhouse-18.16-users.xml.example`, and manually merge only the
-two user entries inside its existing `<users>` element. Keep the operator's
-existing profiles, quotas, and includes. Restrict `<networks>` to the actual
-loopback/private subnet(s); never add a public or `0.0.0.0/0` network.
+`deploy/ubuntu/clickhouse-18.16-users.xml.example`, and manually merge its two
+profile entries into the existing `<profiles>` element and its two user entries
+into the existing `<users>` element. The profiles carry the legacy `readonly`
+controls: `dc_agent_query` is `readonly=1` and `dc_agent_ingest` is
+`readonly=0`. Keep the operator's existing profiles, quotas, and includes.
+Restrict `<networks>` to the actual loopback/private subnet(s); never add a
+public or `0.0.0.0/0` network.
 
 ## Generate password hashes
 
@@ -44,9 +47,9 @@ printf %s "$password" | sha256sum
 unset password
 ```
 
-Do not commit the digest or plaintext password to this repository. The query user
-must remain read-only (`readonly=1`); the ingest user is writable only within the
-allow-listed `default` database under the legacy access model.
+Do not commit the digest or plaintext password to this repository. The query
+profile must remain read-only (`readonly=1`); the ingest profile is writable only
+within the allow-listed `default` database under the legacy access model.
 
 After saving the manually reviewed XML, validate and restart the service. A
 restart is privileged and interrupts active ClickHouse work, so schedule it:
@@ -72,22 +75,71 @@ clickhouse-client --host 127.0.0.1 --user dc_agent_ingest --password \
   --query 'SELECT 1'
 ```
 
-For an operator-reviewed write probe, create a temporary table in `default`,
-insert one row, select it with the query account, and drop the table afterwards.
-Treat the create/drop commands as destructive and run them only in the approved
-database. The ingest account must not be able to read or write other databases.
+### Expected-failure permission probes
+
+Run these only after the connection probes pass. The setup and cleanup commands
+use the reviewed operator account and are destructive: they create and drop the
+isolated `operator_probe` database. Do not substitute an application database.
+
+```bash
+clickhouse-client --host 127.0.0.1 --user default --password --multiquery <<'SQL'
+CREATE DATABASE operator_probe;
+CREATE TABLE operator_probe.secret_probe (value UInt8) ENGINE = Memory;
+INSERT INTO operator_probe.secret_probe VALUES (1);
+SQL
+```
+
+#### Query-account write denial probe
+
+This command must fail with a permission error; a successful write is a rollout
+blocker. It must not leave a table behind because the query profile is readonly.
+
+```bash
+if clickhouse-client --host 127.0.0.1 --user dc_agent_query --password \
+  --query 'CREATE TABLE default.dc_agent_query_write_denied (value UInt8) ENGINE = Memory'; then
+  echo 'unexpected query-account write success' >&2
+  exit 1
+fi
+```
+
+Both application accounts must also fail with a permission error when they try
+to access the unrelated probe table:
+
+```bash
+for user in dc_agent_query dc_agent_ingest; do
+  if clickhouse-client --host 127.0.0.1 --user "$user" --password \
+    --query 'SELECT * FROM operator_probe.secret_probe'; then
+    echo "unexpected cross-database access for $user" >&2
+    exit 1
+  fi
+done
+```
+
+After both denials are observed, remove the operator-created probe database:
+
+```bash
+clickhouse-client --host 127.0.0.1 --user default --password \
+  --query 'DROP DATABASE operator_probe'
+```
 
 ## API and worker environment
 
-Set the following in both the API and structured-worker Supervisor environment
-files. Keep the existing role-specific password-file paths protected and outside
-the repository:
+Keep role-specific password-file paths protected and outside the repository.
+
+### API Supervisor environment
 
 ```dotenv
 CLICKHOUSE_URL=http://127.0.0.1:8123
 CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16
 CLICKHOUSE_QUERY_USER=dc_agent_query
 CLICKHOUSE_QUERY_PASSWORD_FILE=/etc/dc-agent/secrets/clickhouse-query-password
+```
+
+### Worker Supervisor environment
+
+```dotenv
+CLICKHOUSE_URL=http://127.0.0.1:8123
+CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16
 CLICKHOUSE_INGEST_USER=dc_agent_ingest
 CLICKHOUSE_INGEST_PASSWORD_FILE=/etc/dc-agent/secrets/clickhouse-ingest-password
 ```

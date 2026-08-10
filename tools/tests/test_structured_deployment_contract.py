@@ -101,24 +101,34 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertIsNotNone(users)
         assert users is not None
         self.assertIn("<users>", xml)
+        profiles = root.find("profiles")
+        self.assertIsNotNone(profiles)
+        assert profiles is not None
+        self.assertEqual(profiles.findtext("dc_agent_query/readonly"), "1")
+        self.assertEqual(profiles.findtext("dc_agent_ingest/readonly"), "0")
         for username in ("dc_agent_query", "dc_agent_ingest"):
             with self.subTest(username=username):
                 self.assertRegex(xml, rf"(?ms)<{username}>.*?</{username}>")
                 user = users.find(username)
                 self.assertIsNotNone(user)
                 assert user is not None
-                self.assertEqual(user.findtext("profile"), "default")
+                self.assertEqual(user.findtext("profile"), username)
                 self.assertEqual(user.findtext("quota"), "default")
                 self.assertEqual(user.findtext("allow_databases/database"), "default")
                 self.assertTrue(user.findtext("password_sha256_hex", "").startswith("REPLACE_"))
-        self.assertEqual(users.findtext("dc_agent_query/readonly"), "1")
-        self.assertEqual(users.findtext("dc_agent_ingest/readonly"), "0")
+                self.assertIsNone(user.find("readonly"))
         self.assertNotIn("0.0.0.0/0", xml)
         self.assertNotRegex(xml, r"(?i)\b(?:CREATE|ALTER|GRANT|REVOKE)\s+(?:USER|ROLE|TABLE|SELECT|INSERT)")
         self.assertRegex(xml, r'<password_sha256_hex>[A-Z0-9_{}-]+</password_sha256_hex>')
         self.assertIn("CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16", guide)
         self.assertRegex(guide, r"(?is)api.*?CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16")
         self.assertRegex(guide, r"(?is)worker.*?CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16")
+        self.assertIn("API Supervisor environment", guide)
+        self.assertIn("Worker Supervisor environment", guide)
+        self.assertIn("Query-account write denial probe", guide)
+        self.assertIn("CREATE DATABASE operator_probe", guide)
+        self.assertIn("CREATE TABLE operator_probe.secret_probe", guide)
+        self.assertIn("must fail with a permission error", guide)
 
     def test_env_examples_define_structured_rollout_contract(self) -> None:
         for path in ENV_EXAMPLES:
