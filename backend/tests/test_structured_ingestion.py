@@ -3,15 +3,19 @@ from __future__ import annotations
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from threading import Event, Thread
+
+import pyarrow as pa
 
 from app.structured_ingestion import (
     ArrowParquetSink,
     SpreadsheetPublisher,
     StructuredIngestionError,
 )
+from app.clickhouse_compatibility import ClickHouseCompatibilityMode, ClickHouseCompatibilityProfile
 from app.structured_models import StructuredColumnType, StructuredPublicationResult
 from tests.support.structured_fakes import (
     RecordingParquetSink,
@@ -128,6 +132,56 @@ class StructuredIngestionTest(unittest.TestCase):
         )
         self.assertEqual(gateway.validations[0]["row_count"], 5)
         self.assertEqual(gateway.validations[0]["content_hash"], result.content_hash)
+
+    def test_legacy_datetime_uses_second_precision_and_drops_microseconds(self) -> None:
+        confirmed = sample_confirmed_schema(self.temp_dir, row_count=1)
+        datetime_column = replace(
+            confirmed.schema.columns[2], data_type=StructuredColumnType.DATETIME
+        )
+        schema = replace(
+            confirmed.schema,
+            worksheet_name="legacy-datetime",
+            columns=(*confirmed.schema.columns[:2], datetime_column),
+        )
+        path = write_csv(
+            self.temp_dir / "legacy-datetime.csv",
+            [[column.original_name for column in schema.columns], ["10", "east", "2026-01-01T10:11:12.987654"]],
+        )
+        sink = RecordingParquetSink(self.temp_dir / "parquet-legacy-datetime")
+
+        SpreadsheetPublisher(
+            sink=sink,
+            clickhouse=RecordingPublicationGateway(),
+            compatibility=ClickHouseCompatibilityProfile.for_mode(
+                ClickHouseCompatibilityMode.LEGACY_18_16
+            ),
+        ).publish(path, schema, "pub-legacy-datetime")
+
+        batch = sink.batches[0]
+        self.assertEqual(batch.schema.field("order_date").type, pa.timestamp("s"))
+        self.assertEqual(batch.to_pylist()[0]["order_date"], datetime(2026, 1, 1, 10, 11, 12))
+        self.assertEqual(batch.to_pylist()[0]["order_date"].microsecond, 0)
+
+    def test_each_insert_batch_reports_cumulative_checkpoint_rows(self) -> None:
+        confirmed = sample_confirmed_schema(self.temp_dir, row_count=5)
+        checkpoints: list[int | None] = []
+
+        def lease_guard(*, checkpoint_row: int | None = None) -> None:
+            checkpoints.append(checkpoint_row)
+
+        SpreadsheetPublisher(
+            sink=RecordingParquetSink(self.temp_dir / "parquet-checkpoints"),
+            clickhouse=RecordingPublicationGateway(),
+            batch_rows=2,
+        ).publish(
+            confirmed.path,
+            confirmed.schema,
+            "pub-checkpoints",
+            lease_guard=lease_guard,
+        )
+
+        self.assertEqual([row for row in checkpoints if row is not None], [2, 4, 5])
+        self.assertEqual(max(row for row in checkpoints if row is not None), 5)
 
     def test_ingestion_flushes_variable_width_rows_at_the_byte_limit(self) -> None:
         confirmed = sample_confirmed_schema(self.temp_dir, row_count=1)
@@ -523,7 +577,7 @@ class StructuredIngestionTest(unittest.TestCase):
         lease_lost = Event()
         old_errors: list[Exception] = []
 
-        def old_lease_guard() -> None:
+        def old_lease_guard(*, checkpoint_row: int | None = None) -> None:
             if lease_lost.is_set():
                 raise RuntimeError("old lease lost")
 

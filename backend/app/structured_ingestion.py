@@ -16,6 +16,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from openpyxl import load_workbook
 
+from .clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
 from .clickhouse_gateway import _content_hash_from_observation, _row_digest_lanes
 from .spreadsheet_schema import (
     ENCODING_PROBE_BYTES,
@@ -89,6 +93,7 @@ class SpreadsheetPublisher:
         *,
         sink: ParquetBatchSink | None = None,
         clickhouse: Any,
+        compatibility: ClickHouseCompatibilityProfile | None = None,
         parquet_root: Path | None = None,
         batch_rows: int = 50_000,
         batch_bytes: int = MAX_BATCH_BYTES,
@@ -99,6 +104,10 @@ class SpreadsheetPublisher:
             raise ValueError(f"batch_bytes must be between 1 and {MAX_BATCH_BYTES}")
         self.sink = sink or ArrowParquetSink(parquet_root or Path("./data/parquet"))
         self.clickhouse = clickhouse
+        self.compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.MODERN
+        )
+        self._compatibility = self.compatibility
         self.batch_rows = batch_rows
         self.batch_bytes = batch_bytes
 
@@ -108,7 +117,7 @@ class SpreadsheetPublisher:
         schema: StructuredDatasetSchema,
         publication_id: str,
         *,
-        lease_guard: Callable[[], None] | None = None,
+        lease_guard: Callable[..., None] | None = None,
         staging_token: str | None = None,
         staging_generation: int | None = None,
     ) -> StructuredPublicationResult:
@@ -147,7 +156,7 @@ class SpreadsheetPublisher:
         content_sums = [0, 0, 0, 0]
         content_xors = [0, 0, 0, 0]
         row_count = 0
-        column_schema = _arrow_schema(schema.columns)
+        column_schema = _arrow_schema(schema.columns, self.compatibility)
 
         try:
             for row_number, values, formulas in _iter_source_rows(Path(path), schema):
@@ -163,6 +172,7 @@ class SpreadsheetPublisher:
                         formula,
                         column,
                         row_number=row_number,
+                        compatibility=self.compatibility,
                     )
                     row[column.physical_name] = converted
                     if converted is None:
@@ -245,6 +255,7 @@ class SpreadsheetPublisher:
                     staging_generation=staging_generation,
                     staging_token=staging_token,
                 )
+            inserted_rows = 0
             for batch in self.sink.iter_batches(output_paths):
                 _check_lease(lease_guard)
                 batches = list(batch.columns)
@@ -256,6 +267,8 @@ class SpreadsheetPublisher:
                     target,
                     pa.RecordBatch.from_arrays(batches, schema=batch_schema),
                 )
+                inserted_rows += batch.num_rows
+                _check_lease(lease_guard, checkpoint_row=inserted_rows)
 
             numeric_range_values = {
                 name: (bounds[0], bounds[1]) for name, bounds in numeric_ranges.items()
@@ -299,9 +312,15 @@ class SpreadsheetPublisher:
         return output_path
 
 
-def _check_lease(lease_guard: Callable[[], None] | None) -> None:
+def _check_lease(
+    lease_guard: Callable[..., None] | None,
+    checkpoint_row: int | None = None,
+) -> None:
     if lease_guard is not None:
-        lease_guard()
+        if checkpoint_row is None:
+            lease_guard()
+        else:
+            lease_guard(checkpoint_row=checkpoint_row)
 
 
 def _iter_source_rows(
@@ -465,6 +484,7 @@ def _convert_value(
     column: StructuredColumnSchema,
     *,
     row_number: int,
+    compatibility: ClickHouseCompatibilityProfile | None = None,
 ) -> Any:
     if isinstance(formula, str) and formula.startswith("=") and value is None:
         if column.allow_aggregate:
@@ -514,7 +534,10 @@ def _convert_value(
                 parsed_datetime = datetime.fromisoformat(str(value).strip())
             if parsed_datetime.tzinfo is not None and parsed_datetime.utcoffset() is not None:
                 raise ValueError("timezone-aware datetimes are not supported")
-            return parsed_datetime
+            profile = compatibility or ClickHouseCompatibilityProfile.for_mode(
+                ClickHouseCompatibilityMode.MODERN
+            )
+            return profile.normalize_datetime(parsed_datetime)
         if column.data_type is StructuredColumnType.BOOLEAN:
             if isinstance(value, bool):
                 return value
@@ -553,8 +576,14 @@ def _decimal_38_9(value: Any) -> Decimal:
     return quantized
 
 
-def _arrow_schema(columns: Sequence[StructuredColumnSchema]) -> pa.Schema:
-    fields = [pa.field(column.physical_name, _arrow_type(column.data_type)) for column in columns]
+def _arrow_schema(
+    columns: Sequence[StructuredColumnSchema],
+    compatibility: ClickHouseCompatibilityProfile | None = None,
+) -> pa.Schema:
+    fields = [
+        pa.field(column.physical_name, _arrow_type(column.data_type, compatibility))
+        for column in columns
+    ]
     fields.extend(
         [
             pa.field("_source_id", pa.string(), nullable=False),
@@ -567,13 +596,23 @@ def _arrow_schema(columns: Sequence[StructuredColumnSchema]) -> pa.Schema:
     return pa.schema(fields)
 
 
-def _arrow_type(column_type: StructuredColumnType) -> pa.DataType:
+def _arrow_type(
+    column_type: StructuredColumnType,
+    compatibility: ClickHouseCompatibilityProfile | None = None,
+) -> pa.DataType:
+    profile = compatibility or ClickHouseCompatibilityProfile.for_mode(
+        ClickHouseCompatibilityMode.MODERN
+    )
     return {
         StructuredColumnType.STRING: pa.string(),
         StructuredColumnType.INTEGER: pa.int64(),
         StructuredColumnType.DECIMAL: pa.decimal128(38, 9),
         StructuredColumnType.DATE: pa.date32(),
-        StructuredColumnType.DATETIME: pa.timestamp("ms"),
+        StructuredColumnType.DATETIME: pa.timestamp(
+            "s"
+            if profile.mode is ClickHouseCompatibilityMode.LEGACY_18_16
+            else "ms"
+        ),
         StructuredColumnType.BOOLEAN: pa.bool_(),
     }[column_type]
 

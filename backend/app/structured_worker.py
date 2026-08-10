@@ -11,6 +11,7 @@ from threading import Event, Lock, Thread, current_thread, main_thread
 from time import monotonic, sleep
 from typing import Any, Protocol
 
+from .clickhouse_compatibility import ClickHouseCompatibilityProfile
 from .clickhouse_gateway import ClickHouseGateway
 from .database import Database
 from .offline_settings import OfflineSettings, require_secret_file
@@ -31,7 +32,7 @@ class StructuredPublisher(Protocol):
         schema: object,
         publication_id: str,
         *,
-        lease_guard: Callable[[], None] | None = None,
+        lease_guard: Callable[..., None] | None = None,
         staging_token: str | None = None,
         staging_generation: int | None = None,
     ) -> StructuredPublicationResult: ...
@@ -113,7 +114,7 @@ class StructuredIngestionWorker:
                 raise StructuredLeaseError("Structured publication lease was lost")
             with renew_lock:
                 current = monotonic()
-                if not force and current < next_renewal_at[0]:
+                if checkpoint_row is None and not force and current < next_renewal_at[0]:
                     return
                 try:
                     self._repository.renew_publication_lease(
@@ -304,11 +305,18 @@ def build_structured_worker(
             autogenerate_session_id=False,
         )
         clients = (ingest_client, query_client)
+        compatibility = ClickHouseCompatibilityProfile.for_mode(
+            settings.clickhouse_compatibility_mode
+        )
+        gateway = ClickHouseGateway(
+            ingest_client,
+            query_client=query_client,
+            compatibility=compatibility,
+        )
+        gateway.preflight()
         publisher = SpreadsheetPublisher(
-            clickhouse=ClickHouseGateway(
-                ingest_client,
-                query_client=query_client,
-            ),
+            clickhouse=gateway,
+            compatibility=compatibility,
             parquet_root=settings.parquet_root,
             batch_rows=settings.structured_ingest_batch_rows,
         )
