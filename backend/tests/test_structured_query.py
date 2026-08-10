@@ -5,6 +5,10 @@ from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 
+from app.clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
 from app.structured_models import (
     StructuredClarification,
     StructuredColumnType,
@@ -1044,6 +1048,46 @@ class StructuredIntentParserTest(unittest.TestCase):
 
 
 class StructuredQueryPlannerTest(unittest.TestCase):
+    def test_legacy_datetime_equality_uses_datetime_placeholder_and_truncates_microseconds(
+        self,
+    ) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        profile = ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.LEGACY_18_16
+        )
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        datetime_column = replace(
+            dataset.schema.columns[2], data_type=StructuredColumnType.DATETIME
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(*dataset.schema.columns[:2], datetime_column),
+                    ),
+                ),
+            ),
+        )
+
+        plan = StructuredQueryPlanner(catalog, compatibility=profile).plan(
+            StructuredIntent(
+                "ds-sales",
+                "sum",
+                "order_amount",
+                (StructuredFilter("order_date", "eq", "2026-01-01T12:30:45.987654"),),
+            ),
+            sample_publication(),
+        )
+
+        self.assertNotIn("DateTime64(3)", plan.sql)
+        self.assertIn("{filter_0:DateTime}", plan.sql)
+        self.assertEqual(plan.parameters["filter_0"], datetime(2026, 1, 1, 12, 30, 45))
+
     def test_plan_is_select_only_and_aggregate_whitelisted(self) -> None:
         import sqlglot
         from sqlglot import exp
@@ -1107,7 +1151,10 @@ class StructuredQueryPlannerTest(unittest.TestCase):
                 ),
             ),
         )
-        plan = StructuredQueryPlanner(catalog).plan(
+        modern_profile = ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.MODERN
+        )
+        plan = StructuredQueryPlanner(catalog, compatibility=modern_profile).plan(
             StructuredIntent(
                 "ds-sales",
                 "sum",
@@ -1126,6 +1173,64 @@ class StructuredQueryPlannerTest(unittest.TestCase):
 
         self.assertIn("order_date < {filter_0_upper:DateTime64(3)}", plan.sql)
         self.assertEqual(plan.parameters["filter_0_upper"], datetime(2026, 2, 1))
+
+    def test_legacy_datetime_date_range_expands_upper_bound_with_datetime_placeholder(
+        self,
+    ) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        profile = ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.LEGACY_18_16
+        )
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        datetime_column = replace(
+            dataset.schema.columns[2], data_type=StructuredColumnType.DATETIME
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(*dataset.schema.columns[:2], datetime_column),
+                    ),
+                ),
+            ),
+        )
+
+        plan = StructuredQueryPlanner(catalog, compatibility=profile).plan(
+            StructuredIntent(
+                "ds-sales",
+                "sum",
+                "order_amount",
+                (StructuredFilter("order_date", "between", "2026-01-01", "2026-01-31"),),
+            ),
+            sample_publication(),
+        )
+
+        self.assertIn("order_date < {filter_0_upper:DateTime}", plan.sql)
+        self.assertEqual(plan.parameters["filter_0_upper"], datetime(2026, 2, 1))
+
+    def test_legacy_decimal_filter_preserves_decimal_parameter(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        profile = ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.LEGACY_18_16
+        )
+        plan = StructuredQueryPlanner(sample_catalog(), compatibility=profile).plan(
+            StructuredIntent(
+                "ds-sales",
+                "sum",
+                "order_amount",
+                (StructuredFilter("order_amount", "gte", "100.125"),),
+            ),
+            sample_publication(),
+        )
+
+        self.assertIn("{filter_0:Decimal(38, 9)}", plan.sql)
+        self.assertEqual(plan.parameters["filter_0"], Decimal("100.125"))
 
     def test_count_all_rows_and_count_non_null_are_distinct(self) -> None:
         from app.structured_query import StructuredQueryPlanner
@@ -1192,6 +1297,45 @@ class StructuredQueryPlannerTest(unittest.TestCase):
 
 
 class StructuredQueryExecutorTest(unittest.TestCase):
+    def test_executor_regenerates_plan_with_the_same_legacy_profile(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        profile = ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.LEGACY_18_16
+        )
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        datetime_column = replace(
+            dataset.schema.columns[2], data_type=StructuredColumnType.DATETIME
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(*dataset.schema.columns[:2], datetime_column),
+                    ),
+                ),
+            ),
+        )
+        plan = StructuredQueryPlanner(catalog, compatibility=profile).plan(
+            StructuredIntent(
+                "ds-sales",
+                "sum",
+                "order_amount",
+                (StructuredFilter("order_date", "eq", "2026-01-01T12:30:45.987654"),),
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(aggregate_rows=[(Decimal("20"), 1, 1, 0)])
+
+        result = StructuredQueryExecutor(catalog, gateway, compatibility=profile).execute(plan)
+
+        self.assertEqual(result.value, Decimal("20"))
+        self.assertEqual(gateway.queries[0][0], plan.sql)
+
     def test_gateway_query_uses_only_read_only_client_and_bounded_settings(self) -> None:
         from app.clickhouse_gateway import ClickHouseGateway
 

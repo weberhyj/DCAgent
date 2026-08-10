@@ -13,6 +13,10 @@ from typing import Literal
 import sqlglot
 from sqlglot import exp
 
+from .clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
 from .structured_models import (
     StructuredAggregateResult,
     StructuredCatalog,
@@ -72,8 +76,15 @@ class UnsafeStructuredQueryError(ValueError):
 
 
 class StructuredQueryPlanner:
-    def __init__(self, catalog: StructuredCatalog) -> None:
+    def __init__(
+        self,
+        catalog: StructuredCatalog,
+        compatibility: ClickHouseCompatibilityProfile | None = None,
+    ) -> None:
         self._catalog = catalog
+        self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.MODERN
+        )
 
     def plan(
         self,
@@ -120,14 +131,18 @@ class StructuredQueryPlanner:
                 raise UnsafeStructuredQueryError("unknown or disallowed filter column")
             name = _require_identifier(column.physical_name)
             parameter_name = f"filter_{index}"
-            parameter_type = _clickhouse_parameter_type(column.data_type)
-            parameters[parameter_name] = _convert_parameter(item.value, column.data_type)
+            parameter_type = self._compatibility.parameter_type(column.data_type)
+            parameters[parameter_name] = _convert_parameter(
+                item.value, column.data_type, self._compatibility
+            )
             placeholder = f"{{{parameter_name}:{parameter_type}}}"
             if item.operator == "between":
                 if item.upper_value is None:
                     raise UnsafeStructuredQueryError("between filter requires an upper value")
                 upper_name = f"filter_{index}_upper"
-                upper_value = _convert_parameter(item.upper_value, column.data_type)
+                upper_value = _convert_parameter(
+                    item.upper_value, column.data_type, self._compatibility
+                )
                 upper_operator = "<="
                 if column.data_type is StructuredColumnType.DATETIME and re.fullmatch(
                     r"\d{4}-\d{2}-\d{2}", item.upper_value
@@ -186,11 +201,15 @@ class StructuredQueryExecutor:
         catalog: StructuredCatalog,
         clickhouse_gateway: object,
         *,
+        compatibility: ClickHouseCompatibilityProfile | None = None,
         clock: Callable[[], float] = time.perf_counter,
         audit_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> None:
         self._catalog = catalog
         self._clickhouse = clickhouse_gateway
+        self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.MODERN
+        )
         self._clock = clock
         self._audit_id_factory = audit_id_factory
 
@@ -204,7 +223,7 @@ class StructuredQueryExecutor:
         assert publication is not None
 
         try:
-            expected = StructuredQueryPlanner(self._catalog).plan(
+            expected = StructuredQueryPlanner(self._catalog, self._compatibility).plan(
                 StructuredIntent(
                     dataset_id=plan.dataset_id,
                     aggregate=plan.aggregate,
@@ -994,18 +1013,11 @@ def _require_identifier(value: str) -> str:
     return value
 
 
-def _clickhouse_parameter_type(column_type: StructuredColumnType) -> str:
-    return {
-        StructuredColumnType.STRING: "String",
-        StructuredColumnType.INTEGER: "Int64",
-        StructuredColumnType.DECIMAL: "Decimal(38, 9)",
-        StructuredColumnType.DATE: "Date",
-        StructuredColumnType.DATETIME: "DateTime64(3)",
-        StructuredColumnType.BOOLEAN: "UInt8",
-    }[column_type]
-
-
-def _convert_parameter(value: str, column_type: StructuredColumnType) -> object:
+def _convert_parameter(
+    value: str,
+    column_type: StructuredColumnType,
+    compatibility: ClickHouseCompatibilityProfile,
+) -> object:
     try:
         if column_type is StructuredColumnType.INTEGER:
             return int(value)
@@ -1014,7 +1026,7 @@ def _convert_parameter(value: str, column_type: StructuredColumnType) -> object:
         if column_type is StructuredColumnType.DATE:
             return date.fromisoformat(value)
         if column_type is StructuredColumnType.DATETIME:
-            return datetime.fromisoformat(value)
+            return compatibility.normalize_datetime(datetime.fromisoformat(value))
         if column_type is StructuredColumnType.BOOLEAN:
             normalized = value.strip().casefold()
             if normalized in {"1", "true", "yes", "是"}:

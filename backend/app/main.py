@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.engine import make_url
 
 from . import __version__
+from .clickhouse_compatibility import ClickHouseCompatibilityProfile
 from .clickhouse_gateway import ClickHouseGateway, StructuredStorageError
 from .database import Database, resolve_database_url
 from .evaluation_import import EvaluationImportService
@@ -566,14 +567,22 @@ def _create_structured_answer_service(
             settings.clickhouse_query_password_file,
             "CLICKHOUSE_QUERY_PASSWORD_FILE",
         )
+    compatibility = ClickHouseCompatibilityProfile.for_mode(
+        settings.clickhouse_compatibility_mode
+    )
     gateway = _LazyStructuredQueryGateway(
         clickhouse_client_factory,
         settings.clickhouse_url,
         username=settings.clickhouse_query_user,
         password=query_password,
         timeout_seconds=settings.structured_query_timeout_seconds,
+        compatibility=compatibility,
     )
-    service = StructuredAnswerService(structured_repository.get_catalog, gateway)
+    service = StructuredAnswerService(
+        structured_repository.get_catalog,
+        gateway,
+        compatibility=compatibility,
+    )
     return service, (gateway,)
 
 
@@ -586,12 +595,14 @@ class _LazyStructuredQueryGateway:
         username: str | None = None,
         password: str | None = None,
         timeout_seconds: int | None = None,
+        compatibility: ClickHouseCompatibilityProfile | None = None,
     ) -> None:
         self._client_factory = client_factory
         self._dsn = dsn
         self._username = username
         self._password = password
         self._timeout_seconds = timeout_seconds
+        self._compatibility = compatibility
         self._condition = Condition()
         self._closed = False
         self._initializing = False
@@ -678,7 +689,9 @@ class _LazyStructuredQueryGateway:
                 ingest_client,
                 query_client=query_client,
                 max_execution_time=self._timeout_seconds or 30,
+                compatibility=self._compatibility,
             )
+            gateway.preflight()
         except Exception:
             _close_clickhouse_clients(clients)
             raise

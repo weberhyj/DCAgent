@@ -10,6 +10,10 @@ from unittest.mock import patch
 
 from clickhouse_connect.driver.exceptions import ProgrammingError
 
+from app.clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
 from app.clickhouse_gateway import StructuredStorageError
 from app.database import (
     Database,
@@ -107,10 +111,18 @@ class LifecycleClickHouseClient:
     def __init__(self, query_handler=None) -> None:
         self.close_calls = 0
         self.query_calls = 0
+        self.statements: list[str] = []
         self.query_handler = query_handler
 
     def query(self, *args: object, **kwargs: object) -> object:
         self.query_calls += 1
+        statement = args[0] if args else ""
+        if isinstance(statement, str):
+            self.statements.append(statement)
+            if statement == "SELECT version()":
+                return {"value": "25.1.1"}
+            if statement in {"SELECT 1", "SELECT toDecimalString(toDecimal64(1, 9), 9)"}:
+                return {"value": 1}
         if self.query_handler is not None:
             return self.query_handler(*args, **kwargs)
         return {"value": 1}
@@ -137,7 +149,12 @@ class SessionConstrainedClickHouseClient(LifecycleClickHouseClient):
         self._active_session: str | None = None
         self._query_attempts = 0
 
-    def query(self, *_args: object, **_kwargs: object) -> object:
+    def query(self, *args: object, **_kwargs: object) -> object:
+        statement = args[0] if args else ""
+        if statement == "SELECT version()":
+            return {"value": "25.1.1"}
+        if statement in {"SELECT 1", "SELECT toDecimalString(toDecimal64(1, 9), 9)"}:
+            return {"value": 1}
         with self._session_lock:
             self._query_attempts += 1
             if self._query_attempts == self._expected_queries:
@@ -283,7 +300,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             return client
 
         gateway = _LazyStructuredQueryGateway(build_client, "http://clickhouse")
-        query_thread = Thread(target=lambda: gateway.query("SELECT 1", {}))
+        query_thread = Thread(target=lambda: gateway.query("SELECT workload", {}))
         query_thread.start()
         self.assertTrue(query_started.wait(2))
         close_thread = Thread(target=lambda: (gateway.close(), close_returned.set()))
@@ -328,7 +345,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
 
         def run_query() -> None:
             try:
-                gateway.query("SELECT 1", {})
+                gateway.query("SELECT workload", {})
             except Exception as error:
                 errors.append(error)
 
@@ -340,6 +357,66 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         for thread in threads:
             thread.join(2)
         self.assertEqual(errors, [])
+
+    def test_lazy_gateway_preflights_before_publishing_the_legacy_gateway(self) -> None:
+        profile = ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.LEGACY_18_16
+        )
+        clients: list[LifecycleClickHouseClient] = []
+
+        class LegacyClient(LifecycleClickHouseClient):
+            def query(self, *args: object, **kwargs: object) -> object:
+                if args and args[0] == "SELECT version()":
+                    self.statements.append("SELECT version()")
+                    return {"value": "18.16.1"}
+                return super().query(*args, **kwargs)
+
+        def build_client(**_kwargs: object) -> LifecycleClickHouseClient:
+            client = LegacyClient()
+            clients.append(client)
+            return client
+
+        gateway = _LazyStructuredQueryGateway(
+            build_client,
+            "http://clickhouse",
+            compatibility=profile,
+        )
+
+        self.assertEqual(gateway.query("SELECT workload", {}), {"value": 1})
+
+        self.assertIs(gateway._gateway._compatibility, profile)
+        self.assertEqual(
+            clients[1].statements[:3],
+            [
+                "SELECT version()",
+                "SELECT 1",
+                "SELECT toString(toDecimal64(1, 9))",
+            ],
+        )
+
+    def test_lazy_gateway_closes_clients_when_legacy_preflight_rejects_server(self) -> None:
+        profile = ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.LEGACY_18_16
+        )
+        clients: list[LifecycleClickHouseClient] = []
+
+        def build_client(**_kwargs: object) -> LifecycleClickHouseClient:
+            client = LifecycleClickHouseClient()
+            clients.append(client)
+            return client
+
+        gateway = _LazyStructuredQueryGateway(
+            build_client,
+            "http://clickhouse",
+            compatibility=profile,
+        )
+
+        with self.assertRaisesRegex(StructuredStorageError, "18.16 server version"):
+            gateway.query("SELECT workload", {})
+
+        self.assertEqual([client.close_calls for client in clients], [1, 1])
+        self.assertIsNone(gateway._gateway)
+        self.assertIsNone(gateway._clients)
 
     def test_lazy_gateway_disables_autogenerated_sessions_for_shared_query_client(self) -> None:
         client_calls: list[dict[str, object]] = []
@@ -471,7 +548,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
 
         def run_query() -> None:
             try:
-                result = gateway.query("SELECT 1", {})
+                result = gateway.query("SELECT workload", {})
             except Exception as error:
                 with outcome_lock:
                     errors.append(error)
@@ -556,7 +633,9 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         clients: list[object] = []
 
         class Client:
-            def query(self, *_args: object, **_kwargs: object) -> object:
+            def query(self, *args: object, **_kwargs: object) -> object:
+                if args and args[0] == "SELECT version()":
+                    return {"value": "25.1.1"}
                 return {"value": 1}
 
         def build_client(**kwargs: object) -> object:
@@ -622,7 +701,9 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.close_calls = 0
 
-            def query(self, *_args: object, **_kwargs: object) -> object:
+            def query(self, *args: object, **_kwargs: object) -> object:
+                if args and args[0] == "SELECT version()":
+                    return {"value": "25.1.1"}
                 return {"value": 1}
 
             def close(self) -> None:
