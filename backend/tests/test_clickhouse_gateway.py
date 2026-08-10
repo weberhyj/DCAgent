@@ -11,7 +11,13 @@ from app.clickhouse_gateway import (
     ClickHousePublicationTarget,
     StructuredStorageError,
     StructuredValidationStatistics,
+    _validation_query,
 )
+from app.clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
+from app.structured_models import StructuredColumnType
 from tests.support.structured_fakes import sample_columns
 
 
@@ -95,6 +101,46 @@ def empty_content_observation() -> tuple[str, dict[str, int]]:
 
 
 class ClickHouseGatewayTest(unittest.TestCase):
+    def test_legacy_gateway_uses_datetime_and_never_emits_forbidden_tokens(self) -> None:
+        ingest = RecordingIngestClient()
+        query = RecordingQueryClient([[('18.16.1',)], [(1,)], [('1',)]])
+        gateway = ClickHouseGateway(
+            ingest,
+            query_client=query,
+            compatibility=ClickHouseCompatibilityProfile.for_mode(
+                ClickHouseCompatibilityMode.LEGACY_18_16
+            ),
+        )
+        gateway.preflight()
+        schema = replace(
+            sample_confirmed_schema_pathless(),
+            columns=(
+                *sample_columns()[:2],
+                replace(sample_columns()[2], data_type=StructuredColumnType.DATETIME),
+            ),
+        )
+        gateway.create_table("structured_sales", schema.columns)
+        ddl = "\n".join(statement for statement, _settings in ingest.ddl)
+        self.assertIn("Nullable(DateTime)", ddl)
+        self.assertNotIn("DateTime64", ddl)
+        validation = _validation_query(
+            ClickHousePublicationTarget(schema, "structured_sales_staging", "structured_sales", "a" * 64),
+            "structured_sales",
+            ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16),
+        )
+        self.assertNotIn("toDecimalString", validation)
+
+    def test_preflight_rejects_non_18_16_in_legacy_mode_before_work(self) -> None:
+        query = RecordingQueryClient([[('22.8.1',)]])
+        gateway = ClickHouseGateway(
+            RecordingIngestClient(),
+            query_client=query,
+            compatibility=ClickHouseCompatibilityProfile.for_mode(
+                ClickHouseCompatibilityMode.LEGACY_18_16
+            ),
+        )
+        with self.assertRaisesRegex(StructuredStorageError, "18.16"):
+            gateway.preflight()
     def test_gateway_rejects_untrusted_identifiers(self) -> None:
         gateway = ClickHouseGateway(RecordingIngestClient())
 
