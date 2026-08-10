@@ -92,11 +92,12 @@ SQL
 #### Query-account write denial probe
 
 This command must fail with a permission error; a successful write is a rollout
-blocker. It must not leave a table behind because the query profile is readonly.
+blocker. The temporary table is session-scoped, so even an unexpected success
+cannot leave a persistent application table behind.
 
 ```bash
 if clickhouse-client --host 127.0.0.1 --user dc_agent_query --password \
-  --query 'CREATE TABLE default.dc_agent_query_write_denied (value UInt8) ENGINE = Memory'; then
+  --query 'CREATE TEMPORARY TABLE dc_agent_query_write_denied (value UInt8) ENGINE = Memory'; then
   echo 'unexpected query-account write success' >&2
   exit 1
 fi

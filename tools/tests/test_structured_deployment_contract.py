@@ -129,6 +129,14 @@ class StructuredDeploymentContractTests(unittest.TestCase):
         self.assertIn("CREATE DATABASE operator_probe", guide)
         self.assertIn("CREATE TABLE operator_probe.secret_probe", guide)
         self.assertIn("must fail with a permission error", guide)
+        write_probe = re.search(
+            r"(?ms)^#### Query-account write denial probe\n(?P<body>.*?)(?=^####|^###|\Z)",
+            guide,
+        )
+        self.assertIsNotNone(write_probe)
+        assert write_probe is not None
+        self.assertIn("CREATE TEMPORARY TABLE dc_agent_query_write_denied", write_probe.group("body"))
+        self.assertNotRegex(write_probe.group("body"), r"CREATE TABLE\s+default\.")
 
     def test_env_examples_define_structured_rollout_contract(self) -> None:
         for path in ENV_EXAMPLES:
