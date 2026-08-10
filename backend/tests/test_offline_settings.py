@@ -29,6 +29,14 @@ class OfflineSettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(OfflineSettingsError, "CLICKHOUSE_COMPATIBILITY_MODE"):
             OfflineSettings.from_environ({"CLICKHOUSE_COMPATIBILITY_MODE": "18.16"})
 
+    def test_settings_reject_clickhouse_mode_case_and_whitespace_variants(self) -> None:
+        for value in ("MODERN", " legacy_18_16 "):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    OfflineSettingsError, "CLICKHOUSE_COMPATIBILITY_MODE"
+                ):
+                    OfflineSettings.from_environ({"CLICKHOUSE_COMPATIBILITY_MODE": value})
+
     def test_parse_bool_supports_offline_environment_values(self) -> None:
         for value in ("1", "true", "YES", " on "):
             with self.subTest(value=value):

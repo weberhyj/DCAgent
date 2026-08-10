@@ -145,9 +145,7 @@ class OfflineSettings:
         structured_query_enabled = parse_bool(
             environ.get("STRUCTURED_QUERY_ENABLED"), default=False
         )
-        compatibility_value = (
-            environ.get("CLICKHOUSE_COMPATIBILITY_MODE", "modern").strip().lower()
-        )
+        compatibility_value = environ.get("CLICKHOUSE_COMPATIBILITY_MODE", "modern")
         try:
             clickhouse_compatibility_mode = ClickHouseCompatibilityMode(compatibility_value)
         except ValueError as error:
