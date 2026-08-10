@@ -583,7 +583,7 @@ offline = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.16" },
     { name = "asynctor", specifier = ">=0.13.2" },
-    { name = "clickhouse-connect", specifier = ">=0.8" },
+    { name = "clickhouse-connect", specifier = "==1.6.0" },
     { name = "fastapi", specifier = ">=0.116.0" },
     { name = "gunicorn", specifier = ">=26.0.0" },
     { name = "httpx", specifier = ">=0.28.0" },

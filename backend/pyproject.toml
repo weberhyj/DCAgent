@@ -6,7 +6,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.16",
     "asynctor>=0.13.2",
-    "clickhouse-connect>=0.8",
+    "clickhouse-connect==1.6.0",
     "fastapi>=0.116.0",
     "gunicorn>=26.0.0",
     "httpx>=0.28.0",
