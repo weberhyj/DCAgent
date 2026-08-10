@@ -125,13 +125,12 @@ def _password_from_file(environ: Mapping[str, str], name: str) -> str:
 
 
 def _target_skip_reason(environ: Mapping[str, str]) -> str | None:
-    if environ.get("RUN_CLICKHOUSE_18_16", "").strip() == "1":
-        _validate_target_environment(environ)
-        return None
-    try:
-        _validate_target_environment(environ)
-    except TargetConfigurationError as error:
-        return f"ClickHouse 18.16.1 target guard: {error}"
+    if environ.get("RUN_CLICKHOUSE_18_16", "").strip() != "1":
+        return (
+            "ClickHouse 18.16.1 target guard: "
+            "set RUN_CLICKHOUSE_18_16=1 for an explicit ClickHouse 18.16.1 target"
+        )
+    _validate_target_environment(environ)
     return None
 
 
@@ -229,6 +228,41 @@ class TestLegacy18EnvironmentValidation:
 
 
 class TestLegacy1816AcceptanceGuards:
+    def test_non_opted_in_complete_target_skips_without_importing_dependencies(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ingest_password = root / "ingest-password"
+            query_password = root / "query-password"
+            ingest_password.write_text("ingest-secret", encoding="utf-8")
+            query_password.write_text("query-secret", encoding="utf-8")
+            environ = {
+                "CLICKHOUSE_COMPATIBILITY_MODE": _LEGACY_MODE,
+                "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+                "CLICKHOUSE_INGEST_USER": "ingest-user",
+                "CLICKHOUSE_QUERY_USER": "query-user",
+                "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+                "CLICKHOUSE_QUERY_PASSWORD_FILE": str(query_password),
+            }
+
+            def dependencies_must_not_be_imported(name: str) -> object:
+                raise AssertionError(f"unexpected dependency import: {name}")
+
+            def target_validation_must_not_run(environ: Mapping[str, str]) -> _TargetEnvironment:
+                raise AssertionError("unexpected target validation")
+
+            monkeypatch.setitem(
+                globals(), "_validate_target_environment", target_validation_must_not_run
+            )
+
+            assert _acceptance_collection_guard(
+                environ, dependencies_must_not_be_imported
+            ) == (
+                "ClickHouse 18.16.1 target guard: "
+                "set RUN_CLICKHOUSE_18_16=1 for an explicit ClickHouse 18.16.1 target"
+            )
+
     def test_opted_in_invalid_target_fails_collection_guard_instead_of_skipping(self) -> None:
         with pytest.raises(TargetConfigurationError, match="CLICKHOUSE_COMPATIBILITY_MODE"):
             _acceptance_collection_guard({"RUN_CLICKHOUSE_18_16": "1"})
