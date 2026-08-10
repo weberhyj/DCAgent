@@ -14,6 +14,7 @@ from app.structured_ingestion import (
     ArrowParquetSink,
     SpreadsheetPublisher,
     StructuredIngestionError,
+    _canonical_row,
 )
 from app.clickhouse_compatibility import ClickHouseCompatibilityMode, ClickHouseCompatibilityProfile
 from app.structured_models import StructuredColumnType, StructuredPublicationResult
@@ -100,6 +101,36 @@ class StructuredIngestionTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir_context.cleanup()
+
+    def test_legacy_datetime_canonicalization_matches_clickhouse_seconds_contract(self) -> None:
+        profile = ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.LEGACY_18_16
+        )
+
+        canonical = _canonical_row(
+            {"order_date": datetime(2026, 1, 1, 10, 11, 12, 987654)},
+            profile,
+        )
+
+        self.assertEqual(
+            profile.canonical_value_expression("order_date", StructuredColumnType.DATETIME),
+            "toString(order_date)",
+        )
+        self.assertEqual(canonical, b"V19:2026-01-01 10:11:12;")
+
+    def test_modern_datetime_canonicalization_preserves_milliseconds_contract(self) -> None:
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.MODERN)
+
+        canonical = _canonical_row(
+            {"order_date": datetime(2026, 1, 1, 10, 11, 12, 987654)},
+            profile,
+        )
+
+        self.assertEqual(
+            profile.canonical_value_expression("order_date", StructuredColumnType.DATETIME),
+            "toString(order_date)",
+        )
+        self.assertEqual(canonical, b"V23:2026-01-01 10:11:12.987;")
 
     def test_ingestion_writes_bounded_batches_and_counts_rows(self) -> None:
         confirmed = sample_confirmed_schema(self.temp_dir, row_count=5)

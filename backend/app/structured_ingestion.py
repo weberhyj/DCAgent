@@ -198,7 +198,7 @@ class SpreadsheetPublisher:
                         "_row_number": row_number,
                     }
                 )
-                canonical_row = _canonical_row(row)
+                canonical_row = _canonical_row(row, self.compatibility)
                 if len(canonical_row) > self.batch_bytes:
                     raise StructuredIngestionError(
                         "row_size_limit_exceeded",
@@ -621,15 +621,27 @@ def _row_is_empty(values: Sequence[Any], formulas: Sequence[Any]) -> bool:
     return not any(value is not None and str(value).strip() for value in (*values, *formulas))
 
 
-def _canonical_row(row: Mapping[str, Any]) -> bytes:
-    return b"".join(_canonical_value(row[key]) for key in row)
+def _canonical_row(
+    row: Mapping[str, Any],
+    compatibility: ClickHouseCompatibilityProfile | None = None,
+) -> bytes:
+    return b"".join(_canonical_value(row[key], compatibility) for key in row)
 
 
-def _canonical_value(value: Any) -> bytes:
+def _canonical_value(
+    value: Any,
+    compatibility: ClickHouseCompatibilityProfile | None = None,
+) -> bytes:
     if value is None:
         return b"N;"
     if isinstance(value, datetime):
-        rendered = value.isoformat(sep=" ", timespec="milliseconds")
+        if (
+            compatibility is not None
+            and compatibility.mode is ClickHouseCompatibilityMode.LEGACY_18_16
+        ):
+            rendered = value.isoformat(sep=" ", timespec="seconds")
+        else:
+            rendered = value.isoformat(sep=" ", timespec="milliseconds")
     elif isinstance(value, date):
         rendered = value.isoformat()
     elif isinstance(value, Decimal):
