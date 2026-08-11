@@ -464,11 +464,11 @@ class StructuredQueryExecutor:
 
         try:
             row = _multi_aggregate_row(raw_result, len(plan.metrics))
-            total_count = int(row["total_count"])
+            total_count = _strict_integer(row["total_count"])
             metric_results: list[StructuredMetricResult] = []
             for index, metric_intent in enumerate(plan.metrics):
-                valid_count = int(row[f"metric_{index}_valid_count"])
-                null_count = int(row[f"metric_{index}_null_count"])
+                valid_count = _strict_integer(row[f"metric_{index}_valid_count"])
+                null_count = _strict_integer(row[f"metric_{index}_null_count"])
                 if (
                     min(total_count, valid_count, null_count) < 0
                     or valid_count + null_count != total_count
@@ -484,14 +484,20 @@ class StructuredQueryExecutor:
                 )
                 if metric is None:
                     return StructuredUnavailable("结构化查询返回了无效结果")
+                if metric_intent.aggregate == "count":
+                    value = _strict_integer(row[f"metric_{index}_value"])
+                    if value < 0 or value != valid_count:
+                        return StructuredUnavailable("结构化查询返回了不一致的计数")
+                else:
+                    value = _aggregate_value(
+                        row[f"metric_{index}_value"], metric_intent.aggregate
+                    )
                 metric_results.append(
                     StructuredMetricResult(
                         aggregate=metric_intent.aggregate,
                         metric_physical_name=metric_intent.metric_physical_name,
                         metric_display_name=metric.display_name,
-                        value=_aggregate_value(
-                            row[f"metric_{index}_value"], metric_intent.aggregate
-                        ),
+                        value=value,
                         valid_count=valid_count,
                         null_count=null_count,
                     )
@@ -1483,6 +1489,26 @@ def _aggregate_row(result: object) -> Mapping[str, object]:
                 )
             )
     raise TypeError("unsupported ClickHouse aggregate result shape")
+
+
+def _strict_integer(value: object) -> int:
+    if isinstance(value, bool):
+        raise TypeError("boolean is not an integer result")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite() or value != value.to_integral_value():
+            raise ValueError("non-integral decimal result")
+        return int(value)
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("non-integral float result")
+        return int(value)
+    if isinstance(value, str):
+        if re.fullmatch(r"[+-]?\d+", value) is None:
+            raise ValueError("non-integral string result")
+        return int(value)
+    raise TypeError("unsupported integer result type")
 
 
 def _multi_aggregate_row(

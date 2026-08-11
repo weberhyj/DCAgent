@@ -1726,6 +1726,105 @@ class StructuredQueryExecutorTest(unittest.TestCase):
         self.assertEqual(result.metrics[0].value, 2)
         self.assertIsInstance(result.metrics[0].value, int)
 
+    def test_multi_executor_rejects_non_integral_count_fields_without_coercion(
+        self,
+    ) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+        invalid_fields = (
+            ("total_count", Decimal("-0.5")),
+            ("metric_0_valid_count", 1.5),
+            ("metric_0_null_count", "0.5"),
+            ("total_count", True),
+        )
+
+        for field, invalid_value in invalid_fields:
+            with self.subTest(field=field, invalid_value=invalid_value):
+                row = {
+                    "total_count": 1,
+                    "metric_0_value": "10",
+                    "metric_0_valid_count": 1,
+                    "metric_0_null_count": 0,
+                }
+                row[field] = invalid_value
+                result = StructuredQueryExecutor(
+                    catalog,
+                    FakeClickHouse(aggregate_rows=[row]),
+                ).execute_multi(plan)
+
+                self.assertEqual(
+                    result,
+                    StructuredUnavailable("结构化查询返回了无效结果"),
+                )
+
+    def test_multi_executor_rejects_negative_count_metric_value(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("count", "region"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": 1,
+                    "metric_0_value": -1,
+                    "metric_0_valid_count": 1,
+                    "metric_0_null_count": 0,
+                }
+            ]
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        self.assertEqual(result, StructuredUnavailable("结构化查询返回了不一致的计数"))
+
+    def test_multi_executor_rejects_count_metric_value_not_equal_to_valid_count(
+        self,
+    ) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("count", "region"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": 2,
+                    "metric_0_value": 1,
+                    "metric_0_valid_count": 2,
+                    "metric_0_null_count": 0,
+                }
+            ]
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        self.assertEqual(result, StructuredUnavailable("结构化查询返回了不一致的计数"))
+
     def test_multi_executor_rejects_inconsistent_counts(self) -> None:
         from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
 
