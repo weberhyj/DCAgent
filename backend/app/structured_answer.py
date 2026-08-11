@@ -10,6 +10,10 @@ from typing import Literal
 from uuid import uuid4
 
 from .agent import AgentRunResult, AgentStep
+from .clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
 from .models import ChatMessageModel, ComposerMode, ResponseParagraphModel
 from .structured_models import (
     StructuredAggregateResult,
@@ -110,9 +114,13 @@ class StructuredAnswerService:
         self,
         catalog_provider: Callable[[], StructuredCatalog],
         clickhouse_gateway: object,
+        compatibility: ClickHouseCompatibilityProfile | None = None,
     ) -> None:
         self._catalog_provider = catalog_provider
         self._clickhouse_gateway = clickhouse_gateway
+        self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.MODERN
+        )
         self._catalog_snapshot: StructuredCatalog | None = None
         self._catalog_snapshot_lock = Lock()
         self._catalog_request_generation = 0
@@ -186,7 +194,9 @@ class StructuredAnswerService:
                 "active publication unavailable",
             )
         try:
-            plan = StructuredQueryPlanner(catalog).plan(resolution, publication)
+            plan = StructuredQueryPlanner(catalog, self._compatibility).plan(
+                resolution, publication
+            )
         except UnsafeStructuredQueryError:
             return _structured_run(
                 conversation_id,
@@ -195,7 +205,11 @@ class StructuredAnswerService:
                 "结构化查询服务不可用：查询计划未通过安全校验。",
                 "structured query planning failed",
             )
-        result = StructuredQueryExecutor(catalog, self._clickhouse_gateway).execute(plan)
+        result = StructuredQueryExecutor(
+            catalog,
+            self._clickhouse_gateway,
+            compatibility=self._compatibility,
+        ).execute(plan)
         if isinstance(result, StructuredUnavailable):
             return _structured_run(
                 conversation_id,

@@ -15,6 +15,10 @@ from .structured_models import (
     StructuredColumnType,
     StructuredDatasetSchema,
 )
+from .clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
 
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9_]+$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -59,6 +63,7 @@ class ClickHouseGateway:
         max_execution_time: int = 30,
         max_memory_usage: int = 512 * 1024 * 1024,
         max_result_rows: int = 10_000,
+        compatibility: ClickHouseCompatibilityProfile | None = None,
     ) -> None:
         if query_client is ingest_client and query_client is not None:
             raise StructuredStorageError(
@@ -66,13 +71,59 @@ class ClickHouseGateway:
             )
         self._ingest_client = ingest_client
         self._query_client = query_client
+        self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
+            ClickHouseCompatibilityMode.MODERN
+        )
         self._settings = {
+            **self._compatibility.command_settings(),
             "max_execution_time": max_execution_time,
             "max_memory_usage": max_memory_usage,
             "max_result_rows": max_result_rows,
             "result_overflow_mode": "break",
         }
-        self._query_settings = {**self._settings, "readonly": 1}
+        query_readonly = (
+            2
+            if self._compatibility.mode is ClickHouseCompatibilityMode.LEGACY_18_16
+            else 1
+        )
+        self._query_settings = {
+            **self._compatibility.query_settings(),
+            **self._settings,
+            "readonly": query_readonly,
+        }
+
+    def preflight(self) -> str:
+        """Verify server capabilities before any worker can claim a job."""
+        try:
+            version_result = self._query("SELECT version()")
+            version = _first_scalar(version_result)
+            self._compatibility.validate_server_version(version)
+        except StructuredStorageError:
+            raise
+        except Exception as error:
+            if self._compatibility.mode is ClickHouseCompatibilityMode.LEGACY_18_16:
+                capability = "18.16 server version"
+            else:
+                capability = "server version"
+            raise StructuredStorageError(f"ClickHouse {capability} preflight failed") from error
+        try:
+            self._query("SELECT 1")
+            expression = self._compatibility.canonical_value_expression(
+                "toDecimal64(1, 9)", StructuredColumnType.DECIMAL
+            )
+            decimal_result = self._query(f"SELECT {expression}")
+            if (
+                self._compatibility.mode is ClickHouseCompatibilityMode.LEGACY_18_16
+                and _first_scalar(decimal_result) != "1.000000000"
+            ):
+                raise StructuredStorageError(
+                    "ClickHouse Decimal canonical rendering preflight failed"
+                )
+        except StructuredStorageError:
+            raise
+        except Exception as error:
+            raise StructuredStorageError("ClickHouse capability probe preflight failed") from error
+        return version
 
     def create_table(
         self,
@@ -83,7 +134,9 @@ class ClickHouseGateway:
         definitions = []
         for column in columns:
             _require_identifier(column.physical_name)
-            definitions.append(f"{column.physical_name} {_clickhouse_type(column.data_type)}")
+            definitions.append(
+                f"{column.physical_name} {self._compatibility.storage_type(column.data_type)}"
+            )
         definitions.extend(f"{name} {column_type}" for name, column_type in _METADATA_COLUMNS)
         statement = (
             f"CREATE TABLE {table_name} ("
@@ -205,7 +258,7 @@ class ClickHouseGateway:
     ) -> None:
         _require_identifier(table_name)
         described = self._query(f"DESCRIBE TABLE {table_name}")
-        observed = self._query(_validation_query(target, table_name))
+        observed = self._query(_validation_query(target, table_name, self._compatibility))
         observed_values = _as_mapping(observed)
 
         if int(observed_values.get("row_count", -1)) != statistics.row_count:
@@ -229,7 +282,7 @@ class ClickHouseGateway:
             raise StructuredStorageError("ClickHouse actual row content hash validation failed")
 
         expected_schema = [
-            (column.physical_name, _clickhouse_type(column.data_type))
+            (column.physical_name, self._compatibility.storage_type(column.data_type))
             for column in target.schema.columns
         ] + list(_METADATA_COLUMNS)
         described_schema = _as_described_schema(described)
@@ -301,7 +354,11 @@ class ClickHouseGateway:
         return query(statement, settings=dict(self._query_settings))
 
 
-def _validation_query(target: ClickHousePublicationTarget, table_name: str) -> str:
+def _validation_query(
+    target: ClickHousePublicationTarget,
+    table_name: str,
+    compatibility: ClickHouseCompatibilityProfile | None = None,
+) -> str:
     _require_identifier(table_name)
     projections = [
         "count() AS row_count",
@@ -316,7 +373,7 @@ def _validation_query(target: ClickHousePublicationTarget, table_name: str) -> s
             projections.append(f"count({name}) AS count_{name}")
             projections.append(f"min({name}) AS min_{name}")
             projections.append(f"max({name}) AS max_{name}")
-    row_digest = f"SHA256({_canonical_row_expression(target.schema.columns)})"
+    row_digest = f"SHA256({_canonical_row_expression(target.schema.columns, compatibility)})"
     for index in range(4):
         lane = f"reinterpretAsUInt64(substring({row_digest}, {index * 8 + 1}, 8))"
         projections.append(f"sumWithOverflow({lane}) AS content_sum_{index}")
@@ -324,7 +381,13 @@ def _validation_query(target: ClickHousePublicationTarget, table_name: str) -> s
     return f"SELECT {', '.join(projections)} FROM {table_name}"
 
 
-def _canonical_row_expression(columns: Sequence[StructuredColumnSchema]) -> str:
+def _canonical_row_expression(
+    columns: Sequence[StructuredColumnSchema],
+    compatibility: ClickHouseCompatibilityProfile | None = None,
+) -> str:
+    compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
+        ClickHouseCompatibilityMode.MODERN
+    )
     names_and_types = [(column.physical_name, column.data_type) for column in columns]
     names_and_types.extend(
         (
@@ -340,11 +403,7 @@ def _canonical_row_expression(columns: Sequence[StructuredColumnSchema]) -> str:
     segments = []
     for name, column_type in names_and_types:
         _require_identifier(name)
-        rendered = (
-            f"toDecimalString({name}, 9)"
-            if column_type is StructuredColumnType.DECIMAL
-            else f"toString({name})"
-        )
+        rendered = compatibility.canonical_value_expression(name, column_type)
         segments.append(
             f"if(isNull({name}), 'N;', "
             f"concat('V', toString(length({rendered})), ':', {rendered}, ';'))"
@@ -425,15 +484,33 @@ def _as_single_column_values(result: Any) -> list[str]:
         ) from error
 
 
-def _clickhouse_type(column_type: StructuredColumnType) -> str:
-    return {
-        StructuredColumnType.STRING: "Nullable(String)",
-        StructuredColumnType.INTEGER: "Nullable(Int64)",
-        StructuredColumnType.DECIMAL: "Nullable(Decimal(38, 9))",
-        StructuredColumnType.DATE: "Nullable(Date)",
-        StructuredColumnType.DATETIME: "Nullable(DateTime64(3))",
-        StructuredColumnType.BOOLEAN: "Nullable(UInt8)",
-    }[column_type]
+def _clickhouse_type(
+    column_type: StructuredColumnType,
+    compatibility: ClickHouseCompatibilityProfile | None = None,
+) -> str:
+    compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
+        ClickHouseCompatibilityMode.MODERN
+    )
+    return compatibility.storage_type(column_type)
+
+
+def _first_scalar(result: Any) -> str:
+    if isinstance(result, Mapping):
+        if result:
+            return str(next(iter(result.values())))
+    result_rows = getattr(result, "result_rows", None)
+    if result_rows:
+        row = result_rows[0]
+    elif isinstance(result, Sequence) and not isinstance(result, (str, bytes)) and result:
+        row = result[0]
+    else:
+        raise StructuredStorageError("ClickHouse version result has an unsupported shape")
+    if isinstance(row, Mapping):
+        if row:
+            return str(next(iter(row.values())))
+    if isinstance(row, Sequence) and not isinstance(row, (str, bytes)) and row:
+        return str(row[0])
+    return str(row)
 
 
 def _require_identifier(value: str) -> str:

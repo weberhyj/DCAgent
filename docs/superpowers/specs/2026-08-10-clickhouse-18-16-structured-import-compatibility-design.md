@@ -88,6 +88,9 @@ The legacy profile sends exactly `max_execution_time`, `max_memory_usage`, `max_
 server policy that makes one readonly or unavailable is reported before a publication is claimed.
 The obsolete `overflow_mode` key is never sent.
 
+The legacy query account uses `readonly=2`: writes remain denied, while ClickHouse 18.16 permits
+the HTTP query to apply those bounded settings. Modern gateways continue to send `readonly=1`.
+
 ## Startup Preflight
 
 Both the structured worker and the lazy structured-query connection run a preflight before their
@@ -157,6 +160,9 @@ ingestion account has broader rights inside the allowed application database. It
 to access unrelated databases. Operators merge the reviewed configuration into the system-managed
 ClickHouse configuration and restart ClickHouse. Project scripts validate connectivity and effective
 capabilities but do not overwrite the system configuration automatically.
+
+The query profile uses `readonly=2`, which is the legacy read-only level that permits bounded
+per-query settings; deployment probes still verify that DDL and DML fail for this account.
 
 ## Dependency Policy
 

@@ -1,0 +1,56 @@
+<!--
+  ClickHouse 18.16 legacy users configuration example.
+
+  Replace each REPLACE_WITH_SHA256_HEX_* token with the lowercase SHA-256 digest
+  of the corresponding password. Do not put plaintext passwords in this file.
+  Merge the reviewed user entries into the system-owned users.xml manually; this
+  example is documentation and is never installed automatically.
+-->
+<clickhouse>
+  <profiles>
+    <!-- ClickHouse 18.16 applies readonly through profiles, not user elements. -->
+    <dc_agent_query>
+      <!-- readonly=2 denies writes while allowing bounded per-query settings. -->
+      <readonly>2</readonly>
+    </dc_agent_query>
+    <dc_agent_ingest>
+      <readonly>0</readonly>
+    </dc_agent_ingest>
+  </profiles>
+
+  <users>
+    <dc_agent_query>
+      <password_sha256_hex>REPLACE_WITH_SHA256_HEX_QUERY_PASSWORD</password_sha256_hex>
+      <networks>
+        <!-- Keep only the loopback/private subnet(s) used by the API. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+      </networks>
+      <profile>dc_agent_query</profile>
+      <quota>default</quota>
+      <allow_databases>
+        <database>default</database>
+      </allow_databases>
+    </dc_agent_query>
+
+    <dc_agent_ingest>
+      <password_sha256_hex>REPLACE_WITH_SHA256_HEX_INGEST_PASSWORD</password_sha256_hex>
+      <networks>
+        <!-- Keep only the loopback/private subnet(s) used by the worker. -->
+        <ip>127.0.0.1</ip>
+        <ip>::1</ip>
+        <ip>10.0.0.0/8</ip>
+        <ip>172.16.0.0/12</ip>
+        <ip>192.168.0.0/16</ip>
+      </networks>
+      <profile>dc_agent_ingest</profile>
+      <quota>default</quota>
+      <allow_databases>
+        <database>default</database>
+      </allow_databases>
+    </dc_agent_ingest>
+  </users>
+</clickhouse>

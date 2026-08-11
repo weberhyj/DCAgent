@@ -11,6 +11,8 @@ from unittest.mock import patch
 from sqlalchemy import select
 
 import app.structured_repository as structured_repository_module
+from app.clickhouse_compatibility import ClickHouseCompatibilityMode
+from app.clickhouse_gateway import StructuredStorageError
 from app.database import (
     Database,
     KnowledgeSourceRecord,
@@ -86,6 +88,23 @@ class FailOncePublisher(RecordingPublisher):
         self.staging_tokens.append(staging_token)
         self.staging_generations.append(staging_generation)
         raise RuntimeError("first attempt failed")
+
+
+class PreflightClient:
+    def __init__(self, *, version: str = "25.1.1", failure: Exception | None = None) -> None:
+        self.version = version
+        self.failure = failure
+        self.close_calls = 0
+
+    def query(self, statement: str, *, settings: dict[str, object]):
+        if self.failure is not None:
+            raise self.failure
+        if statement == "SELECT version()":
+            return [(self.version,)]
+        return [(1,)]
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class StructuredWorkerTest(unittest.TestCase):
@@ -510,6 +529,37 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertEqual(status.job.checkpoint_row, 2)
         self.assertEqual(status.source_status, INDEXED)
 
+    def test_worker_persists_positive_checkpoint_from_multi_batch_callback(self) -> None:
+        job = self.enqueue()
+        observed: list[int] = []
+
+        class CheckpointPublisher:
+            def publish(inner_self, path, schema, publication_id, *, lease_guard=None, **kwargs):
+                assert lease_guard is not None
+                for checkpoint in (2, 4, 5):
+                    lease_guard(checkpoint_row=checkpoint)
+                    current = self.repository.get_structured_status(self.source_id, job.id)
+                    observed.append(current.job.checkpoint_row)
+                return StructuredPublicationResult(
+                    publication_id=publication_id,
+                    physical_table_name="structured_ds_sales_v1_pub_new",
+                    row_count=5,
+                    column_count=3,
+                    null_counts={"order_amount": 0, "region": 0, "order_date": 0},
+                    content_hash="b" * 64,
+                )
+
+        worker = StructuredIngestionWorker(
+            self.repository,
+            CheckpointPublisher(),
+            worker_id="worker-1",
+            lease_seconds=60,
+        )
+
+        self.assertTrue(worker.run_once())
+        self.assertEqual(observed, [2, 4, 5])
+        self.assertEqual(self.repository.get_structured_status(self.source_id, job.id).job.checkpoint_row, 5)
+
     def test_structured_publication_indexes_only_after_clickhouse_completion(self) -> None:
         events = []
         original_complete = self.repository.complete_publication
@@ -851,7 +901,7 @@ class StructuredWorkerTest(unittest.TestCase):
 
         def build_client(**kwargs):
             calls.append(kwargs)
-            client = object()
+            client = PreflightClient()
             clients.append(client)
             return client
 
@@ -894,6 +944,61 @@ class StructuredWorkerTest(unittest.TestCase):
         self.assertIs(gateway._query_client, clients[1])
         self.assertIsNot(gateway._ingest_client, gateway._query_client)
 
+    def test_worker_factory_runs_preflight_before_any_job_claim_and_closes_clients(self) -> None:
+        ingest_password = Path(self.temp_dir.name) / "preflight-failure-password"
+        ingest_password.write_text("ingest-secret", encoding="utf-8")
+        clients: list[PreflightClient] = []
+
+        def build_client(**_kwargs):
+            client = PreflightClient(failure=RuntimeError("server unavailable"))
+            clients.append(client)
+            return client
+
+        with patch.object(StructuredRepository, "claim_publication") as claim:
+            with self.assertRaisesRegex(StructuredStorageError, "preflight failed"):
+                build_structured_worker(
+                    {
+                        "STRUCTURED_QUERY_ENABLED": "true",
+                        "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+                        "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+                        "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+                        "PARQUET_ROOT": self.temp_dir.name,
+                    },
+                    database_factory=lambda _url: self.database,
+                    clickhouse_client_factory=build_client,
+                )
+
+        claim.assert_not_called()
+        self.assertEqual([client.close_calls for client in clients], [1, 1])
+
+    def test_worker_factory_forwards_selected_compatibility_profile_to_gateway_and_publisher(self) -> None:
+        ingest_password = Path(self.temp_dir.name) / "legacy-profile-password"
+        ingest_password.write_text("ingest-secret", encoding="utf-8")
+        clients: list[PreflightClient] = []
+
+        def build_client(**_kwargs):
+            client = PreflightClient(version="18.16.1")
+            clients.append(client)
+            return client
+
+        worker = build_structured_worker(
+            {
+                "STRUCTURED_QUERY_ENABLED": "true",
+                "CLICKHOUSE_COMPATIBILITY_MODE": "legacy_18_16",
+                "CLICKHOUSE_INGEST_PASSWORD_FILE": str(ingest_password),
+                "DATABASE_URL": "postgresql://user:pass@127.0.0.1:5432/app",
+                "CLICKHOUSE_URL": "http://127.0.0.1:8123",
+                "PARQUET_ROOT": self.temp_dir.name,
+            },
+            database_factory=lambda _url: self.database,
+            clickhouse_client_factory=build_client,
+        )
+
+        gateway = worker._publisher.clickhouse
+        self.assertEqual(gateway._compatibility.mode, ClickHouseCompatibilityMode.LEGACY_18_16)
+        self.assertIs(worker._publisher.compatibility, gateway._compatibility)
+        self.assertEqual(worker._publisher.compatibility.mode, ClickHouseCompatibilityMode.LEGACY_18_16)
+
     def test_worker_factory_injects_real_metadata_indexer_in_qwen3_mode(self) -> None:
         ingest_password = Path(self.temp_dir.name) / "qwen-ingest-password"
         ingest_password.write_text("ingest-secret", encoding="utf-8")
@@ -933,7 +1038,7 @@ class StructuredWorkerTest(unittest.TestCase):
             worker = build_structured_worker(
                 environment,
                 database_factory=lambda _url: self.database,
-                clickhouse_client_factory=lambda **_kwargs: object(),
+                clickhouse_client_factory=lambda **_kwargs: PreflightClient(),
             )
 
         self.assertIs(worker.metadata_indexer, metadata_indexer)

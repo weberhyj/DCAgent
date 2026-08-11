@@ -6,6 +6,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
+from .clickhouse_compatibility import ClickHouseCompatibilityMode
 from .database import resolve_database_url
 
 
@@ -136,6 +137,7 @@ class OfflineSettings:
     model_root: Path
     model_slots: int
     dependency_timeout_seconds: float
+    clickhouse_compatibility_mode: ClickHouseCompatibilityMode
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> OfflineSettings:
@@ -143,6 +145,13 @@ class OfflineSettings:
         structured_query_enabled = parse_bool(
             environ.get("STRUCTURED_QUERY_ENABLED"), default=False
         )
+        compatibility_value = environ.get("CLICKHOUSE_COMPATIBILITY_MODE", "modern")
+        try:
+            clickhouse_compatibility_mode = ClickHouseCompatibilityMode(compatibility_value)
+        except ValueError as error:
+            raise OfflineSettingsError(
+                "CLICKHOUSE_COMPATIBILITY_MODE must be one of: modern, legacy_18_16"
+            ) from error
         query_password_file = _password_file_from_environ(
             environ,
             path_key="CLICKHOUSE_QUERY_PASSWORD_FILE",
@@ -211,5 +220,6 @@ class OfflineSettings:
             model_root=Path(environ.get("MODEL_ROOT", "./models")),
             model_slots=model_slots,
             dependency_timeout_seconds=float(environ.get("DEPENDENCY_TIMEOUT_SECONDS", "2.0")),
+            clickhouse_compatibility_mode=clickhouse_compatibility_mode,
             **values,
         )

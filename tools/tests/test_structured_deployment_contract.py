@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +75,71 @@ def service_block(compose: str, service: str) -> str:
 
 
 class StructuredDeploymentContractTests(unittest.TestCase):
+    def test_clickhouse_compatibility_mode_is_explicit_in_examples(self) -> None:
+        for path in ENV_EXAMPLES:
+            values = active_assignments(path.read_text(encoding="utf-8"))
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertEqual(values.get("CLICKHOUSE_COMPATIBILITY_MODE"), "modern")
+
+    def test_compose_wires_required_clickhouse_compatibility_mode_to_consumers(self) -> None:
+        compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        expected = "CLICKHOUSE_COMPATIBILITY_MODE: ${CLICKHOUSE_COMPATIBILITY_MODE:?CLICKHOUSE_COMPATIBILITY_MODE is required}"
+        for service in ("api", "ingestion-worker"):
+            with self.subTest(service=service):
+                self.assertIn(expected, service_block(compose, service))
+
+    def test_ubuntu_18_16_legacy_account_materials_are_conservative(self) -> None:
+        xml_path = REPO_ROOT / "deploy" / "ubuntu" / "clickhouse-18.16-users.xml.example"
+        guide_path = REPO_ROOT / "deploy" / "ubuntu" / "CLICKHOUSE_18_16.md"
+        xml = xml_path.read_text(encoding="utf-8")
+        guide = guide_path.read_text(encoding="utf-8")
+        root = ET.fromstring(xml)
+        self.assertEqual(root.tag, "clickhouse")
+        users = root.find("users")
+        self.assertIsNotNone(users)
+        assert users is not None
+        self.assertIn("<users>", xml)
+        profiles = root.find("profiles")
+        self.assertIsNotNone(profiles)
+        assert profiles is not None
+        self.assertEqual(profiles.findtext("dc_agent_query/readonly"), "2")
+        self.assertEqual(profiles.findtext("dc_agent_ingest/readonly"), "0")
+        for username in ("dc_agent_query", "dc_agent_ingest"):
+            with self.subTest(username=username):
+                self.assertRegex(xml, rf"(?ms)<{username}>.*?</{username}>")
+                user = users.find(username)
+                self.assertIsNotNone(user)
+                assert user is not None
+                self.assertEqual(user.findtext("profile"), username)
+                self.assertEqual(user.findtext("quota"), "default")
+                self.assertEqual(user.findtext("allow_databases/database"), "default")
+                self.assertTrue(user.findtext("password_sha256_hex", "").startswith("REPLACE_"))
+                self.assertIsNone(user.find("readonly"))
+        self.assertNotIn("0.0.0.0/0", xml)
+        self.assertNotRegex(xml, r"(?i)\b(?:CREATE|ALTER|GRANT|REVOKE)\s+(?:USER|ROLE|TABLE|SELECT|INSERT)")
+        self.assertRegex(xml, r'<password_sha256_hex>[A-Z0-9_{}-]+</password_sha256_hex>')
+        self.assertIn('test "$server_version" = "18.16.1"', guide)
+        self.assertNotIn("Continue only when the server reports `18.16.x`", guide)
+        self.assertIn("CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16", guide)
+        self.assertRegex(guide, r"(?is)api.*?CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16")
+        self.assertRegex(guide, r"(?is)worker.*?CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16")
+        self.assertIn("API Supervisor environment", guide)
+        self.assertIn("Worker Supervisor environment", guide)
+        self.assertIn("Query-account write denial probe", guide)
+        self.assertIn("CREATE DATABASE operator_probe", guide)
+        self.assertIn("CREATE TABLE operator_probe.secret_probe", guide)
+        self.assertIn("must fail with a permission error", guide)
+        write_probe = re.search(
+            r"(?ms)^#### Query-account write denial probe\n(?P<body>.*?)(?=^####|^###|\Z)",
+            guide,
+        )
+        self.assertIsNotNone(write_probe)
+        assert write_probe is not None
+        self.assertIn("CREATE TEMPORARY TABLE dc_agent_query_write_denied", write_probe.group("body"))
+        self.assertNotRegex(write_probe.group("body"), r"CREATE TABLE\s+default\.")
+
     def test_env_examples_define_structured_rollout_contract(self) -> None:
         for path in ENV_EXAMPLES:
             text = path.read_text(encoding="utf-8")

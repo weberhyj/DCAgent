@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app.llm import create_llm_provider
+from app.clickhouse_compatibility import ClickHouseCompatibilityMode
 from app.offline_settings import (
     OfflineSettings,
     OfflineSettingsError,
@@ -15,6 +16,27 @@ from app.offline_settings import (
 
 
 class OfflineSettingsTest(unittest.TestCase):
+    def test_settings_parse_legacy_clickhouse_mode(self) -> None:
+        settings = OfflineSettings.from_environ(
+            {"CLICKHOUSE_COMPATIBILITY_MODE": "legacy_18_16"}
+        )
+        self.assertIs(
+            settings.clickhouse_compatibility_mode,
+            ClickHouseCompatibilityMode.LEGACY_18_16,
+        )
+
+    def test_settings_reject_unknown_clickhouse_mode(self) -> None:
+        with self.assertRaisesRegex(OfflineSettingsError, "CLICKHOUSE_COMPATIBILITY_MODE"):
+            OfflineSettings.from_environ({"CLICKHOUSE_COMPATIBILITY_MODE": "18.16"})
+
+    def test_settings_reject_clickhouse_mode_case_and_whitespace_variants(self) -> None:
+        for value in ("MODERN", " legacy_18_16 "):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    OfflineSettingsError, "CLICKHOUSE_COMPATIBILITY_MODE"
+                ):
+                    OfflineSettings.from_environ({"CLICKHOUSE_COMPATIBILITY_MODE": value})
+
     def test_parse_bool_supports_offline_environment_values(self) -> None:
         for value in ("1", "true", "YES", " on "):
             with self.subTest(value=value):
