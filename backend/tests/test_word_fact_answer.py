@@ -67,8 +67,8 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         service = WordFactAnswerService(
             FakeFacts(
                 [
-                    match("张三", "年龄", "28岁", source_id="kb-a"),
-                    match("张三", "年龄", "29岁", source_id="kb-b"),
+                    match("张三", "年龄", "28岁", chunk_id="chunk-a"),
+                    match("张三", "年龄", "29岁", chunk_id="chunk-b"),
                 ]
             )
         )
@@ -77,7 +77,10 @@ class WordFactAnswerServiceTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertIn("存在多个年龄值", result.reply.paragraphs[0].text)
+        self.assertEqual(
+            result.reply.paragraphs[0].text,
+            "同一来源中存在多个年龄值，请核对来源数据。",
+        )
         self.assertNotIn("张三的年龄是28岁", result.reply.paragraphs[0].text)
 
     def test_same_value_from_multiple_sources_still_clarifies_same_name_entity(self) -> None:
@@ -94,7 +97,29 @@ class WordFactAnswerServiceTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertIn("请确认来源", result.reply.paragraphs[0].text)
+        self.assertEqual(
+            result.reply.paragraphs[0].text,
+            "多个来源包含张三的年龄记录，请确认来源。",
+        )
+        self.assertNotIn("多个年龄值", result.reply.paragraphs[0].text)
+
+    def test_malformed_match_fails_closed_without_leaking_value(self) -> None:
+        service = WordFactAnswerService(
+            FakeFacts([match("张三", "年龄", "28岁 性别：女")])
+        )
+
+        result = service.try_answer("conv-1", "张三几岁", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result.reply.paragraphs[0].text,
+            "无法安全返回张三的年龄，请核对来源数据。",
+        )
+        self.assertNotIn("性别", result.reply.paragraphs[0].text)
+        self.assertNotIn("女", result.reply.paragraphs[0].text)
+        self.assertEqual(result.reply.paragraphs[0].citations, [])
+        self.assertEqual(result.evidence_count, 0)
 
     def test_missing_target_field_returns_not_found_not_rag(self) -> None:
         result = WordFactAnswerService(FakeFacts([])).try_answer(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -36,15 +37,6 @@ FACT_FIELD_ALIASES = {
         "\u62c5\u4efb",
         "title",
     ),
-    "\u90e8\u95e8": ("\u90e8\u95e8", "\u6240\u5c5e\u90e8\u95e8", "department"),
-    "\u5de5\u53f7": ("\u5de5\u53f7", "\u5458\u5de5\u7f16\u53f7", "employee id"),
-    "\u5165\u804c\u65e5\u671f": (
-        "\u5165\u804c\u65e5\u671f",
-        "\u5165\u804c\u65f6\u95f4",
-        "hire date",
-    ),
-    "\u7535\u8bdd": ("\u7535\u8bdd", "\u8054\u7cfb\u7535\u8bdd", "\u624b\u673a", "phone"),
-    "\u90ae\u7bb1": ("\u90ae\u7bb1", "\u7535\u5b50\u90ae\u7bb1", "email"),
 }
 _CANONICAL_FACT_FIELDS = {
     normalize_fact_key(alias): canonical
@@ -154,8 +146,68 @@ class FieldAliasMatch:
 
 
 _POLITE_PREFIXES = ("能否告诉我", "帮我查一下", "请问")
-_QUESTION_PARTICLES = ("是什么", "什么", "的", "是", "吗", "呢")
-_ENTITY_SEPARATORS = ("以及", "、", "和")
+_QUESTION_END_PARTICLES = ("吗", "呢")
+_EXPLICIT_ENTITY_SEPARATORS = ("以及", "、")
+_ORGANIZATION_SUFFIXES = (
+    "公司",
+    "集团",
+    "部门",
+    "医院",
+    "学校",
+    "大学",
+    "中心",
+    "委员会",
+    "研究院",
+    "事务所",
+    "银行",
+    "政府",
+    "协会",
+    "工厂",
+)
+_FIELD_LIST_ALIASES = {
+    "年龄": ("年龄", "年纪", "岁数"),
+    "性别": ("性别", "男女"),
+    "职务": ("职务", "职位", "岗位"),
+}
+_FIELD_QUERY_FORMS = {
+    "年龄": (
+        "几岁",
+        "多大",
+        "年龄",
+        "年龄是什么",
+        "年龄是多少",
+        "年龄多少",
+        "年纪",
+        "年纪是什么",
+        "年纪是多少",
+        "年纪多少",
+        "岁数",
+        "岁数是什么",
+        "岁数是多少",
+        "岁数多少",
+    ),
+    "性别": (
+        "性别",
+        "性别是什么",
+        "性别是男是女",
+        "男女",
+        "男女是什么",
+    ),
+    "职务": (
+        "职务",
+        "职务是什么",
+        "职务是做什么",
+        "职位",
+        "职位是什么",
+        "岗位",
+        "岗位是什么",
+        "担任什么",
+        "担任什么职务",
+        "担任什么职位",
+        "担任什么岗位",
+    ),
+}
+_EMBEDDED_KEY_VALUE = re.compile(r"[^:：\n]{1,80}[:：]\s*\S")
 
 
 def normalize_question_with_positions(question: str) -> tuple[str, tuple[int, ...]]:
@@ -166,7 +218,9 @@ def normalize_question_with_positions(question: str) -> tuple[str, tuple[int, ..
     normalized: list[str] = []
     positions: list[int] = []
     for position, character in enumerate(unicodedata.normalize("NFKC", question).casefold()):
-        if character.isspace() or unicodedata.category(character).startswith("P"):
+        if character.isspace() or (
+            character != "、" and unicodedata.category(character).startswith("P")
+        ):
             continue
         normalized.append(character)
         positions.append(position)
@@ -211,58 +265,33 @@ def extract_single_entity(
     question: str,
     field_matches: Sequence[FieldAliasMatch],
 ) -> str | WordFactClarification:
-    """Extract one entity after removing only recognized factual question wording."""
+    """Extract the entity only when the complete question matches the exact grammar."""
 
-    normalized, positions = normalize_question_with_positions(question)
-    del normalized
-    removed_positions = {
-        positions[index]
-        for match in field_matches
-        for index in range(match.start, match.end)
-        if index < len(positions)
-    }
-    entity = "".join(
-        character
-        for index, character in enumerate(question)
-        if index not in removed_positions
-        and not character.isspace()
-        and (
-            character == "、" or not unicodedata.category(character).startswith("P")
-        )
-    )
-    for prefix in _POLITE_PREFIXES:
-        if entity.startswith(prefix):
-            entity = entity[len(prefix) :]
-            break
-    changed = True
-    while changed:
-        changed = False
-        for particle in _QUESTION_PARTICLES:
-            if entity.endswith(particle):
-                entity = entity[: -len(particle)]
-                changed = True
-                break
-
-    for separator in _ENTITY_SEPARATORS:
-        if separator in entity:
-            candidates = tuple(part for part in entity.replace("以及", "、").replace("和", "、").split("、") if part)
-            return WordFactClarification("一次只能查询一个实体，请选择", candidates)
+    del field_matches
+    query_match = _match_exact_factual_query(question)
+    if query_match is None:
+        return WordFactClarification("请使用精确事实问法", ())
+    entity, _fields = query_match
+    candidates = _entity_list_candidates(entity)
+    if candidates is not None:
+        return WordFactClarification("一次只能查询一个实体，请选择", candidates)
     if not entity:
         return WordFactClarification("请指定一个实体", ())
     return entity
 
 
 def resolve_word_factual_intent(question: str) -> WordFactualResolution:
-    normalized, _positions = normalize_question_with_positions(question)
-    field_matches = find_longest_field_aliases(normalized)
-    if not field_matches:
+    query_match = _match_exact_factual_query(question)
+    if query_match is None:
         return None
-    fields = tuple(dict.fromkeys(item.field for item in field_matches))
+    entity, fields = query_match
     if len(fields) != 1:
         return WordFactClarification("一次只能查询一个事实字段，请选择", fields)
-    entity = extract_single_entity(question, field_matches)
-    if isinstance(entity, WordFactClarification):
-        return entity
+    candidates = _entity_list_candidates(entity)
+    if candidates is not None:
+        return WordFactClarification("一次只能查询一个实体，请选择", candidates)
+    if not entity:
+        return WordFactClarification("请指定一个实体", ())
     field = fields[0]
     return WordFactualIntent(
         entity=entity,
@@ -270,6 +299,112 @@ def resolve_word_factual_intent(question: str) -> WordFactualResolution:
         field=field,
         field_normalized=normalize_fact_key(field),
     )
+
+
+def _match_exact_factual_query(question: str) -> tuple[str, tuple[str, ...]] | None:
+    normalized, _positions = normalize_question_with_positions(question)
+    for prefix in sorted(_POLITE_PREFIXES, key=len, reverse=True):
+        normalized_prefix = normalize_fact_key(prefix)
+        if normalized.startswith(normalized_prefix):
+            normalized = normalized[len(normalized_prefix) :]
+            break
+    while normalized.endswith(_QUESTION_END_PARTICLES):
+        normalized = normalized[:-1]
+
+    multi_field = _match_multi_field_query(normalized)
+    if multi_field is not None:
+        return multi_field
+
+    matches: list[tuple[int, str, str]] = []
+    for field, forms in _FIELD_QUERY_FORMS.items():
+        for form in forms:
+            normalized_form = normalize_fact_key(form)
+            if normalized.endswith(normalized_form):
+                matches.append((len(normalized_form), field, normalized_form))
+    if not matches:
+        return None
+    _length, field, form = max(matches, key=lambda item: (item[0], item[1]))
+    entity = _strip_entity_connector(normalized[: -len(form)])
+    return entity, (field,)
+
+
+def _match_multi_field_query(question: str) -> tuple[str, tuple[str, ...]] | None:
+    aliases = sorted(
+        (
+            (normalize_fact_key(alias), field)
+            for field, field_aliases in _FIELD_LIST_ALIASES.items()
+            for alias in field_aliases
+        ),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    separators = ("以及", "、", "和")
+    for start in range(1, len(question)):
+        cursor = start
+        fields: list[str] = []
+        while cursor < len(question):
+            alias_match = next(
+                (
+                    (alias, field)
+                    for alias, field in aliases
+                    if question.startswith(alias, cursor)
+                ),
+                None,
+            )
+            if alias_match is None:
+                break
+            alias, field = alias_match
+            fields.append(field)
+            cursor += len(alias)
+            if cursor == len(question):
+                unique_fields = tuple(dict.fromkeys(fields))
+                if len(unique_fields) > 1:
+                    return _strip_entity_connector(question[:start]), unique_fields
+                break
+            separator = next(
+                (item for item in separators if question.startswith(item, cursor)),
+                None,
+            )
+            if separator is None:
+                break
+            cursor += len(separator)
+    return None
+
+
+def _strip_entity_connector(entity: str) -> str:
+    return entity[:-1] if entity.endswith("的") else entity
+
+
+def _entity_list_candidates(entity: str) -> tuple[str, ...] | None:
+    for separator in _EXPLICIT_ENTITY_SEPARATORS:
+        if separator in entity:
+            candidates = tuple(part for part in entity.split(separator) if part)
+            if len(candidates) > 1:
+                return candidates
+    if "和" not in entity:
+        return None
+    candidates = tuple(part for part in entity.split("和") if part)
+    if len(candidates) > 1 and all(
+        _looks_like_bounded_he_list_member(item) for item in candidates
+    ):
+        return candidates
+    return None
+
+
+def _looks_like_bounded_he_list_member(value: str) -> bool:
+    return (
+        2 <= len(value) <= 4
+        and all("\u3400" <= item <= "\u9fff" for item in value)
+        and not value.endswith(_ORGANIZATION_SUFFIXES)
+    )
+
+
+def fact_value_has_embedded_key_value(value: str) -> bool:
+    """Return whether a display value contains another apparent key/value record."""
+
+    if not isinstance(value, str):
+        return True
+    return _EMBEDDED_KEY_VALUE.search(value) is not None
 
 
 def validate_word_fact_answer(
@@ -294,19 +429,43 @@ def validate_word_fact_answer(
         if match.fact.entity_normalized == intent.entity_normalized
         and match.fact.field_normalized == intent.field_normalized
     ]
+    if any(fact_value_has_embedded_key_value(match.fact.value) for match in selected):
+        return answer == unsafe_word_fact_answer(intent)
     unique_by_source_value: dict[tuple[str, str], WordFactMatch] = {}
     for match in selected:
         unique_by_source_value.setdefault((match.fact.source_id, match.fact.value), match)
     unique_matches = tuple(unique_by_source_value.values())
     if not unique_matches:
-        return answer == f"未找到{intent.entity}的{intent.field}。"
+        return answer == missing_word_fact_answer(intent)
 
     source_ids = {match.fact.source_id for match in unique_matches}
     values = {match.fact.value for match in unique_matches}
-    if len(source_ids) != 1 or len(values) != 1:
-        return answer == f"存在多个{intent.field}值，请确认来源。"
+    if len(source_ids) != 1:
+        return answer == source_ambiguity_word_fact_answer(intent)
+    if len(values) != 1:
+        return answer == conflicting_word_fact_answer(intent)
     value = next(iter(values))
-    return answer == f"{intent.entity}的{intent.field}是{value}。"
+    return answer == exact_word_fact_answer(intent, value)
+
+
+def exact_word_fact_answer(intent: WordFactualIntent, value: str) -> str:
+    return f"{intent.entity}的{intent.field}是{value}。"
+
+
+def missing_word_fact_answer(intent: WordFactualIntent) -> str:
+    return f"未找到{intent.entity}的{intent.field}。"
+
+
+def source_ambiguity_word_fact_answer(intent: WordFactualIntent) -> str:
+    return f"多个来源包含{intent.entity}的{intent.field}记录，请确认来源。"
+
+
+def conflicting_word_fact_answer(intent: WordFactualIntent) -> str:
+    return f"同一来源中存在多个{intent.field}值，请核对来源数据。"
+
+
+def unsafe_word_fact_answer(intent: WordFactualIntent) -> str:
+    return f"无法安全返回{intent.entity}的{intent.field}，请核对来源数据。"
 
 
 class WordFactRepository(Protocol):

@@ -18,6 +18,7 @@ from .word_facts import (
     FACT_FIELD_ALIASES,
     KnowledgeFactModel,
     canonical_fact_field,
+    fact_value_has_embedded_key_value,
     normalize_fact_key,
 )
 
@@ -25,12 +26,11 @@ CHUNK_SIZE = 600
 CHUNK_OVERLAP = 120
 
 FACT_ENTITY_ALIASES = ("姓名", "人员", "员工", "人物", "名称")
-_DOCX_FACT_FIELDS = ("年龄", "性别", "职务")
 
 _FACT_FIELD_BY_ALIAS = {
     normalize_fact_key(alias): field
-    for field in _DOCX_FACT_FIELDS
-    for alias in FACT_FIELD_ALIASES[field]
+    for field, aliases in FACT_FIELD_ALIASES.items()
+    for alias in aliases
 }
 _FACT_ENTITY_KEYS = {normalize_fact_key(alias) for alias in FACT_ENTITY_ALIASES}
 _KEY_VALUE_DELIMITER = re.compile(r"[，,；;\n]+")
@@ -229,7 +229,7 @@ def extract_docx_facts(
                 if column >= len(block.cells):
                     continue
                 value = block.cells[column].strip()
-                if not value:
+                if not value or fact_value_has_embedded_key_value(value):
                     continue
                 facts.append(
                     _make_fact(
@@ -256,6 +256,7 @@ def extract_docx_facts(
             (_FACT_FIELD_BY_ALIAS[pair.key], pair)
             for pair in pairs
             if pair.key in _FACT_FIELD_BY_ALIAS
+            and not fact_value_has_embedded_key_value(pair.value)
         ]
         if len(entity_pairs) == 1 and field_pairs:
             for field, pair in field_pairs:
@@ -295,9 +296,12 @@ def extract_docx_facts(
                 )
             )
 
-    unique_facts: dict[str, KnowledgeFactModel] = {}
+    unique_facts: dict[tuple[str, str, str], KnowledgeFactModel] = {}
     for fact in facts:
-        unique_facts.setdefault(fact.id, fact)
+        unique_facts.setdefault(
+            (fact.entity_normalized, fact.field_normalized, fact.value),
+            fact,
+        )
     return tuple(unique_facts.values())
 
 

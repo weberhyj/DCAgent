@@ -11,7 +11,12 @@ from .word_facts import (
     WordFactMatch,
     WordFactRepository,
     WordFactualIntent,
+    conflicting_word_fact_answer,
+    exact_word_fact_answer,
+    missing_word_fact_answer,
     resolve_word_factual_intent,
+    source_ambiguity_word_fact_answer,
+    unsafe_word_fact_answer,
     validate_word_fact_answer,
 )
 
@@ -35,12 +40,14 @@ def _deduplicate_selected_matches(
 
 def _fact_answer_text(intent: WordFactualIntent, matches: Sequence[WordFactMatch]) -> str:
     if not matches:
-        return f"未找到{intent.entity}的{intent.field}。"
+        return missing_word_fact_answer(intent)
     source_ids = {match.fact.source_id for match in matches}
     values = {match.fact.value for match in matches}
-    if len(source_ids) != 1 or len(values) != 1:
-        return f"存在多个{intent.field}值，请确认来源。"
-    return f"{intent.entity}的{intent.field}是{next(iter(values))}。"
+    if len(source_ids) != 1:
+        return source_ambiguity_word_fact_answer(intent)
+    if len(values) != 1:
+        return conflicting_word_fact_answer(intent)
+    return exact_word_fact_answer(intent, next(iter(values)))
 
 
 def _fact_citations(
@@ -73,10 +80,12 @@ def build_word_fact_run(
 ) -> AgentRunResult:
     """Build the standard completed agent result for a deterministic fact outcome."""
 
-    if intent is not None and not validate_word_fact_answer(intent, matches, answer):
-        raise ValueError("word fact answer failed validation")
+    safe_matches = tuple(matches)
+    if intent is not None and not validate_word_fact_answer(intent, safe_matches, answer):
+        answer = unsafe_word_fact_answer(intent)
+        safe_matches = ()
     timestamp = display_datetime_label()
-    unique_source_ids = list(dict.fromkeys(match.fact.source_id for match in matches))
+    unique_source_ids = list(dict.fromkeys(match.fact.source_id for match in safe_matches))
     reply = ChatMessageModel(
         id=f"msg-{uuid4().hex[:8]}",
         role="assistant",
@@ -84,7 +93,9 @@ def build_word_fact_run(
         paragraphs=[
             ResponseParagraphModel(
                 text=answer,
-                citations=_fact_citations(intent, matches) if intent is not None else [],
+                citations=(
+                    _fact_citations(intent, safe_matches) if intent is not None else []
+                ),
             )
         ],
     )
@@ -110,7 +121,7 @@ def build_word_fact_run(
         completed_at=timestamp,
         reply=reply,
         steps=[step],
-        evidence_count=len(matches),
+        evidence_count=len(safe_matches),
         source_count=len(unique_source_ids),
     )
 

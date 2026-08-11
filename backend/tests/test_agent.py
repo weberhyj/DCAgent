@@ -379,6 +379,43 @@ class WordFactRouteRepositoryTests(unittest.TestCase):
         self.assertGreater(self.search_calls, 0)
         self.assertEqual(self.recording_llm.generation_calls, 1)
 
+    def test_open_questions_with_field_vocabulary_continue_to_hybrid_rag(self) -> None:
+        for question in (
+            "介绍财务部门",
+            "公司的岗位职责是什么",
+            "张三的年龄变化趋势是什么",
+        ):
+            with self.subTest(question=question):
+                self.recording_llm = RecordingRouteProvider()
+                self.search_calls = 0
+                self.inspect_calls = 0
+                repository, conversation_id = self.build_repository(
+                    word_fact_service=self.fact_service
+                )
+
+                repository.send_message(conversation_id, question, "deep")
+
+                self.assertGreater(self.search_calls, 0)
+                self.assertEqual(self.recording_llm.generation_calls, 1)
+
+    def test_malformed_fact_is_safe_terminal_and_never_calls_rag(self) -> None:
+        repository, conversation_id = self.build_repository(
+            word_fact_service=WordFactAnswerService(
+                FakeFacts([word_fact_match("张三", "年龄", "28岁 性别：女")])
+            )
+        )
+
+        _, _, messages = repository.send_message(conversation_id, "张三几岁", "deep")
+
+        self.assertEqual(
+            messages[-1].paragraphs[0].text,
+            "无法安全返回张三的年龄，请核对来源数据。",
+        )
+        self.assertNotIn("女", messages[-1].paragraphs[0].text)
+        self.assertEqual(self.recording_llm.generation_calls, 0)
+        self.assertEqual(self.search_calls, 0)
+        self.assertEqual(self.inspect_calls, 0)
+
     def test_missing_fact_is_terminal_and_never_inspects_document(self) -> None:
         repository, conversation_id = self.build_repository(
             word_fact_service=WordFactAnswerService(FakeFacts([]))

@@ -184,6 +184,38 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
 
         self.assertEqual(events, ["postgres-facts", "qdrant-upsert"])
 
+    def test_docx_queue_deduplicates_identical_source_facts_before_persistence(self) -> None:
+        source_id = "kb-ingestion-duplicate-facts"
+        path = Path(self.temp_dir.name) / "duplicate-people.docx"
+        document = Document()
+        document.add_paragraph("姓名：张三，年龄：28岁")
+        document.add_paragraph("说明" * 400)
+        document.add_paragraph("姓名：张三，年龄：28岁")
+        document.save(path)
+        self.repository.add_uploaded_knowledge_source(
+            source_id,
+            "duplicate-people.docx",
+            "文档",
+            "公开",
+            0,
+            str(path),
+            path.stat().st_size,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        self.queue.process(source_id, path, "文档")
+
+        matches = self.repository.find_knowledge_facts(
+            WordFactualIntent(
+                entity="张三",
+                entity_normalized=normalize_fact_key("张三"),
+                field="年龄",
+                field_normalized=normalize_fact_key("年龄"),
+            )
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].fact.locator, {"paragraph": 0})
+
     def test_qdrant_failure_does_not_delete_postgres_chunks(self) -> None:
         class FailingLifecycle:
             def upsert_source(self, source_id):

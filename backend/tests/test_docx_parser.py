@@ -147,6 +147,22 @@ class DocxParserTest(unittest.TestCase):
         self.assertEqual(result.facts, ())
         self.assertIn("二十八岁", "\n".join(item.text for item in result.chunks))
 
+    def test_values_with_embedded_other_field_keys_are_quarantined(self) -> None:
+        path = self.temp_dir / "malformed-values.docx"
+        document = Document()
+        document.add_paragraph("姓名：张三，年龄：28岁 性别：女")
+        table = document.add_table(rows=1, cols=2)
+        table.rows[0].cells[0].text = "姓名"
+        table.rows[0].cells[1].text = "年龄"
+        row = table.add_row().cells
+        row[0].text = "李四"
+        row[1].text = "31岁 职务：经理"
+        document.save(path)
+
+        result = parse_docx_knowledge_file(path, source_id="kb-malformed-values")
+
+        self.assertEqual(result.facts, ())
+
     def test_table_requires_exactly_one_entity_header(self) -> None:
         path = write_docx_table(
             self.temp_dir / "ambiguous-table.docx",
@@ -300,6 +316,21 @@ class DocxParserTest(unittest.TestCase):
             [chunk.id for chunk in first.chunks],
             [chunk.id for chunk in second.chunks],
         )
+
+    def test_identical_source_facts_in_different_chunks_keep_first_evidence(self) -> None:
+        path = write_docx(
+            self.temp_dir / "duplicate-facts.docx",
+            paragraphs=[
+                "姓名：张三，年龄：28岁",
+                "说明" * 400,
+                "姓名：张三，年龄：28岁",
+            ],
+        )
+
+        result = parse_docx_knowledge_file(path, source_id="kb-duplicate-facts")
+
+        self.assertEqual(len(result.facts), 1)
+        self.assertEqual(result.facts[0].locator, {"paragraph": 0})
 
     def test_legacy_parse_function_still_returns_list_of_chunks(self) -> None:
         path = write_docx(

@@ -7,6 +7,7 @@ from sqlalchemy import inspect
 from app.database import Database
 from app.models import KnowledgeFactModel as ExportedKnowledgeFactModel
 from app.word_facts import (
+    FACT_FIELD_ALIASES,
     KnowledgeFactModel,
     WordFactClarification,
     WordFactualIntent,
@@ -46,6 +47,11 @@ class WordFactContractTests(unittest.TestCase):
         self.assertEqual(canonical_fact_field("\u5e74\u7eaa"), "\u5e74\u9f84")
         with self.assertRaisesRegex(ValueError, "unknown fact field"):
             canonical_fact_field("\u672a\u914d\u7f6e\u5b57\u6bb5")
+
+    def test_shared_field_registry_contains_only_docx_extractable_fields(self) -> None:
+        self.assertEqual(set(FACT_FIELD_ALIASES), {"年龄", "性别", "职务"})
+        with self.assertRaisesRegex(ValueError, "unknown fact field"):
+            canonical_fact_field("部门")
 
     def test_age_gender_and_job_aliases_share_plan_canonical_fields(self) -> None:
         cases = (
@@ -107,6 +113,26 @@ class WordFactualIntentTests(unittest.TestCase):
 
     def test_open_introduction_is_not_factual(self) -> None:
         self.assertIsNone(resolve_word_factual_intent("介绍张三"))
+
+    def test_open_questions_with_field_vocabulary_are_not_factual(self) -> None:
+        for question in (
+            "介绍财务部门",
+            "公司的岗位职责是什么",
+            "张三的年龄变化趋势是什么",
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(resolve_word_factual_intent(question))
+
+    def test_he_inside_person_or_organization_name_is_not_a_list_separator(self) -> None:
+        for question, entity in (
+            ("李和平几岁", "李和平"),
+            ("仁和公司的职务是什么", "仁和公司"),
+        ):
+            with self.subTest(question=question):
+                resolution = resolve_word_factual_intent(question)
+                self.assertIsInstance(resolution, WordFactualIntent)
+                assert isinstance(resolution, WordFactualIntent)
+                self.assertEqual(resolution.entity, entity)
 
     def test_multiple_fields_and_entities_request_clarification(self) -> None:
         field_resolution = resolve_word_factual_intent("张三的年龄和性别")
