@@ -586,6 +586,46 @@ introduced.
 
 This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.
 
+The in-process `LargeMultiSummaryGateway` case injects a precomputed aggregate row. It is useful for
+batching, response-shape, one-row-return, and no-LLM resource checks, but it is not evidence that a
+database executed the filter or Decimal aggregates.
+
+Before release, the approved target host must pass the real 100,001-row ClickHouse gate below. Set
+all listed variables before importing the test module; the two password variables must point to
+readable absolute secret-file paths. A skipped test, `Ran 0 tests`, or a run against an in-memory
+gateway is not a live green result.
+
+```bash
+set -Eeuo pipefail
+export RUN_OFFLINE_INTEGRATION=1
+export CLICKHOUSE_HOST='<private-target-host>'
+export CLICKHOUSE_PORT='8123'
+export CLICKHOUSE_INGEST_USER='structured_ingest'
+export CLICKHOUSE_QUERY_USER='structured_query'
+export CLICKHOUSE_INGEST_PASSWORD_FILE='/absolute/path/to/ingest-password-file'
+export CLICKHOUSE_QUERY_PASSWORD_FILE='/absolute/path/to/query-password-file'
+
+test "$RUN_OFFLINE_INTEGRATION" = '1'
+test -n "$CLICKHOUSE_HOST"
+test -n "$CLICKHOUSE_INGEST_USER"
+test -n "$CLICKHOUSE_QUERY_USER"
+test -f "$CLICKHOUSE_INGEST_PASSWORD_FILE"
+test -f "$CLICKHOUSE_QUERY_PASSWORD_FILE"
+
+(
+  cd backend
+  uv run --project . --group dev --group offline python -m unittest \
+    tests.integration.test_structured_aggregation_e2e.StructuredAggregationTargetHostGateTest.test_large_filtered_multi_summary_matches_decimal_reference \
+    -v
+)
+```
+
+The hard gate publishes all 100,001 rows to the configured ClickHouse target, executes the actual
+parameterized `地区为华东` multi-summary, compares the three database-returned Decimal sums and
+matched/valid/null counts with an independent reference, verifies exactly one `SELECT` and one
+returned aggregate row, and confirms that Physoc is never called. The command must finish with one
+executed test, zero failures, and zero skips.
+
 Rollback is configuration-only and preserves published data. Set
 `STRUCTURED_QUERY_ENABLED=false`, stop the current topology, and restart without the indexing
 profile. The worker refuses to start while the feature flag is false, so rollback cannot continue

@@ -203,7 +203,6 @@ class StructuredMultiAggregatePlan:
 @dataclass(frozen=True, slots=True)
 class StructuredAggregateResult:
     dataset_id: str
-    source_id: str
     schema_version: int
     aggregate: StructuredAggregateName
     metric_physical_name: str | None
@@ -218,6 +217,7 @@ class StructuredAggregateResult:
     filters: tuple[StructuredFilter, ...]
     elapsed_ms: float
     audit_id: str
+    source_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

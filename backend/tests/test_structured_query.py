@@ -10,6 +10,7 @@ from app.clickhouse_compatibility import (
     ClickHouseCompatibilityProfile,
 )
 from app.structured_models import (
+    StructuredAggregateResult,
     StructuredClarification,
     StructuredColumnType,
     StructuredFilter,
@@ -1240,6 +1241,57 @@ class StructuredIntentParsingTest(unittest.TestCase):
         self.assertEqual(result.metric_physical_name, "order_amount_v2")
 
 
+class StructuredAggregateResultCompatibilityTest(unittest.TestCase):
+    def test_legacy_keyword_constructor_defaults_new_source_id(self) -> None:
+        result = StructuredAggregateResult(
+            dataset_id="ds-sales",
+            schema_version=1,
+            aggregate="sum",
+            metric_physical_name="order_amount",
+            metric_display_name="订单金额",
+            value=Decimal("30.50"),
+            total_count=2,
+            valid_count=2,
+            null_count=0,
+            source_name="sales.xlsx",
+            worksheet_name="明细",
+            publication_id="pub-sales-1",
+            filters=(),
+            elapsed_ms=1.25,
+            audit_id="audit-legacy-keyword",
+        )
+
+        self.assertEqual(result.source_id, "")
+        self.assertEqual(result.aggregate, "sum")
+        self.assertEqual(result.value, Decimal("30.50"))
+
+    def test_legacy_positional_constructor_keeps_existing_field_positions(self) -> None:
+        result = StructuredAggregateResult(
+            "ds-sales",
+            1,
+            "sum",
+            "order_amount",
+            "订单金额",
+            Decimal("30.50"),
+            2,
+            2,
+            0,
+            "sales.xlsx",
+            "明细",
+            "pub-sales-1",
+            (),
+            1.25,
+            "audit-legacy-positional",
+        )
+
+        self.assertEqual(result.dataset_id, "ds-sales")
+        self.assertEqual(result.schema_version, 1)
+        self.assertEqual(result.aggregate, "sum")
+        self.assertEqual(result.metric_physical_name, "order_amount")
+        self.assertEqual(result.audit_id, "audit-legacy-positional")
+        self.assertEqual(result.source_id, "")
+
+
 class StructuredQueryPlannerTest(unittest.TestCase):
     def test_multi_plan_uses_one_select_with_stable_projection_aliases(self) -> None:
         from app.structured_query import StructuredQueryPlanner
@@ -1766,6 +1818,127 @@ class StructuredQueryExecutorTest(unittest.TestCase):
                     result,
                     StructuredUnavailable("结构化查询返回了无效结果"),
                 )
+
+    def test_multi_executor_rejects_none_for_non_count_with_positive_valid_count(
+        self,
+    ) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": 1,
+                    "metric_0_value": None,
+                    "metric_0_valid_count": 1,
+                    "metric_0_null_count": 0,
+                }
+            ]
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        self.assertEqual(result, StructuredUnavailable("结构化查询返回了无效结果"))
+
+    def test_multi_executor_rejects_boolean_non_count_value(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": 1,
+                    "metric_0_value": True,
+                    "metric_0_valid_count": 1,
+                    "metric_0_null_count": 0,
+                }
+            ]
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        self.assertEqual(result, StructuredUnavailable("结构化查询返回了无效结果"))
+
+    def test_multi_executor_rejects_non_finite_decimal_values(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+
+        for invalid_value in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+            with self.subTest(invalid_value=invalid_value):
+                gateway = FakeClickHouse(
+                    aggregate_rows=[
+                        {
+                            "total_count": 1,
+                            "metric_0_value": invalid_value,
+                            "metric_0_valid_count": 1,
+                            "metric_0_null_count": 0,
+                        }
+                    ]
+                )
+
+                result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+                self.assertEqual(
+                    result,
+                    StructuredUnavailable("结构化查询返回了无效结果"),
+                )
+
+    def test_multi_executor_rejects_unexpected_result_aliases(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": 1,
+                    "metric_0_value": Decimal("10"),
+                    "metric_0_valid_count": 1,
+                    "metric_0_null_count": 0,
+                    "unexpected_alias": "must not be accepted",
+                }
+            ]
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        self.assertEqual(result, StructuredUnavailable("结构化查询返回了无效结果"))
 
     def test_multi_executor_rejects_negative_count_metric_value(self) -> None:
         from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner

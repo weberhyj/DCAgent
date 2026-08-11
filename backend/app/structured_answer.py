@@ -325,8 +325,10 @@ class StructuredAnswerService:
 def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     if not _has_aggregate_language(question):
         return False
+    if _is_implicit_summary(question):
+        return True
     if (
-        (_is_implicit_row_count(question) or _is_implicit_summary(question))
+        _is_implicit_row_count(question)
         and len([dataset for dataset in catalog.datasets if dataset.active_publication is not None])
         == 1
     ):

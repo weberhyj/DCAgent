@@ -227,7 +227,12 @@ class InMemoryAggregateGateway:
 
 
 class LargeMultiSummaryGateway:
-    """Ingestion/query fake that never materializes source rows for query evaluation."""
+    """Precomputed one-row fake for structure/resource acceptance only.
+
+    The query method intentionally does not evaluate SQL or parameters, so this fake cannot prove
+    ClickHouse filtering or Decimal arithmetic. The opt-in target-host gate below provides that
+    database evidence.
+    """
 
     def __init__(self, result: dict[str, object]) -> None:
         self.result = result
@@ -323,7 +328,7 @@ def _reference(
 
 
 class StructuredAggregationEndToEndTest(unittest.TestCase):
-    def test_large_summary_matches_decimal_reference_without_python_rows_or_llm(self) -> None:
+    def test_large_summary_structure_resource_and_single_row_contract(self) -> None:
         expected = _multi_decimal_reference("华东")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -333,6 +338,8 @@ class StructuredAggregationEndToEndTest(unittest.TestCase):
                 catalog.datasets[0].schema,
                 columns=catalog.datasets[0].schema.columns[:4],
             )
+            # Injecting the independently calculated baseline verifies deterministic rendering and
+            # the one-result-row/no-LLM resource contract, not ClickHouse numeric correctness.
             gateway = LargeMultiSummaryGateway(
                 {
                     "total_count": expected["total_count"],

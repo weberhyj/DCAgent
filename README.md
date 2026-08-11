@@ -224,7 +224,9 @@ execution default, and the default bounded ingestion batch is 50,000 rows.
 The feature is usable only after an administrator has approved a confirmed schema for the XLSX/CSV
 dataset and the offline `--profile indexing` worker has published that schema version. See
 [`deploy/offline/README.md`](deploy/offline/README.md) for migration, worker startup, smoke aggregate,
-rollback, and ClickHouse failure handling.
+rollback, ClickHouse failure handling, and the mandatory live 100,001-row filtered-summary gate.
+The in-process large-sheet fake only proves batching, deterministic response structure, one returned
+aggregate row, and LLM isolation; it does not prove ClickHouse filtering or Decimal arithmetic.
 
 ## 当前真实架构与能力边界
 

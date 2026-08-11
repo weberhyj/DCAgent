@@ -382,10 +382,18 @@ class StructuredQueryExecutor:
 
         try:
             row = _aggregate_row(raw_result)
-            value = _aggregate_value(row["aggregate_value"], plan.aggregate)
-            total_count = int(row["total_count"])
-            valid_count = int(row["valid_count"])
-            null_count = int(row["null_count"])
+            _require_exact_result_aliases(
+                row,
+                ("aggregate_value", "total_count", "valid_count", "null_count"),
+            )
+            total_count = _strict_integer(row["total_count"])
+            valid_count = _strict_integer(row["valid_count"])
+            null_count = _strict_integer(row["null_count"])
+            value = _aggregate_value(
+                row["aggregate_value"],
+                plan.aggregate,
+                valid_count=valid_count,
+            )
         except (KeyError, TypeError, ValueError, IndexError, ArithmeticError):
             return StructuredUnavailable("结构化查询返回了无效结果")
         if min(total_count, valid_count, null_count) < 0 or valid_count + null_count != total_count:
@@ -464,6 +472,10 @@ class StructuredQueryExecutor:
 
         try:
             row = _multi_aggregate_row(raw_result, len(plan.metrics))
+            _require_exact_result_aliases(
+                row,
+                _multi_aggregate_aliases(len(plan.metrics)),
+            )
             total_count = _strict_integer(row["total_count"])
             metric_results: list[StructuredMetricResult] = []
             for index, metric_intent in enumerate(plan.metrics):
@@ -490,7 +502,9 @@ class StructuredQueryExecutor:
                         return StructuredUnavailable("结构化查询返回了不一致的计数")
                 else:
                     value = _aggregate_value(
-                        row[f"metric_{index}_value"], metric_intent.aggregate
+                        row[f"metric_{index}_value"],
+                        metric_intent.aggregate,
+                        valid_count=valid_count,
                     )
                 metric_results.append(
                     StructuredMetricResult(
@@ -1467,16 +1481,20 @@ def _aggregate_row(result: object) -> Mapping[str, object]:
     named_results = getattr(result, "named_results", None)
     if named_results is not None:
         rows = list(named_results())
-        if rows and isinstance(rows[0], Mapping):
+        if len(rows) == 1 and isinstance(rows[0], Mapping):
             return rows[0]
+        raise ValueError("aggregate query must return exactly one named row")
     column_names = getattr(result, "column_names", None)
     result_rows = getattr(result, "result_rows", None)
-    if column_names and result_rows:
-        return dict(zip(column_names, result_rows[0], strict=True))
+    if column_names is not None and result_rows is not None:
+        rows = list(result_rows)
+        if len(rows) != 1:
+            raise ValueError("aggregate query must return exactly one result row")
+        return dict(zip(column_names, rows[0], strict=True))
     if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
         rows = list(result)
-        if not rows:
-            raise ValueError("empty aggregate result")
+        if len(rows) != 1:
+            raise ValueError("aggregate query must return exactly one result row")
         first = rows[0]
         if isinstance(first, Mapping):
             return first
@@ -1540,24 +1558,54 @@ def _multi_aggregate_row(
         if isinstance(first, Sequence) and not isinstance(
             first, (str, bytes, bytearray)
         ):
-            aliases = ["total_count"]
-            for index in range(metric_count):
-                aliases.extend(
-                    (
-                        f"metric_{index}_value",
-                        f"metric_{index}_valid_count",
-                        f"metric_{index}_null_count",
-                    )
-                )
-            return dict(zip(aliases, first, strict=True))
+            return dict(zip(_multi_aggregate_aliases(metric_count), first, strict=True))
     raise TypeError("unsupported ClickHouse multi-aggregate result shape")
 
 
-def _aggregate_value(value: object, aggregate: Literal["avg", "sum", "count", "min", "max"]):
-    if value is None:
-        return None
+def _multi_aggregate_aliases(metric_count: int) -> tuple[str, ...]:
+    aliases = ["total_count"]
+    for index in range(metric_count):
+        aliases.extend(
+            (
+                f"metric_{index}_value",
+                f"metric_{index}_valid_count",
+                f"metric_{index}_null_count",
+            )
+        )
+    return tuple(aliases)
+
+
+def _require_exact_result_aliases(
+    row: Mapping[str, object],
+    expected_aliases: tuple[str, ...],
+) -> None:
+    actual_aliases = tuple(row)
+    if len(actual_aliases) != len(expected_aliases) or set(actual_aliases) != set(expected_aliases):
+        raise ValueError("aggregate result aliases do not match the generated projection")
+
+
+def _aggregate_value(
+    value: object,
+    aggregate: Literal["avg", "sum", "count", "min", "max"],
+    *,
+    valid_count: int,
+):
     if aggregate == "count":
         return int(value)
-    if isinstance(value, (int, Decimal)):
+    if value is None:
+        if valid_count == 0:
+            return None
+        raise ValueError("non-empty aggregate result cannot be null")
+    if isinstance(value, bool):
+        raise TypeError("boolean is not a numeric aggregate result")
+    if isinstance(value, int):
         return value
-    return Decimal(str(value))
+    if isinstance(value, Decimal):
+        numeric = value
+    elif isinstance(value, (float, str)):
+        numeric = Decimal(str(value))
+    else:
+        raise TypeError("unsupported aggregate result type")
+    if not numeric.is_finite():
+        raise ValueError("aggregate result must be finite")
+    return numeric

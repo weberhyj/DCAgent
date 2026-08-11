@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import httpx
@@ -238,6 +239,100 @@ class LLMProviderTest(unittest.TestCase):
                 self.assertIn("结构化查询服务不可用", messages[-1].paragraphs[0].text)
                 self.assertEqual(rag_search.calls, 0)
                 self.assertIsNone(provider.request)
+
+    def test_implicit_summary_with_zero_or_multiple_publications_stays_structured(
+        self,
+    ) -> None:
+        class RecordingRetrievalRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, request: object) -> object:
+                self.calls += 1
+                raise AssertionError(f"implicit summary reached retrieval: {request}")
+
+        class NoQueryGateway:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def query(self, statement: str, parameters: object) -> object:
+                self.calls += 1
+                raise AssertionError(
+                    f"unresolved implicit summary reached ClickHouse: {statement} {parameters}"
+                )
+
+        base = sample_multi_metric_catalog()
+        first = base.datasets[0]
+        assert first.active_publication is not None
+        second_dataset_id = "ds-sales-2"
+        second = replace(
+            first,
+            schema=replace(
+                first.schema,
+                dataset_id=second_dataset_id,
+                source_id="kb-sales-2",
+                worksheet_name="明细2",
+            ),
+            source_name="sales-2.xlsx",
+            active_publication=replace(
+                first.active_publication,
+                publication_id="pub-sales-2",
+                dataset_id=second_dataset_id,
+                physical_table_name="structured_sales_2",
+            ),
+        )
+        cases = (
+            (
+                "zero",
+                replace(base, datasets=(replace(first, active_publication=None),)),
+                "没有已确认并发布的结构化数据集",
+            ),
+            (
+                "multiple",
+                replace(base, datasets=(first, second)),
+                "请指定要查询的数据集",
+            ),
+        )
+
+        for label, catalog, expected_message in cases:
+            with self.subTest(label=label):
+                rag_search = RecordingRetrievalRouter()
+                provider = RecordingLLMProvider()
+                gateway = NoQueryGateway()
+                structured_service = StructuredAnswerService(lambda: catalog, gateway)
+                structured_result = structured_service.try_answer(
+                    "conv-structured-regression",
+                    "汇总",
+                    "deep",
+                    [],
+                )
+                self.assertIsNotNone(structured_result)
+                repository = InMemoryChatRepository(
+                    ChatState(
+                        conversations=[],
+                        messages_by_conversation={},
+                        knowledge_sources=[],
+                    ),
+                    llm_provider=provider,
+                    structured_service=structured_service,
+                    retrieval_router=rag_search,
+                    retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                _, _, messages = repository.send_message(
+                    conversation_id,
+                    "汇总",
+                    "deep",
+                )
+
+                self.assertIn(expected_message, messages[-1].paragraphs[0].text)
+                self.assertEqual(rag_search.calls, 0)
+                self.assertIsNone(provider.request)
+                self.assertEqual(gateway.calls, 0)
+                runs = repository.list_agent_runs()
+                self.assertEqual(len(runs), 1)
+                self.assertEqual(runs[0].steps[0].tool_name, "query_structured_data")
 
     def test_clickhouse_failure_after_excel_route_never_searches_word_documents(self) -> None:
         class FailingClickHouseGateway:
