@@ -1,31 +1,37 @@
 /// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { loadEnv } from 'vite'
+import { normalizeAdminBasePath } from './src/config/adminBasePath'
 
-const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:9313'
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  const apiProxyTarget = env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:9313'
 
-export default defineConfig({
-  plugins: [vue()],
-  resolve: {
-    extensions: ['.ts', '.tsx', '.mjs', '.js', '.jsx', '.json'],
-    alias: {
-      '@': '/src',
-    },
-  },
-  server: {
-    port: 5177,
-    host: true,
-    allowedHosts: true,
-    proxy: {
-      '/api': {
-        target: apiProxyTarget,
-        changeOrigin: true,
+  return {
+    base: normalizeAdminBasePath(env.VITE_ADMIN_BASE_PATH),
+    plugins: [vue()],
+    resolve: {
+      extensions: ['.ts', '.tsx', '.mjs', '.js', '.jsx', '.json'],
+      alias: {
+        '@': '/src',
       },
     },
-  },
-  test: {
-    globals: true,
-    environment: 'jsdom',
-    include: ['src/**/*.spec.ts'],
-  },
+    server: {
+      port: 5177,
+      host: true,
+      allowedHosts: true,
+      proxy: {
+        '/api': {
+          target: apiProxyTarget,
+          changeOrigin: true,
+        },
+      },
+    },
+    test: {
+      globals: true,
+      environment: 'jsdom',
+      include: ['src/**/*.spec.ts'],
+    },
+  }
 })
