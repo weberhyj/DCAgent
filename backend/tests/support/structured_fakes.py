@@ -163,6 +163,86 @@ def sample_catalog(*, ambiguous: bool = False) -> StructuredCatalog:
     )
 
 
+def sample_multi_metric_catalog(metric_count: int = 3) -> StructuredCatalog:
+    columns = [
+        StructuredColumnSchema(
+            physical_name="sales_amount",
+            original_name="销售额",
+            display_name="销售额",
+            data_type=StructuredColumnType.DECIMAL,
+            aliases=("销售",),
+            allow_aggregate=True,
+            allow_filter=False,
+        ),
+        StructuredColumnSchema(
+            physical_name="cost_amount",
+            original_name="成本",
+            display_name="成本",
+            data_type=StructuredColumnType.DECIMAL,
+            aliases=(),
+            allow_aggregate=True,
+            allow_filter=False,
+        ),
+        StructuredColumnSchema(
+            physical_name="profit_amount",
+            original_name="利润",
+            display_name="利润",
+            data_type=StructuredColumnType.DECIMAL,
+            aliases=(),
+            allow_aggregate=True,
+            allow_filter=False,
+        ),
+        StructuredColumnSchema(
+            physical_name="region",
+            original_name="地区",
+            display_name="地区",
+            data_type=StructuredColumnType.STRING,
+            aliases=("区域",),
+            allow_aggregate=False,
+            allow_filter=True,
+        ),
+        StructuredColumnSchema(
+            physical_name="internal_score",
+            original_name="内部评分",
+            display_name="内部评分",
+            data_type=StructuredColumnType.DECIMAL,
+            aliases=(),
+            allow_aggregate=False,
+            allow_filter=False,
+        ),
+    ]
+    if metric_count > 3:
+        for index in range(4, metric_count + 1):
+            columns.append(
+                StructuredColumnSchema(
+                    physical_name=f"metric_{index:02d}",
+                    original_name=f"指标{index:02d}",
+                    display_name=f"指标{index:02d}",
+                    data_type=StructuredColumnType.DECIMAL,
+                    aliases=(),
+                    allow_aggregate=True,
+                    allow_filter=False,
+                )
+            )
+    schema = StructuredDatasetSchema(
+        dataset_id="ds-sales",
+        source_id="kb-sales",
+        worksheet_name="明细",
+        schema_version=1,
+        columns=tuple(columns),
+        schema_hash="a" * 64,
+    )
+    return StructuredCatalog(
+        datasets=(
+            StructuredDatasetCatalog(
+                schema=schema,
+                source_name="sales.xlsx",
+                active_publication=sample_publication(),
+            ),
+        ),
+    )
+
+
 class RecordingParquetSink:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or Path(".")

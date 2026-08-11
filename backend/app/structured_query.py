@@ -26,12 +26,19 @@ from .structured_models import (
     StructuredDatasetCatalog,
     StructuredFilter,
     StructuredIntent,
+    StructuredMetricIntent,
+    StructuredMultiAggregateIntent,
     StructuredPublication,
     StructuredQueryPlan,
     StructuredUnavailable,
 )
 
-StructuredIntentResolution = StructuredIntent | StructuredClarification | StructuredUnavailable
+StructuredIntentResolution = (
+    StructuredIntent
+    | StructuredMultiAggregateIntent
+    | StructuredClarification
+    | StructuredUnavailable
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -62,6 +69,10 @@ _AGGREGATE_WORDS = (
     ("count", ("多少条", "数量", "计数")),
     ("max", ("最大", "最高")),
     ("min", ("最小", "最低")),
+)
+_SUMMARY_WORDS = ("汇总", "统计")
+_NUMERIC_TYPES = frozenset(
+    {StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL}
 )
 _COMPARISON_OPERATORS = {"大于": "gt", "不少于": "gte", "小于": "lt", "不超过": "lte"}
 _DATE_RANGE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\s*至\s*(\d{4}-\d{2}-\d{2})")
@@ -315,7 +326,10 @@ def parse_structured_intent(
 
 
 def resolve_structured_intent(
-    question: str, catalog: StructuredCatalog
+    question: str,
+    catalog: StructuredCatalog,
+    *,
+    implicit_summary_max_metrics: int = 12,
 ) -> StructuredIntentResolution:
     dataset_result = _parse_dataset_clause(question, catalog)
     if dataset_result.issue is not None:
@@ -337,43 +351,117 @@ def resolve_structured_intent(
         question,
         dataset.schema.columns,
         consumed,
+        allow_missing=True,
     )
     if aggregate_result.issue is not None:
         return aggregate_result.issue
-    assert aggregate_result.value is not None
-    aggregate = aggregate_result.value
 
     consumed = (*consumed, *aggregate_result.consumed_spans)
-    metric_result = _parse_metric_clause(
+    available = _mask_spans(question, consumed)
+    field_spans = _column_name_spans(available, dataset.schema.columns)
+    has_summary_word = any(
+        not any(_contains(field_span, span) for field_span in field_spans)
+        for word in _SUMMARY_WORDS
+        for span in _find_normalized_spans(available, word)
+    )
+    if aggregate_result.value is None and not has_summary_word:
+        return StructuredUnavailable("未识别到受支持的聚合意图")
+    aggregate = aggregate_result.value or "sum"
+
+    metric_list_result = _parse_metric_list(
         question,
         dataset.schema.columns,
         aggregate,
-        filter_result.value,
-        filter_result.shared_columns,
-        aggregate_result.count_all_hint,
         consumed,
     )
-    if metric_result.issue is not None:
-        return metric_result.issue
-    metric = metric_result.value
+    if metric_list_result.issue is not None:
+        return metric_list_result.issue
+    assert metric_list_result.value is not None
+    metrics = metric_list_result.value
 
-    consumed = (*consumed, *metric_result.consumed_spans)
-    remaining = _mask_spans(question, consumed)
-    if _DATE_RANGE_RE.search(remaining) or re.search(r"大于|不少于|小于|不超过|为|=", remaining):
-        return StructuredUnavailable("结构化查询包含未识别的筛选条件")
+    if metrics:
+        consumed = (*consumed, *metric_list_result.consumed_spans)
+        remaining = _mask_spans(question, consumed)
+        if _DATE_RANGE_RE.search(remaining) or re.search(
+            r"大于|不少于|小于|不超过|为|=", remaining
+        ):
+            return StructuredUnavailable("结构化查询包含未识别的筛选条件")
+        if len(metrics) == 1:
+            return StructuredIntent(
+                dataset_id=dataset.schema.dataset_id,
+                aggregate=aggregate,
+                metric_physical_name=metrics[0].physical_name,
+                filters=filter_result.value,
+            )
+        return StructuredMultiAggregateIntent(
+            dataset_id=dataset.schema.dataset_id,
+            metrics=tuple(
+                StructuredMetricIntent(aggregate, column.physical_name) for column in metrics
+            ),
+            filters=filter_result.value,
+            implicit=False,
+        )
 
-    return StructuredIntent(
-        dataset_id=dataset.schema.dataset_id,
-        aggregate=aggregate,
-        metric_physical_name=None if metric is None else metric.physical_name,
-        filters=filter_result.value,
-    )
+    if aggregate_result.value is not None:
+        metric_result = _parse_metric_clause(
+            question,
+            dataset.schema.columns,
+            aggregate,
+            filter_result.value,
+            filter_result.shared_columns,
+            aggregate_result.count_all_hint,
+            consumed,
+        )
+        if metric_result.issue is not None:
+            return metric_result.issue
+        metric = metric_result.value
+
+        consumed = (*consumed, *metric_result.consumed_spans)
+        remaining = _mask_spans(question, consumed)
+        if _DATE_RANGE_RE.search(remaining) or re.search(
+            r"大于|不少于|小于|不超过|为|=", remaining
+        ):
+            return StructuredUnavailable("结构化查询包含未识别的筛选条件")
+
+        return StructuredIntent(
+            dataset_id=dataset.schema.dataset_id,
+            aggregate=aggregate,
+            metric_physical_name=None if metric is None else metric.physical_name,
+            filters=filter_result.value,
+        )
+
+    if has_summary_word:
+        implicit_columns = tuple(
+            column
+            for column in dataset.schema.columns
+            if column.allow_aggregate and column.data_type in _NUMERIC_TYPES
+        )
+        if not implicit_columns:
+            return StructuredUnavailable("没有可汇总的已授权数值列")
+        if len(implicit_columns) > implicit_summary_max_metrics:
+            return StructuredClarification(
+                f"可汇总指标超过上限，最多可汇总 {implicit_summary_max_metrics} 个指标，请选择",
+                tuple(column.display_name for column in implicit_columns),
+            )
+        return StructuredMultiAggregateIntent(
+            dataset_id=dataset.schema.dataset_id,
+            metrics=tuple(
+                StructuredMetricIntent("sum", column.physical_name)
+                for column in implicit_columns
+            ),
+            filters=filter_result.value,
+            implicit=True,
+        )
+
+    return StructuredUnavailable("未识别到受支持的聚合意图")
 
 
 def _parse_aggregate_clause(
     question: str,
     columns: tuple[StructuredColumnSchema, ...],
     excluded_spans: tuple[_TextSpan, ...],
+    *,
+    allow_missing: bool = False,
 ) -> _ClauseParseResult[str]:
     available = _mask_spans(question, excluded_spans)
     field_spans = _column_name_spans(available, columns)
@@ -395,12 +483,80 @@ def _parse_aggregate_clause(
             )
         )
     if not matches:
+        if allow_missing:
+            return _ClauseParseResult()
         return _ClauseParseResult(issue=StructuredUnavailable("未识别到受支持的聚合意图"))
     aggregate = next(iter(matches))
     return _ClauseParseResult(
         value=aggregate,
         consumed_spans=_merge_spans(matches[aggregate]),
         count_all_hint=count_all_hint,
+    )
+
+
+def _parse_metric_list(
+    question: str,
+    columns: tuple[StructuredColumnSchema, ...],
+    aggregate: str,
+    excluded_spans: tuple[_TextSpan, ...],
+) -> _ClauseParseResult[tuple[StructuredColumnSchema, ...]]:
+    available = _mask_spans(question, excluded_spans)
+    candidates = (
+        columns
+        if aggregate == "count"
+        else tuple(column for column in columns if column.allow_aggregate)
+    )
+    raw_matches: list[tuple[_TextSpan, int, int, StructuredColumnSchema]] = []
+    for column in candidates:
+        for priority, name in _resolution_names(column):
+            normalized_name = _normalize(name)
+            if not normalized_name:
+                continue
+            for span in _find_normalized_spans(available, name):
+                raw_matches.append((span, priority, len(normalized_name), column))
+
+    maximal = [
+        match
+        for match in raw_matches
+        if not any(
+            other[2] > match[2]
+            and _contains(other[0], match[0])
+            for other in raw_matches
+        )
+    ]
+    by_span: dict[_TextSpan, list[tuple[int, StructuredColumnSchema]]] = {}
+    for span, priority, _, column in maximal:
+        by_span.setdefault(span, []).append((priority, column))
+
+    selected: list[StructuredColumnSchema] = []
+    selected_names: set[str] = set()
+    selected_spans: list[_TextSpan] = []
+    for span in sorted(by_span, key=lambda item: (item.start, -(item.end - item.start))):
+        if selected_spans and span.start < selected_spans[-1].end:
+            continue
+        span_matches = by_span[span]
+        best_priority = min(priority for priority, _ in span_matches)
+        finalists = {
+            column.physical_name: column
+            for priority, column in span_matches
+            if priority == best_priority
+        }
+        if len(finalists) > 1:
+            return _ClauseParseResult(
+                issue=StructuredClarification(
+                    "字段名称存在歧义，请选择一个",
+                    tuple(sorted(finalists)),
+                )
+            )
+        column = next(iter(finalists.values()))
+        if column.physical_name not in selected_names:
+            selected.append(column)
+            selected_names.add(column.physical_name)
+        selected_spans.append(span)
+
+    return _ClauseParseResult(
+        value=tuple(selected),
+        consumed_spans=tuple(selected_spans),
     )
 
 

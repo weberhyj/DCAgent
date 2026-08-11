@@ -23,11 +23,86 @@ from tests.support.structured_fakes import (
     FakeClickHouse,
     RecordingLLMProvider,
     sample_catalog,
+    sample_multi_metric_catalog,
     sample_publication,
 )
 
 
-class StructuredIntentParserTest(unittest.TestCase):
+class StructuredIntentParsingTest(unittest.TestCase):
+    def test_huizong_without_metric_selects_all_governed_numeric_columns(self) -> None:
+        result = resolve_structured_intent(
+            "地区为华东的汇总",
+            sample_multi_metric_catalog(),
+            implicit_summary_max_metrics=12,
+        )
+        self.assertIsInstance(result, StructuredMultiAggregateIntent)
+        assert isinstance(result, StructuredMultiAggregateIntent)
+        self.assertTrue(result.implicit)
+        self.assertEqual(
+            [(item.aggregate, item.metric_physical_name) for item in result.metrics],
+            [
+                ("sum", "sales_amount"),
+                ("sum", "cost_amount"),
+                ("sum", "profit_amount"),
+            ],
+        )
+        self.assertEqual(result.filters, (StructuredFilter("region", "eq", "华东"),))
+
+    def test_explicit_multi_metric_summary_preserves_question_order(self) -> None:
+        result = resolve_structured_intent(
+            "地区为华东的利润、销售额、成本汇总",
+            sample_multi_metric_catalog(),
+        )
+        self.assertIsInstance(result, StructuredMultiAggregateIntent)
+        assert isinstance(result, StructuredMultiAggregateIntent)
+        self.assertFalse(result.implicit)
+        self.assertEqual(
+            [item.metric_physical_name for item in result.metrics],
+            ["profit_amount", "sales_amount", "cost_amount"],
+        )
+
+    def test_explicit_average_applies_to_every_named_metric(self) -> None:
+        result = resolve_structured_intent(
+            "华东地区销售额和成本平均值",
+            sample_multi_metric_catalog(),
+        )
+        self.assertIsInstance(result, StructuredMultiAggregateIntent)
+        assert isinstance(result, StructuredMultiAggregateIntent)
+        self.assertEqual([item.aggregate for item in result.metrics], ["avg", "avg"])
+
+    def test_single_metric_huizong_keeps_single_metric_contract(self) -> None:
+        result = resolve_structured_intent(
+            "华东地区销售额汇总", sample_multi_metric_catalog()
+        )
+        self.assertEqual(
+            result,
+            StructuredIntent(
+                dataset_id="ds-sales",
+                aggregate="sum",
+                metric_physical_name="sales_amount",
+                filters=(StructuredFilter("region", "eq", "华东"),),
+            ),
+        )
+
+    def test_implicit_summary_over_limit_clarifies_without_selecting_first_columns(
+        self,
+    ) -> None:
+        result = resolve_structured_intent(
+            "汇总",
+            sample_multi_metric_catalog(metric_count=13),
+            implicit_summary_max_metrics=12,
+        )
+        self.assertIsInstance(result, StructuredClarification)
+        assert isinstance(result, StructuredClarification)
+        self.assertEqual(len(result.candidates), 13)
+        self.assertIn("最多可汇总 12 个指标", result.message)
+
+    def test_summary_does_not_include_string_or_disallowed_numeric_columns(self) -> None:
+        result = resolve_structured_intent("汇总", sample_multi_metric_catalog())
+        assert isinstance(result, StructuredMultiAggregateIntent)
+        self.assertNotIn("region", [item.metric_physical_name for item in result.metrics])
+        self.assertNotIn("internal_score", [item.metric_physical_name for item in result.metrics])
+
     def test_multi_metric_contracts_preserve_metric_order(self) -> None:
         intent = StructuredMultiAggregateIntent(
             dataset_id="ds-sales",
@@ -59,14 +134,31 @@ class StructuredIntentParserTest(unittest.TestCase):
         self.assertIsInstance(result, StructuredClarification)
         self.assertEqual(set(result.candidates), {"net_amount", "order_amount"})
 
-    def test_independently_mentioned_metrics_clarify_even_when_lengths_differ(self) -> None:
+    def test_independently_mentioned_metrics_resolve_in_question_order(self) -> None:
         result = resolve_structured_intent(
             "订单金额和净金额平均值",
             sample_catalog(ambiguous=True),
         )
 
-        self.assertIsInstance(result, StructuredClarification)
-        self.assertEqual(result.candidates, ("net_amount", "order_amount"))
+        self.assertIsInstance(result, StructuredMultiAggregateIntent)
+        assert isinstance(result, StructuredMultiAggregateIntent)
+        self.assertEqual(
+            [item.metric_physical_name for item in result.metrics],
+            ["order_amount", "net_amount"],
+        )
+
+    def test_count_multi_metric_accepts_confirmed_non_aggregate_columns(self) -> None:
+        result = resolve_structured_intent(
+            "地区和销售额计数",
+            sample_multi_metric_catalog(),
+        )
+
+        self.assertIsInstance(result, StructuredMultiAggregateIntent)
+        assert isinstance(result, StructuredMultiAggregateIntent)
+        self.assertEqual(
+            [item.metric_physical_name for item in result.metrics],
+            ["region", "sales_amount"],
+        )
 
     def test_parses_numeric_and_date_range_filters(self) -> None:
         intent = parse_structured_intent(
