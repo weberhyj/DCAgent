@@ -29,6 +29,89 @@ from tests.support.structured_fakes import (
 
 
 class StructuredIntentParsingTest(unittest.TestCase):
+    def test_mixed_allowed_and_disallowed_metrics_never_degrade_to_single_metric(
+        self,
+    ) -> None:
+        result = resolve_structured_intent(
+            "销售额和内部评分汇总",
+            sample_multi_metric_catalog(),
+        )
+
+        self.assertIsInstance(result, StructuredUnavailable)
+
+    def test_same_span_across_name_priorities_requires_clarification(self) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        shadow = replace(
+            base.schema.columns[0],
+            physical_name="shadow_amount",
+            original_name="order_amount",
+            display_name="order_amount",
+            aliases=(),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    base,
+                    schema=replace(
+                        base.schema,
+                        columns=(*base.schema.columns, shadow),
+                    ),
+                ),
+            ),
+        )
+
+        result = resolve_structured_intent("order_amount平均值", catalog)
+
+        self.assertIsInstance(result, StructuredClarification)
+        assert isinstance(result, StructuredClarification)
+        self.assertEqual(result.candidates, ("order_amount", "shadow_amount"))
+
+    def test_overlapping_metric_names_select_longest_match_before_question_order(
+        self,
+    ) -> None:
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        short_metric = replace(
+            base.schema.columns[0],
+            physical_name="metric_short",
+            original_name="短指标",
+            display_name="短指标",
+            aliases=("abc",),
+        )
+        long_metric = replace(
+            base.schema.columns[0],
+            physical_name="metric_long",
+            original_name="长指标",
+            display_name="长指标",
+            aliases=("bcde",),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    base,
+                    schema=replace(
+                        base.schema,
+                        columns=(short_metric, long_metric, *base.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+
+        result = resolve_structured_intent("abcde平均值", catalog)
+
+        self.assertEqual(
+            result,
+            StructuredIntent(
+                dataset_id="ds-sales",
+                aggregate="avg",
+                metric_physical_name="metric_long",
+                filters=(),
+            ),
+        )
+
     def test_huizong_without_metric_selects_all_governed_numeric_columns(self) -> None:
         result = resolve_structured_intent(
             "地区为华东的汇总",

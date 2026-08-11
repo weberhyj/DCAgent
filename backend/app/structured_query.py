@@ -501,46 +501,51 @@ def _parse_metric_list(
     excluded_spans: tuple[_TextSpan, ...],
 ) -> _ClauseParseResult[tuple[StructuredColumnSchema, ...]]:
     available = _mask_spans(question, excluded_spans)
-    candidates = (
-        columns
-        if aggregate == "count"
-        else tuple(column for column in columns if column.allow_aggregate)
-    )
-    raw_matches: list[tuple[_TextSpan, int, int, StructuredColumnSchema]] = []
-    for column in candidates:
-        for priority, name in _resolution_names(column):
+    raw_matches: list[tuple[_TextSpan, int, StructuredColumnSchema]] = []
+    for column in columns:
+        for _, name in _resolution_names(column):
             normalized_name = _normalize(name)
             if not normalized_name:
                 continue
             for span in _find_normalized_spans(available, name):
-                raw_matches.append((span, priority, len(normalized_name), column))
+                raw_matches.append((span, len(normalized_name), column))
 
-    maximal = [
-        match
-        for match in raw_matches
-        if not any(
-            other[2] > match[2]
-            and _contains(other[0], match[0])
-            for other in raw_matches
-        )
-    ]
     by_span: dict[_TextSpan, list[tuple[int, StructuredColumnSchema]]] = {}
-    for span, priority, _, column in maximal:
-        by_span.setdefault(span, []).append((priority, column))
+    for span, match_length, column in raw_matches:
+        by_span.setdefault(span, []).append((match_length, column))
+
+    span_groups: list[
+        tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]
+    ] = []
+    for span, span_matches in by_span.items():
+        finalists = {column.physical_name: column for _, column in span_matches}
+        span_groups.append(
+            (
+                span,
+                max(match_length for match_length, _ in span_matches),
+                finalists,
+            )
+        )
+
+    non_overlapping: list[
+        tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]
+    ] = []
+    for match in sorted(
+        span_groups,
+        key=lambda item: (-item[1], item[0].start, item[0].end),
+    ):
+        span = match[0]
+        if any(
+            span.start < selected_span.end and selected_span.start < span.end
+            for selected_span, _, _ in non_overlapping
+        ):
+            continue
+        non_overlapping.append(match)
 
     selected: list[StructuredColumnSchema] = []
     selected_names: set[str] = set()
     selected_spans: list[_TextSpan] = []
-    for span in sorted(by_span, key=lambda item: (item.start, -(item.end - item.start))):
-        if selected_spans and span.start < selected_spans[-1].end:
-            continue
-        span_matches = by_span[span]
-        best_priority = min(priority for priority, _ in span_matches)
-        finalists = {
-            column.physical_name: column
-            for priority, column in span_matches
-            if priority == best_priority
-        }
+    for span, _, finalists in sorted(non_overlapping, key=lambda item: item[0]):
         if len(finalists) > 1:
             return _ClauseParseResult(
                 issue=StructuredClarification(
@@ -553,6 +558,17 @@ def _parse_metric_list(
             selected.append(column)
             selected_names.add(column.physical_name)
         selected_spans.append(span)
+
+    disallowed = tuple(
+        column for column in selected if aggregate != "count" and not column.allow_aggregate
+    )
+    if disallowed:
+        return _ClauseParseResult(
+            issue=StructuredUnavailable(
+                "指标列未授权用于聚合: "
+                + "、".join(column.display_name for column in disallowed)
+            )
+        )
 
     return _ClauseParseResult(
         value=tuple(selected),
