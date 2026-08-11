@@ -35,7 +35,7 @@ from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
 from app.structured_repository import StructuredRepository
-from tests.support.structured_fakes import sample_catalog
+from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
 
 
 class RecordingLLMProvider:
@@ -847,6 +847,101 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         runs = repository.list_agent_runs()
         self.assertEqual(len(runs), 1)
         self.assertEqual([step.tool_name for step in runs[0].steps], ["query_structured_data"])
+
+    def test_filtered_multi_summary_uses_clickhouse_once_and_never_calls_llm(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway(
+            result={
+                "total_count": 4,
+                "metric_0_value": Decimal("350.50"),
+                "metric_0_valid_count": 3,
+                "metric_0_null_count": 1,
+                "metric_1_value": Decimal("200"),
+                "metric_1_valid_count": 4,
+                "metric_1_null_count": 0,
+                "metric_2_value": None,
+                "metric_2_valid_count": 0,
+                "metric_2_null_count": 4,
+            }
+        )
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(), gateway
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "地区为华东的销售额、成本、利润汇总",
+            "deep",
+        )
+
+        self.assertEqual(len(gateway.calls), 1)
+        self.assertEqual(provider.calls, 0)
+        runs = repository.list_agent_runs()
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].steps[0].tool_name, "query_structured_data")
+        self.assertEqual(runs[0].steps[0].source_ids, ["kb-sales"])
+        reply = messages[-1]
+        self.assertEqual(
+            reply.paragraphs[0].text,
+            "结构化汇总结果：sales.xlsx / 明细，匹配 4 行，筛选条件：region:eq:华东。",
+        )
+        self.assertEqual(len(reply.artifacts), 1)
+        artifact = reply.artifacts[0]
+        self.assertEqual(artifact.type, "table")
+        self.assertEqual(artifact.title, "结构化汇总结果")
+        self.assertEqual(artifact.source, "sales.xlsx")
+        self.assertEqual(
+            artifact.columns,
+            ["指标", "聚合", "值", "匹配行数", "有效值", "空值"],
+        )
+        self.assertEqual(
+            artifact.rows,
+            [
+                ["销售额", "sum", "350.50", "4", "3", "1"],
+                ["成本", "sum", "200", "4", "4", "0"],
+                ["利润", "sum", "null", "4", "0", "4"],
+            ],
+        )
+
+    def test_implicit_limit_clarification_executes_neither_clickhouse_nor_llm(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(metric_count=13),
+                gateway,
+                implicit_summary_max_metrics=12,
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(conversation_id, "汇总", "quick")
+
+        self.assertIn("最多可汇总 12 个指标", messages[-1].paragraphs[0].text)
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(provider.calls, 0)
+
+    def test_single_metric_existing_answer_format_remains_supported(self) -> None:
+        gateway = RecordingClickHouseGateway()
+        result = StructuredAnswerService(lambda: sample_catalog(), gateway).try_answer(
+            "conv-1",
+            "华东地区订单金额总和",
+            "quick",
+            [],
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("aggregate=sum", result.reply.paragraphs[0].text)
+        self.assertEqual(result.reply.artifacts, [])
+        self.assertEqual(result.steps[0].source_ids, ["kb-sales"])
 
     def test_structured_decimal_value_uses_deterministic_thousands_separator(self) -> None:
         gateway = RecordingClickHouseGateway(

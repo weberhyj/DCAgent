@@ -14,7 +14,13 @@ from .clickhouse_compatibility import (
     ClickHouseCompatibilityMode,
     ClickHouseCompatibilityProfile,
 )
-from .models import ChatMessageModel, ComposerMode, ResponseParagraphModel
+from .models import (
+    ArtifactModel,
+    ChatMessageModel,
+    ComposerMode,
+    ResponseParagraphModel,
+    TableArtifactModel,
+)
 from .structured_models import (
     StructuredAggregateResult,
     StructuredCatalog,
@@ -23,6 +29,8 @@ from .structured_models import (
     StructuredDatasetCatalog,
     StructuredFilter,
     StructuredIntent,
+    StructuredMultiAggregateIntent,
+    StructuredMultiAggregateResult,
     StructuredUnavailable,
 )
 from .structured_query import (
@@ -50,10 +58,13 @@ _CHINESE_AGGREGATE_TERMS = (
     "最小值",
     "最小",
     "最低",
+    "汇总",
+    "统计",
 )
 _IMPLICIT_ROW_COUNT_RE = re.compile(
     r"^(?:(?:总共|一共|共有)有?)?多少条(?:记录|数据|明细|行)?[？?。.]?$"
 )
+_IMPLICIT_SUMMARY_RE = re.compile(r"^(?:请)?(?:汇总|统计)[？?。.]?$")
 _STRONG_AGGREGATE_SUFFIXES = tuple(
     sorted(
         (
@@ -70,6 +81,8 @@ _STRONG_AGGREGATE_SUFFIXES = tuple(
             "最小值",
             "最小",
             "最低",
+            "汇总",
+            "统计",
         ),
         key=len,
         reverse=True,
@@ -166,7 +179,11 @@ class StructuredAnswerService:
         if not is_structured_candidate(question, catalog):
             return None
 
-        resolution = resolve_structured_intent(question, catalog)
+        resolution = resolve_structured_intent(
+            question,
+            catalog,
+            implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+        )
         if isinstance(resolution, StructuredClarification):
             candidates = "、".join(resolution.candidates)
             suffix = f" 可选项：{candidates}。" if candidates else ""
@@ -196,9 +213,27 @@ class StructuredAnswerService:
                 "active publication unavailable",
             )
         try:
-            plan = StructuredQueryPlanner(catalog, self._compatibility).plan(
-                resolution, publication
-            )
+            if isinstance(resolution, StructuredMultiAggregateIntent):
+                plan = StructuredQueryPlanner(
+                    catalog,
+                    self._compatibility,
+                    implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+                ).plan_multi(resolution, publication)
+                result = StructuredQueryExecutor(
+                    catalog,
+                    self._clickhouse_gateway,
+                    compatibility=self._compatibility,
+                    implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+                ).execute_multi(plan)
+            else:
+                plan = StructuredQueryPlanner(catalog, self._compatibility).plan(
+                    resolution, publication
+                )
+                result = StructuredQueryExecutor(
+                    catalog,
+                    self._clickhouse_gateway,
+                    compatibility=self._compatibility,
+                ).execute(plan)
         except UnsafeStructuredQueryError:
             return _structured_run(
                 conversation_id,
@@ -207,11 +242,6 @@ class StructuredAnswerService:
                 "结构化查询服务不可用：查询计划未通过安全校验。",
                 "structured query planning failed",
             )
-        result = StructuredQueryExecutor(
-            catalog,
-            self._clickhouse_gateway,
-            compatibility=self._compatibility,
-        ).execute(plan)
         if isinstance(result, StructuredUnavailable):
             return _structured_run(
                 conversation_id,
@@ -220,13 +250,44 @@ class StructuredAnswerService:
                 f"结构化查询服务不可用：{result.message}。",
                 "structured query unavailable",
             )
+        if isinstance(result, StructuredMultiAggregateResult):
+            paragraph = (
+                f"结构化汇总结果：{result.source_name} / {result.worksheet_name}，"
+                f"匹配 {result.total_count} 行，筛选条件：{_format_filters(result.filters)}。"
+            )
+            artifact = TableArtifactModel(
+                type="table",
+                title="结构化汇总结果",
+                source=result.source_name,
+                columns=["指标", "聚合", "值", "匹配行数", "有效值", "空值"],
+                rows=[
+                    [
+                        item.metric_display_name,
+                        item.aggregate,
+                        _format_numeric_value(item.value),
+                        str(result.total_count),
+                        str(item.valid_count),
+                        str(item.null_count),
+                    ]
+                    for item in result.metrics
+                ],
+            )
+            return _structured_run(
+                conversation_id,
+                question,
+                mode,
+                paragraph,
+                f"structured multi-aggregate completed; audit_id={result.audit_id}",
+                source_ids=[result.source_id],
+                artifacts=[artifact],
+            )
         return _structured_run(
             conversation_id,
             question,
             mode,
             _format_result(result),
             f"structured aggregate completed; audit_id={result.audit_id}",
-            source_ids=[result.dataset_id],
+            source_ids=[result.source_id],
         )
 
     def _next_catalog_request_generation(self) -> int:
@@ -254,7 +315,7 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     if not _has_aggregate_language(question):
         return False
     if (
-        _is_implicit_row_count(question)
+        (_is_implicit_row_count(question) or _is_implicit_summary(question))
         and len([dataset for dataset in catalog.datasets if dataset.active_publication is not None])
         == 1
     ):
@@ -406,6 +467,10 @@ def _is_implicit_row_count(question: str) -> bool:
     return _IMPLICIT_ROW_COUNT_RE.fullmatch(question.strip()) is not None
 
 
+def _is_implicit_summary(question: str) -> bool:
+    return _IMPLICIT_SUMMARY_RE.fullmatch(question.strip()) is not None
+
+
 def _classify_without_catalog(question: str) -> Literal["weak", "strong", "concept"]:
     stripped = question.strip()
     normalized = _normalize(stripped)
@@ -480,7 +545,10 @@ def _has_chinese_equality_filter(question: str) -> bool:
         field_start = max(question.rfind(item, 0, index) for item in _EQUALITY_FIELD_DELIMITERS) + 1
         field = question[field_start:index]
         value = question[index + 1 :]
-        if not _normalize(field) or not _normalize(value):
+        normalized_field = _normalize(field)
+        if not normalized_field or not _normalize(value):
+            continue
+        if normalized_field in _AGGREGATE_CONCEPT_TERMS:
             continue
         remaining = question[:field_start] + "_" * len(field) + question[index:]
         if _has_aggregate_language(remaining):
@@ -570,7 +638,10 @@ def _normalize(value: str) -> str:
     return re.sub(r"[\s\W]+", "", value.casefold(), flags=re.UNICODE)
 
 
-def _active_publication(catalog: StructuredCatalog, intent: StructuredIntent):
+def _active_publication(
+    catalog: StructuredCatalog,
+    intent: StructuredIntent | StructuredMultiAggregateIntent,
+):
     matches = [
         dataset.active_publication
         for dataset in catalog.datasets
@@ -628,6 +699,7 @@ def _structured_run(
     output_summary: str,
     *,
     source_ids: list[str] | None = None,
+    artifacts: list[ArtifactModel] | None = None,
 ) -> AgentRunResult:
     timestamp = display_datetime_label()
     run_id = f"agent-{uuid4().hex[:12]}"
@@ -636,6 +708,7 @@ def _structured_run(
         role="assistant",
         time=timestamp,
         paragraphs=[ResponseParagraphModel(text=answer)],
+        artifacts=artifacts or [],
     )
     step = AgentStep(
         id=f"step-{uuid4().hex[:12]}",

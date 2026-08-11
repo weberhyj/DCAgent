@@ -29,7 +29,10 @@ from app.models import (
     ResponseParagraphModel,
 )
 from app.repository import STATUS_INDEXED, InMemoryChatRepository
+from app.retrieval_models import RetrievalScope
 from app.seed import build_seed_state
+from app.structured_answer import StructuredAnswerService
+from tests.support.structured_fakes import sample_multi_metric_catalog
 
 
 class RecordingLLMProvider:
@@ -191,6 +194,48 @@ class RecordingPhysocClient:
 
 
 class LLMProviderTest(unittest.TestCase):
+    def test_clickhouse_failure_after_excel_route_never_searches_word_documents(self) -> None:
+        class FailingClickHouseGateway:
+            def __init__(self) -> None:
+                self.queries: list[tuple[str, object]] = []
+
+            def query(self, statement: str, parameters: object) -> object:
+                self.queries.append((statement, parameters))
+                raise RuntimeError("clickhouse offline")
+
+        class RecordingRetrievalRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, request: object) -> object:
+                self.calls += 1
+                raise AssertionError(f"structured request reached retrieval: {request}")
+
+        gateway = FailingClickHouseGateway()
+        rag_search = RecordingRetrievalRouter()
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[]),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(), gateway
+            ),
+            retrieval_router=rag_search,
+            retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "地区为华东的销售额、成本汇总",
+            "deep",
+        )
+
+        self.assertIn("结构化查询服务不可用", messages[-1].paragraphs[0].text)
+        self.assertEqual(len(gateway.queries), 1)
+        self.assertEqual(rag_search.calls, 0)
+        self.assertIsNone(provider.request)
+
     def test_build_knowledge_context_exposes_only_numbered_chunk_text(self) -> None:
         context = build_knowledge_context([indexed_hit(score=8.75, rank=1)])
 
