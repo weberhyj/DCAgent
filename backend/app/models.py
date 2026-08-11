@@ -179,3 +179,4 @@ class ChatState:
     messages_by_conversation: dict[str, list[ChatMessageModel]]
     knowledge_sources: list[KnowledgeSourceModel]
     knowledge_chunks_by_source: dict[str, list[KnowledgeChunkModel]] = field(default_factory=dict)
+    knowledge_facts_by_source: dict[str, list[KnowledgeFactModel]] = field(default_factory=dict)

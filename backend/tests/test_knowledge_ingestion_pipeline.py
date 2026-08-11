@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from docx import Document
 from fastapi.testclient import TestClient
 
 from app.ingestion import KnowledgeIndexUnavailableError, KnowledgeIngestionQueue
@@ -12,6 +13,7 @@ from app.main import create_app
 from app.repository import InMemoryChatRepository
 from app.seed import build_seed_state
 from app.text_parser import parse_knowledge_file, parse_knowledge_file_result
+from app.word_facts import WordFactualIntent, normalize_fact_key
 
 
 class KnowledgeIngestionPipelineTest(unittest.TestCase):
@@ -131,6 +133,56 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
 
         self.assertEqual(events, [("qdrant", 1), "postgres-indexed", "fence-release"])
         self.assertEqual(self.repository.get_source_index_status(source_id), "indexed")
+
+    def test_docx_queue_persists_facts_before_qdrant_publication(self) -> None:
+        events: list[str] = []
+        source_id = "kb-ingestion-facts"
+        path = Path(self.temp_dir.name) / "people.docx"
+        document = Document()
+        document.add_paragraph("姓名：张三，年龄：28岁，性别：女")
+        document.save(path)
+        self.repository.add_uploaded_knowledge_source(
+            source_id,
+            "people.docx",
+            "文档",
+            "公开",
+            0,
+            str(path),
+            path.stat().st_size,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        original_complete = self.repository.complete_knowledge_source_indexing
+
+        def complete_with_fact_event(*args, **kwargs):
+            result = original_complete(*args, **kwargs)
+            matches = self.repository.find_knowledge_facts(
+                WordFactualIntent(
+                    entity="张三",
+                    entity_normalized=normalize_fact_key("张三"),
+                    field="年龄",
+                    field_normalized=normalize_fact_key("年龄"),
+                )
+            )
+            if matches:
+                events.append("postgres-facts")
+            return result
+
+        self.repository.complete_knowledge_source_indexing = complete_with_fact_event
+
+        class RecordingLifecycle:
+            def upsert_source(inner_self, source_id, *, finalize=None, on_failure=None):
+                events.append("qdrant-upsert")
+                return "publication-1", 1
+
+        queue = KnowledgeIngestionQueue(
+            self.repository,
+            index_lifecycle=RecordingLifecycle(),
+        )
+
+        queue.process(source_id, path, "文档")
+
+        self.assertEqual(events, ["postgres-facts", "qdrant-upsert"])
 
     def test_qdrant_failure_does_not_delete_postgres_chunks(self) -> None:
         class FailingLifecycle:

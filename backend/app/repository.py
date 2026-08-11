@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from threading import Lock
@@ -51,6 +52,7 @@ from .retrieval import (
 )
 from .retrieval_scope import StaticRetrievalScopeProvider
 from .time_utils import display_datetime_label
+from .word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
 
 if TYPE_CHECKING:
     from .retrieval_models import RetrievalScope
@@ -341,7 +343,22 @@ class ChatRepository(Protocol):
         self,
         source_id: str,
         chunks: list[KnowledgeChunkModel],
+        *,
+        facts: Sequence[KnowledgeFactModel] = (),
     ) -> KnowledgeSourceModel: ...
+
+    def replace_knowledge_facts(
+        self,
+        source_id: str,
+        facts: Sequence[KnowledgeFactModel],
+    ) -> None: ...
+
+    def find_knowledge_facts(
+        self,
+        intent: WordFactualIntent,
+        *,
+        permission_tags: Sequence[str] = (),
+    ) -> list[WordFactMatch]: ...
 
     def fail_knowledge_source_indexing(
         self,
@@ -980,22 +997,85 @@ class InMemoryChatRepository:
                 source for source in self._state.knowledge_sources if source.id != source_id
             ]
             self._state.knowledge_chunks_by_source.pop(source_id, None)
+            self._state.knowledge_facts_by_source.pop(source_id, None)
             return deepcopy(self._state.knowledge_sources), deleted
 
     def complete_knowledge_source_indexing(
         self,
         source_id: str,
         chunks: list[KnowledgeChunkModel],
+        *,
+        facts: Sequence[KnowledgeFactModel] = (),
     ) -> KnowledgeSourceModel:
         with self._lock:
             source = self._find_knowledge_source(source_id)
             embedded_chunks = ensure_chunk_embeddings(chunks)
+            fact_list = self._validate_knowledge_facts(
+                source_id,
+                {chunk.id for chunk in embedded_chunks},
+                facts,
+            )
             source.records = len(embedded_chunks)
             source.status = STATUS_INDEXED
             source.error_message = None
             source.updated_at = today_label()
             self._state.knowledge_chunks_by_source[source_id] = deepcopy(embedded_chunks)
+            self._state.knowledge_facts_by_source[source_id] = deepcopy(fact_list)
             return deepcopy(source)
+
+    def replace_knowledge_facts(
+        self,
+        source_id: str,
+        facts: Sequence[KnowledgeFactModel],
+    ) -> None:
+        with self._lock:
+            self._find_knowledge_source(source_id)
+            chunk_ids = {
+                chunk.id for chunk in self._state.knowledge_chunks_by_source.get(source_id, [])
+            }
+            fact_list = self._validate_knowledge_facts(source_id, chunk_ids, facts)
+            self._state.knowledge_facts_by_source[source_id] = deepcopy(fact_list)
+
+    def find_knowledge_facts(
+        self,
+        intent: WordFactualIntent,
+        *,
+        permission_tags: Sequence[str] = (),
+    ) -> list[WordFactMatch]:
+        if isinstance(permission_tags, (str, bytes, bytearray)):
+            raise TypeError("permission_tags must be a sequence")
+        effective_permission_tags = {
+            tag.strip()
+            for tag in permission_tags
+            if isinstance(tag, str) and tag.strip()
+        }
+        with self._lock:
+            matches: list[WordFactMatch] = []
+            for source in sorted(self._state.knowledge_sources, key=lambda item: item.name):
+                if source.status != STATUS_INDEXED:
+                    continue
+                if (
+                    effective_permission_tags
+                    and source.classification not in effective_permission_tags
+                ):
+                    continue
+                facts = sorted(
+                    self._state.knowledge_facts_by_source.get(source.id, []),
+                    key=lambda fact: fact.id,
+                )
+                for fact in facts:
+                    if (
+                        fact.entity_normalized == intent.entity_normalized
+                        and fact.field_normalized == intent.field_normalized
+                    ):
+                        matches.append(
+                            WordFactMatch(
+                                fact=fact,
+                                source_name=source.name,
+                                classification=source.classification,
+                            )
+                        )
+            return deepcopy(matches)
 
     def fail_knowledge_source_indexing(
         self,
@@ -1009,6 +1089,7 @@ class InMemoryChatRepository:
             source.error_message = error_message
             source.updated_at = today_label()
             self._state.knowledge_chunks_by_source[source_id] = []
+            self._state.knowledge_facts_by_source.pop(source_id, None)
             return deepcopy(source)
 
     def complete_retrieval_source_indexing(
@@ -1056,6 +1137,7 @@ class InMemoryChatRepository:
             source.error_message = None
             source.updated_at = today_label()
             self._state.knowledge_chunks_by_source[source_id] = []
+            self._state.knowledge_facts_by_source.pop(source_id, None)
             return deepcopy(source)
 
     def list_knowledge_chunks(self, source_id: str) -> list[KnowledgeChunkModel]:
@@ -1167,6 +1249,20 @@ class InMemoryChatRepository:
             if source.id == source_id:
                 return source
         raise HTTPException(status_code=404, detail="Knowledge source not found")
+
+    @staticmethod
+    def _validate_knowledge_facts(
+        source_id: str,
+        chunk_ids: set[str],
+        facts: Sequence[KnowledgeFactModel],
+    ) -> list[KnowledgeFactModel]:
+        fact_list = list(facts)
+        for fact in fact_list:
+            if fact.source_id != source_id:
+                raise ValueError("fact source_id must match the indexed source")
+            if fact.chunk_id not in chunk_ids:
+                raise ValueError("fact chunk_id must belong to the indexed source bundle")
+        return fact_list
 
     def _find_evaluation_batch(self, batch_id: str) -> EvaluationBatchModel:
         for batch in self._evaluation_batches:

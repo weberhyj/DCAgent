@@ -3,14 +3,16 @@ from __future__ import annotations
 import io
 import os
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
 from loguru import logger as loguru_logger
+from sqlalchemy import select
 
 from app.agent import GREETING_REPLY, AgentRunResult
-from app.database import Database
+from app.database import Database, KnowledgeFactRecord, KnowledgeSourceRecord
 from app.embedding_fingerprint import EmbeddingFingerprint
 from app.models import ChatMessageModel, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
@@ -23,6 +25,7 @@ from app.retrieval_router import (
 from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.seed import build_seed_state
 from app.sql_repository import SqlChatRepository
+from app.word_facts import KnowledgeFactModel, WordFactualIntent, normalize_fact_key
 
 TEST_EMBEDDING_FINGERPRINT = EmbeddingFingerprint(
     model_name="qwen2.5:0.5b",
@@ -41,6 +44,323 @@ class SqlRepositoryTest(unittest.TestCase):
         self.database.create_schema()
         self.repository = SqlChatRepository(self.database)
         self.repository.seed_if_empty(build_seed_state())
+
+    def _add_fact_source(
+        self,
+        repository,
+        *,
+        source_id: str,
+        source_name: str,
+        classification: str = "公开",
+        fact_id: str | None = None,
+        entity: str = "张三",
+        value: str = "27岁",
+    ) -> KnowledgeFactModel:
+        repository.add_uploaded_knowledge_source(
+            source_id=source_id,
+            name=source_name,
+            source_type="文档",
+            classification=classification,
+            records=0,
+            file_path=source_name,
+            file_size=128,
+            mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        chunk_id = f"chunk-{source_id}"
+        fact = KnowledgeFactModel.create(
+            id=fact_id or f"fact-{source_id}",
+            source_id=source_id,
+            chunk_id=chunk_id,
+            entity=entity,
+            field="年龄",
+            value=value,
+            confidence=0.97,
+            locator={"paragraph": 1},
+        )
+        repository.complete_knowledge_source_indexing(
+            source_id,
+            [
+                KnowledgeChunkModel(
+                    id=chunk_id,
+                    source_id=source_id,
+                    chunk_index=0,
+                    text=f"姓名：{entity}，年龄：{value}",
+                    token_count=10,
+                )
+            ],
+            facts=[fact],
+        )
+        return fact
+
+    def _fact_intent(self) -> WordFactualIntent:
+        return WordFactualIntent(
+            entity="张 三",
+            entity_normalized=normalize_fact_key("张三"),
+            field="岁数",
+            field_normalized=normalize_fact_key("年龄"),
+        )
+
+    def _memory_repository_with_fact(self, source_id: str) -> InMemoryChatRepository:
+        repository = InMemoryChatRepository(build_seed_state())
+        self._add_fact_source(
+            repository,
+            source_id=source_id,
+            source_name=f"{source_id}.docx",
+        )
+        return repository
+
+    def _stored_fact_ids(self, source_id: str) -> list[str]:
+        with self.database.session() as session:
+            return list(
+                session.scalars(
+                    select(KnowledgeFactRecord.id)
+                    .where(KnowledgeFactRecord.source_id == source_id)
+                    .order_by(KnowledgeFactRecord.id)
+                ).all()
+            )
+
+    def test_complete_indexing_replaces_old_source_facts(self) -> None:
+        first = self._add_fact_source(
+            self.repository,
+            source_id="kb-people",
+            source_name="people.docx",
+            fact_id="fact-old",
+        )
+        second = replace(
+            first,
+            id="fact-new",
+            chunk_id="chunk-new",
+            value="28岁",
+        )
+
+        self.repository.complete_knowledge_source_indexing(
+            "kb-people",
+            [
+                KnowledgeChunkModel(
+                    id="chunk-new",
+                    source_id="kb-people",
+                    chunk_index=0,
+                    text="姓名：张三，年龄：28岁",
+                    token_count=10,
+                )
+            ],
+            facts=[second],
+        )
+
+        matches = self.repository.find_knowledge_facts(self._fact_intent())
+        self.assertEqual([item.fact.id for item in matches], ["fact-new"])
+        self.assertEqual([item.fact.value for item in matches], ["28岁"])
+
+    def test_query_requires_indexed_permitted_exact_sources_in_stable_order(self) -> None:
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-public-z",
+            source_name="b-people.docx",
+            fact_id="fact-z",
+        )
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-public-a",
+            source_name="a-people.docx",
+            fact_id="fact-a",
+        )
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-private",
+            source_name="private.docx",
+            classification="内部·机密",
+        )
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-parsing",
+            source_name="parsing.docx",
+        )
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-near-match",
+            source_name="near-match.docx",
+            entity="张三丰",
+        )
+        with self.database.session() as session:
+            session.get(KnowledgeSourceRecord, "kb-parsing").status = "解析中"
+
+        matches = self.repository.find_knowledge_facts(
+            self._fact_intent(),
+            permission_tags=("公开",),
+        )
+
+        self.assertEqual(
+            [item.fact.source_id for item in matches],
+            ["kb-public-a", "kb-public-z"],
+        )
+        self.assertEqual(
+            [(item.source_name, item.classification) for item in matches],
+            [("a-people.docx", "公开"), ("b-people.docx", "公开")],
+        )
+
+    def test_complete_indexing_rejects_facts_outside_incoming_bundle_atomically(self) -> None:
+        old_fact = self._add_fact_source(
+            self.repository,
+            source_id="kb-atomic",
+            source_name="atomic.docx",
+            fact_id="fact-old",
+        )
+        invalid_facts = (
+            replace(
+                old_fact,
+                id="fact-wrong-source",
+                source_id="kb-other",
+                chunk_id="chunk-new",
+            ),
+            replace(old_fact, id="fact-missing-chunk", chunk_id="chunk-missing"),
+        )
+
+        for invalid_fact in invalid_facts:
+            with self.subTest(fact_id=invalid_fact.id):
+                with self.assertRaises(ValueError):
+                    self.repository.complete_knowledge_source_indexing(
+                        "kb-atomic",
+                        [
+                            KnowledgeChunkModel(
+                                id="chunk-new",
+                                source_id="kb-atomic",
+                                chunk_index=0,
+                                text="姓名：张三，年龄：28岁",
+                                token_count=10,
+                            )
+                        ],
+                        facts=[invalid_fact],
+                    )
+
+                matches = self.repository.find_knowledge_facts(self._fact_intent())
+                self.assertEqual([item.fact.id for item in matches], ["fact-old"])
+                self.assertEqual(
+                    [chunk.id for chunk in self.repository.list_knowledge_chunks("kb-atomic")],
+                    ["chunk-kb-atomic"],
+                )
+                source = next(
+                    item
+                    for item in self.repository.list_knowledge_sources()
+                    if item.id == "kb-atomic"
+                )
+                self.assertEqual(source.status, "已索引")
+
+    def test_memory_complete_indexing_replaces_old_source_facts(self) -> None:
+        repository = self._memory_repository_with_fact("kb-memory-replace")
+        replacement = KnowledgeFactModel.create(
+            id="fact-memory-new",
+            source_id="kb-memory-replace",
+            chunk_id="chunk-memory-new",
+            entity="张三",
+            field="年龄",
+            value="28岁",
+            confidence=0.97,
+            locator={"paragraph": 2},
+        )
+
+        repository.complete_knowledge_source_indexing(
+            "kb-memory-replace",
+            [
+                KnowledgeChunkModel(
+                    id="chunk-memory-new",
+                    source_id="kb-memory-replace",
+                    chunk_index=0,
+                    text="姓名：张三，年龄：28岁",
+                    token_count=10,
+                )
+            ],
+            facts=[replacement],
+        )
+
+        matches = repository.find_knowledge_facts(self._fact_intent())
+        self.assertEqual([item.fact.id for item in matches], ["fact-memory-new"])
+
+    def test_replace_knowledge_facts_uses_existing_source_chunks(self) -> None:
+        first = self._add_fact_source(
+            self.repository,
+            source_id="kb-replace-only",
+            source_name="replace-only.docx",
+            fact_id="fact-replace-old",
+        )
+        replacement = replace(first, id="fact-replace-new", value="29岁")
+
+        self.repository.replace_knowledge_facts("kb-replace-only", [replacement])
+
+        matches = self.repository.find_knowledge_facts(self._fact_intent())
+        self.assertEqual([item.fact.id for item in matches], ["fact-replace-new"])
+        self.assertEqual([item.fact.value for item in matches], ["29岁"])
+
+    def test_memory_replace_knowledge_facts_uses_existing_source_chunks(self) -> None:
+        repository = self._memory_repository_with_fact("kb-memory-replace-only")
+        replacement = KnowledgeFactModel.create(
+            id="fact-memory-replace-new",
+            source_id="kb-memory-replace-only",
+            chunk_id="chunk-kb-memory-replace-only",
+            entity="张三",
+            field="年龄",
+            value="29岁",
+            confidence=0.97,
+            locator={"paragraph": 2},
+        )
+
+        repository.replace_knowledge_facts("kb-memory-replace-only", [replacement])
+
+        matches = repository.find_knowledge_facts(self._fact_intent())
+        self.assertEqual([item.fact.id for item in matches], ["fact-memory-replace-new"])
+
+    def test_memory_reindex_clears_source_facts(self) -> None:
+        repository = self._memory_repository_with_fact("kb-memory-reindex")
+
+        repository.reindex_knowledge_source("kb-memory-reindex")
+
+        self.assertNotIn("kb-memory-reindex", repository._state.knowledge_facts_by_source)
+
+    def test_memory_failure_clears_source_facts(self) -> None:
+        repository = self._memory_repository_with_fact("kb-memory-failure")
+
+        repository.fail_knowledge_source_indexing("kb-memory-failure", "parse failed")
+
+        self.assertNotIn("kb-memory-failure", repository._state.knowledge_facts_by_source)
+
+    def test_memory_delete_clears_source_facts(self) -> None:
+        repository = self._memory_repository_with_fact("kb-memory-delete")
+
+        repository.delete_knowledge_source("kb-memory-delete")
+
+        self.assertNotIn("kb-memory-delete", repository._state.knowledge_facts_by_source)
+
+    def test_sql_reindex_physically_clears_source_facts(self) -> None:
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-sql-reindex",
+            source_name="sql-reindex.docx",
+        )
+
+        self.repository.reindex_knowledge_source("kb-sql-reindex")
+
+        self.assertEqual(self._stored_fact_ids("kb-sql-reindex"), [])
+
+    def test_sql_failure_physically_clears_source_facts(self) -> None:
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-sql-failure",
+            source_name="sql-failure.docx",
+        )
+
+        self.repository.fail_knowledge_source_indexing("kb-sql-failure", "parse failed")
+
+        self.assertEqual(self._stored_fact_ids("kb-sql-failure"), [])
+
+    def test_sql_delete_physically_clears_source_facts(self) -> None:
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-sql-delete",
+            source_name="sql-delete.docx",
+        )
+
+        self.repository.delete_knowledge_source("kb-sql-delete")
+
+        self.assertEqual(self._stored_fact_ids("kb-sql-delete"), [])
 
     def test_reads_seed_conversations_and_messages(self) -> None:
         conversations = self.repository.list_conversations()

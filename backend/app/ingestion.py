@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from .repository import ChatRepository
 from .spreadsheet_schema import infer_spreadsheet_schema
 from .structured_repository import StructuredRepository
-from .text_parser import parse_knowledge_file
+from .text_parser import parse_knowledge_file_result
 
 
 @dataclass(slots=True)
@@ -117,8 +117,16 @@ class KnowledgeIngestionQueue:
                 preview = infer_spreadsheet_schema(job.file_path, job.source_id)
                 self._structured_repository.save_preview(preview)
                 return
-            chunks = parse_knowledge_file(job.file_path, job.source_id, job.source_type)
-            self._repository.complete_knowledge_source_indexing(job.source_id, chunks)
+            parse_result = parse_knowledge_file_result(
+                job.file_path,
+                job.source_id,
+                job.source_type,
+            )
+            self._repository.complete_knowledge_source_indexing(
+                job.source_id,
+                list(parse_result.chunks),
+                facts=parse_result.facts,
+            )
         except Exception as exc:
             try:
                 message = str(exc) or exc.__class__.__name__
