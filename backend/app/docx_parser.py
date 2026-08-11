@@ -370,10 +370,24 @@ def _chunk_id_for_range(
     value_start: int,
     value_end: int,
 ) -> str:
-    for span in spans:
-        if span.start <= value_start and value_end <= span.end:
-            return span.chunk_id
-    raise ValueError("fact value is not fully contained in any DOCX chunk")
+    fully_containing = [
+        span
+        for span in spans
+        if span.start <= value_start and value_end <= span.end
+    ]
+    if fully_containing:
+        return min(
+            fully_containing,
+            key=lambda span: (span.start, span.end, span.chunk_id),
+        ).chunk_id
+
+    def fallback_rank(span: BlockChunkSpan) -> tuple[int, int, int, int, str]:
+        overlap = max(0, min(span.end, value_end) - max(span.start, value_start))
+        contains_start = int(span.start <= value_start < span.end)
+        # Prefer maximum evidence, then the value anchor, document order, and stable ID.
+        return (-overlap, -contains_start, span.start, span.end, span.chunk_id)
+
+    return min(spans, key=fallback_rank).chunk_id
 
 
 def _stable_chunk_id(

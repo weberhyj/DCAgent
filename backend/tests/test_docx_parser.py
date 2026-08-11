@@ -226,6 +226,19 @@ class DocxParserTest(unittest.TestCase):
         evidence_chunk = next(chunk for chunk in result.chunks if chunk.id == fact.chunk_id)
         self.assertIn(fact.value, evidence_chunk.text)
 
+    def test_cross_boundary_inline_value_uses_chunk_with_maximum_evidence(self) -> None:
+        value = "v" * 300
+        path = write_docx(
+            self.temp_dir / "cross-boundary-inline.docx",
+            paragraphs=[f"姓名：张三，备注：{'x' * 430}，职务：{value}"],
+        )
+
+        result = parse_docx_knowledge_file(path, source_id="kb-cross-boundary-inline")
+
+        fact = next(item for item in result.facts if item.field == "职务")
+        evidence_chunk = next(chunk for chunk in result.chunks if chunk.id == fact.chunk_id)
+        self.assertIn(fact.value[-200:], evidence_chunk.text)
+
     def test_oversized_table_fact_references_chunk_containing_cell_value(self) -> None:
         path = write_docx_table(
             self.temp_dir / "long-table-fact.docx",
@@ -238,6 +251,21 @@ class DocxParserTest(unittest.TestCase):
         fact = next(item for item in result.facts if item.field == "年龄")
         evidence_chunk = next(chunk for chunk in result.chunks if chunk.id == fact.chunk_id)
         self.assertIn(fact.value, evidence_chunk.text)
+
+    def test_table_value_over_chunk_size_uses_chunk_containing_value_start(self) -> None:
+        value = "w" * 700
+        path = write_docx_table(
+            self.temp_dir / "overlong-table-value.docx",
+            headers=["姓名", "职务"],
+            rows=[["李四", value]],
+        )
+
+        result = parse_docx_knowledge_file(path, source_id="kb-overlong-table")
+
+        fact = next(item for item in result.facts if item.field == "职务")
+        evidence_chunk = next(chunk for chunk in result.chunks if chunk.id == fact.chunk_id)
+        self.assertTrue(evidence_chunk.text.startswith("李四 | "))
+        self.assertIn(fact.value[:500], evidence_chunk.text)
 
     def test_table_row_stays_whole_and_preserves_cell_locators(self) -> None:
         path = self.temp_dir / "row-locator.docx"
