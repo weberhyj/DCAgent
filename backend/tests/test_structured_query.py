@@ -14,6 +14,8 @@ from app.structured_models import (
     StructuredColumnType,
     StructuredFilter,
     StructuredIntent,
+    StructuredMetricIntent,
+    StructuredMultiAggregateIntent,
     StructuredUnavailable,
 )
 from app.structured_query import parse_structured_intent, resolve_structured_intent
@@ -26,6 +28,21 @@ from tests.support.structured_fakes import (
 
 
 class StructuredIntentParserTest(unittest.TestCase):
+    def test_multi_metric_contracts_preserve_metric_order(self) -> None:
+        intent = StructuredMultiAggregateIntent(
+            dataset_id="ds-sales",
+            metrics=(
+                StructuredMetricIntent("sum", "sales_amount"),
+                StructuredMetricIntent("sum", "cost_amount"),
+            ),
+            filters=(StructuredFilter("region", "eq", "华东"),),
+            implicit=False,
+        )
+        self.assertEqual(
+            [(item.aggregate, item.metric_physical_name) for item in intent.metrics],
+            [("sum", "sales_amount"), ("sum", "cost_amount")],
+        )
+
     def test_parses_average_with_alias_and_filter(self) -> None:
         intent = parse_structured_intent(
             "统计华东地区订单金额的平均值",
@@ -1393,6 +1410,7 @@ class StructuredQueryExecutorTest(unittest.TestCase):
         result = executor.execute(plan)
 
         self.assertEqual(result.dataset_id, "ds-sales")
+        self.assertEqual(result.source_id, "kb-sales")
         self.assertEqual(result.schema_version, 1)
         self.assertEqual(result.aggregate, "avg")
         self.assertEqual(result.metric_physical_name, "order_amount")

@@ -115,12 +115,14 @@ class StructuredAnswerService:
         catalog_provider: Callable[[], StructuredCatalog],
         clickhouse_gateway: object,
         compatibility: ClickHouseCompatibilityProfile | None = None,
+        implicit_summary_max_metrics: int = 12,
     ) -> None:
         self._catalog_provider = catalog_provider
         self._clickhouse_gateway = clickhouse_gateway
         self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
             ClickHouseCompatibilityMode.MODERN
         )
+        self._implicit_summary_max_metrics = implicit_summary_max_metrics
         self._catalog_snapshot: StructuredCatalog | None = None
         self._catalog_snapshot_lock = Lock()
         self._catalog_request_generation = 0

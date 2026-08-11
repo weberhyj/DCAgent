@@ -582,6 +582,7 @@ def _create_structured_answer_service(
         structured_repository.get_catalog,
         gateway,
         compatibility=compatibility,
+        implicit_summary_max_metrics=settings.structured_implicit_summary_max_metrics,
     )
     return service, (gateway,)
 

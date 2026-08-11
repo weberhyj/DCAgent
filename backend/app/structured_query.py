@@ -274,6 +274,7 @@ class StructuredQueryExecutor:
         )
         return StructuredAggregateResult(
             dataset_id=dataset.schema.dataset_id,
+            source_id=dataset.schema.source_id,
             schema_version=dataset.schema.schema_version,
             aggregate=plan.aggregate,
             metric_physical_name=plan.metric_physical_name,

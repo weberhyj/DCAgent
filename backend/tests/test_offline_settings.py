@@ -16,6 +16,21 @@ from app.offline_settings import (
 
 
 class OfflineSettingsTest(unittest.TestCase):
+    def test_implicit_summary_limit_defaults_to_twelve(self) -> None:
+        settings = OfflineSettings.from_environ({})
+        self.assertEqual(settings.structured_implicit_summary_max_metrics, 12)
+
+    def test_implicit_summary_limit_is_bounded(self) -> None:
+        for value in ("0", "51", "not-an-integer"):
+            with self.subTest(value=value), self.assertRaises(OfflineSettingsError):
+                OfflineSettings.from_environ(
+                    {"STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS": value}
+                )
+        settings = OfflineSettings.from_environ(
+            {"STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS": "20"}
+        )
+        self.assertEqual(settings.structured_implicit_summary_max_metrics, 20)
+
     def test_settings_parse_legacy_clickhouse_mode(self) -> None:
         settings = OfflineSettings.from_environ(
             {"CLICKHOUSE_COMPATIBILITY_MODE": "legacy_18_16"}
