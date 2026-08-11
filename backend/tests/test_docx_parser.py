@@ -8,6 +8,7 @@ from docx import Document
 
 from app.docx_parser import parse_docx_knowledge_file, read_docx_blocks
 from app.text_parser import parse_knowledge_file
+from app.word_facts import KnowledgeFactModel, normalize_fact_key
 
 
 ParagraphFixture = str | tuple[str, str]
@@ -64,6 +65,29 @@ class DocxParserTest(unittest.TestCase):
             },
         )
         self.assertEqual({item.confidence for item in result.facts}, {0.97})
+
+    def test_extracted_fields_pass_the_shared_canonical_contract(self) -> None:
+        path = write_docx(
+            self.temp_dir / "shared-contract.docx",
+            paragraphs=["姓名：张三，岁数：28岁，男女：女，职位：工程师"],
+        )
+
+        result = parse_docx_knowledge_file(path, source_id="kb-shared-contract")
+
+        self.assertEqual([fact.field for fact in result.facts], ["年龄", "性别", "职务"])
+        for index, fact in enumerate(result.facts):
+            recreated = KnowledgeFactModel.create(
+                id=f"fact-recreated-{index}",
+                source_id=fact.source_id,
+                chunk_id=fact.chunk_id,
+                entity=fact.entity,
+                field=fact.field,
+                value=fact.value,
+                confidence=fact.confidence,
+                locator=fact.locator,
+            )
+            self.assertEqual(recreated.field, fact.field)
+            self.assertEqual(fact.field_normalized, normalize_fact_key(fact.field))
 
     def test_table_row_extracts_fields_and_locator(self) -> None:
         path = write_docx_table(
@@ -189,6 +213,31 @@ class DocxParserTest(unittest.TestCase):
             [chunk.metadata["locators"] for chunk in result.chunks],
             [[{"paragraph": 0}], [{"paragraph": 0}]],
         )
+
+    def test_oversized_inline_fact_references_chunk_containing_late_value(self) -> None:
+        path = write_docx(
+            self.temp_dir / "long-inline-fact.docx",
+            paragraphs=[f"姓名：张三，备注：{'x' * 650}，年龄：73岁"],
+        )
+
+        result = parse_docx_knowledge_file(path, source_id="kb-long-inline")
+
+        fact = next(item for item in result.facts if item.field == "年龄")
+        evidence_chunk = next(chunk for chunk in result.chunks if chunk.id == fact.chunk_id)
+        self.assertIn(fact.value, evidence_chunk.text)
+
+    def test_oversized_table_fact_references_chunk_containing_cell_value(self) -> None:
+        path = write_docx_table(
+            self.temp_dir / "long-table-fact.docx",
+            headers=["姓名", "备注", "年龄"],
+            rows=[["李四", "x" * 650, "74岁"]],
+        )
+
+        result = parse_docx_knowledge_file(path, source_id="kb-long-table")
+
+        fact = next(item for item in result.facts if item.field == "年龄")
+        evidence_chunk = next(chunk for chunk in result.chunks if chunk.id == fact.chunk_id)
+        self.assertIn(fact.value, evidence_chunk.text)
 
     def test_table_row_stays_whole_and_preserves_cell_locators(self) -> None:
         path = self.temp_dir / "row-locator.docx"

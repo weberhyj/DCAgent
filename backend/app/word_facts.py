@@ -19,18 +19,36 @@ def normalize_fact_key(value: str) -> str:
     )
 
 
-_FACT_FIELD_ALIASES = {
-    "\u5e74\u9f84": ("\u5e74\u9f84", "\u5e74\u7eaa", "\u5c81\u6570", "age"),
+FACT_FIELD_ALIASES = {
+    "\u5e74\u9f84": (
+        "\u5e74\u9f84",
+        "\u5e74\u7eaa",
+        "\u5c81\u6570",
+        "\u51e0\u5c81",
+        "\u591a\u5927",
+        "age",
+    ),
+    "\u6027\u522b": ("\u6027\u522b", "\u7537\u5973"),
+    "\u804c\u52a1": (
+        "\u804c\u52a1",
+        "\u804c\u4f4d",
+        "\u5c97\u4f4d",
+        "\u62c5\u4efb",
+        "title",
+    ),
     "\u90e8\u95e8": ("\u90e8\u95e8", "\u6240\u5c5e\u90e8\u95e8", "department"),
-    "\u804c\u4f4d": ("\u804c\u4f4d", "\u804c\u52a1", "\u5c97\u4f4d", "title"),
     "\u5de5\u53f7": ("\u5de5\u53f7", "\u5458\u5de5\u7f16\u53f7", "employee id"),
-    "\u5165\u804c\u65e5\u671f": ("\u5165\u804c\u65e5\u671f", "\u5165\u804c\u65f6\u95f4", "hire date"),
+    "\u5165\u804c\u65e5\u671f": (
+        "\u5165\u804c\u65e5\u671f",
+        "\u5165\u804c\u65f6\u95f4",
+        "hire date",
+    ),
     "\u7535\u8bdd": ("\u7535\u8bdd", "\u8054\u7cfb\u7535\u8bdd", "\u624b\u673a", "phone"),
     "\u90ae\u7bb1": ("\u90ae\u7bb1", "\u7535\u5b50\u90ae\u7bb1", "email"),
 }
 _CANONICAL_FACT_FIELDS = {
     normalize_fact_key(alias): canonical
-    for canonical, aliases in _FACT_FIELD_ALIASES.items()
+    for canonical, aliases in FACT_FIELD_ALIASES.items()
     for alias in aliases
 }
 

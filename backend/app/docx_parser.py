@@ -14,22 +14,23 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 from .models import KnowledgeChunkModel
-from .word_facts import KnowledgeFactModel, normalize_fact_key
+from .word_facts import (
+    FACT_FIELD_ALIASES,
+    KnowledgeFactModel,
+    canonical_fact_field,
+    normalize_fact_key,
+)
 
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 120
 
-FACT_FIELD_ALIASES = {
-    "年龄": ("年龄", "岁数", "几岁", "多大"),
-    "性别": ("性别", "男女"),
-    "职务": ("职务", "职位", "岗位", "担任"),
-}
 FACT_ENTITY_ALIASES = ("姓名", "人员", "员工", "人物", "名称")
+_DOCX_FACT_FIELDS = ("年龄", "性别", "职务")
 
 _FACT_FIELD_BY_ALIAS = {
     normalize_fact_key(alias): field
-    for field, aliases in FACT_FIELD_ALIASES.items()
-    for alias in aliases
+    for field in _DOCX_FACT_FIELDS
+    for alias in FACT_FIELD_ALIASES[field]
 }
 _FACT_ENTITY_KEYS = {normalize_fact_key(alias) for alias in FACT_ENTITY_ALIASES}
 _KEY_VALUE_DELIMITER = re.compile(r"[，,；;\n]+")
@@ -52,10 +53,25 @@ class KnowledgeParseResult:
     facts: tuple[KnowledgeFactModel, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class BlockChunkSpan:
+    chunk_id: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedKeyValue:
+    key: str
+    value: str
+    value_start: int
+    value_end: int
+
+
 def parse_docx_knowledge_file(path: Path, source_id: str) -> KnowledgeParseResult:
     blocks = read_docx_blocks(path)
-    chunks, block_chunk_ids = chunk_docx_blocks(source_id, blocks)
-    facts = extract_docx_facts(source_id, blocks, block_chunk_ids)
+    chunks, block_chunk_spans = chunk_docx_blocks(source_id, blocks)
+    facts = extract_docx_facts(source_id, blocks, block_chunk_spans)
     return KnowledgeParseResult(chunks=chunks, facts=facts)
 
 
@@ -108,9 +124,9 @@ def read_docx_blocks(path: Path) -> tuple[DocxBlock, ...]:
 def chunk_docx_blocks(
     source_id: str,
     blocks: Sequence[DocxBlock],
-) -> tuple[tuple[KnowledgeChunkModel, ...], dict[int, str]]:
+) -> tuple[tuple[KnowledgeChunkModel, ...], dict[int, tuple[BlockChunkSpan, ...]]]:
     chunks: list[KnowledgeChunkModel] = []
-    block_chunk_ids: dict[int, str] = {}
+    mutable_block_spans: dict[int, list[BlockChunkSpan]] = {}
     pending_texts: list[str] = []
     pending_locators: list[dict[str, int]] = []
     pending_block_indexes: list[int] = []
@@ -118,7 +134,7 @@ def chunk_docx_blocks(
     def append_chunk(
         text: str,
         locators: list[dict[str, int]],
-        block_indexes: Sequence[int],
+        block_ranges: Sequence[tuple[int, int, int]],
     ) -> None:
         chunk_index = len(chunks)
         chunk_id = _stable_chunk_id(source_id, chunk_index, text, locators)
@@ -132,8 +148,10 @@ def chunk_docx_blocks(
                 metadata={"locators": locators},
             )
         )
-        for block_index in block_indexes:
-            block_chunk_ids.setdefault(block_index, chunk_id)
+        for block_index, start, end in block_ranges:
+            mutable_block_spans.setdefault(block_index, []).append(
+                BlockChunkSpan(chunk_id=chunk_id, start=start, end=end)
+            )
 
     def flush_pending() -> None:
         if not pending_texts:
@@ -141,7 +159,10 @@ def chunk_docx_blocks(
         append_chunk(
             "\n".join(pending_texts),
             list(pending_locators),
-            tuple(pending_block_indexes),
+            tuple(
+                (block_index, 0, len(blocks[block_index].text))
+                for block_index in pending_block_indexes
+            ),
         )
         pending_texts.clear()
         pending_locators.clear()
@@ -154,7 +175,11 @@ def chunk_docx_blocks(
             start = 0
             while start < len(block.text):
                 end = min(len(block.text), start + CHUNK_SIZE)
-                append_chunk(block.text[start:end], list(locators), (block_index,))
+                append_chunk(
+                    block.text[start:end],
+                    list(locators),
+                    ((block_index, start, end),),
+                )
                 if end == len(block.text):
                     break
                 start = end - CHUNK_OVERLAP
@@ -172,13 +197,16 @@ def chunk_docx_blocks(
     flush_pending()
     if not chunks:
         append_chunk("空白文件", [], ())
-    return tuple(chunks), block_chunk_ids
+    return tuple(chunks), {
+        block_index: tuple(spans)
+        for block_index, spans in mutable_block_spans.items()
+    }
 
 
 def extract_docx_facts(
     source_id: str,
     blocks: Sequence[DocxBlock],
-    block_chunk_ids: Mapping[int, str],
+    block_chunk_spans: Mapping[int, Sequence[BlockChunkSpan]],
 ) -> tuple[KnowledgeFactModel, ...]:
     facts: list[KnowledgeFactModel] = []
     active_heading_entity: str | None = None
@@ -206,7 +234,10 @@ def extract_docx_facts(
                 facts.append(
                     _make_fact(
                         source_id=source_id,
-                        chunk_id=block_chunk_ids[block_index],
+                        chunk_id=_chunk_id_for_range(
+                            block_chunk_spans[block_index],
+                            *_table_cell_range(block, column),
+                        ),
                         entity=entity,
                         field=field,
                         value=value,
@@ -220,21 +251,25 @@ def extract_docx_facts(
             active_heading_entity = _heading_entity(block.text)
 
         pairs = _parse_key_values(block.text)
-        entity_pairs = [value for key, value in pairs if key in _FACT_ENTITY_KEYS]
+        entity_pairs = [pair.value for pair in pairs if pair.key in _FACT_ENTITY_KEYS]
         field_pairs = [
-            (_FACT_FIELD_BY_ALIAS[key], value)
-            for key, value in pairs
-            if key in _FACT_FIELD_BY_ALIAS
+            (_FACT_FIELD_BY_ALIAS[pair.key], pair)
+            for pair in pairs
+            if pair.key in _FACT_FIELD_BY_ALIAS
         ]
         if len(entity_pairs) == 1 and field_pairs:
-            for field, value in field_pairs:
+            for field, pair in field_pairs:
                 facts.append(
                     _make_fact(
                         source_id=source_id,
-                        chunk_id=block_chunk_ids[block_index],
+                        chunk_id=_chunk_id_for_range(
+                            block_chunk_spans[block_index],
+                            pair.value_start,
+                            pair.value_end,
+                        ),
                         entity=entity_pairs[0],
                         field=field,
-                        value=value,
+                        value=pair.value,
                         confidence=0.97,
                         locator=block.locator,
                     )
@@ -243,14 +278,18 @@ def extract_docx_facts(
 
         if block.is_heading or active_heading_entity is None or entity_pairs:
             continue
-        for field, value in field_pairs:
+        for field, pair in field_pairs:
             facts.append(
                 _make_fact(
                     source_id=source_id,
-                    chunk_id=block_chunk_ids[block_index],
+                    chunk_id=_chunk_id_for_range(
+                        block_chunk_spans[block_index],
+                        pair.value_start,
+                        pair.value_end,
+                    ),
                     entity=active_heading_entity,
                     field=field,
-                    value=value,
+                    value=pair.value,
                     confidence=0.95,
                     locator=block.locator,
                 )
@@ -316,6 +355,27 @@ def _block_locators(block: DocxBlock) -> list[dict[str, int]]:
     ]
 
 
+def _table_cell_range(block: DocxBlock, target_column: int) -> tuple[int, int]:
+    start = 0
+    for column, cell in enumerate(block.cells):
+        end = start + len(cell)
+        if column == target_column:
+            return start, end
+        start = end + len(" | ")
+    raise IndexError(f"table column is out of range: {target_column}")
+
+
+def _chunk_id_for_range(
+    spans: Sequence[BlockChunkSpan],
+    value_start: int,
+    value_end: int,
+) -> str:
+    for span in spans:
+        if span.start <= value_start and value_end <= span.end:
+            return span.chunk_id
+    raise ValueError("fact value is not fully contained in any DOCX chunk")
+
+
 def _stable_chunk_id(
     source_id: str,
     chunk_index: int,
@@ -342,22 +402,46 @@ def _estimate_token_count(text: str) -> int:
     return max(1, len(ascii_words) + len(non_ascii_chars))
 
 
-def _parse_key_values(text: str) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    for segment in _KEY_VALUE_DELIMITER.split(text):
-        match = _KEY_VALUE.fullmatch(segment)
-        if match is None:
-            continue
-        key = normalize_fact_key(match.group(1))
-        value = match.group(2).strip()
-        if key and value:
-            pairs.append((key, value))
+def _parse_key_values(text: str) -> list[ParsedKeyValue]:
+    pairs: list[ParsedKeyValue] = []
+    segment_start = 0
+    for delimiter in _KEY_VALUE_DELIMITER.finditer(text):
+        _append_key_value(pairs, text, segment_start, delimiter.start())
+        segment_start = delimiter.end()
+    _append_key_value(pairs, text, segment_start, len(text))
     return pairs
+
+
+def _append_key_value(
+    pairs: list[ParsedKeyValue],
+    text: str,
+    segment_start: int,
+    segment_end: int,
+) -> None:
+    segment = text[segment_start:segment_end]
+    match = _KEY_VALUE.fullmatch(segment)
+    if match is None:
+        return
+    key = normalize_fact_key(match.group(1))
+    raw_value = match.group(2)
+    value = raw_value.strip()
+    if not key or not value:
+        return
+    leading_whitespace = len(raw_value) - len(raw_value.lstrip())
+    value_start = segment_start + match.start(2) + leading_whitespace
+    pairs.append(
+        ParsedKeyValue(
+            key=key,
+            value=value,
+            value_start=value_start,
+            value_end=value_start + len(value),
+        )
+    )
 
 
 def _heading_entity(text: str) -> str | None:
     pairs = _parse_key_values(text)
-    entities = [value for key, value in pairs if key in _FACT_ENTITY_KEYS]
+    entities = [pair.value for pair in pairs if pair.key in _FACT_ENTITY_KEYS]
     if len(entities) == 1:
         return entities[0]
     if pairs or any(delimiter in text for delimiter in ("：", ":", "，", ",", "；", ";", "\n")):
@@ -378,18 +462,17 @@ def _make_fact(
 ) -> KnowledgeFactModel:
     clean_entity = entity.strip()
     clean_value = value.strip()
+    canonical_field = canonical_fact_field(field)
     entity_key = normalize_fact_key(clean_entity)
-    field_key = normalize_fact_key(field)
+    field_key = normalize_fact_key(canonical_field)
     payload = "\x1f".join((source_id, chunk_id, entity_key, field_key, clean_value))
     fact_id = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    return KnowledgeFactModel(
+    return KnowledgeFactModel.create(
         id=fact_id,
         source_id=source_id,
         chunk_id=chunk_id,
         entity=clean_entity,
-        entity_normalized=entity_key,
-        field=field,
-        field_normalized=field_key,
+        field=canonical_field,
         value=clean_value,
         confidence=confidence,
         locator=dict(locator),

@@ -40,6 +40,28 @@ class WordFactContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown fact field"):
             canonical_fact_field("\u672a\u914d\u7f6e\u5b57\u6bb5")
 
+    def test_age_gender_and_job_aliases_share_plan_canonical_fields(self) -> None:
+        cases = (
+            ("\u5c81\u6570", "\u5e74\u9f84"),
+            ("\u6027\u522b", "\u6027\u522b"),
+            ("\u804c\u4f4d", "\u804c\u52a1"),
+        )
+
+        for alias, canonical in cases:
+            with self.subTest(alias=alias):
+                fact = KnowledgeFactModel.create(
+                    id=f"fact-{canonical}",
+                    source_id="kb-people",
+                    chunk_id="chunk-1",
+                    entity="\u5f20\u4e09",
+                    field=alias,
+                    value="\u793a\u4f8b\u503c",
+                    confidence=0.97,
+                    locator={"paragraph": 0},
+                )
+                self.assertEqual(fact.field, canonical)
+                self.assertEqual(fact.field_normalized, normalize_fact_key(canonical))
+
     def test_fact_rejects_invalid_identifier_and_confidence(self) -> None:
         with self.assertRaises(ValueError):
             KnowledgeFactModel.create(
