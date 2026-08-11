@@ -16,6 +16,7 @@ from app.structured_models import (
     StructuredIntent,
     StructuredMetricIntent,
     StructuredMultiAggregateIntent,
+    StructuredMultiAggregateResult,
     StructuredUnavailable,
 )
 from app.structured_query import parse_structured_intent, resolve_structured_intent
@@ -1240,6 +1241,167 @@ class StructuredIntentParsingTest(unittest.TestCase):
 
 
 class StructuredQueryPlannerTest(unittest.TestCase):
+    def test_multi_plan_uses_one_select_with_stable_projection_aliases(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        intent = StructuredMultiAggregateIntent(
+            dataset_id="ds-sales",
+            metrics=(
+                StructuredMetricIntent("sum", "sales_amount"),
+                StructuredMetricIntent("sum", "cost_amount"),
+                StructuredMetricIntent("sum", "profit_amount"),
+            ),
+            filters=(StructuredFilter("region", "eq", "华东"),),
+            implicit=False,
+        )
+
+        plan = StructuredQueryPlanner(catalog).plan_multi(intent, sample_publication())
+
+        self.assertEqual(plan.sql.count("SELECT"), 1)
+        self.assertIn("count() AS total_count", plan.sql)
+        self.assertIn("sum(sales_amount) AS metric_0_value", plan.sql)
+        self.assertIn("count(cost_amount) AS metric_1_valid_count", plan.sql)
+        self.assertIn(
+            "count() - count(profit_amount) AS metric_2_null_count",
+            plan.sql,
+        )
+        self.assertNotIn("华东", plan.sql)
+        self.assertEqual(plan.parameters, {"filter_0": "华东"})
+
+    def test_multi_plan_rejects_empty_metrics(self) -> None:
+        from app.structured_query import StructuredQueryPlanner, UnsafeStructuredQueryError
+
+        with self.assertRaisesRegex(UnsafeStructuredQueryError, "metric"):
+            StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
+                StructuredMultiAggregateIntent("ds-sales", (), (), False),
+                sample_publication(),
+            )
+
+    def test_multi_plan_rejects_duplicate_metric_columns(self) -> None:
+        from app.structured_query import StructuredQueryPlanner, UnsafeStructuredQueryError
+
+        duplicate = StructuredMetricIntent("sum", "sales_amount")
+        with self.assertRaisesRegex(UnsafeStructuredQueryError, "duplicate"):
+            StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
+                StructuredMultiAggregateIntent(
+                    "ds-sales",
+                    (duplicate, duplicate),
+                    (),
+                    False,
+                ),
+                sample_publication(),
+            )
+
+    def test_multi_plan_rejects_unknown_metric_columns(self) -> None:
+        from app.structured_query import StructuredQueryPlanner, UnsafeStructuredQueryError
+
+        with self.assertRaisesRegex(UnsafeStructuredQueryError, "unknown"):
+            StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
+                StructuredMultiAggregateIntent(
+                    "ds-sales",
+                    (StructuredMetricIntent("sum", "missing_amount"),),
+                    (),
+                    False,
+                ),
+                sample_publication(),
+            )
+
+    def test_multi_plan_rejects_non_count_on_disallowed_metric_column(self) -> None:
+        from app.structured_query import StructuredQueryPlanner, UnsafeStructuredQueryError
+
+        with self.assertRaisesRegex(UnsafeStructuredQueryError, "disallowed"):
+            StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
+                StructuredMultiAggregateIntent(
+                    "ds-sales",
+                    (StructuredMetricIntent("sum", "internal_score"),),
+                    (),
+                    False,
+                ),
+                sample_publication(),
+            )
+
+    def test_multi_plan_count_accepts_confirmed_non_aggregate_column(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        plan = StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("count", "region"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+
+        self.assertIn("count(region) AS metric_0_value", plan.sql)
+
+    def test_multi_plan_rejects_non_active_publication(self) -> None:
+        from app.structured_query import StructuredQueryPlanner, UnsafeStructuredQueryError
+
+        publication = replace(sample_publication(), publication_id="pub-forged")
+        with self.assertRaisesRegex(UnsafeStructuredQueryError, "active"):
+            StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
+                StructuredMultiAggregateIntent(
+                    "ds-sales",
+                    (StructuredMetricIntent("sum", "sales_amount"),),
+                    (),
+                    False,
+                ),
+                publication,
+            )
+
+    def test_multi_plan_rejects_implicit_metric_count_above_configured_cap(self) -> None:
+        from app.structured_query import StructuredQueryPlanner, UnsafeStructuredQueryError
+
+        intent = StructuredMultiAggregateIntent(
+            "ds-sales",
+            (
+                StructuredMetricIntent("sum", "sales_amount"),
+                StructuredMetricIntent("sum", "cost_amount"),
+                StructuredMetricIntent("sum", "profit_amount"),
+            ),
+            (),
+            True,
+        )
+
+        with self.assertRaisesRegex(UnsafeStructuredQueryError, "limit"):
+            StructuredQueryPlanner(
+                sample_multi_metric_catalog(),
+                implicit_summary_max_metrics=2,
+            ).plan_multi(intent, sample_publication())
+
+    def test_multi_plan_allows_explicit_metric_count_above_implicit_cap(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        intent = StructuredMultiAggregateIntent(
+            "ds-sales",
+            (
+                StructuredMetricIntent("sum", "sales_amount"),
+                StructuredMetricIntent("sum", "cost_amount"),
+                StructuredMetricIntent("sum", "profit_amount"),
+            ),
+            (),
+            False,
+        )
+
+        plan = StructuredQueryPlanner(
+            sample_multi_metric_catalog(),
+            implicit_summary_max_metrics=2,
+        ).plan_multi(intent, sample_publication())
+
+        self.assertEqual(len(plan.metrics), 3)
+
+    def test_multi_plan_rejects_non_whitelisted_aggregate(self) -> None:
+        from app.structured_query import StructuredQueryPlanner, UnsafeStructuredQueryError
+
+        metric = StructuredMetricIntent("median", "sales_amount")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(UnsafeStructuredQueryError, "aggregate"):
+            StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
+                StructuredMultiAggregateIntent("ds-sales", (metric,), (), False),
+                sample_publication(),
+            )
+
     def test_legacy_datetime_equality_uses_datetime_placeholder_and_truncates_microseconds(
         self,
     ) -> None:
@@ -1489,6 +1651,283 @@ class StructuredQueryPlannerTest(unittest.TestCase):
 
 
 class StructuredQueryExecutorTest(unittest.TestCase):
+    def test_multi_executor_returns_clickhouse_values_without_python_recalculation(
+        self,
+    ) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": 2,
+                    "metric_0_value": "300.25",
+                    "metric_0_valid_count": 2,
+                    "metric_0_null_count": 0,
+                    "metric_1_value": "120.10",
+                    "metric_1_valid_count": 2,
+                    "metric_1_null_count": 0,
+                }
+            ]
+        )
+        catalog = sample_multi_metric_catalog()
+        intent = StructuredMultiAggregateIntent(
+            "ds-sales",
+            (
+                StructuredMetricIntent("sum", "sales_amount"),
+                StructuredMetricIntent("sum", "cost_amount"),
+            ),
+            (StructuredFilter("region", "eq", "华东"),),
+            False,
+        )
+        plan = StructuredQueryPlanner(catalog).plan_multi(intent, sample_publication())
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        self.assertIsInstance(result, StructuredMultiAggregateResult)
+        assert isinstance(result, StructuredMultiAggregateResult)
+        self.assertEqual(result.total_count, 2)
+        self.assertEqual(
+            [item.value for item in result.metrics],
+            [Decimal("300.25"), Decimal("120.10")],
+        )
+        self.assertEqual(
+            [item.metric_display_name for item in result.metrics],
+            ["销售额", "成本"],
+        )
+        self.assertEqual(len(gateway.queries), 1)
+
+    def test_multi_executor_decodes_count_value_as_integer(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("count", "region"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": "3",
+                    "metric_0_value": "2",
+                    "metric_0_valid_count": "2",
+                    "metric_0_null_count": "1",
+                }
+            ]
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        assert isinstance(result, StructuredMultiAggregateResult)
+        self.assertEqual(result.metrics[0].value, 2)
+        self.assertIsInstance(result.metrics[0].value, int)
+
+    def test_multi_executor_rejects_inconsistent_counts(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": 2,
+                    "metric_0_value": "10",
+                    "metric_0_valid_count": 2,
+                    "metric_0_null_count": 1,
+                }
+            ]
+        )
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        self.assertEqual(result, StructuredUnavailable("结构化查询返回了不一致的计数"))
+
+    def test_multi_executor_rejects_negative_counts_as_inconsistent(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": -1,
+                    "metric_0_value": "10",
+                    "metric_0_valid_count": -1,
+                    "metric_0_null_count": 0,
+                }
+            ]
+        )
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        self.assertEqual(result, StructuredUnavailable("结构化查询返回了不一致的计数"))
+
+    def test_multi_executor_requires_exactly_one_result_row(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (),
+                False,
+            ),
+            sample_publication(),
+        )
+        valid_row = {
+            "total_count": 1,
+            "metric_0_value": "10",
+            "metric_0_valid_count": 1,
+            "metric_0_null_count": 0,
+        }
+
+        for rows in ([], [valid_row, valid_row]):
+            with self.subTest(row_count=len(rows)):
+                gateway = FakeClickHouse(aggregate_rows=rows)
+                result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+                self.assertEqual(
+                    result,
+                    StructuredUnavailable("结构化查询返回了无效结果"),
+                )
+                self.assertEqual(len(gateway.queries), 1)
+
+    def test_multi_executor_rejects_forged_sql_or_parameters_before_gateway_call(
+        self,
+    ) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        valid = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (StructuredMetricIntent("sum", "sales_amount"),),
+                (StructuredFilter("region", "eq", "华东"),),
+                False,
+            ),
+            sample_publication(),
+        )
+        forged_plans = (
+            replace(valid, sql=f"{valid.sql} JOIN secret_table ON 1 = 1"),
+            replace(valid, parameters={"filter_0": "华南"}),
+        )
+
+        for forged in forged_plans:
+            with self.subTest(sql=forged.sql, parameters=forged.parameters):
+                gateway = FakeClickHouse(aggregate_rows=[])
+                result = StructuredQueryExecutor(catalog, gateway).execute_multi(forged)
+                self.assertEqual(
+                    result,
+                    StructuredUnavailable("结构化查询计划未通过安全校验"),
+                )
+                self.assertEqual(gateway.queries, [])
+
+    def test_multi_executor_enforces_its_implicit_metric_cap_before_gateway_call(
+        self,
+    ) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        plan = StructuredQueryPlanner(
+            catalog,
+            implicit_summary_max_metrics=3,
+        ).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (
+                    StructuredMetricIntent("sum", "sales_amount"),
+                    StructuredMetricIntent("sum", "cost_amount"),
+                    StructuredMetricIntent("sum", "profit_amount"),
+                ),
+                (),
+                True,
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(aggregate_rows=[])
+
+        result = StructuredQueryExecutor(
+            catalog,
+            gateway,
+            implicit_summary_max_metrics=2,
+        ).execute_multi(plan)
+
+        self.assertEqual(result, StructuredUnavailable("结构化查询计划已失效"))
+        self.assertEqual(gateway.queries, [])
+
+    def test_multi_executor_returns_all_governed_metadata_with_one_audit_id(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        filters = (StructuredFilter("region", "eq", "华东"),)
+        plan = StructuredQueryPlanner(catalog).plan_multi(
+            StructuredMultiAggregateIntent(
+                "ds-sales",
+                (
+                    StructuredMetricIntent("min", "sales_amount"),
+                    StructuredMetricIntent("max", "cost_amount"),
+                ),
+                filters,
+                False,
+            ),
+            sample_publication(),
+        )
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "total_count": 3,
+                    "metric_0_value": Decimal("10.50"),
+                    "metric_0_valid_count": 2,
+                    "metric_0_null_count": 1,
+                    "metric_1_value": None,
+                    "metric_1_valid_count": 0,
+                    "metric_1_null_count": 3,
+                }
+            ]
+        )
+        times = iter((20.0, 20.125))
+        executor = StructuredQueryExecutor(
+            catalog,
+            gateway,
+            clock=lambda: next(times),
+            audit_id_factory=lambda: "audit-multi-fixed",
+        )
+
+        result = executor.execute_multi(plan)
+
+        assert isinstance(result, StructuredMultiAggregateResult)
+        self.assertEqual(result.dataset_id, "ds-sales")
+        self.assertEqual(result.source_id, "kb-sales")
+        self.assertEqual(result.schema_version, 1)
+        self.assertEqual(result.source_name, "sales.xlsx")
+        self.assertEqual(result.worksheet_name, "明细")
+        self.assertEqual(result.publication_id, "pub-sales-1")
+        self.assertEqual(result.filters, filters)
+        self.assertAlmostEqual(result.elapsed_ms, 125.0)
+        self.assertEqual(result.audit_id, "audit-multi-fixed")
+        self.assertEqual(result.metrics[0].value, Decimal("10.50"))
+        self.assertIsNone(result.metrics[1].value)
+
     def test_executor_regenerates_plan_with_the_same_legacy_profile(self) -> None:
         from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
 

@@ -27,7 +27,10 @@ from .structured_models import (
     StructuredFilter,
     StructuredIntent,
     StructuredMetricIntent,
+    StructuredMetricResult,
     StructuredMultiAggregateIntent,
+    StructuredMultiAggregatePlan,
+    StructuredMultiAggregateResult,
     StructuredPublication,
     StructuredQueryPlan,
     StructuredUnavailable,
@@ -91,11 +94,14 @@ class StructuredQueryPlanner:
         self,
         catalog: StructuredCatalog,
         compatibility: ClickHouseCompatibilityProfile | None = None,
+        *,
+        implicit_summary_max_metrics: int = 12,
     ) -> None:
         self._catalog = catalog
         self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
             ClickHouseCompatibilityMode.MODERN
         )
+        self._implicit_summary_max_metrics = implicit_summary_max_metrics
 
     def plan(
         self,
@@ -197,6 +203,114 @@ class StructuredQueryPlanner:
             filters=intent.filters,
         )
 
+    def plan_multi(
+        self,
+        intent: StructuredMultiAggregateIntent,
+        publication: StructuredPublication,
+    ) -> StructuredMultiAggregatePlan:
+        dataset = self._require_dataset(intent.dataset_id)
+        active = dataset.active_publication
+        if active is None:
+            raise UnsafeStructuredQueryError("structured dataset is not published")
+        if publication != active:
+            raise UnsafeStructuredQueryError("publication is not the active catalog publication")
+        if not intent.metrics:
+            raise UnsafeStructuredQueryError("multi-metric summary requires at least one metric")
+        if (
+            intent.implicit
+            and len(intent.metrics) > self._implicit_summary_max_metrics
+        ):
+            raise UnsafeStructuredQueryError("implicit metric count exceeds configured limit")
+
+        table_name = _require_identifier(publication.physical_table_name)
+        columns = {column.physical_name: column for column in dataset.schema.columns}
+        projections = ["count() AS total_count"]
+        seen_columns: set[str] = set()
+        for index, metric_intent in enumerate(intent.metrics):
+            aggregate = metric_intent.aggregate
+            if aggregate not in _ALLOWED_AGGREGATES:
+                raise UnsafeStructuredQueryError("unsupported aggregate")
+            name = _require_identifier(metric_intent.metric_physical_name)
+            if name in seen_columns:
+                raise UnsafeStructuredQueryError("duplicate metric column")
+            seen_columns.add(name)
+            metric = columns.get(name)
+            if metric is None:
+                raise UnsafeStructuredQueryError("unknown metric column")
+            if aggregate != "count" and not metric.allow_aggregate:
+                raise UnsafeStructuredQueryError("disallowed aggregate column")
+            aggregate_expression = f"{aggregate}({name})"
+            projections.extend(
+                (
+                    f"{aggregate_expression} AS metric_{index}_value",
+                    f"count({name}) AS metric_{index}_valid_count",
+                    f"count() - count({name}) AS metric_{index}_null_count",
+                )
+            )
+
+        parameters: dict[str, object] = {}
+        predicates = []
+        for index, item in enumerate(intent.filters):
+            column = columns.get(item.physical_name)
+            if column is None or not column.allow_filter:
+                raise UnsafeStructuredQueryError("unknown or disallowed filter column")
+            name = _require_identifier(column.physical_name)
+            parameter_name = f"filter_{index}"
+            parameter_type = self._compatibility.parameter_type(column.data_type)
+            parameters[parameter_name] = _convert_parameter(
+                item.value, column.data_type, self._compatibility
+            )
+            placeholder = f"{{{parameter_name}:{parameter_type}}}"
+            if item.operator == "between":
+                if item.upper_value is None:
+                    raise UnsafeStructuredQueryError("between filter requires an upper value")
+                upper_name = f"filter_{index}_upper"
+                upper_value = _convert_parameter(
+                    item.upper_value, column.data_type, self._compatibility
+                )
+                upper_operator = "<="
+                if column.data_type is StructuredColumnType.DATETIME and re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}", item.upper_value
+                ):
+                    upper_value = upper_value + timedelta(days=1)
+                    upper_operator = "<"
+                parameters[upper_name] = upper_value
+                upper_placeholder = f"{{{upper_name}:{parameter_type}}}"
+                predicates.append(
+                    f"({name} >= {placeholder} AND {name} {upper_operator} {upper_placeholder})"
+                )
+            else:
+                operator = {
+                    "eq": "=",
+                    "gt": ">",
+                    "gte": ">=",
+                    "lt": "<",
+                    "lte": "<=",
+                }.get(item.operator)
+                if operator is None:
+                    raise UnsafeStructuredQueryError("unsupported filter operator")
+                if item.upper_value is not None:
+                    raise UnsafeStructuredQueryError("non-range filter cannot have an upper value")
+                predicates.append(f"{name} {operator} {placeholder}")
+
+        sql = f"SELECT {', '.join(projections)} FROM {table_name}"
+        if predicates:
+            sql += " WHERE " + " AND ".join(predicates)
+        _validate_generated_select(
+            sql,
+            table_name=table_name,
+            allowed_columns=frozenset(columns),
+        )
+        return StructuredMultiAggregatePlan(
+            publication_id=publication.publication_id,
+            dataset_id=intent.dataset_id,
+            metrics=intent.metrics,
+            sql=sql,
+            parameters=parameters,
+            filters=intent.filters,
+            implicit=intent.implicit,
+        )
+
     def _require_dataset(self, dataset_id: str) -> StructuredDatasetCatalog:
         matches = [
             dataset for dataset in self._catalog.datasets if dataset.schema.dataset_id == dataset_id
@@ -213,6 +327,7 @@ class StructuredQueryExecutor:
         clickhouse_gateway: object,
         *,
         compatibility: ClickHouseCompatibilityProfile | None = None,
+        implicit_summary_max_metrics: int = 12,
         clock: Callable[[], float] = time.perf_counter,
         audit_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> None:
@@ -221,6 +336,7 @@ class StructuredQueryExecutor:
         self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
             ClickHouseCompatibilityMode.MODERN
         )
+        self._implicit_summary_max_metrics = implicit_summary_max_metrics
         self._clock = clock
         self._audit_id_factory = audit_id_factory
 
@@ -302,8 +418,103 @@ class StructuredQueryExecutor:
             audit_id=self._audit_id_factory(),
         )
 
+    def execute_multi(
+        self, plan: StructuredMultiAggregatePlan
+    ) -> StructuredMultiAggregateResult | StructuredUnavailable:
+        dataset = self._require_active_dataset(plan)
+        if isinstance(dataset, StructuredUnavailable):
+            return dataset
+        publication = dataset.active_publication
+        assert publication is not None
+
+        try:
+            expected = StructuredQueryPlanner(
+                self._catalog,
+                self._compatibility,
+                implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+            ).plan_multi(
+                StructuredMultiAggregateIntent(
+                    dataset_id=plan.dataset_id,
+                    metrics=plan.metrics,
+                    filters=plan.filters,
+                    implicit=plan.implicit,
+                ),
+                publication,
+            )
+        except UnsafeStructuredQueryError:
+            return StructuredUnavailable("结构化查询计划已失效")
+        if plan.sql != expected.sql or dict(plan.parameters) != dict(expected.parameters):
+            return StructuredUnavailable("结构化查询计划未通过安全校验")
+
+        query = getattr(self._clickhouse, "query", None)
+        if query is None:
+            return StructuredUnavailable("结构化查询服务暂时不可用")
+        started = self._clock()
+        try:
+            raw_result = query(plan.sql, plan.parameters)
+        except Exception as error:
+            if (
+                isinstance(error, TimeoutError)
+                or "timeout" in str(error).casefold()
+                or "timed out" in str(error).casefold()
+            ):
+                return StructuredUnavailable("结构化查询超时，请稍后重试")
+            return StructuredUnavailable("结构化查询服务暂时不可用")
+        elapsed_ms = max(0.0, (self._clock() - started) * 1000.0)
+
+        try:
+            row = _multi_aggregate_row(raw_result, len(plan.metrics))
+            total_count = int(row["total_count"])
+            metric_results: list[StructuredMetricResult] = []
+            for index, metric_intent in enumerate(plan.metrics):
+                valid_count = int(row[f"metric_{index}_valid_count"])
+                null_count = int(row[f"metric_{index}_null_count"])
+                if (
+                    min(total_count, valid_count, null_count) < 0
+                    or valid_count + null_count != total_count
+                ):
+                    return StructuredUnavailable("结构化查询返回了不一致的计数")
+                metric = next(
+                    (
+                        column
+                        for column in dataset.schema.columns
+                        if column.physical_name == metric_intent.metric_physical_name
+                    ),
+                    None,
+                )
+                if metric is None:
+                    return StructuredUnavailable("结构化查询返回了无效结果")
+                metric_results.append(
+                    StructuredMetricResult(
+                        aggregate=metric_intent.aggregate,
+                        metric_physical_name=metric_intent.metric_physical_name,
+                        metric_display_name=metric.display_name,
+                        value=_aggregate_value(
+                            row[f"metric_{index}_value"], metric_intent.aggregate
+                        ),
+                        valid_count=valid_count,
+                        null_count=null_count,
+                    )
+                )
+        except (KeyError, TypeError, ValueError, IndexError, ArithmeticError):
+            return StructuredUnavailable("结构化查询返回了无效结果")
+
+        return StructuredMultiAggregateResult(
+            dataset_id=dataset.schema.dataset_id,
+            source_id=dataset.schema.source_id,
+            schema_version=dataset.schema.schema_version,
+            metrics=tuple(metric_results),
+            total_count=total_count,
+            source_name=dataset.source_name,
+            worksheet_name=dataset.schema.worksheet_name,
+            publication_id=publication.publication_id,
+            filters=plan.filters,
+            elapsed_ms=elapsed_ms,
+            audit_id=self._audit_id_factory(),
+        )
+
     def _require_active_dataset(
-        self, plan: StructuredQueryPlan
+        self, plan: StructuredQueryPlan | StructuredMultiAggregatePlan
     ) -> StructuredDatasetCatalog | StructuredUnavailable:
         matches = [
             dataset
@@ -1272,6 +1483,48 @@ def _aggregate_row(result: object) -> Mapping[str, object]:
                 )
             )
     raise TypeError("unsupported ClickHouse aggregate result shape")
+
+
+def _multi_aggregate_row(
+    result: object,
+    metric_count: int,
+) -> Mapping[str, object]:
+    if isinstance(result, Mapping):
+        return result
+    named_results = getattr(result, "named_results", None)
+    if named_results is not None:
+        rows = list(named_results())
+        if len(rows) != 1 or not isinstance(rows[0], Mapping):
+            raise ValueError("multi-aggregate query must return exactly one named row")
+        return rows[0]
+    column_names = getattr(result, "column_names", None)
+    result_rows = getattr(result, "result_rows", None)
+    if column_names is not None and result_rows is not None:
+        rows = list(result_rows)
+        if len(rows) != 1:
+            raise ValueError("multi-aggregate query must return exactly one result row")
+        return dict(zip(column_names, rows[0], strict=True))
+    if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
+        rows = list(result)
+        if len(rows) != 1:
+            raise ValueError("multi-aggregate query must return exactly one result row")
+        first = rows[0]
+        if isinstance(first, Mapping):
+            return first
+        if isinstance(first, Sequence) and not isinstance(
+            first, (str, bytes, bytearray)
+        ):
+            aliases = ["total_count"]
+            for index in range(metric_count):
+                aliases.extend(
+                    (
+                        f"metric_{index}_value",
+                        f"metric_{index}_valid_count",
+                        f"metric_{index}_null_count",
+                    )
+                )
+            return dict(zip(aliases, first, strict=True))
+    raise TypeError("unsupported ClickHouse multi-aggregate result shape")
 
 
 def _aggregate_value(value: object, aggregate: Literal["avg", "sum", "count", "min", "max"]):
