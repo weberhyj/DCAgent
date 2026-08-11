@@ -6,7 +6,14 @@ from sqlalchemy import inspect
 
 from app.database import Database
 from app.models import KnowledgeFactModel as ExportedKnowledgeFactModel
-from app.word_facts import KnowledgeFactModel, canonical_fact_field, normalize_fact_key
+from app.word_facts import (
+    KnowledgeFactModel,
+    WordFactClarification,
+    WordFactualIntent,
+    canonical_fact_field,
+    normalize_fact_key,
+    resolve_word_factual_intent,
+)
 
 
 class WordFactContractTests(unittest.TestCase):
@@ -85,6 +92,30 @@ class WordFactContractTests(unittest.TestCase):
                 confidence=1.01,
                 locator={},
             )
+
+
+class WordFactualIntentTests(unittest.TestCase):
+    def test_age_and_job_aliases_resolve_canonical_fields(self) -> None:
+        self.assertEqual(
+            resolve_word_factual_intent("张三几岁"),
+            WordFactualIntent("张三", "张三", "年龄", "年龄"),
+        )
+        job = resolve_word_factual_intent("请问张三担任什么职位？")
+        self.assertIsInstance(job, WordFactualIntent)
+        assert isinstance(job, WordFactualIntent)
+        self.assertEqual(job.field, "职务")
+
+    def test_open_introduction_is_not_factual(self) -> None:
+        self.assertIsNone(resolve_word_factual_intent("介绍张三"))
+
+    def test_multiple_fields_and_entities_request_clarification(self) -> None:
+        field_resolution = resolve_word_factual_intent("张三的年龄和性别")
+        self.assertIsInstance(field_resolution, WordFactClarification)
+        assert isinstance(field_resolution, WordFactClarification)
+        self.assertEqual(field_resolution.candidates, ("年龄", "性别"))
+
+        entity_resolution = resolve_word_factual_intent("张三和李四几岁")
+        self.assertIsInstance(entity_resolution, WordFactClarification)
 
 
 class WordFactSchemaTests(unittest.TestCase):
