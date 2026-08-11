@@ -117,6 +117,13 @@ class WordFactualIntentTests(unittest.TestCase):
         entity_resolution = resolve_word_factual_intent("张三和李四几岁")
         self.assertIsInstance(entity_resolution, WordFactClarification)
 
+    def test_list_separator_between_entities_requests_clarification(self) -> None:
+        resolution = resolve_word_factual_intent("张三、李四几岁")
+
+        self.assertIsInstance(resolution, WordFactClarification)
+        assert isinstance(resolution, WordFactClarification)
+        self.assertEqual(resolution.candidates, ("张三", "李四"))
+
 
 class WordFactSchemaTests(unittest.TestCase):
     def test_head_migration_creates_fact_lookup_indexes(self) -> None:

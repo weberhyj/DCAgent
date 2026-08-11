@@ -226,7 +226,9 @@ def extract_single_entity(
         for index, character in enumerate(question)
         if index not in removed_positions
         and not character.isspace()
-        and not unicodedata.category(character).startswith("P")
+        and (
+            character == "、" or not unicodedata.category(character).startswith("P")
+        )
     )
     for prefix in _POLITE_PREFIXES:
         if entity.startswith(prefix):
