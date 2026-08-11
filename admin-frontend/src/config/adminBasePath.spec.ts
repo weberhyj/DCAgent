@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeAdminBasePath } from './adminBasePath'
+import { normalizeAdminBasePath, resolveAdminPublicAsset } from './adminBasePath'
 
 describe('normalizeAdminBasePath', () => {
   it('defaults to the administration subpath', () => {
@@ -13,6 +13,14 @@ describe('normalizeAdminBasePath', () => {
     expect(normalizeAdminBasePath('/operations')).toBe('/operations/')
     expect(normalizeAdminBasePath('/operations/')).toBe('/operations/')
     expect(normalizeAdminBasePath('/')).toBe('/')
+  })
+
+  it('resolves public assets below the configured base', () => {
+    expect(resolveAdminPublicAsset('favicon-logo.svg', '/admin/')).toBe('/admin/favicon-logo.svg')
+    expect(resolveAdminPublicAsset('/favicon-logo.svg', '/operations/')).toBe(
+      '/operations/favicon-logo.svg',
+    )
+    expect(resolveAdminPublicAsset('favicon-logo.svg', '/')).toBe('/favicon-logo.svg')
   })
 
   it.each([

@@ -2,8 +2,10 @@
 import { Bot, Database, LayoutDashboard, ListChecks, ShieldCheck } from 'lucide-vue-next'
 import { onMounted } from 'vue'
 import { useBackendVersion } from '@/composables/useBackendVersion'
+import { resolveAdminPublicAsset } from '@/config/adminBasePath'
 
 const { displayVersion, load: loadBackendVersion } = useBackendVersion()
+const brandLogoUrl = resolveAdminPublicAsset('favicon-logo.svg', import.meta.env.BASE_URL)
 
 onMounted(() => {
   void loadBackendVersion()
@@ -21,7 +23,7 @@ const navigation = [
   <div class="admin-shell">
     <aside class="admin-sidebar">
       <RouterLink class="admin-brand" :to="{ name: 'overview' }" aria-label="返回管理概览">
-        <img class="admin-brand__mark" :src="'/favicon-logo.svg'" alt="" aria-hidden="true">
+        <img class="admin-brand__mark" :src="brandLogoUrl" alt="" aria-hidden="true">
         <span class="admin-brand__copy">
           <strong>DC-Agent</strong>
         </span>

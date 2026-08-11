@@ -1,16 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentRunAudit, KnowledgeSource } from '@/types/chat'
 
-const httpMock = vi.hoisted(() => ({
-  delete: vi.fn(),
-  get: vi.fn(),
-  post: vi.fn(),
-  put: vi.fn(),
-}))
+const { axiosCreateMock, httpMock } = vi.hoisted(() => {
+  const requestMock = {
+    delete: vi.fn(),
+    get: vi.fn(),
+    post: vi.fn(),
+    put: vi.fn(),
+  }
+
+  return {
+    axiosCreateMock: vi.fn(() => requestMock),
+    httpMock: requestMock,
+  }
+})
 
 vi.mock('axios', () => ({
   default: {
-    create: vi.fn(() => httpMock),
+    create: axiosCreateMock,
   },
 }))
 
@@ -51,7 +58,16 @@ describe('knowledge api service', () => {
     httpMock.get.mockReset()
     httpMock.post.mockReset()
     httpMock.put.mockReset()
+    axiosCreateMock.mockClear()
     vi.resetModules()
+  })
+
+  it('keeps backend requests rooted outside the administration subpath', async () => {
+    await loadApi()
+
+    expect(axiosCreateMock).toHaveBeenCalledWith(expect.objectContaining({
+      baseURL: '/api',
+    }))
   })
 
   it('loads the backend application version', async () => {

@@ -26,3 +26,7 @@ export function normalizeAdminBasePath(value?: string): string {
 
   return `/${segments.join('/')}/`
 }
+
+export function resolveAdminPublicAsset(assetPath: string, basePath: string): string {
+  return `${normalizeAdminBasePath(basePath)}${assetPath.replace(/^\/+/, '')}`
+}

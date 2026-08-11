@@ -7,7 +7,9 @@ describe('administration application favicon', () => {
     const html = readFileSync(join(process.cwd(), 'index.html'), 'utf8')
     const assetPath = join(process.cwd(), 'public', 'favicon-logo.svg')
 
-    expect(html).toContain('<link rel="icon" type="image/svg+xml" href="/favicon-logo.svg" />')
+    expect(html).toContain(
+      '<link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon-logo.svg" />',
+    )
     expect(existsSync(assetPath)).toBe(true)
     expect(readFileSync(assetPath, 'utf8')).toContain('viewBox="0 0 66.77 66.77"')
   })
