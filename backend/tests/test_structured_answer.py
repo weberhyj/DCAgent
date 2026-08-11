@@ -1205,6 +1205,11 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             with self.subTest(question=question):
                 self._assert_catalog_failure_uses_legacy_path(question)
 
+    def test_catalog_failure_field_name_before_copula_remains_structured(self) -> None:
+        self._assert_catalog_failure_is_strong_candidate(
+            "产品说明平均值为10的销售额总和"
+        )
+
     def test_catalog_failure_explicit_filter_grammars_are_strong_candidates(self) -> None:
         questions = (
             "订单金额大于10的平均值",

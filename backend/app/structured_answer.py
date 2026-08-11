@@ -94,6 +94,17 @@ _HAS_EXPLICIT_FILTER_RE = re.compile(
 )
 _CONCEPT_ANYWHERE_PHRASES = ("什么是", "什么叫", "何为", "是什么意思")
 _CONCEPT_TERM_INTRODUCERS = ("解释一下", "讲讲", "介绍一下", "说明一下")
+_CONCEPT_COPULA_REQUEST_PREFIXES = ("请解释一下", "请介绍一下", "请说明")
+_CONCEPT_COPULA_PREDICATE_SUFFIXES = (
+    "指标",
+    "概念",
+    "术语",
+    "方法",
+    "统计量",
+    "度量",
+    "定义",
+    "含义",
+)
 _CONCEPT_TERM_SUFFIXES = (
     "是什么",
     "是什么意思",
@@ -476,11 +487,11 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
     normalized = _normalize(stripped)
     if not _has_aggregate_language(normalized):
         return "weak"
-    if _has_prefixed_copula_concept_shape(normalized):
+    concept_body = _normalize(_strip_concept_question_tail(stripped))
+    if _has_prefixed_copula_concept_shape(concept_body):
         return "concept"
     if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(stripped):
         return "strong"
-    concept_body = _normalize(_strip_concept_question_tail(stripped))
     if _is_priority_aggregate_concept_shape(concept_body):
         return "concept"
     if _has_metric_qualified_concept_shape(normalized):
@@ -544,15 +555,19 @@ def _has_metric_qualified_concept_shape(normalized: str) -> bool:
 
 
 def _has_prefixed_copula_concept_shape(normalized: str) -> bool:
-    concept_prefixes = (*_CONCEPT_TERM_INTRODUCERS, "说明", "解释", "介绍")
-    for term in _AGGREGATE_CONCEPT_TERMS:
-        start = normalized.find(term)
-        while start >= 0:
-            prefix = normalized[:start]
-            suffix = normalized[start + len(term) :]
-            if prefix.endswith(concept_prefixes) and suffix.startswith("为"):
-                return True
-            start = normalized.find(term, start + 1)
+    for prefix in _CONCEPT_COPULA_REQUEST_PREFIXES:
+        if not normalized.startswith(prefix):
+            continue
+        body = normalized[len(prefix) :]
+        for term in _AGGREGATE_CONCEPT_TERMS:
+            marker = f"{term}为"
+            if not body.startswith(marker):
+                continue
+            predicate = body[len(marker) :]
+            return any(
+                predicate.endswith(suffix)
+                for suffix in _CONCEPT_COPULA_PREDICATE_SUFFIXES
+            )
     return False
 
 
