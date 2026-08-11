@@ -15,6 +15,7 @@ REVISION = "20260715_00"
 QWEN3_RETRIEVAL_REVISION = "20260727_04"
 SHADOW_EVALUATION_LABELS_REVISION = "20260728_05"
 EMBEDDING_FINGERPRINT_REVISION = "20260730_06"
+WORD_FACTS_REVISION = "20260811_07"
 
 EXPECTED_COLUMNS: dict[str, tuple[tuple[str, str, bool, bool], ...]] = {
     "agent_runs": (
@@ -379,7 +380,7 @@ class AlembicBaselineTest(unittest.TestCase):
                 self.assertIn(("request_id",), shadow_unique_constraints)
                 with engine.connect() as connection:
                     self.assertEqual(
-                        EMBEDDING_FINGERPRINT_REVISION,
+                        WORD_FACTS_REVISION,
                         connection.scalar(text("SELECT version_num FROM alembic_version")),
                     )
             finally:

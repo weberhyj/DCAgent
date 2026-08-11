@@ -705,7 +705,7 @@ class LazyStartupTest(unittest.TestCase):
                 "CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)"
             )
             connection.exec_driver_sql(
-                "INSERT INTO alembic_version (version_num) VALUES ('20260730_06')"
+                "INSERT INTO alembic_version (version_num) VALUES ('20260811_07')"
             )
 
         class FakeResponse:
