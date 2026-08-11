@@ -576,6 +576,16 @@ ClickHouse connect/read path. The indexing worker does not inherit that limit; p
 the storage gateway's independent 30-second execution default until a dedicated publish setting is
 introduced.
 
+### Filtered Excel summaries
+
+- Existing published Excel/CSV datasets do not need to be uploaded or published again.
+- “汇总”/“统计” sums all `allowAggregate` integer/decimal columns and returns matched/valid/null counts.
+- `STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS` defaults to 12; over-limit questions ask the user to choose fields.
+- All metrics in one answer are calculated by one ClickHouse `SELECT`.
+- ClickHouse or parsing failures return a structured error and never search Word/PDF chunks.
+
+This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.
+
 Rollback is configuration-only and preserves published data. Set
 `STRUCTURED_QUERY_ENABLED=false`, stop the current topology, and restart without the indexing
 profile. The worker refuses to start while the feature flag is false, so rollback cannot continue

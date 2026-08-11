@@ -9,11 +9,81 @@ from fastapi.testclient import TestClient
 
 from app.llm import LLMProviderError
 from app.main import create_app
-from app.models import ChatState
+from app.models import ChatMessageModel, ChatState, ResponseParagraphModel
 from app.repository import InMemoryChatRepository
+from app.retrieval_models import RetrievalScope
+from app.structured_answer import StructuredAnswerService
+from tests.support.structured_fakes import sample_multi_metric_catalog
 
 
 class RagAcceptanceTest(unittest.TestCase):
+    def test_clickhouse_timeout_has_no_word_citations_rag_or_llm_calls(self) -> None:
+        class FailingClickHouseGateway:
+            def __init__(self) -> None:
+                self.query_calls = 0
+                self.returned_row_count = 0
+                self.fail_with = TimeoutError("timed out")
+
+            def query(self, _statement: str, _parameters: object) -> object:
+                self.query_calls += 1
+                raise self.fail_with
+
+        class RecordingRagSearch:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, request: object) -> object:
+                self.calls += 1
+                raise AssertionError(f"structured query reached Word/PDF RAG: {request}")
+
+        class WordAnswerLLM:
+            def __init__(self) -> None:
+                self.generation_calls = 0
+
+            def generate_reply(self, _request: object) -> ChatMessageModel:
+                self.generation_calls += 1
+                return ChatMessageModel(
+                    id="msg-word-fallback",
+                    role="assistant",
+                    time="2026-08-11 12:00:00",
+                    paragraphs=[ResponseParagraphModel(text="word-policy.docx fallback")],
+                )
+
+        gateway = FailingClickHouseGateway()
+        rag_search = RecordingRagSearch()
+        llm = WordAnswerLLM()
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[]),
+            llm_provider=llm,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(),
+                gateway,
+            ),
+            retrieval_router=rag_search,
+            retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+        )
+        client = TestClient(
+            create_app(repository=repository, upload_dir=Path(self.temp_dir.name))
+        )
+        conversation_id = client.post("/api/conversations").json()["activeConversationId"]
+
+        response = client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "地区为华东的销售额、成本、利润汇总", "mode": "source"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        assistant = response.json()["messages"][-1]
+        paragraph = assistant["paragraphs"][0]
+        self.assertIn("结构化查询超时", paragraph["text"])
+        self.assertEqual(paragraph["citations"], [])
+        self.assertEqual(assistant["artifacts"], [])
+        self.assertNotIn("word-policy.docx", paragraph["text"])
+        self.assertEqual(gateway.query_calls, 1)
+        self.assertEqual(gateway.returned_row_count, 0)
+        self.assertEqual(rag_search.calls, 0)
+        self.assertEqual(llm.generation_calls, 0)
+
     def test_model_failure_returns_explicit_unavailable_without_raw_retrieval_chunks(self) -> None:
         raw_chunk = "CONFIDENTIAL raw retrieved payroll passage"
         internal_url = "http://physoc.internal.example/private"

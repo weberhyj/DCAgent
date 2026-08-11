@@ -353,6 +353,16 @@ Legacy 结果或模板文本伪装成模型答案。
 calculated from RAG chunks；Qdrant 中只保存表结构、字段和安全摘要，绝不把局部切片平均值当作
 完整数据结果。
 
+### Filtered Excel summaries
+
+- Existing published Excel/CSV datasets do not need to be uploaded or published again.
+- “汇总”/“统计” sums all `allowAggregate` integer/decimal columns and returns matched/valid/null counts.
+- `STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS` defaults to 12; over-limit questions ask the user to choose fields.
+- All metrics in one answer are calculated by one ClickHouse `SELECT`.
+- ClickHouse or parsing failures return a structured error and never search Word/PDF chunks.
+
+This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.
+
 这里的“精确统计”只承诺覆盖通过校验的 publication，不等同于无条件覆盖原工作簿中的每个
 单元格。空值、错误值、公式结果、隐藏行、多 Sheet 合并方式和类型转换规则仍需在目标业务
 数据集上冻结口径并验收。
