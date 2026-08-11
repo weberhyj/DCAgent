@@ -365,6 +365,18 @@ calculated from RAG chunks；Qdrant 中只保存表结构、字段和安全摘�
 
 This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.
 
+### Word factual-answer reindexing
+
+Word factual answers use extracted `knowledge_facts`; existing Word sources must be reindexed, while
+published Excel tables do not require re-uploading.
+
+1. Apply Alembic revision 20260811_07.
+2. Confirm every existing Word source still has a readable file_path.
+3. POST /api/knowledge/sources/{source_id}/reindex once for each Word source.
+4. Keep the old retrieval publication active until the normal Qdrant publication fence completes.
+5. Verify records > 0, knowledge_facts contains rows, and “张三几岁” returns only age.
+6. If conflicts appear, disable the factual route and inspect extracted facts; do not route the question to unrelated Word RAG.
+
 这里的“精确统计”只承诺覆盖通过校验的 publication，不等同于无条件覆盖原工作簿中的每个
 单元格。空值、错误值、公式结果、隐藏行、多 Sheet 合并方式和类型转换规则仍需在目标业务
 数据集上冻结口径并验收。

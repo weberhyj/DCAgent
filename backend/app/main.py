@@ -42,6 +42,7 @@ from .sql_repository import SqlChatRepository
 from .storage import KnowledgeFileStorage
 from .structured_answer import StructuredAnswerService
 from .structured_repository import StructuredRepository
+from .word_fact_answer import WordFactAnswerService
 
 
 class _DefaultRetrievalResourceFactory:
@@ -207,6 +208,7 @@ def create_default_repository(
         structured_service=structured_service,
         owns_database=True,
     )
+    repository._word_fact_service = WordFactAnswerService(repository)
     return repository
 
 
@@ -416,6 +418,10 @@ def create_production_app(
                     llm_provider=llm_provider,  # type: ignore[arg-type]
                     structured_service=structured_service,
                     retrieval_permission_tags=retrieval_settings.permission_tags,
+                )
+                repository._word_fact_service = WordFactAnswerService(
+                    repository,
+                    permission_tags=retrieval_settings.permission_tags,
                 )
             else:
                 repository = repository_factory()

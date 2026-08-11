@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from .retrieval_router import RetrievalRouter
     from .retrieval_scope import RetrievalScopeProvider
     from .structured_answer import StructuredAnswerService
+    from .word_fact_answer import WordFactAnswerService
 
 STATUS_INDEXED = "已索引"
 STATUS_INDEXING = "解析中"
@@ -463,6 +464,7 @@ class InMemoryChatRepository:
         state: ChatState,
         llm_provider: LLMProvider | None = None,
         structured_service: StructuredAnswerService | None = None,
+        word_fact_service: WordFactAnswerService | None = None,
         *,
         retrieval_router: RetrievalRouter | None = None,
         retrieval_scope: RetrievalScope | None = None,
@@ -478,6 +480,7 @@ class InMemoryChatRepository:
         self._state = state
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service
+        self._word_fact_service = word_fact_service
         self.retrieval_router = retrieval_router
         self._retrieval_scope_provider = effective_scope_provider
         self._lock = Lock()
@@ -583,6 +586,13 @@ class InMemoryChatRepository:
         )
         if agent_result is None and self._structured_service is not None:
             agent_result = self._structured_service.try_answer(
+                conversation_id=conversation_id,
+                content=clean_content,
+                mode=mode,
+                previous_messages=previous_messages,
+            )
+        if agent_result is None and self._word_fact_service is not None:
+            agent_result = self._word_fact_service.try_answer(
                 conversation_id=conversation_id,
                 content=clean_content,
                 mode=mode,

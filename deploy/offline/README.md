@@ -586,6 +586,18 @@ introduced.
 
 This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.
 
+### Word factual-answer reindexing
+
+Word factual answers use extracted `knowledge_facts`; existing Word sources must be reindexed, while
+published Excel tables do not require re-uploading.
+
+1. Apply Alembic revision 20260811_07.
+2. Confirm every existing Word source still has a readable file_path.
+3. POST /api/knowledge/sources/{source_id}/reindex once for each Word source.
+4. Keep the old retrieval publication active until the normal Qdrant publication fence completes.
+5. Verify records > 0, knowledge_facts contains rows, and “张三几岁” returns only age.
+6. If conflicts appear, disable the factual route and inspect extracted facts; do not route the question to unrelated Word RAG.
+
 The in-process `LargeMultiSummaryGateway` case injects a precomputed aggregate row. It is useful for
 batching, response-shape, one-row-return, and no-LLM resource checks, but it is not evidence that a
 database executed the filter or Decimal aggregates.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Sequence
 
 from app.agent import (
     GREETING_REPLY,
@@ -11,11 +12,15 @@ from app.agent import (
 from app.llm import LLMRequest
 from app.models import (
     ChatMessageModel,
+    ChatState,
     KnowledgeChunkModel,
     KnowledgeSearchHitModel,
     KnowledgeSourceModel,
     ResponseParagraphModel,
 )
+from app.repository import InMemoryChatRepository
+from app.word_fact_answer import WordFactAnswerService
+from app.word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
 
 
 def source(source_id: str, name: str) -> KnowledgeSourceModel:
@@ -65,6 +70,56 @@ class RecordingProvider:
             role="assistant",
             time="2026-07-10 10:00:01",
             paragraphs=[ResponseParagraphModel(text="已完成多步调查。[1]")],
+        )
+
+
+def word_fact_match(
+    entity: str,
+    field: str,
+    value: str,
+) -> WordFactMatch:
+    fact = KnowledgeFactModel.create(
+        id=f"fact-{entity}-{field}-{value}",
+        source_id="kb-people",
+        chunk_id="chunk-people-1",
+        entity=entity,
+        field=field,
+        value=value,
+        confidence=0.98,
+        locator={"paragraph": 1},
+    )
+    return WordFactMatch(
+        fact=fact,
+        source_name="people.docx",
+        classification="内部",
+    )
+
+
+class FakeFacts:
+    def __init__(self, matches: Sequence[WordFactMatch]) -> None:
+        self._matches = list(matches)
+
+    def find_knowledge_facts(
+        self,
+        _intent: WordFactualIntent,
+        *,
+        permission_tags: Sequence[str] = (),
+    ) -> list[WordFactMatch]:
+        del permission_tags
+        return list(self._matches)
+
+
+class RecordingRouteProvider:
+    def __init__(self) -> None:
+        self.generation_calls = 0
+
+    def generate_reply(self, _request: LLMRequest) -> ChatMessageModel:
+        self.generation_calls += 1
+        return ChatMessageModel(
+            id=f"msg-route-{self.generation_calls}",
+            role="assistant",
+            time="2026-08-11 12:00:00",
+            paragraphs=[ResponseParagraphModel(text="hybrid RAG answer")],
         )
 
 
@@ -261,6 +316,78 @@ class AgentTest(unittest.TestCase):
         )
         self.assertIsNotNone(provider.request)
         self.assertEqual(provider.request.knowledge_hits, [])
+
+
+class WordFactRouteRepositoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.recording_llm = RecordingRouteProvider()
+        self.fact_service = WordFactAnswerService(
+            FakeFacts([word_fact_match("张三", "年龄", "28岁")])
+        )
+        self.search_calls = 0
+        self.inspect_calls = 0
+
+    def build_repository(
+        self,
+        *,
+        word_fact_service: WordFactAnswerService | None = None,
+    ) -> tuple[InMemoryChatRepository, str]:
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[]),
+            llm_provider=self.recording_llm,
+            word_fact_service=word_fact_service,
+        )
+
+        def search(
+            _query: str,
+            _limit: int,
+            _routing_key: str,
+        ) -> list[KnowledgeSearchHitModel]:
+            self.search_calls += 1
+            return []
+
+        def inspect(_source_id: str) -> list[KnowledgeChunkModel]:
+            self.inspect_calls += 1
+            return []
+
+        repository._agent = ReadOnlyKnowledgeAgent(
+            KnowledgeAgentTools(search_knowledge=search, inspect_document=inspect),
+            self.recording_llm,
+        )
+        _, conversation_id, _ = repository.create_conversation()
+        return repository, conversation_id
+
+    def test_fact_route_precedes_agent_and_llm(self) -> None:
+        repository, conversation_id = self.build_repository(
+            word_fact_service=self.fact_service
+        )
+
+        _, _, messages = repository.send_message(conversation_id, "张三几岁", "deep")
+
+        self.assertEqual(messages[-1].paragraphs[0].text, "张三的年龄是28岁。")
+        self.assertEqual(self.recording_llm.generation_calls, 0)
+        self.assertEqual(self.search_calls, 0)
+        self.assertEqual(self.inspect_calls, 0)
+
+    def test_open_word_question_continues_to_hybrid_rag(self) -> None:
+        repository, conversation_id = self.build_repository(
+            word_fact_service=self.fact_service
+        )
+
+        repository.send_message(conversation_id, "介绍张三", "deep")
+
+        self.assertGreater(self.search_calls, 0)
+        self.assertEqual(self.recording_llm.generation_calls, 1)
+
+    def test_missing_fact_is_terminal_and_never_inspects_document(self) -> None:
+        repository, conversation_id = self.build_repository(
+            word_fact_service=WordFactAnswerService(FakeFacts([]))
+        )
+
+        repository.send_message(conversation_id, "张三几岁", "deep")
+
+        self.assertEqual(self.search_calls, 0)
+        self.assertEqual(self.inspect_calls, 0)
 
 
 if __name__ == "__main__":

@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from .retrieval_router import RetrievalRouter
     from .retrieval_scope import RetrievalScopeProvider
     from .structured_answer import StructuredAnswerService
+    from .word_fact_answer import WordFactAnswerService
 
 
 def _required_permission_tag(value: object) -> str:
@@ -474,6 +475,7 @@ class SqlChatRepository:
         database: Database,
         llm_provider: LLMProvider | None = None,
         structured_service: StructuredAnswerService | None = None,
+        word_fact_service: WordFactAnswerService | None = None,
         *,
         owns_database: bool = False,
         retrieval_permission_tags: Sequence[str] = (),
@@ -491,6 +493,7 @@ class SqlChatRepository:
         self._database = database
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service
+        self._word_fact_service = word_fact_service
         self.retrieval_router = retrieval_router
         self._retrieval_scope_provider = effective_scope_provider
         self._owns_database = owns_database
@@ -654,6 +657,13 @@ class SqlChatRepository:
         )
         if agent_result is None and self._structured_service is not None:
             agent_result = self._structured_service.try_answer(
+                conversation_id=conversation_id,
+                content=clean_content,
+                mode=mode,
+                previous_messages=previous_messages,
+            )
+        if agent_result is None and self._word_fact_service is not None:
+            agent_result = self._word_fact_service.try_answer(
                 conversation_id=conversation_id,
                 content=clean_content,
                 mode=mode,
