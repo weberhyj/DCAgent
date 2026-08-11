@@ -476,6 +476,8 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
     normalized = _normalize(stripped)
     if not _has_aggregate_language(normalized):
         return "weak"
+    if _has_prefixed_copula_concept_shape(normalized):
+        return "concept"
     if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(stripped):
         return "strong"
     concept_body = _normalize(_strip_concept_question_tail(stripped))
@@ -485,7 +487,11 @@ def _classify_without_catalog(question: str) -> Literal["weak", "strong", "conce
         return "strong"
     if _is_aggregate_concept_question(normalized):
         return "concept"
-    if _is_implicit_row_count(stripped) or _has_field_aggregate_suffix(normalized):
+    if (
+        _is_implicit_row_count(stripped)
+        or _is_implicit_summary(stripped)
+        or _has_field_aggregate_suffix(normalized)
+    ):
         return "strong"
     return "weak"
 
@@ -534,6 +540,19 @@ def _has_metric_qualified_concept_shape(normalized: str) -> bool:
             start = normalized.find(phrase, start + 1)
     if normalized.endswith("是什么"):
         return _has_field_aggregate_suffix(normalized[: -len("是什么")])
+    return False
+
+
+def _has_prefixed_copula_concept_shape(normalized: str) -> bool:
+    concept_prefixes = (*_CONCEPT_TERM_INTRODUCERS, "说明", "解释", "介绍")
+    for term in _AGGREGATE_CONCEPT_TERMS:
+        start = normalized.find(term)
+        while start >= 0:
+            prefix = normalized[:start]
+            suffix = normalized[start + len(term) :]
+            if prefix.endswith(concept_prefixes) and suffix.startswith("为"):
+                return True
+            start = normalized.find(term, start + 1)
     return False
 
 

@@ -29,7 +29,8 @@ from app.models import (
     ResponseParagraphModel,
 )
 from app.repository import STATUS_INDEXED, InMemoryChatRepository
-from app.retrieval_models import RetrievalScope
+from app.retrieval_models import RetrievalMode, RetrievalScope
+from app.retrieval_router import RoutedRetrievalOutcome
 from app.seed import build_seed_state
 from app.structured_answer import StructuredAnswerService
 from tests.support.structured_fakes import sample_multi_metric_catalog
@@ -194,6 +195,50 @@ class RecordingPhysocClient:
 
 
 class LLMProviderTest(unittest.TestCase):
+    def test_cold_catalog_failure_implicit_summary_never_reaches_retrieval_or_llm(
+        self,
+    ) -> None:
+        class RecordingRetrievalRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, _request: object) -> RoutedRetrievalOutcome:
+                self.calls += 1
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.LEGACY,
+                    hits=(),
+                    stage_ms={},
+                )
+
+        def failing_catalog():
+            raise RuntimeError("catalog down")
+
+        for question in ("汇总", "统计"):
+            with self.subTest(question=question):
+                rag_search = RecordingRetrievalRouter()
+                provider = RecordingLLMProvider()
+                repository = InMemoryChatRepository(
+                    ChatState(
+                        conversations=[],
+                        messages_by_conversation={},
+                        knowledge_sources=[],
+                    ),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(
+                        failing_catalog,
+                        object(),
+                    ),
+                    retrieval_router=rag_search,
+                    retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                _, _, messages = repository.send_message(conversation_id, question, "deep")
+
+                self.assertIn("结构化查询服务不可用", messages[-1].paragraphs[0].text)
+                self.assertEqual(rag_search.calls, 0)
+                self.assertIsNone(provider.request)
+
     def test_clickhouse_failure_after_excel_route_never_searches_word_documents(self) -> None:
         class FailingClickHouseGateway:
             def __init__(self) -> None:

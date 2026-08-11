@@ -1196,6 +1196,15 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             with self.subTest(question=question):
                 self._assert_catalog_failure_uses_legacy_path(question)
 
+    def test_catalog_failure_prefixed_copula_concept_remains_on_legacy_path(self) -> None:
+        for question in (
+            "请说明平均值为常用统计指标",
+            "请解释一下平均值为常用统计指标",
+            "请介绍一下平均值为常用统计指标",
+        ):
+            with self.subTest(question=question):
+                self._assert_catalog_failure_uses_legacy_path(question)
+
     def test_catalog_failure_explicit_filter_grammars_are_strong_candidates(self) -> None:
         questions = (
             "订单金额大于10的平均值",
