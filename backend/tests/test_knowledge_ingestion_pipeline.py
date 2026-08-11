@@ -11,7 +11,7 @@ from app.ingestion import KnowledgeIndexUnavailableError, KnowledgeIngestionQueu
 from app.main import create_app
 from app.repository import InMemoryChatRepository
 from app.seed import build_seed_state
-from app.text_parser import parse_knowledge_file
+from app.text_parser import parse_knowledge_file, parse_knowledge_file_result
 
 
 class KnowledgeIngestionPipelineTest(unittest.TestCase):
@@ -82,6 +82,16 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         self.assertTrue(all("\x00" not in chunk.text for chunk in chunks))
         self.assertIn("差旅制度", chunks[0].text)
         self.assertIn("审批流程", chunks[0].text)
+
+    def test_non_docx_parse_result_keeps_chunk_compatibility_without_facts(self) -> None:
+        path = Path(self.temp_dir.name) / "plain-note.txt"
+        path.write_text("plain searchable passage", encoding="utf-8")
+
+        result = parse_knowledge_file_result(path, source_id="kb-plain", source_type="TXT")
+
+        self.assertIsInstance(result.chunks, tuple)
+        self.assertEqual(result.facts, ())
+        self.assertEqual([chunk.text for chunk in result.chunks], ["plain searchable passage"])
 
     def test_new_document_updates_postgres_then_active_qdrant_collection(self) -> None:
         events = []
