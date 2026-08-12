@@ -70,7 +70,10 @@ class KnowledgeAnswerRouter:
 
         if self._structured_service is not None:
             structured = self._structured_service.try_answer(
-                conversation_id, content, mode, previous_messages
+                conversation_id=conversation_id,
+                content=content,
+                mode=mode,
+                previous_messages=previous_messages,
             )
             if structured is not None:
                 return structured

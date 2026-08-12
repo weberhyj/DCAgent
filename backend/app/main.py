@@ -209,6 +209,7 @@ def create_default_repository(
         owns_database=True,
     )
     repository._word_fact_service = WordFactAnswerService(repository)
+    repository._answer_router._word_fact_service = repository._word_fact_service
     return repository
 
 
@@ -423,6 +424,7 @@ def create_production_app(
                     repository,
                     permission_tags=retrieval_settings.permission_tags,
                 )
+                repository._answer_router._word_fact_service = repository._word_fact_service
             else:
                 repository = repository_factory()
                 if structured_service is not None:

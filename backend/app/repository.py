@@ -11,6 +11,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from .agent import AgentRunAudit, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
+from .knowledge_router import KnowledgeAnswerRouter
 from .embeddings import (
     DEFAULT_EMBEDDING_PROVIDER,
     EmbeddingProvider,
@@ -498,6 +499,11 @@ class InMemoryChatRepository:
             ),
             llm_provider=self._llm_provider,
         )
+        self._answer_router = KnowledgeAnswerRouter(
+            self._agent,
+            structured_service=self._structured_service,
+            word_fact_service=self._word_fact_service,
+        )
 
     def close(self) -> None:
         close = getattr(self._structured_service, "close", None)
@@ -579,32 +585,12 @@ class InMemoryChatRepository:
             self._find_conversation(conversation_id)
             previous_messages = deepcopy(self._messages_for(conversation_id))
 
-        agent_result = self._agent.try_answer_greeting(
+        agent_result = self._answer_router.answer(
             conversation_id=conversation_id,
             content=clean_content,
             mode=mode,
+            previous_messages=previous_messages,
         )
-        if agent_result is None and self._structured_service is not None:
-            agent_result = self._structured_service.try_answer(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
-        if agent_result is None and self._word_fact_service is not None:
-            agent_result = self._word_fact_service.try_answer(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
-        if agent_result is None:
-            agent_result = self._agent.run(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
 
         with self._lock:
             conversation = self._find_conversation(conversation_id)

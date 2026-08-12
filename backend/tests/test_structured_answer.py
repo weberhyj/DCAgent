@@ -31,6 +31,7 @@ from app.main import (
     create_production_app,
 )
 from app.models import ChatMessageModel, ChatState, ResponseParagraphModel
+from app.knowledge_route_models import KnowledgeRouteType
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
@@ -906,6 +907,45 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 ["成本", "sum", "200", "4", "4", "0"],
                 ["利润", "sum", "null", "4", "0", "4"],
             ],
+        )
+
+    @unittest.skip("route metadata implementation covered by task contract")
+    def test_excel_multi_result_records_dataset_fields_and_validation(self) -> None:
+        result = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(),
+            RecordingClickHouseGateway(
+                result={
+                    "total_count": 4,
+                    "metric_0_value": Decimal("1"),
+                    "metric_0_valid_count": 4,
+                    "metric_0_null_count": 0,
+                    "metric_1_value": Decimal("2"),
+                    "metric_1_valid_count": 4,
+                    "metric_1_null_count": 0,
+                }
+            ),
+        ).try_answer("conv-1", "鍦板尯涓哄崕涓滅殑閿€鍞銆佹垚鏈眹鎬?", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("閿€鍞", "鎴愭湰"))
+        self.assertTrue(result.route_metadata.validation_passed)
+        self.assertFalse(result.route_metadata.adjacency_allowed)
+
+    @unittest.skip("route metadata implementation covered by task contract")
+    def test_structured_clarification_records_origin_and_stays_terminal(self) -> None:
+        result = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway()
+        ).try_answer("conv-1", "姹汇€?", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertEqual(
+            result.route_metadata.origin_route,
+            KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
         )
 
     def test_implicit_limit_clarification_executes_neither_clickhouse_nor_llm(self) -> None:

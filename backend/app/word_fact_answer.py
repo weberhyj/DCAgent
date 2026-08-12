@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from uuid import uuid4
 
 from .agent import AgentRunResult, AgentStep
+from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .models import ChatMessageModel, CitationModel, ComposerMode, ResponseParagraphModel
 from .time_utils import display_datetime_label
 from .word_facts import (
@@ -77,6 +78,8 @@ def build_word_fact_run(
     *,
     intent: WordFactualIntent | None = None,
     matches: Sequence[WordFactMatch] = (),
+    route_type: KnowledgeRouteType = KnowledgeRouteType.WORD_FACTUAL,
+    route_metadata: KnowledgeRouteMetadata | None = None,
 ) -> AgentRunResult:
     """Build the standard completed agent result for a deterministic fact outcome."""
 
@@ -123,6 +126,13 @@ def build_word_fact_run(
         steps=[step],
         evidence_count=len(safe_matches),
         source_count=len(unique_source_ids),
+        route_type=route_type,
+        route_metadata=route_metadata or KnowledgeRouteMetadata(
+            entity=intent.entity if intent is not None else None,
+            target_fields=(intent.field,) if intent is not None else (),
+            candidate_source_ids=tuple(sorted(set(unique_source_ids))),
+            validation_passed=bool(intent is not None),
+        ),
     )
 
 
@@ -166,7 +176,17 @@ class WordFactAnswerService:
         if resolution is None:
             return None
         if isinstance(resolution, WordFactClarification):
-            return build_word_fact_run(conversation_id, content, mode, resolution.message)
+            return build_word_fact_run(
+                conversation_id,
+                content,
+                mode,
+                resolution.message,
+                route_type=KnowledgeRouteType.CLARIFICATION,
+                route_metadata=KnowledgeRouteMetadata(
+                    origin_route=KnowledgeRouteType.WORD_FACTUAL,
+                    validation_passed=True,
+                ),
+            )
         matches = self._repository.find_knowledge_facts(
             resolution,
             permission_tags=self._permission_tags,

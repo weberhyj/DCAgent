@@ -10,6 +10,7 @@ from typing import Literal
 from uuid import uuid4
 
 from .agent import AgentRunResult, AgentStep
+from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .clickhouse_compatibility import (
     ClickHouseCompatibilityMode,
     ClickHouseCompatibilityProfile,
@@ -185,6 +186,10 @@ class StructuredAnswerService:
                 mode,
                 "结构化查询服务不可用：无法读取已发布的数据目录。",
                 "catalog unavailable",
+                route_metadata=KnowledgeRouteMetadata(
+                    degradation_reason="catalog_unavailable",
+                    validation_passed=False,
+                ),
             )
         self._replace_catalog_snapshot(catalog, catalog_request_generation)
         if not is_structured_candidate(question, catalog):
@@ -204,6 +209,11 @@ class StructuredAnswerService:
                 mode,
                 f"需要澄清后才能查询结构化数据：{resolution.message}。{suffix}".strip(),
                 "structured clarification required",
+                route_type=KnowledgeRouteType.CLARIFICATION,
+                route_metadata=KnowledgeRouteMetadata(
+                    origin_route=_structured_route_for_resolution(resolution),
+                    validation_passed=True,
+                ),
             )
         if isinstance(resolution, StructuredUnavailable):
             return _structured_run(
@@ -212,6 +222,10 @@ class StructuredAnswerService:
                 mode,
                 f"结构化查询服务不可用：{resolution.message}。",
                 "structured intent unavailable",
+                route_metadata=KnowledgeRouteMetadata(
+                    degradation_reason="intent_unavailable",
+                    validation_passed=False,
+                ),
             )
 
         publication = _active_publication(catalog, resolution)
@@ -222,6 +236,11 @@ class StructuredAnswerService:
                 mode,
                 "结构化查询服务不可用：数据集没有有效的活动发布版本。",
                 "active publication unavailable",
+                route_metadata=KnowledgeRouteMetadata(
+                    dataset_id=resolution.dataset_id,
+                    degradation_reason="publication_unavailable",
+                    validation_passed=False,
+                ),
             )
         try:
             if isinstance(resolution, StructuredMultiAggregateIntent):
@@ -252,6 +271,11 @@ class StructuredAnswerService:
                 mode,
                 "结构化查询服务不可用：查询计划未通过安全校验。",
                 "structured query planning failed",
+                route_metadata=KnowledgeRouteMetadata(
+                    dataset_id=resolution.dataset_id,
+                    degradation_reason="plan_rejected",
+                    validation_passed=False,
+                ),
             )
         if isinstance(result, StructuredUnavailable):
             return _structured_run(
@@ -260,6 +284,11 @@ class StructuredAnswerService:
                 mode,
                 f"结构化查询服务不可用：{result.message}。",
                 "structured query unavailable",
+                route_metadata=KnowledgeRouteMetadata(
+                    dataset_id=resolution.dataset_id,
+                    degradation_reason="clickhouse_unavailable",
+                    validation_passed=False,
+                ),
             )
         if isinstance(result, StructuredMultiAggregateResult):
             paragraph = (
@@ -291,6 +320,13 @@ class StructuredAnswerService:
                 f"structured multi-aggregate completed; audit_id={result.audit_id}",
                 source_ids=[result.source_id],
                 artifacts=[artifact],
+                route_type=KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+                route_metadata=KnowledgeRouteMetadata(
+                    dataset_id=result.dataset_id,
+                    target_fields=tuple(item.metric_display_name for item in result.metrics),
+                    candidate_source_ids=(result.source_id,),
+                    validation_passed=True,
+                ),
             )
         return _structured_run(
             conversation_id,
@@ -299,6 +335,12 @@ class StructuredAnswerService:
             _format_result(result),
             f"structured aggregate completed; audit_id={result.audit_id}",
             source_ids=[result.source_id],
+            route_metadata=KnowledgeRouteMetadata(
+                dataset_id=result.dataset_id,
+                target_fields=(result.metric_display_name or result.metric_physical_name or "all_rows",),
+                candidate_source_ids=(result.source_id,),
+                validation_passed=True,
+            ),
         )
 
     def _next_catalog_request_generation(self) -> int:
@@ -686,6 +728,16 @@ def _active_publication(
     return matches[0] if len(matches) == 1 else None
 
 
+def _structured_route_for_resolution(
+    resolution: StructuredIntent | StructuredMultiAggregateIntent | StructuredClarification,
+) -> KnowledgeRouteType:
+    return (
+        KnowledgeRouteType.EXCEL_MULTI_AGGREGATE
+        if isinstance(resolution, StructuredMultiAggregateIntent)
+        else KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
+    )
+
+
 def _format_result(result: StructuredAggregateResult) -> str:
     metric = result.metric_display_name or result.metric_physical_name or "all_rows"
     value = _format_numeric_value(result.value)
@@ -736,6 +788,8 @@ def _structured_run(
     *,
     source_ids: list[str] | None = None,
     artifacts: list[ArtifactModel] | None = None,
+    route_type: KnowledgeRouteType = KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE,
+    route_metadata: KnowledgeRouteMetadata | None = None,
 ) -> AgentRunResult:
     timestamp = display_datetime_label()
     run_id = f"agent-{uuid4().hex[:12]}"
@@ -770,4 +824,9 @@ def _structured_run(
         steps=[step],
         evidence_count=0,
         source_count=len(set(source_ids or [])),
+        route_type=route_type,
+        route_metadata=route_metadata or KnowledgeRouteMetadata(
+            validation_passed=True,
+            adjacency_allowed=False,
+        ),
     )

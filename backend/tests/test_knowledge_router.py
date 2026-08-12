@@ -70,7 +70,7 @@ class RecordingStructured:
         self._calls = calls
         self._result = result
 
-    def try_answer(self, *_args: object) -> AgentRunResult | None:
+    def try_answer(self, *_args: object, **_kwargs: object) -> AgentRunResult | None:
         self._calls.append("excel")
         return self._result
 
@@ -80,7 +80,7 @@ class RecordingWordFacts:
         self._calls = calls
         self._result = result
 
-    def try_answer(self, *_args: object) -> AgentRunResult | None:
+    def try_answer(self, *_args: object, **_kwargs: object) -> AgentRunResult | None:
         self._calls.append("word")
         return self._result
 

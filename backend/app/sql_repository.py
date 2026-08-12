@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.sql.dml import Update
 
 from .agent import AgentRunAudit, AgentStep, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
+from .knowledge_router import KnowledgeAnswerRouter
 from .database import (
     AgentRunRecord,
     AgentStepRecord,
@@ -511,6 +512,11 @@ class SqlChatRepository:
             ),
             llm_provider=self._llm_provider,
         )
+        self._answer_router = KnowledgeAnswerRouter(
+            self._agent,
+            structured_service=self._structured_service,
+            word_fact_service=self._word_fact_service,
+        )
 
     def close(self) -> None:
         with self._close_lock:
@@ -650,32 +656,12 @@ class SqlChatRepository:
             ).all()
             previous_messages = [message_from_record(record) for record in previous_records]
 
-        agent_result = self._agent.try_answer_greeting(
+        agent_result = self._answer_router.answer(
             conversation_id=conversation_id,
             content=clean_content,
             mode=mode,
+            previous_messages=previous_messages,
         )
-        if agent_result is None and self._structured_service is not None:
-            agent_result = self._structured_service.try_answer(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
-        if agent_result is None and self._word_fact_service is not None:
-            agent_result = self._word_fact_service.try_answer(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
-        if agent_result is None:
-            agent_result = self._agent.run(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
         user_message = ChatMessageModel(
             id=f"msg-{uuid4().hex[:8]}",
             role="user",
