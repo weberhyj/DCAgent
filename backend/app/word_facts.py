@@ -418,14 +418,16 @@ def fact_value_has_embedded_key_value(value: str, *, field: str) -> bool:
         for alias in field_aliases
     )
     normalized_value = unicodedata.normalize("NFKC", value).casefold()
-    return any(
-        re.search(
-            rf"{re.escape(unicodedata.normalize('NFKC', alias).casefold())}\s*[:：]",
-            normalized_value,
-        )
-        is not None
-        for alias in aliases
-    )
+    for alias in aliases:
+        normalized_alias = unicodedata.normalize("NFKC", alias).casefold()
+        escaped_alias = re.escape(normalized_alias)
+        if normalized_alias.isascii():
+            pattern = rf"(?<![A-Za-z0-9_]){escaped_alias}(?![A-Za-z0-9_])\s*[:：]"
+        else:
+            pattern = rf"{escaped_alias}\s*[:：]"
+        if re.search(pattern, normalized_value) is not None:
+            return True
+    return False
 
 
 def validate_word_fact_answer(
@@ -441,7 +443,7 @@ def validate_word_fact_answer(
     for field, aliases in FACT_FIELD_ALIASES.items():
         if field == intent.field:
             continue
-        if any(normalize_fact_key(alias) in normalized_answer for alias in aliases):
+        if any(_contains_fact_alias(normalized_answer, alias) for alias in aliases):
             return False
 
     selected = [
@@ -490,6 +492,14 @@ def conflicting_word_fact_answer(intent: WordFactualIntent) -> str:
 
 def unsafe_word_fact_answer(intent: WordFactualIntent) -> str:
     return f"无法安全返回{intent.entity}的{intent.field}，请核对来源数据。"
+
+
+def _contains_fact_alias(normalized_text: str, alias: str) -> bool:
+    normalized_alias = normalize_fact_key(alias)
+    if normalized_alias.isascii():
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(normalized_alias)}(?![A-Za-z0-9_])"
+        return re.search(pattern, normalized_text) is not None
+    return normalized_alias in normalized_text
 
 
 class WordFactRepository(Protocol):

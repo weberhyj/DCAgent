@@ -122,19 +122,27 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         self.assertEqual(result.evidence_count, 0)
 
     def test_legitimate_colon_value_passes_safe_answer_validation(self) -> None:
-        service = WordFactAnswerService(
-            FakeFacts([match("张三", "职务", "高级工程师（方向：AI）")])
-        )
+        for value in (
+            "高级工程师（方向：AI）",
+            "https://example.com/page:1",
+            "message: queued",
+        ):
+            with self.subTest(value=value):
+                service = WordFactAnswerService(
+                    FakeFacts([match("张三", "职务", value)])
+                )
 
-        result = service.try_answer("conv-1", "张三的职务是什么", "quick", [])
+                result = service.try_answer(
+                    "conv-1", "张三的职务是什么", "quick", []
+                )
 
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(
-            result.reply.paragraphs[0].text,
-            "张三的职务是高级工程师（方向：AI）。",
-        )
-        self.assertEqual(result.evidence_count, 1)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(
+                    result.reply.paragraphs[0].text,
+                    f"张三的职务是{value}。",
+                )
+                self.assertEqual(result.evidence_count, 1)
 
     def test_missing_target_field_returns_not_found_not_rag(self) -> None:
         result = WordFactAnswerService(FakeFacts([])).try_answer(

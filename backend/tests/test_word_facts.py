@@ -12,6 +12,7 @@ from app.word_facts import (
     WordFactClarification,
     WordFactualIntent,
     canonical_fact_field,
+    fact_value_has_embedded_key_value,
     normalize_fact_key,
     resolve_word_factual_intent,
 )
@@ -52,6 +53,17 @@ class WordFactContractTests(unittest.TestCase):
         self.assertEqual(set(FACT_FIELD_ALIASES), {"年龄", "性别", "职务"})
         with self.assertRaisesRegex(ValueError, "unknown fact field"):
             canonical_fact_field("部门")
+
+    def test_ascii_field_alias_requires_identifier_boundaries(self) -> None:
+        for value in ("https://example.com/page:1", "message: queued"):
+            with self.subTest(value=value):
+                self.assertFalse(
+                    fact_value_has_embedded_key_value(value, field="职务")
+                )
+        self.assertTrue(fact_value_has_embedded_key_value("age: 28", field="职务"))
+        self.assertTrue(
+            fact_value_has_embedded_key_value("28岁 性别：女", field="年龄")
+        )
 
     def test_age_gender_and_job_aliases_share_plan_canonical_fields(self) -> None:
         cases = (

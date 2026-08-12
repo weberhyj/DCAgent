@@ -151,6 +151,7 @@ class DocxParserTest(unittest.TestCase):
         path = self.temp_dir / "malformed-values.docx"
         document = Document()
         document.add_paragraph("姓名：张三，年龄：28岁 性别：女")
+        document.add_paragraph("姓名：王五，职务：工程师 age: 28")
         table = document.add_table(rows=1, cols=2)
         table.rows[0].cells[0].text = "姓名"
         table.rows[0].cells[1].text = "年龄"
@@ -168,12 +169,13 @@ class DocxParserTest(unittest.TestCase):
         document = Document()
         document.add_paragraph("姓名：张三，职务：高级工程师（方向：AI）")
         document.add_paragraph("姓名：李四，职务：值班经理 08:30")
+        document.add_paragraph("姓名：赵六，职务：message: queued")
         table = document.add_table(rows=1, cols=2)
         table.rows[0].cells[0].text = "姓名"
         table.rows[0].cells[1].text = "职务"
         row = table.add_row().cells
         row[0].text = "王五"
-        row[1].text = "https://example.com"
+        row[1].text = "https://example.com/page:1"
         document.save(path)
 
         result = parse_docx_knowledge_file(path, source_id="kb-legitimate-colons")
@@ -183,7 +185,8 @@ class DocxParserTest(unittest.TestCase):
             {
                 ("张三", "高级工程师（方向：AI）"),
                 ("李四", "值班经理 08:30"),
-                ("王五", "https://example.com"),
+                ("王五", "https://example.com/page:1"),
+                ("赵六", "message: queued"),
             },
         )
 
