@@ -7,31 +7,31 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
-def test_frontends_use_one_pnpm_workspace_and_lockfile() -> None:
+def test_frontends_use_one_yarn_workspace_and_node_modules_linker() -> None:
     root_manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-    workspace = (ROOT / "pnpm-workspace.yaml").read_text(encoding="utf-8")
-    lock = (ROOT / "pnpm-lock.yaml").read_text(encoding="utf-8")
+    yarnrc = (ROOT / ".yarnrc.yml").read_text(encoding="utf-8")
 
     assert root_manifest["private"] is True
-    assert re.fullmatch(r"pnpm@\d+\.\d+\.\d+", root_manifest["packageManager"])
-    assert "  - frontend" in workspace
-    assert "  - admin-frontend" in workspace
-    assert "  esbuild: true" in workspace
-    assert "  vue-demi: true" in workspace
-    assert "  frontend:" in lock
-    assert "  admin-frontend:" in lock
+    assert root_manifest["packageManager"] == "yarn@4.9.2"
+    assert root_manifest["workspaces"] == ["frontend", "admin-frontend"]
+    assert "nodeLinker: node-modules" in yarnrc
+    assert "yarnPath: .yarn/releases/yarn-4.9.2.cjs" in yarnrc
+    assert '"@floating-ui/vue@*"' in yarnrc
+    assert "vue: \"*\"" in yarnrc
+    assert not (ROOT / "pnpm-workspace.yaml").exists()
+    assert not (ROOT / "pnpm-lock.yaml").exists()
     assert not list(ROOT.glob("*/package-lock.json"))
 
 
-def test_frontend_smoke_entrypoints_use_pnpm_filters() -> None:
+def test_frontend_smoke_entrypoints_use_yarn_workspaces() -> None:
     commands = {
         "frontend": (ROOT / "tools" / "start_smoke_frontend.cmd").read_text(encoding="utf-8"),
         "admin": (ROOT / "tools" / "start_smoke_admin.cmd").read_text(encoding="utf-8"),
     }
 
-    assert "pnpm.cmd --filter dc-agent-frontend dev" in commands["frontend"]
-    assert "pnpm.cmd --filter dc-agent-admin-frontend dev" in commands["admin"]
+    assert "yarn.cmd workspace dc-agent-frontend dev" in commands["frontend"]
+    assert "yarn.cmd workspace dc-agent-admin-frontend dev" in commands["admin"]
     assert all(
-        re.search(r"(?m)^\s*npm(?:\.cmd)?\s", command) is None
+        re.search(r"(?m)^\s*(?:npm|pnpm)(?:\.cmd)?\s", command) is None
         for command in commands.values()
     )

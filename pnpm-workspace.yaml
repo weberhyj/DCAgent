@@ -1,7 +1,0 @@
-packages:
-  - frontend
-  - admin-frontend
-
-allowBuilds:
-  esbuild: true
-  vue-demi: true
