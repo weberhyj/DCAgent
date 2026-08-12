@@ -481,7 +481,6 @@ class InMemoryChatRepository:
         self._state = state
         self._llm_provider = llm_provider or TemplateLLMProvider()
         self._structured_service = structured_service
-        self._word_fact_service = word_fact_service
         self.retrieval_router = retrieval_router
         self._retrieval_scope_provider = effective_scope_provider
         self._lock = Lock()
@@ -499,6 +498,11 @@ class InMemoryChatRepository:
             ),
             llm_provider=self._llm_provider,
         )
+        if word_fact_service is None:
+            from .word_fact_answer import WordFactAnswerService
+
+            word_fact_service = WordFactAnswerService(self)
+        self._word_fact_service = word_fact_service
         self._answer_router = KnowledgeAnswerRouter(
             self._agent,
             structured_service=self._structured_service,
@@ -509,6 +513,22 @@ class InMemoryChatRepository:
         close = getattr(self._structured_service, "close", None)
         if callable(close):
             close()
+
+    def configure_answer_services(
+        self,
+        *,
+        structured_service: StructuredAnswerService | None = None,
+        word_fact_service: WordFactAnswerService | None = None,
+    ) -> None:
+        if structured_service is not None:
+            self._structured_service = structured_service
+        if word_fact_service is not None:
+            self._word_fact_service = word_fact_service
+        self._answer_router = KnowledgeAnswerRouter(
+            self._agent,
+            structured_service=self._structured_service,
+            word_fact_service=self._word_fact_service,
+        )
 
     def configure_retrieval(
         self,

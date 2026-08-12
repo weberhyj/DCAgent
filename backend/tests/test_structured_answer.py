@@ -35,6 +35,7 @@ from app.knowledge_route_models import KnowledgeRouteType
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
+from app.structured_query import UnsafeStructuredQueryError
 from app.structured_repository import StructuredRepository
 from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
 
@@ -909,7 +910,6 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             ],
         )
 
-    @unittest.skip("route metadata implementation covered by task contract")
     def test_excel_multi_result_records_dataset_fields_and_validation(self) -> None:
         result = StructuredAnswerService(
             lambda: sample_multi_metric_catalog(),
@@ -922,31 +922,52 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                     "metric_1_value": Decimal("2"),
                     "metric_1_valid_count": 4,
                     "metric_1_null_count": 0,
+                    "metric_2_value": Decimal("3"),
+                    "metric_2_valid_count": 4,
+                    "metric_2_null_count": 0,
                 }
             ),
-        ).try_answer("conv-1", "鍦板尯涓哄崕涓滅殑閿€鍞銆佹垚鏈眹鎬?", "quick", [])
+        ).try_answer("conv-1", "地区为华东的销售额、成本、利润汇总", "quick", [])
 
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
         self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
-        self.assertEqual(result.route_metadata.target_fields, ("閿€鍞", "鎴愭湰"))
+        self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
         self.assertTrue(result.route_metadata.validation_passed)
         self.assertFalse(result.route_metadata.adjacency_allowed)
 
-    @unittest.skip("route metadata implementation covered by task contract")
-    def test_structured_clarification_records_origin_and_stays_terminal(self) -> None:
+    def test_structured_clarification_records_multi_origin_and_known_metadata(self) -> None:
         result = StructuredAnswerService(
-            lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway()
-        ).try_answer("conv-1", "姹汇€?", "quick", [])
+            lambda: sample_multi_metric_catalog(metric_count=13), RecordingClickHouseGateway()
+        ).try_answer("conv-1", "汇总", "quick", [])
 
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
-        self.assertEqual(
-            result.route_metadata.origin_route,
-            KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(len(result.route_metadata.target_fields), 13)
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+
+    def test_multi_plan_rejection_keeps_intended_route_metadata(self) -> None:
+        service = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway()
         )
+        with patch("app.structured_answer.StructuredQueryPlanner.plan_multi", side_effect=UnsafeStructuredQueryError):
+            result = service.try_answer(
+                "conv-1", "地区为华东的销售额、成本、利润汇总", "quick", []
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertEqual(result.route_metadata.degradation_reason, "plan_rejected")
 
     def test_implicit_limit_clarification_executes_neither_clickhouse_nor_llm(self) -> None:
         provider = RecordingLLMProvider()

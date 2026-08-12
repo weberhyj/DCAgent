@@ -208,8 +208,6 @@ def create_default_repository(
         structured_service=structured_service,
         owns_database=True,
     )
-    repository._word_fact_service = WordFactAnswerService(repository)
-    repository._answer_router._word_fact_service = repository._word_fact_service
     return repository
 
 
@@ -420,20 +418,17 @@ def create_production_app(
                     structured_service=structured_service,
                     retrieval_permission_tags=retrieval_settings.permission_tags,
                 )
-                repository._word_fact_service = WordFactAnswerService(
-                    repository,
-                    permission_tags=retrieval_settings.permission_tags,
-                )
-                repository._answer_router._word_fact_service = repository._word_fact_service
             else:
                 repository = repository_factory()
                 if structured_service is not None:
-                    if not hasattr(repository, "_structured_service"):
+                    if not hasattr(repository, "configure_answer_services"):
                         raise TypeError(
-                            "When STRUCTURED_QUERY_ENABLED=true, repository_factory must "
-                            "return a structured-service-aware repository"
+                            "When STRUCTURED_QUERY_ENABLED=true, repository_factory must return "
+                            "a repository that accepts atomic answer-service configuration"
                         )
-                    repository._structured_service = structured_service  # type: ignore[attr-defined]
+                    repository.configure_answer_services(  # type: ignore[attr-defined]
+                        structured_service=structured_service
+                    )
             own(repository)
             retrieval_gateway = None
             index_lifecycle = None

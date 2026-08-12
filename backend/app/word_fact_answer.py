@@ -84,9 +84,12 @@ def build_word_fact_run(
     """Build the standard completed agent result for a deterministic fact outcome."""
 
     safe_matches = tuple(matches)
+    candidate_source_ids = tuple(sorted({match.fact.source_id for match in safe_matches}))
+    validation_passed = intent is not None
     if intent is not None and not validate_word_fact_answer(intent, safe_matches, answer):
         answer = unsafe_word_fact_answer(intent)
         safe_matches = ()
+        validation_passed = False
     timestamp = display_datetime_label()
     unique_source_ids = list(dict.fromkeys(match.fact.source_id for match in safe_matches))
     reply = ChatMessageModel(
@@ -130,8 +133,8 @@ def build_word_fact_run(
         route_metadata=route_metadata or KnowledgeRouteMetadata(
             entity=intent.entity if intent is not None else None,
             target_fields=(intent.field,) if intent is not None else (),
-            candidate_source_ids=tuple(sorted(set(unique_source_ids))),
-            validation_passed=bool(intent is not None),
+            candidate_source_ids=candidate_source_ids,
+            validation_passed=validation_passed,
         ),
     )
 

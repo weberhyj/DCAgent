@@ -211,7 +211,7 @@ class StructuredAnswerService:
                 "structured clarification required",
                 route_type=KnowledgeRouteType.CLARIFICATION,
                 route_metadata=KnowledgeRouteMetadata(
-                    origin_route=_structured_route_for_resolution(resolution),
+                    **_clarification_route_metadata(catalog, resolution),
                     validation_passed=True,
                 ),
             )
@@ -236,8 +236,9 @@ class StructuredAnswerService:
                 mode,
                 "结构化查询服务不可用：数据集没有有效的活动发布版本。",
                 "active publication unavailable",
+                route_type=_route_for_intent(resolution),
                 route_metadata=KnowledgeRouteMetadata(
-                    dataset_id=resolution.dataset_id,
+                    **_intent_route_metadata(catalog, resolution),
                     degradation_reason="publication_unavailable",
                     validation_passed=False,
                 ),
@@ -271,8 +272,9 @@ class StructuredAnswerService:
                 mode,
                 "结构化查询服务不可用：查询计划未通过安全校验。",
                 "structured query planning failed",
+                route_type=_route_for_intent(resolution),
                 route_metadata=KnowledgeRouteMetadata(
-                    dataset_id=resolution.dataset_id,
+                    **_intent_route_metadata(catalog, resolution),
                     degradation_reason="plan_rejected",
                     validation_passed=False,
                 ),
@@ -284,8 +286,9 @@ class StructuredAnswerService:
                 mode,
                 f"结构化查询服务不可用：{result.message}。",
                 "structured query unavailable",
+                route_type=_route_for_intent(resolution),
                 route_metadata=KnowledgeRouteMetadata(
-                    dataset_id=resolution.dataset_id,
+                    **_intent_route_metadata(catalog, resolution),
                     degradation_reason="clickhouse_unavailable",
                     validation_passed=False,
                 ),
@@ -728,14 +731,61 @@ def _active_publication(
     return matches[0] if len(matches) == 1 else None
 
 
-def _structured_route_for_resolution(
-    resolution: StructuredIntent | StructuredMultiAggregateIntent | StructuredClarification,
+def _intent_route_metadata(
+    catalog: StructuredCatalog,
+    intent: StructuredIntent | StructuredMultiAggregateIntent,
+) -> dict[str, object]:
+    dataset = next(item for item in catalog.datasets if item.schema.dataset_id == intent.dataset_id)
+    physical_names = (
+        tuple(metric.metric_physical_name for metric in intent.metrics)
+        if isinstance(intent, StructuredMultiAggregateIntent)
+        else (intent.metric_physical_name,)
+    )
+    fields = tuple(
+        next(column.display_name for column in dataset.schema.columns if column.physical_name == name)
+        if name is not None else "all_rows"
+        for name in physical_names
+    )
+    return {
+        "dataset_id": dataset.schema.dataset_id,
+        "target_fields": fields,
+        "candidate_source_ids": (dataset.schema.source_id,),
+        "origin_route": _route_for_intent(intent),
+    }
+
+
+def _route_for_intent(
+    intent: StructuredIntent | StructuredMultiAggregateIntent,
 ) -> KnowledgeRouteType:
     return (
         KnowledgeRouteType.EXCEL_MULTI_AGGREGATE
-        if isinstance(resolution, StructuredMultiAggregateIntent)
+        if isinstance(intent, StructuredMultiAggregateIntent)
         else KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
     )
+
+
+def _clarification_route_metadata(
+    catalog: StructuredCatalog,
+    clarification: StructuredClarification,
+) -> dict[str, object]:
+    candidates = set(clarification.candidates)
+    matches = [
+        dataset
+        for dataset in catalog.datasets
+        if candidates
+        and candidates.issubset(
+            {column.display_name for column in dataset.schema.columns if column.allow_aggregate}
+        )
+    ]
+    if len(matches) == 1:
+        dataset = matches[0]
+        return {
+            "dataset_id": dataset.schema.dataset_id,
+            "target_fields": tuple(clarification.candidates),
+            "candidate_source_ids": (dataset.schema.source_id,),
+            "origin_route": KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+        }
+    return {"origin_route": KnowledgeRouteType.EXCEL_MULTI_AGGREGATE}
 
 
 def _format_result(result: StructuredAggregateResult) -> str:

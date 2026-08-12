@@ -4,6 +4,7 @@ import unittest
 from collections.abc import Sequence
 
 from app.word_fact_answer import WordFactAnswerService
+from app.knowledge_route_models import KnowledgeRouteType
 from app.word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
 
 
@@ -61,6 +62,11 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         self.assertNotIn("性别", text)
         self.assertNotIn("职务", text)
         self.assertEqual([step.tool_name for step in result.steps], ["query_word_fact"])
+        self.assertEqual(result.route_type, KnowledgeRouteType.WORD_FACTUAL)
+        self.assertEqual(result.route_metadata.entity, "张三")
+        self.assertEqual(result.route_metadata.target_fields, ("年龄",))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-people",))
+        self.assertTrue(result.route_metadata.validation_passed)
         self.assertEqual(result.reply.paragraphs[0].citations[0].excerpt, "年龄：28岁")
 
     def test_conflicting_values_return_source_clarification(self) -> None:
@@ -120,6 +126,11 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         self.assertNotIn("女", result.reply.paragraphs[0].text)
         self.assertEqual(result.reply.paragraphs[0].citations, [])
         self.assertEqual(result.evidence_count, 0)
+        self.assertEqual(result.route_type, KnowledgeRouteType.WORD_FACTUAL)
+        self.assertEqual(result.route_metadata.entity, "张三")
+        self.assertEqual(result.route_metadata.target_fields, ("年龄",))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-people",))
+        self.assertFalse(result.route_metadata.validation_passed)
 
     def test_legitimate_colon_value_passes_safe_answer_validation(self) -> None:
         for value in (
