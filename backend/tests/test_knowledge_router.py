@@ -197,6 +197,40 @@ class KnowledgeRouteMetadataTests(unittest.TestCase):
 
         self.assertEqual(restored, metadata)
 
+    def test_to_dict_rejects_oversized_scalar_metadata(self) -> None:
+        metadata = KnowledgeRouteMetadata(dataset_id="x" * 257)
+
+        with self.assertRaises(ValueError):
+            metadata.to_dict()
+
+    def test_to_dict_rejects_oversized_or_unbounded_metadata_lists(self) -> None:
+        metadata = KnowledgeRouteMetadata(target_fields=tuple("field" for _ in range(33)))
+
+        with self.assertRaises(ValueError):
+            metadata.to_dict()
+
+    def test_to_dict_rejects_oversized_list_items(self) -> None:
+        metadata = KnowledgeRouteMetadata(candidate_source_ids=("s" * 129,))
+
+        with self.assertRaises(ValueError):
+            metadata.to_dict()
+
+    def test_from_dict_requires_actual_booleans_and_string_origin_route(self) -> None:
+        with self.assertRaises(ValueError):
+            KnowledgeRouteMetadata.from_dict({"adjacency_allowed": "false"})
+        with self.assertRaises(ValueError):
+            KnowledgeRouteMetadata.from_dict({"validation_passed": 1})
+        with self.assertRaises(ValueError):
+            KnowledgeRouteMetadata.from_dict({"origin_route": 1})
+
+    def test_from_dict_rejects_oversized_scalar_and_list_values(self) -> None:
+        with self.assertRaises(ValueError):
+            KnowledgeRouteMetadata.from_dict({"entity": "x" * 257})
+        with self.assertRaises(ValueError):
+            KnowledgeRouteMetadata.from_dict({"target_fields": ["field"] * 33})
+        with self.assertRaises(ValueError):
+            KnowledgeRouteMetadata.from_dict({"candidate_source_ids": ["s" * 129]})
+
 
 if __name__ == "__main__":
     unittest.main()
