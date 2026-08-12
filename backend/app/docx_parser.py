@@ -15,6 +15,7 @@ from docx.text.paragraph import Paragraph
 
 from .models import KnowledgeChunkModel
 from .word_facts import (
+    FACT_ENTITY_ALIASES,
     FACT_FIELD_ALIASES,
     KnowledgeFactModel,
     canonical_fact_field,
@@ -24,8 +25,6 @@ from .word_facts import (
 
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 120
-
-FACT_ENTITY_ALIASES = ("姓名", "人员", "员工", "人物", "名称")
 
 _FACT_FIELD_BY_ALIAS = {
     normalize_fact_key(alias): field
@@ -229,7 +228,7 @@ def extract_docx_facts(
                 if column >= len(block.cells):
                     continue
                 value = block.cells[column].strip()
-                if not value or fact_value_has_embedded_key_value(value):
+                if not value or fact_value_has_embedded_key_value(value, field=field):
                     continue
                 facts.append(
                     _make_fact(
@@ -256,7 +255,10 @@ def extract_docx_facts(
             (_FACT_FIELD_BY_ALIAS[pair.key], pair)
             for pair in pairs
             if pair.key in _FACT_FIELD_BY_ALIAS
-            and not fact_value_has_embedded_key_value(pair.value)
+            and not fact_value_has_embedded_key_value(
+                pair.value,
+                field=_FACT_FIELD_BY_ALIAS[pair.key],
+            )
         ]
         if len(entity_pairs) == 1 and field_pairs:
             for field, pair in field_pairs:

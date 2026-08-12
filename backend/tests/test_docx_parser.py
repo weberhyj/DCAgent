@@ -163,6 +163,30 @@ class DocxParserTest(unittest.TestCase):
 
         self.assertEqual(result.facts, ())
 
+    def test_legitimate_colon_bearing_values_remain_extractable(self) -> None:
+        path = self.temp_dir / "legitimate-colon-values.docx"
+        document = Document()
+        document.add_paragraph("姓名：张三，职务：高级工程师（方向：AI）")
+        document.add_paragraph("姓名：李四，职务：值班经理 08:30")
+        table = document.add_table(rows=1, cols=2)
+        table.rows[0].cells[0].text = "姓名"
+        table.rows[0].cells[1].text = "职务"
+        row = table.add_row().cells
+        row[0].text = "王五"
+        row[1].text = "https://example.com"
+        document.save(path)
+
+        result = parse_docx_knowledge_file(path, source_id="kb-legitimate-colons")
+
+        self.assertEqual(
+            {(fact.entity, fact.value) for fact in result.facts},
+            {
+                ("张三", "高级工程师（方向：AI）"),
+                ("李四", "值班经理 08:30"),
+                ("王五", "https://example.com"),
+            },
+        )
+
     def test_table_requires_exactly_one_entity_header(self) -> None:
         path = write_docx_table(
             self.temp_dir / "ambiguous-table.docx",

@@ -38,6 +38,7 @@ FACT_FIELD_ALIASES = {
         "title",
     ),
 }
+FACT_ENTITY_ALIASES = ("姓名", "人员", "员工", "人物", "名称")
 _CANONICAL_FACT_FIELDS = {
     normalize_fact_key(alias): canonical
     for canonical, aliases in FACT_FIELD_ALIASES.items()
@@ -147,6 +148,7 @@ class FieldAliasMatch:
 
 _POLITE_PREFIXES = ("能否告诉我", "帮我查一下", "请问")
 _QUESTION_END_PARTICLES = ("吗", "呢")
+_FIELD_LIST_FINAL_TAILS = ("是什么", "是多少")
 _EXPLICIT_ENTITY_SEPARATORS = ("以及", "、")
 _ORGANIZATION_SUFFIXES = (
     "公司",
@@ -207,7 +209,6 @@ _FIELD_QUERY_FORMS = {
         "担任什么岗位",
     ),
 }
-_EMBEDDED_KEY_VALUE = re.compile(r"[^:：\n]{1,80}[:：]\s*\S")
 
 
 def normalize_question_with_positions(question: str) -> tuple[str, tuple[int, ...]]:
@@ -329,6 +330,10 @@ def _match_exact_factual_query(question: str) -> tuple[str, tuple[str, ...]] | N
 
 
 def _match_multi_field_query(question: str) -> tuple[str, tuple[str, ...]] | None:
+    for tail in _FIELD_LIST_FINAL_TAILS:
+        if question.endswith(tail):
+            question = question[: -len(tail)]
+            break
     aliases = sorted(
         (
             (normalize_fact_key(alias), field)
@@ -399,12 +404,28 @@ def _looks_like_bounded_he_list_member(value: str) -> bool:
     )
 
 
-def fact_value_has_embedded_key_value(value: str) -> bool:
+def fact_value_has_embedded_key_value(value: str, *, field: str) -> bool:
     """Return whether a display value contains another apparent key/value record."""
 
     if not isinstance(value, str):
         return True
-    return _EMBEDDED_KEY_VALUE.search(value) is not None
+    canonical_field = canonical_fact_field(field)
+    aliases = list(FACT_ENTITY_ALIASES)
+    aliases.extend(
+        alias
+        for candidate_field, field_aliases in FACT_FIELD_ALIASES.items()
+        if candidate_field != canonical_field
+        for alias in field_aliases
+    )
+    normalized_value = unicodedata.normalize("NFKC", value).casefold()
+    return any(
+        re.search(
+            rf"{re.escape(unicodedata.normalize('NFKC', alias).casefold())}\s*[:：]",
+            normalized_value,
+        )
+        is not None
+        for alias in aliases
+    )
 
 
 def validate_word_fact_answer(
@@ -429,7 +450,10 @@ def validate_word_fact_answer(
         if match.fact.entity_normalized == intent.entity_normalized
         and match.fact.field_normalized == intent.field_normalized
     ]
-    if any(fact_value_has_embedded_key_value(match.fact.value) for match in selected):
+    if any(
+        fact_value_has_embedded_key_value(match.fact.value, field=match.fact.field)
+        for match in selected
+    ):
         return answer == unsafe_word_fact_answer(intent)
     unique_by_source_value: dict[tuple[str, str], WordFactMatch] = {}
     for match in selected:

@@ -143,6 +143,17 @@ class WordFactualIntentTests(unittest.TestCase):
         entity_resolution = resolve_word_factual_intent("张三和李四几岁")
         self.assertIsInstance(entity_resolution, WordFactClarification)
 
+    def test_multiple_fields_allow_a_bounded_final_question_tail(self) -> None:
+        for question in (
+            "张三的年龄和性别是什么",
+            "张三年龄、性别是什么",
+        ):
+            with self.subTest(question=question):
+                resolution = resolve_word_factual_intent(question)
+                self.assertIsInstance(resolution, WordFactClarification)
+                assert isinstance(resolution, WordFactClarification)
+                self.assertEqual(resolution.candidates, ("年龄", "性别"))
+
     def test_list_separator_between_entities_requests_clarification(self) -> None:
         resolution = resolve_word_factual_intent("张三、李四几岁")
 
