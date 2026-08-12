@@ -15,6 +15,7 @@ from .embeddings import (
     extract_embedding_terms,
 )
 from .llm import LLMProvider, LLMRequest
+from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .models import (
     ChatMessageModel,
     ComposerMode,
@@ -64,6 +65,8 @@ class AgentRunResult:
     steps: list[AgentStep]
     evidence_count: int
     source_count: int
+    route_type: KnowledgeRouteType = KnowledgeRouteType.DOCUMENT_QA
+    route_metadata: KnowledgeRouteMetadata = field(default_factory=KnowledgeRouteMetadata)
 
     def to_audit(self) -> AgentRunAudit:
         return AgentRunAudit(
@@ -78,6 +81,8 @@ class AgentRunResult:
             evidence_count=self.evidence_count,
             source_count=self.source_count,
             steps=self.steps,
+            route_type=self.route_type,
+            route_metadata=self.route_metadata,
         )
 
 
@@ -94,6 +99,8 @@ class AgentRunAudit:
     evidence_count: int
     source_count: int
     steps: list[AgentStep] = field(default_factory=list)
+    route_type: KnowledgeRouteType = KnowledgeRouteType.DOCUMENT_QA
+    route_metadata: KnowledgeRouteMetadata = field(default_factory=KnowledgeRouteMetadata)
 
 
 @dataclass(slots=True)
@@ -279,6 +286,7 @@ class ReadOnlyKnowledgeAgent:
         content: str,
         mode: ComposerMode,
         previous_messages: list[ChatMessageModel],
+        route_type: KnowledgeRouteType = KnowledgeRouteType.DOCUMENT_QA,
     ) -> AgentRunResult:
         run_id = f"agent-{uuid4().hex[:12]}"
         started_at = now_label()
@@ -314,6 +322,7 @@ class ReadOnlyKnowledgeAgent:
             steps=final_state["steps"],
             evidence_count=len(hits),
             source_count=len({hit.source.id for hit in hits}),
+            route_type=route_type,
         )
 
     def _build_graph(self):
