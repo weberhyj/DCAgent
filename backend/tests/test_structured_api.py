@@ -467,6 +467,30 @@ class StructuredWiringTest(unittest.TestCase):
             self.assertFalse(client.app.state.structured_query_enabled)
             self.assertIsInstance(client.app.state.structured_repository, StructuredRepository)
 
+    def test_legacy_answer_service_factory_accepts_structured_only_injection(self) -> None:
+        class LegacyAnswerServiceRepository(InMemoryChatRepository):
+            def configure_answer_services(self, *, structured_service=None) -> None:
+                super().configure_answer_services(structured_service=structured_service)
+
+        database = Database("sqlite+pysqlite:///:memory:")
+        repository = LegacyAnswerServiceRepository(build_seed_state())
+        production = create_production_app(
+            environ={
+                **self.enabled_environment(),
+                "UNIFIED_KNOWLEDGE_ROUTING_ENABLED": "false",
+                "WORD_FACTUAL_QA_ENABLED": "false",
+            },
+            repository_factory=lambda: repository,
+            database_factory=lambda _url: database,
+            llm_provider_factory=lambda _environment: TemplateLLMProvider(),
+            health_registry_factory=DependencyHealthRegistry,
+        )
+
+        with TestClient(production) as client:
+            self.assertFalse(client.app.state.unified_knowledge_routing_enabled)
+            self.assertFalse(client.app.state.word_factual_qa_enabled)
+            self.assertIsNotNone(repository._structured_service)
+
     def test_enabled_production_app_rejects_legacy_one_argument_queue_factory(self) -> None:
         database = Database("sqlite+pysqlite:///:memory:")
         production = create_production_app(

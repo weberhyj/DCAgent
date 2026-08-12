@@ -57,7 +57,7 @@ from .evaluation import (
     normalized_unique,
 )
 from .evaluation_import import EvaluationImportRow
-from .knowledge_router import KnowledgeAnswerRouter
+from .knowledge_router import KnowledgeAnswerRouter, LegacyKnowledgeAnswerRouter
 from .llm import LLMProvider, TemplateLLMProvider
 from .models import (
     ArtifactModel,
@@ -488,6 +488,8 @@ class SqlChatRepository:
         word_fact_service: WordFactAnswerService | None = None,
         *,
         owns_database: bool = False,
+        unified_knowledge_routing_enabled: bool = True,
+        word_factual_qa_enabled: bool = True,
         retrieval_permission_tags: Sequence[str] = (),
         retrieval_router: RetrievalRouter | None = None,
         retrieval_scope: RetrievalScope | None = None,
@@ -520,11 +522,9 @@ class SqlChatRepository:
             llm_provider=self._llm_provider,
         )
         self._word_fact_service = word_fact_service
-        self._answer_router = KnowledgeAnswerRouter(
-            self._agent,
-            structured_service=self._structured_service,
-            word_fact_service=self._word_fact_service,
-        )
+        self._unified_knowledge_routing_enabled = unified_knowledge_routing_enabled
+        self._word_factual_qa_enabled = word_factual_qa_enabled
+        self._answer_router = self._build_answer_router()
 
     def close(self) -> None:
         with self._close_lock:
@@ -553,11 +553,36 @@ class SqlChatRepository:
                 self._structured_service = structured_service
             if word_fact_service is not None:
                 self._word_fact_service = word_fact_service
-            self._answer_router = KnowledgeAnswerRouter(
+            self._answer_router = self._build_answer_router()
+
+    def configure_knowledge_routing(
+        self,
+        *,
+        unified_enabled: bool,
+        word_factual_enabled: bool,
+    ) -> None:
+        if word_factual_enabled and not unified_enabled:
+            raise ValueError("Word factual QA requires unified knowledge routing")
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("repository is closed")
+            self._unified_knowledge_routing_enabled = unified_enabled
+            self._word_factual_qa_enabled = word_factual_enabled
+            self._answer_router = self._build_answer_router()
+
+    def _build_answer_router(self) -> KnowledgeAnswerRouter | LegacyKnowledgeAnswerRouter:
+        if not self._unified_knowledge_routing_enabled:
+            return LegacyKnowledgeAnswerRouter(
                 self._agent,
                 structured_service=self._structured_service,
-                word_fact_service=self._word_fact_service,
             )
+        return KnowledgeAnswerRouter(
+            self._agent,
+            structured_service=self._structured_service,
+            word_fact_service=(
+                self._word_fact_service if self._word_factual_qa_enabled else None
+            ),
+        )
 
     def configure_retrieval(
         self,

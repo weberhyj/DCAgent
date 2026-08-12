@@ -370,6 +370,13 @@ This Excel-only behavior does not require rebuilding Qdrant indexes or reindexin
 Word factual answers use extracted `knowledge_facts`; existing Word sources must be reindexed, while
 published Excel tables do not require re-uploading.
 
+The routing rollout is disabled by default with
+`UNIFIED_KNOWLEDGE_ROUTING_ENABLED=false` and `WORD_FACTUAL_QA_ENABLED=false`. Unified routing may
+be enabled first without enabling Word facts; Word factual QA must never be enabled while unified
+routing is disabled. For the Ubuntu/Supervisor deployment sequence, route-audit smoke checks, and
+configuration-only rollback, follow
+[`deploy/ubuntu/KNOWLEDGE_ROUTING_ROLLOUT.md`](deploy/ubuntu/KNOWLEDGE_ROUTING_ROLLOUT.md).
+
 1. Apply Alembic revision 20260811_07.
 2. Confirm every existing Word source still has a readable file_path.
 3. POST /api/knowledge/sources/{source_id}/reindex once for each Word source.

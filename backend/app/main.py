@@ -31,7 +31,7 @@ from .infra.health import (
 from .ingestion import KnowledgeIngestionQueue
 from .llm import LLMProvider, create_llm_provider
 from .llm_runtime import validate_production_llm_provider
-from .offline_settings import OfflineSettings, parse_bool, require_secret_file
+from .offline_settings import OfflineSettings, OfflineSettingsError, parse_bool, require_secret_file
 from .repository import ChatRepository
 from .retrieval_models import RetrievalMode
 from .retrieval_scope import DynamicRetrievalScopeProvider
@@ -180,8 +180,25 @@ def create_default_repository(
             **source,
             "STRUCTURED_QUERY_ENABLED": "true" if structured_query_enabled else "false",
         }
+        if not structured_query_enabled:
+            source = {
+                **source,
+                "UNIFIED_KNOWLEDGE_ROUTING_ENABLED": "false",
+                "WORD_FACTUAL_QA_ENABLED": "false",
+            }
     enabled = parse_bool(source.get("STRUCTURED_QUERY_ENABLED"), default=False)
     settings = OfflineSettings.from_environ(source) if enabled else None
+    unified_knowledge_routing_enabled = parse_bool(
+        source.get("UNIFIED_KNOWLEDGE_ROUTING_ENABLED"), default=False
+    )
+    word_factual_qa_enabled = parse_bool(
+        source.get("WORD_FACTUAL_QA_ENABLED"), default=False
+    )
+    if word_factual_qa_enabled and not unified_knowledge_routing_enabled:
+        raise OfflineSettingsError(
+            "WORD_FACTUAL_QA_ENABLED=true requires "
+            "UNIFIED_KNOWLEDGE_ROUTING_ENABLED=true"
+        )
     query_password = (
         require_secret_file(
             settings.clickhouse_query_password_file,
@@ -207,8 +224,11 @@ def create_default_repository(
         llm_provider=llm_provider or create_llm_provider(source),
         structured_service=structured_service,
         owns_database=True,
+        unified_knowledge_routing_enabled=unified_knowledge_routing_enabled,
+        word_factual_qa_enabled=word_factual_qa_enabled,
     )
-    repository.configure_answer_services(word_fact_service=WordFactAnswerService(repository))
+    if word_factual_qa_enabled:
+        repository.configure_answer_services(word_fact_service=WordFactAnswerService(repository))
     return repository
 
 
@@ -417,25 +437,62 @@ def create_production_app(
                     database,  # type: ignore[arg-type]
                     llm_provider=llm_provider,  # type: ignore[arg-type]
                     structured_service=structured_service,
+                    unified_knowledge_routing_enabled=(
+                        settings.unified_knowledge_routing_enabled
+                    ),
+                    word_factual_qa_enabled=settings.word_factual_qa_enabled,
                     retrieval_permission_tags=retrieval_settings.permission_tags,
                 )
-                repository.configure_answer_services(  # type: ignore[attr-defined]
-                    word_fact_service=WordFactAnswerService(
-                        repository,
-                        permission_tags=retrieval_settings.permission_tags,
-                    )
+                repository.configure_knowledge_routing(
+                    unified_enabled=settings.unified_knowledge_routing_enabled,
+                    word_factual_enabled=settings.word_factual_qa_enabled,
                 )
+                if settings.word_factual_qa_enabled:
+                    repository.configure_answer_services(  # type: ignore[attr-defined]
+                        word_fact_service=WordFactAnswerService(
+                            repository,
+                            permission_tags=retrieval_settings.permission_tags,
+                        )
+                    )
             else:
                 repository = repository_factory()
-                if structured_service is not None:
-                    if not hasattr(repository, "configure_answer_services"):
-                        raise TypeError(
-                            "When STRUCTURED_QUERY_ENABLED=true, repository_factory must return "
-                            "a repository that accepts atomic answer-service configuration"
-                        )
-                    repository.configure_answer_services(  # type: ignore[attr-defined]
-                        structured_service=structured_service
+                configure_knowledge_routing = getattr(
+                    repository,
+                    "configure_knowledge_routing",
+                    None,
+                )
+                if callable(configure_knowledge_routing):
+                    configure_knowledge_routing(
+                        unified_enabled=settings.unified_knowledge_routing_enabled,
+                        word_factual_enabled=settings.word_factual_qa_enabled,
                     )
+                elif (
+                    callable(getattr(repository, "send_message", None))
+                    and settings.unified_knowledge_routing_enabled
+                ):
+                    raise TypeError(
+                        "repository_factory must return a repository that accepts "
+                        "configure_knowledge_routing"
+                    )
+                configure_answer_services = getattr(
+                    repository,
+                    "configure_answer_services",
+                    None,
+                )
+                _configure_factory_answer_services(
+                    configure_answer_services,
+                    structured_service=structured_service,
+                    structured_query_enabled=settings.structured_query_enabled,
+                    word_fact_service=(
+                        WordFactAnswerService(
+                            repository,
+                            permission_tags=retrieval_settings.permission_tags,
+                        )
+                        if settings.word_factual_qa_enabled
+                        else None
+                    ),
+                    word_factual_qa_enabled=settings.word_factual_qa_enabled,
+                )
             own(repository)
             retrieval_gateway = None
             index_lifecycle = None
@@ -542,6 +599,10 @@ def create_production_app(
             application.state.repository = repository
             application.state.structured_repository = structured_repository
             application.state.structured_query_enabled = settings.structured_query_enabled
+            application.state.unified_knowledge_routing_enabled = (
+                settings.unified_knowledge_routing_enabled
+            )
+            application.state.word_factual_qa_enabled = settings.word_factual_qa_enabled
             application.state.retrieval_settings = retrieval_settings
             application.state.retrieval_gateway = retrieval_gateway
             application.state.retrieval_scope_provider = retrieval_scope_provider
@@ -782,6 +843,63 @@ def _configure_retrieval_runtime(
         sparse=sparse,
     )
     return gateway, index_lifecycle, scope_provider
+
+
+def _configure_factory_answer_services(
+    configure_answer_services: object,
+    *,
+    structured_service: object | None,
+    structured_query_enabled: bool,
+    word_fact_service: object | None,
+    word_factual_qa_enabled: bool,
+) -> None:
+    """Inject only the answer services enabled by this production configuration."""
+
+    service_kwargs: dict[str, object] = {}
+    if structured_query_enabled:
+        service_kwargs["structured_service"] = structured_service
+    if word_factual_qa_enabled:
+        service_kwargs["word_fact_service"] = word_fact_service
+    if not service_kwargs:
+        return
+    if not callable(configure_answer_services):
+        missing = next(iter(service_kwargs))
+        feature = (
+            "Word factual QA"
+            if missing == "word_fact_service"
+            else "structured query"
+        )
+        raise TypeError(
+            f"{feature} requires repository_factory to accept "
+            "configure_answer_services"
+        )
+    try:
+        signature = inspect.signature(configure_answer_services)
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "repository_factory configure_answer_services signature could not be inspected"
+        ) from error
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if not accepts_kwargs:
+        unsupported = [
+            name
+            for name in service_kwargs
+            if name not in signature.parameters
+        ]
+        if unsupported:
+            if "word_fact_service" in unsupported:
+                raise TypeError(
+                    "Word factual QA requires repository_factory to accept "
+                    "word_fact_service via configure_answer_services"
+                )
+            raise TypeError(
+                "Structured query requires repository_factory to accept "
+                "structured_service via configure_answer_services"
+            )
+    configure_answer_services(**service_kwargs)
 
 
 def _create_custom_ingestion_queue(

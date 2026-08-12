@@ -118,6 +118,8 @@ def require_private_url(value: str, field: str) -> str:
 class OfflineSettings:
     offline_mode: bool
     structured_query_enabled: bool
+    unified_knowledge_routing_enabled: bool
+    word_factual_qa_enabled: bool
     database_url: str
     clickhouse_url: str
     clickhouse_query_user: str
@@ -146,6 +148,17 @@ class OfflineSettings:
         structured_query_enabled = parse_bool(
             environ.get("STRUCTURED_QUERY_ENABLED"), default=False
         )
+        unified_knowledge_routing_enabled = parse_bool(
+            environ.get("UNIFIED_KNOWLEDGE_ROUTING_ENABLED"), default=False
+        )
+        word_factual_qa_enabled = parse_bool(
+            environ.get("WORD_FACTUAL_QA_ENABLED"), default=False
+        )
+        if word_factual_qa_enabled and not unified_knowledge_routing_enabled:
+            raise OfflineSettingsError(
+                "WORD_FACTUAL_QA_ENABLED=true requires "
+                "UNIFIED_KNOWLEDGE_ROUTING_ENABLED=true"
+            )
         compatibility_value = environ.get("CLICKHOUSE_COMPATIBILITY_MODE", "modern")
         try:
             clickhouse_compatibility_mode = ClickHouseCompatibilityMode(compatibility_value)
@@ -218,6 +231,8 @@ class OfflineSettings:
         return cls(
             offline_mode=offline_mode,
             structured_query_enabled=structured_query_enabled,
+            unified_knowledge_routing_enabled=unified_knowledge_routing_enabled,
+            word_factual_qa_enabled=word_factual_qa_enabled,
             clamav_host=environ.get("CLAMAV_HOST", "127.0.0.1"),
             clickhouse_query_user=_clickhouse_user(
                 environ, "CLICKHOUSE_QUERY_USER", "dc_agent_query"

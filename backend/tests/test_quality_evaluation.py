@@ -4,6 +4,7 @@ import json
 import math
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier
@@ -16,10 +17,15 @@ from sqlalchemy.exc import IntegrityError
 
 from app.database import Database, EvaluationRunRecord
 from app.evaluation import EvaluationCaseModel, EvaluationRunModel
+from app.knowledge_route_models import KnowledgeRouteType
 from app.main import create_app
 from app.models import ChatState, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
+from app.structured_answer import StructuredAnswerService
+from app.word_fact_answer import WordFactAnswerService
+from app.word_facts import KnowledgeFactModel, WordFactMatch
+from tests.support.structured_fakes import sample_multi_metric_catalog
 
 
 class RankingMetricTest(unittest.TestCase):
@@ -74,6 +80,75 @@ class RankingMetricTest(unittest.TestCase):
 
         self.assertEqual((metrics.recall, metrics.mrr, metrics.ndcg), (0.0, 0.0, 0.0))
         self.assertTrue(all(math.isfinite(value) for value in metrics))
+
+
+class ExactRouteAvailabilityTest(unittest.TestCase):
+    def test_excel_and_word_exact_routes_work_while_llm_is_unavailable(self) -> None:
+        class UnavailableLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate_reply(self, _request):
+                self.calls += 1
+                raise RuntimeError("llm unavailable")
+
+        class ClickHouse:
+            def query(self, _statement: str, _parameters: object) -> object:
+                return {
+                    "aggregate_value": Decimal("350.50"),
+                    "total_count": 4,
+                    "valid_count": 4,
+                    "null_count": 0,
+                }
+
+        fact = KnowledgeFactModel.create(
+            id="fact-age",
+            source_id="kb-people",
+            chunk_id="chunk-people",
+            entity="张三",
+            field="年龄",
+            value="28岁",
+            confidence=0.99,
+            locator={"paragraph": 1},
+        )
+
+        class Facts:
+            def find_knowledge_facts(self, _intent, *, permission_tags=()):
+                del permission_tags
+                return [
+                    WordFactMatch(
+                        fact=fact,
+                        source_name="people.docx",
+                        classification="internal",
+                    )
+                ]
+
+        llm = UnavailableLLM()
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[]),
+            llm_provider=llm,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(),
+                ClickHouse(),
+            ),
+        )
+        repository.configure_answer_services(
+            word_fact_service=WordFactAnswerService(Facts()),
+        )
+        repository.configure_knowledge_routing(
+            unified_enabled=True,
+            word_factual_enabled=True,
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "地区为华东的销售额汇总", "quick")
+        excel_run = repository.list_agent_runs(1)[0]
+        repository.send_message(conversation_id, "张三几岁", "quick")
+        word_run = repository.list_agent_runs(1)[0]
+
+        self.assertEqual(excel_run.route_type, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
+        self.assertEqual(word_run.route_type, KnowledgeRouteType.WORD_FACTUAL)
+        self.assertEqual(llm.calls, 0)
 
 
 class ShadowReportPrivacyTest(unittest.TestCase):

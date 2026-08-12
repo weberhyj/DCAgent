@@ -33,7 +33,7 @@ from .evaluation import (
     normalized_unique,
 )
 from .evaluation_import import EvaluationImportRow
-from .knowledge_router import KnowledgeAnswerRouter
+from .knowledge_router import KnowledgeAnswerRouter, LegacyKnowledgeAnswerRouter
 from .llm import LLMProvider, TemplateLLMProvider
 from .models import (
     ChatMessageModel,
@@ -297,6 +297,13 @@ def build_knowledge_paragraph(hits: list[KnowledgeSearchHitModel]) -> ResponsePa
 
 
 class ChatRepository(Protocol):
+    def configure_knowledge_routing(
+        self,
+        *,
+        unified_enabled: bool,
+        word_factual_enabled: bool,
+    ) -> None: ...
+
     def list_conversations(self) -> list[ConversationModel]: ...
 
     def create_conversation(
@@ -467,6 +474,8 @@ class InMemoryChatRepository:
         structured_service: StructuredAnswerService | None = None,
         word_fact_service: WordFactAnswerService | None = None,
         *,
+        unified_knowledge_routing_enabled: bool = True,
+        word_factual_qa_enabled: bool = True,
         retrieval_router: RetrievalRouter | None = None,
         retrieval_scope: RetrievalScope | None = None,
         retrieval_scope_provider: RetrievalScopeProvider | None = None,
@@ -498,11 +507,9 @@ class InMemoryChatRepository:
             llm_provider=self._llm_provider,
         )
         self._word_fact_service = word_fact_service
-        self._answer_router = KnowledgeAnswerRouter(
-            self._agent,
-            structured_service=self._structured_service,
-            word_fact_service=self._word_fact_service,
-        )
+        self._unified_knowledge_routing_enabled = unified_knowledge_routing_enabled
+        self._word_factual_qa_enabled = word_factual_qa_enabled
+        self._answer_router = self._build_answer_router()
 
     def close(self) -> None:
         close = getattr(self._structured_service, "close", None)
@@ -519,10 +526,32 @@ class InMemoryChatRepository:
             self._structured_service = structured_service
         if word_fact_service is not None:
             self._word_fact_service = word_fact_service
-        self._answer_router = KnowledgeAnswerRouter(
+        self._answer_router = self._build_answer_router()
+
+    def configure_knowledge_routing(
+        self,
+        *,
+        unified_enabled: bool,
+        word_factual_enabled: bool,
+    ) -> None:
+        if word_factual_enabled and not unified_enabled:
+            raise ValueError("Word factual QA requires unified knowledge routing")
+        self._unified_knowledge_routing_enabled = unified_enabled
+        self._word_factual_qa_enabled = word_factual_enabled
+        self._answer_router = self._build_answer_router()
+
+    def _build_answer_router(self) -> KnowledgeAnswerRouter | LegacyKnowledgeAnswerRouter:
+        if not self._unified_knowledge_routing_enabled:
+            return LegacyKnowledgeAnswerRouter(
+                self._agent,
+                structured_service=self._structured_service,
+            )
+        return KnowledgeAnswerRouter(
             self._agent,
             structured_service=self._structured_service,
-            word_fact_service=self._word_fact_service,
+            word_fact_service=(
+                self._word_fact_service if self._word_factual_qa_enabled else None
+            ),
         )
 
     def configure_retrieval(
