@@ -101,6 +101,11 @@ class PreflightClient:
             raise self.failure
         if statement == "SELECT version()":
             return [(self.version,)]
+        if statement in {
+            "SELECT toString(toDecimal64(1, 9))",
+            "SELECT toDecimalString(toDecimal64(1, 9), 9)",
+        }:
+            return [("1.000000000",)]
         return [(1,)]
 
     def close(self) -> None:
