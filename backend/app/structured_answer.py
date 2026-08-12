@@ -23,6 +23,7 @@ from .models import (
     TableArtifactModel,
 )
 from .structured_models import (
+    MAX_STRUCTURED_ROUTE_FIELDS,
     StructuredAggregateResult,
     StructuredCatalog,
     StructuredClarification,
@@ -178,15 +179,27 @@ class StructuredAnswerService:
             if catalog_snapshot is not None:
                 if not is_structured_candidate(question, catalog_snapshot):
                     return None
-            elif _classify_without_catalog(question) != "strong":
-                return None
+                outage_resolution = resolve_structured_intent(
+                    question,
+                    catalog_snapshot,
+                    implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+                )
+                outage_metadata = _catalog_outage_route_metadata(catalog_snapshot, outage_resolution)
+                outage_route = _route_for_catalog_outage_resolution(outage_resolution)
+            else:
+                if _classify_without_catalog(question) != "strong":
+                    return None
+                outage_metadata = {}
+                outage_route = KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
             return _structured_run(
                 conversation_id,
                 question,
                 mode,
                 "结构化查询服务不可用：无法读取已发布的数据目录。",
                 "catalog unavailable",
+                route_type=outage_route,
                 route_metadata=KnowledgeRouteMetadata(
+                    **outage_metadata,
                     degradation_reason="catalog_unavailable",
                     validation_passed=False,
                 ),
@@ -754,6 +767,29 @@ def _intent_route_metadata(
         "candidate_source_ids": (dataset.schema.source_id,),
         "origin_route": _route_for_intent(intent),
     }
+
+
+def _catalog_outage_route_metadata(
+    catalog: StructuredCatalog,
+    resolution: object,
+) -> dict[str, object]:
+    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent)):
+        return _intent_route_metadata(catalog, resolution)
+    if isinstance(resolution, StructuredClarification):
+        return _clarification_route_metadata(catalog, resolution)
+    if isinstance(resolution, StructuredUnavailable):
+        return _unavailable_route_metadata(resolution)
+    return {}
+
+
+def _route_for_catalog_outage_resolution(resolution: object) -> KnowledgeRouteType:
+    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent)):
+        return _route_for_intent(resolution)
+    if isinstance(resolution, StructuredClarification) and resolution.origin_route is not None:
+        return KnowledgeRouteType(resolution.origin_route)
+    if isinstance(resolution, StructuredUnavailable):
+        return _route_for_parser_outcome(resolution)
+    return KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
 
 
 def _route_for_intent(

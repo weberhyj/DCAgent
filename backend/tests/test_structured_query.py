@@ -155,6 +155,17 @@ class StructuredIntentParsingTest(unittest.TestCase):
         assert isinstance(result, StructuredMultiAggregateIntent)
         self.assertEqual([item.aggregate for item in result.metrics], ["avg", "avg"])
 
+    def test_explicit_multi_metric_route_fields_are_bounded_at_persistence_limit(self) -> None:
+        result = resolve_structured_intent(
+            "地区为华东的" + "、".join(f"指标{i:02d}" for i in range(40)) + "汇总",
+            sample_multi_metric_catalog(metric_count=40),
+        )
+
+        self.assertIsInstance(result, StructuredClarification)
+        assert isinstance(result, StructuredClarification)
+        self.assertEqual(result.origin_route, "excel_multi_aggregate")
+        self.assertLessEqual(len(result.target_fields), 32)
+
     def test_single_metric_huizong_keeps_single_metric_contract(self) -> None:
         result = resolve_structured_intent(
             "华东地区销售额汇总", sample_multi_metric_catalog()

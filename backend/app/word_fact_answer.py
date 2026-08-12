@@ -192,8 +192,22 @@ class WordFactAnswerService:
                     validation_passed=True,
                 ),
             )
-        matches = self._repository.find_knowledge_facts(
-            resolution,
-            permission_tags=self._permission_tags,
-        )
+        try:
+            matches = self._repository.find_knowledge_facts(
+                resolution,
+                permission_tags=self._permission_tags,
+            )
+        except Exception:
+            return build_word_fact_run(
+                conversation_id,
+                content,
+                mode,
+                f"无法查询{resolution.entity}的{resolution.field}，请稍后重试。",
+                route_metadata=KnowledgeRouteMetadata(
+                    entity=resolution.entity,
+                    target_fields=(resolution.field,),
+                    degradation_reason="fact_repository_unavailable",
+                    validation_passed=False,
+                ),
+            )
         return answer_word_fact(conversation_id, content, mode, resolution, matches)

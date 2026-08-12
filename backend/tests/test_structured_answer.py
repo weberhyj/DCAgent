@@ -1228,6 +1228,26 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(provider.calls, 0)
         self.assertIn("不可用", messages[-1].paragraphs[0].text)
 
+    def test_catalog_outage_preserves_warm_multi_route_context(self) -> None:
+        provider = SwitchableCatalogProvider(sample_multi_metric_catalog())
+        service = StructuredAnswerService(provider, RecordingClickHouseGateway())
+        self.assertIsNotNone(service.try_answer("warm", "地区为华东的汇总", "quick", []))
+        provider.error = RuntimeError("catalog down")
+
+        result = service.try_answer(
+            "outage", "地区为华东的销售额、成本、利润汇总", "quick", []
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertEqual(result.route_metadata.degradation_reason, "catalog_unavailable")
+        self.assertFalse(result.route_metadata.validation_passed)
+        result.route_metadata.to_dict()
+
     def test_catalog_failure_keeps_weak_document_count_question_on_legacy_path(self) -> None:
         provider = RecordingLLMProvider()
         gateway = RecordingClickHouseGateway()

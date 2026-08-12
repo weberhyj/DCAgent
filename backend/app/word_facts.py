@@ -6,6 +6,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from .bounded_limits import MAX_ROUTE_METADATA_STRING_LENGTH
+
 
 def normalize_fact_key(value: str) -> str:
     """Create a stable lookup key without changing the display value."""
@@ -280,6 +282,8 @@ def extract_single_entity(
         return WordFactClarification("一次只能查询一个实体，请选择", candidates)
     if not entity:
         return WordFactClarification("请指定一个实体", ())
+    if len(entity) > MAX_ROUTE_METADATA_STRING_LENGTH:
+        return _oversized_entity_clarification(_fields)
     return entity
 
 
@@ -288,6 +292,8 @@ def resolve_word_factual_intent(question: str) -> WordFactualResolution:
     if query_match is None:
         return None
     entity, fields = query_match
+    if len(entity) > MAX_ROUTE_METADATA_STRING_LENGTH:
+        return _oversized_entity_clarification(fields)
     if len(fields) != 1:
         return WordFactClarification(
             "一次只能查询一个事实字段，请选择",
@@ -310,6 +316,14 @@ def resolve_word_factual_intent(question: str) -> WordFactualResolution:
         entity_normalized=normalize_fact_key(entity),
         field=field,
         field_normalized=normalize_fact_key(field),
+    )
+
+
+def _oversized_entity_clarification(fields: tuple[str, ...]) -> WordFactClarification:
+    return WordFactClarification(
+        f"实体名称过长，请提供不超过 {MAX_ROUTE_METADATA_STRING_LENGTH} 个字符的实体名称。",
+        (),
+        target_fields=fields,
     )
 
 

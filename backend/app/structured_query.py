@@ -617,6 +617,18 @@ def resolve_structured_intent(
 
     if metrics:
         consumed = (*consumed, *metric_list_result.consumed_spans)
+        if len(metrics) > MAX_STRUCTURED_ROUTE_FIELDS:
+            return _with_clarification_context(
+                StructuredClarification(
+                    f"一次最多只能汇总 {MAX_STRUCTURED_ROUTE_FIELDS} 个指标，请减少选择",
+                    tuple(column.display_name for column in metrics[:MAX_STRUCTURED_ROUTE_FIELDS]),
+                ),
+                dataset,
+                origin_route="excel_multi_aggregate",
+                target_fields=tuple(
+                    column.display_name for column in metrics[:MAX_STRUCTURED_ROUTE_FIELDS]
+                ),
+            )
         remaining = _mask_spans(question, consumed)
         if _DATE_RANGE_RE.search(remaining) or re.search(
             r"大于|不少于|小于|不超过|为|=", remaining

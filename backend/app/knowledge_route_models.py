@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from collections.abc import Mapping
 
+from .bounded_limits import MAX_ROUTE_METADATA_STRING_LENGTH
 
-MAX_ROUTE_METADATA_STRING_LENGTH = 256
 MAX_ROUTE_METADATA_ITEM_LENGTH = 128
 MAX_ROUTE_METADATA_LIST_COUNT = 32
 

@@ -49,6 +49,11 @@ class FakeFacts:
         return list(self.matches)
 
 
+class FailingFacts:
+    def find_knowledge_facts(self, intent, *, permission_tags=()):
+        raise RuntimeError("fact database down")
+
+
 class WordFactAnswerServiceTests(unittest.TestCase):
     def test_age_answer_contains_no_gender_or_job(self) -> None:
         service = WordFactAnswerService(FakeFacts([match("张三", "年龄", "28岁")]))
@@ -220,6 +225,35 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         service.try_answer("conv-1", "张三几岁", "quick", [])
 
         self.assertEqual(facts.calls[0][1], ("内部", "机密"))
+
+    def test_overlong_exact_entity_returns_bounded_terminal_clarification_without_lookup(self) -> None:
+        facts = FakeFacts([])
+        result = WordFactAnswerService(facts).try_answer(
+            "conv-1", "张" * 301 + "几岁", "quick", []
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertIsNone(result.route_metadata.entity)
+        self.assertEqual(result.route_metadata.target_fields, ("年龄",))
+        self.assertIsNone(result.route_metadata.to_dict()["entity"])
+        self.assertEqual(facts.calls, [])
+
+    def test_fact_repository_failure_is_terminal_and_bounded(self) -> None:
+        result = WordFactAnswerService(FailingFacts()).try_answer(
+            "conv-1", "张三几岁", "quick", []
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.WORD_FACTUAL)
+        self.assertEqual(result.route_metadata.entity, "张三")
+        self.assertEqual(result.route_metadata.target_fields, ("年龄",))
+        self.assertEqual(result.route_metadata.degradation_reason, "fact_repository_unavailable")
+        self.assertFalse(result.route_metadata.validation_passed)
+        self.assertIn("无法查询", result.reply.paragraphs[0].text)
+        result.route_metadata.to_dict()
 
 
 if __name__ == "__main__":

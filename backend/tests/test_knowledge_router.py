@@ -16,6 +16,7 @@ from app.knowledge_router import (
 )
 from app.models import ChatMessageModel, ResponseParagraphModel
 from app.structured_answer import StructuredAnswerService
+from app.word_fact_answer import WordFactAnswerService
 from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
 
 
@@ -90,6 +91,11 @@ class RecordingWordFacts:
     def try_answer(self, *_args: object, **_kwargs: object) -> AgentRunResult | None:
         self._calls.append("word")
         return self._result
+
+
+class FailingFactRepository:
+    def find_knowledge_facts(self, *_args: object, **_kwargs: object):
+        raise RuntimeError("fact database down")
 
 
 class FailingStructuredFallbackDependencies:
@@ -246,6 +252,20 @@ class KnowledgeAnswerRouterTests(unittest.TestCase):
 
         self.assertEqual(result.route_type, KnowledgeRouteType.WORD_FACTUAL)
         self.assertEqual(self.calls, ["greeting", "excel", "word"])
+
+    def test_word_repository_outage_is_terminal_and_never_calls_document_agent(self) -> None:
+        result = KnowledgeAnswerRouter(
+            agent=RecordingAgent(self.calls),
+            structured_service=RecordingStructured(self.calls),
+            word_fact_service=WordFactAnswerService(FailingFactRepository()),
+        ).answer("conv-1", "张三几岁", "deep", [])
+
+        self.assertEqual(result.route_type, KnowledgeRouteType.WORD_FACTUAL)
+        self.assertEqual(
+            result.route_metadata.degradation_reason,
+            "fact_repository_unavailable",
+        )
+        self.assertEqual(self.calls, ["greeting", "excel"])
 
     def test_open_introduction_routes_to_summary_compare(self) -> None:
         result = self.router().answer("conv-1", "介绍张三", "deep", [])

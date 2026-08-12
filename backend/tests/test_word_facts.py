@@ -217,6 +217,17 @@ class WordFactualIntentTests(unittest.TestCase):
         assert isinstance(resolution, WordFactClarification)
         self.assertEqual(resolution.candidates, ("张三", "李四"))
 
+    def test_entity_above_route_scalar_limit_is_bounded_factual_clarification(self) -> None:
+        accepted = resolve_word_factual_intent("张" * 256 + "几岁")
+        resolution = resolve_word_factual_intent("张" * 257 + "几岁")
+
+        self.assertIsInstance(accepted, WordFactualIntent)
+        self.assertIsInstance(resolution, WordFactClarification)
+        assert isinstance(resolution, WordFactClarification)
+        self.assertIsNone(resolution.entity)
+        self.assertEqual(resolution.target_fields, ("年龄",))
+        self.assertEqual(resolution.candidates, ())
+
 
 class WordFactSchemaTests(unittest.TestCase):
     def test_head_migration_creates_fact_lookup_indexes(self) -> None:

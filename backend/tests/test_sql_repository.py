@@ -579,6 +579,21 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertEqual(run.route_metadata.target_fields, ("年龄",))
         self.assertTrue(run.route_metadata.validation_passed)
 
+    def test_overlong_exact_entity_persists_bounded_terminal_route_audit(self) -> None:
+        self.repository.configure_answer_services(
+            word_fact_service=WordFactAnswerService(self.repository)
+        )
+        _, conversation_id, _ = self.repository.create_conversation()
+
+        self.repository.send_message(conversation_id, "张" * 301 + "几岁", "quick")
+
+        run = SqlChatRepository(self.database).list_agent_runs(1)[0]
+        self.assertEqual(run.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertIsNone(run.route_metadata.entity)
+        self.assertEqual(run.route_metadata.target_fields, ("年龄",))
+        self.assertEqual(run.route_metadata.to_dict()["entity"], None)
+        self.assertEqual(run.route_metadata.to_dict()["target_fields"], ["年龄"])
+
     def test_adds_knowledge_source(self) -> None:
         sources = self.repository.add_knowledge_source("董事会纪要.pdf", "PDF", "内部·机密")
 
