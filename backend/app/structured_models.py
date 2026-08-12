@@ -6,6 +6,9 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
+
+MAX_STRUCTURED_ROUTE_FIELDS = 32
+
 MAX_STRUCTURED_ALIASES_PER_COLUMN = 20
 MAX_STRUCTURED_ALIAS_LENGTH = 80
 
@@ -180,6 +183,10 @@ class StructuredClarification:
 @dataclass(frozen=True, slots=True)
 class StructuredUnavailable:
     message: str
+    dataset_id: str | None = None
+    target_fields: tuple[str, ...] = ()
+    candidate_source_ids: tuple[str, ...] = ()
+    origin_route: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

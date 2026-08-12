@@ -18,6 +18,7 @@ from .clickhouse_compatibility import (
     ClickHouseCompatibilityProfile,
 )
 from .structured_models import (
+    MAX_STRUCTURED_ROUTE_FIELDS,
     StructuredAggregateResult,
     StructuredCatalog,
     StructuredClarification,
@@ -574,7 +575,7 @@ def resolve_structured_intent(
         dataset_result.consumed_spans,
     )
     if filter_result.issue is not None:
-        return filter_result.issue
+        return _with_route_context(filter_result.issue, dataset, origin_route="excel_filtered_aggregate")
     assert filter_result.value is not None
 
     consumed = (*dataset_result.consumed_spans, *filter_result.consumed_spans)
@@ -585,7 +586,7 @@ def resolve_structured_intent(
         allow_missing=True,
     )
     if aggregate_result.issue is not None:
-        return aggregate_result.issue
+        return _with_route_context(aggregate_result.issue, dataset, origin_route="excel_filtered_aggregate")
 
     consumed = (*consumed, *aggregate_result.consumed_spans)
     available = _mask_spans(question, consumed)
@@ -596,7 +597,7 @@ def resolve_structured_intent(
         for span in _find_normalized_spans(available, word)
     )
     if aggregate_result.value is None and not has_summary_word:
-        return StructuredUnavailable("未识别到受支持的聚合意图")
+            return _with_route_context(StructuredUnavailable("未识别到受支持的聚合意图"), dataset, origin_route="excel_filtered_aggregate")
     aggregate = aggregate_result.value or "sum"
 
     metric_list_result = _parse_metric_list(
@@ -620,7 +621,7 @@ def resolve_structured_intent(
         if _DATE_RANGE_RE.search(remaining) or re.search(
             r"大于|不少于|小于|不超过|为|=", remaining
         ):
-            return StructuredUnavailable("结构化查询包含未识别的筛选条件")
+            return _with_route_context(StructuredUnavailable("结构化查询包含未识别的筛选条件"), dataset, origin_route="excel_filtered_aggregate")
         if len(metrics) == 1:
             return StructuredIntent(
                 dataset_id=dataset.schema.dataset_id,
@@ -660,7 +661,7 @@ def resolve_structured_intent(
         if _DATE_RANGE_RE.search(remaining) or re.search(
             r"大于|不少于|小于|不超过|为|=", remaining
         ):
-            return StructuredUnavailable("结构化查询包含未识别的筛选条件")
+            return _with_route_context(StructuredUnavailable("结构化查询包含未识别的筛选条件"), dataset, origin_route="excel_filtered_aggregate")
 
         return StructuredIntent(
             dataset_id=dataset.schema.dataset_id,
@@ -677,12 +678,13 @@ def resolve_structured_intent(
         )
         if not implicit_columns:
             return StructuredUnavailable("没有可汇总的已授权数值列")
+        capped_columns = implicit_columns[:MAX_STRUCTURED_ROUTE_FIELDS]
         if len(implicit_columns) > implicit_summary_max_metrics:
             return StructuredClarification(
                 f"可汇总指标超过上限，最多可汇总 {implicit_summary_max_metrics} 个指标，请选择",
-                tuple(column.display_name for column in implicit_columns),
+                tuple(column.display_name for column in capped_columns),
                 dataset_id=dataset.schema.dataset_id,
-                target_fields=tuple(column.display_name for column in implicit_columns),
+                target_fields=tuple(column.display_name for column in capped_columns),
                 candidate_source_ids=(dataset.schema.source_id,),
                 origin_route="excel_multi_aggregate",
             )
@@ -737,14 +739,13 @@ def _parse_aggregate_clause(
     )
 
 
-def _with_clarification_context(
+def _with_route_context(
     issue: StructuredClarification | StructuredUnavailable,
     dataset: StructuredDatasetCatalog,
     *,
     origin_route: str,
 ) -> StructuredClarification | StructuredUnavailable:
-    if not isinstance(issue, StructuredClarification):
-        return issue
+    candidates = issue.candidates if isinstance(issue, StructuredClarification) else ()
     fields = tuple(
         next(
             (
@@ -754,22 +755,14 @@ def _with_clarification_context(
             ),
             candidate,
         )
-        for candidate in issue.candidates
+        for candidate in candidates
     )
-    return StructuredClarification(
-        issue.message,
-        issue.candidates,
-        dataset_id=dataset.schema.dataset_id,
-        target_fields=fields,
-        candidate_source_ids=(dataset.schema.source_id,),
-        origin_route=origin_route,
-    )
-    aggregate = next(iter(matches))
-    return _ClauseParseResult(
-        value=aggregate,
-        consumed_spans=_merge_spans(matches[aggregate]),
-        count_all_hint=count_all_hint,
-    )
+    if isinstance(issue, StructuredClarification):
+        return StructuredClarification(issue.message, issue.candidates, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route)
+    return StructuredUnavailable(issue.message, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route)
+
+
+_with_clarification_context = _with_route_context
 
 
 def _parse_metric_list(

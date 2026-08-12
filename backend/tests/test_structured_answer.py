@@ -952,6 +952,17 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(len(result.route_metadata.target_fields), 13)
         self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
 
+    def test_implicit_clarification_caps_metadata_fields_at_thirty_two(self) -> None:
+        result = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(metric_count=40), RecordingClickHouseGateway()
+        ).try_answer("conv-1", "汇总", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(len(result.route_metadata.target_fields), 32)
+        self.assertEqual(result.route_metadata.target_fields[:3], ("销售额", "成本", "利润"))
+        result.route_metadata.to_dict()
+
     def test_single_field_clarification_records_filtered_origin(self) -> None:
         catalog = sample_catalog()
         with patch(

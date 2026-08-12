@@ -222,7 +222,9 @@ class StructuredAnswerService:
                 mode,
                 f"结构化查询服务不可用：{resolution.message}。",
                 "structured intent unavailable",
+                route_type=_route_for_parser_outcome(resolution),
                 route_metadata=KnowledgeRouteMetadata(
+                    **_unavailable_route_metadata(resolution),
                     degradation_reason="intent_unavailable",
                     validation_passed=False,
                 ),
@@ -793,6 +795,23 @@ def _clarification_route_metadata(
             "origin_route": KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
         }
     return {"origin_route": KnowledgeRouteType.EXCEL_MULTI_AGGREGATE}
+
+
+def _unavailable_route_metadata(outcome: StructuredUnavailable) -> dict[str, object]:
+    return {
+        "dataset_id": outcome.dataset_id,
+        "target_fields": outcome.target_fields,
+        "candidate_source_ids": outcome.candidate_source_ids,
+        "origin_route": None if outcome.origin_route is None else KnowledgeRouteType(outcome.origin_route),
+    }
+
+
+def _route_for_parser_outcome(outcome: StructuredUnavailable) -> KnowledgeRouteType:
+    return (
+        KnowledgeRouteType(outcome.origin_route)
+        if outcome.origin_route is not None
+        else KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
+    )
 
 
 def _format_result(result: StructuredAggregateResult) -> str:
