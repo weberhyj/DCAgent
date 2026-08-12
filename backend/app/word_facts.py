@@ -439,11 +439,11 @@ def validate_word_fact_answer(
 
     if not isinstance(answer, str):
         return False
-    normalized_answer = normalize_fact_key(answer)
+    display_answer = unicodedata.normalize("NFKC", answer).casefold()
     for field, aliases in FACT_FIELD_ALIASES.items():
         if field == intent.field:
             continue
-        if any(_contains_fact_alias(normalized_answer, alias) for alias in aliases):
+        if any(_contains_fact_alias(display_answer, alias) for alias in aliases):
             return False
 
     selected = [
@@ -494,12 +494,12 @@ def unsafe_word_fact_answer(intent: WordFactualIntent) -> str:
     return f"无法安全返回{intent.entity}的{intent.field}，请核对来源数据。"
 
 
-def _contains_fact_alias(normalized_text: str, alias: str) -> bool:
-    normalized_alias = normalize_fact_key(alias)
+def _contains_fact_alias(display_text: str, alias: str) -> bool:
+    normalized_alias = unicodedata.normalize("NFKC", alias).casefold()
     if normalized_alias.isascii():
         pattern = rf"(?<![A-Za-z0-9_]){re.escape(normalized_alias)}(?![A-Za-z0-9_])"
-        return re.search(pattern, normalized_text) is not None
-    return normalized_alias in normalized_text
+        return re.search(pattern, display_text) is not None
+    return normalized_alias in display_text
 
 
 class WordFactRepository(Protocol):

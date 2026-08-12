@@ -10,11 +10,13 @@ from app.word_facts import (
     FACT_FIELD_ALIASES,
     KnowledgeFactModel,
     WordFactClarification,
+    WordFactMatch,
     WordFactualIntent,
     canonical_fact_field,
     fact_value_has_embedded_key_value,
     normalize_fact_key,
     resolve_word_factual_intent,
+    validate_word_fact_answer,
 )
 
 
@@ -64,6 +66,48 @@ class WordFactContractTests(unittest.TestCase):
         self.assertTrue(
             fact_value_has_embedded_key_value("28岁 性别：女", field="年龄")
         )
+
+    def test_answer_validation_preserves_ascii_token_boundaries(self) -> None:
+        intent = WordFactualIntent("张三", "张三", "职务", "职务")
+
+        def word_fact_match(value: str) -> WordFactMatch:
+            return WordFactMatch(
+                fact=KnowledgeFactModel.create(
+                    id=f"fact-{value}",
+                    source_id="kb-people",
+                    chunk_id="chunk-1",
+                    entity="张三",
+                    field="职务",
+                    value=value,
+                    confidence=0.98,
+                    locator={},
+                ),
+                source_name="people.docx",
+                classification="内部",
+            )
+
+        unsafe_value = "engineer age 28"
+        self.assertFalse(
+            validate_word_fact_answer(
+                intent,
+                [word_fact_match(unsafe_value)],
+                f"张三的职务是{unsafe_value}。",
+            )
+        )
+        for value in (
+            "高级工程师（方向：AI）",
+            "值班经理 08:30",
+            "https://example.com/page:1",
+            "message: queued",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(
+                    validate_word_fact_answer(
+                        intent,
+                        [word_fact_match(value)],
+                        f"张三的职务是{value}。",
+                    )
+                )
 
     def test_age_gender_and_job_aliases_share_plan_canonical_fields(self) -> None:
         cases = (
