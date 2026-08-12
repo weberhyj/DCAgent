@@ -96,7 +96,6 @@ class FailingStructuredFallbackDependencies:
     def __init__(self) -> None:
         self.word_calls = 0
         self.search_calls = 0
-        self.document_calls = 0
         self.agent_calls = 0
         self.llm_calls = 0
 
@@ -107,10 +106,6 @@ class FailingStructuredFallbackDependencies:
     def search(self, *_args: object, **_kwargs: object):
         self.search_calls += 1
         raise AssertionError("Excel clarification must not search documents")
-
-    def inspect_document(self, *_args: object, **_kwargs: object):
-        self.document_calls += 1
-        raise AssertionError("Excel clarification must not inspect documents")
 
     def generate_reply(self, *_args: object, **_kwargs: object) -> ChatMessageModel:
         self.llm_calls += 1
@@ -125,10 +120,7 @@ class FailingStructuredFallbackDependencies:
                 return super().run(**kwargs)
 
         return RecordingFailingAgent(
-            KnowledgeAgentTools(
-                search_knowledge=self.search,
-                inspect_document=self.inspect_document,
-            ),
+            KnowledgeAgentTools(search_knowledge=self.search),
             self,
         )
 
@@ -202,7 +194,6 @@ class KnowledgeAnswerRouterTests(unittest.TestCase):
         self.assertTrue(result.route_metadata.validation_passed)
         self.assertEqual(dependencies.word_calls, 0)
         self.assertEqual(dependencies.search_calls, 0)
-        self.assertEqual(dependencies.document_calls, 0)
         self.assertEqual(dependencies.agent_calls, 0)
         self.assertEqual(dependencies.llm_calls, 0)
 
@@ -245,7 +236,6 @@ class KnowledgeAnswerRouterTests(unittest.TestCase):
         self.assertTrue(result.route_metadata.validation_passed)
         self.assertEqual(dependencies.word_calls, 0)
         self.assertEqual(dependencies.search_calls, 0)
-        self.assertEqual(dependencies.document_calls, 0)
         self.assertEqual(dependencies.agent_calls, 0)
         self.assertEqual(dependencies.llm_calls, 0)
 

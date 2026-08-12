@@ -176,7 +176,7 @@ class RagAcceptanceTest(unittest.TestCase):
         self.assertGreater(audit_run["evidenceCount"], 0)
         tool_names = [step["toolName"] for step in audit_run["steps"]]
         self.assertIn("search_knowledge", tool_names)
-        self.assertIn("inspect_document", tool_names)
+        self.assertNotIn("inspect_document", tool_names)
         self.assertIn("compare_evidence", tool_names)
         self.assertIn("compose_answer", tool_names)
         self.assertTrue(all(step["readOnly"] for step in audit_run["steps"]))

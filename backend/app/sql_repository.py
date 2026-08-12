@@ -10,8 +10,13 @@ from sqlalchemy import and_, delete, func, select, text, update
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.sql.dml import Update
 
-from .agent import AgentRunAudit, AgentStep, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
-from .knowledge_router import KnowledgeAnswerRouter
+from .agent import (
+    AgentRunAudit,
+    AgentSearchResult,
+    AgentStep,
+    KnowledgeAgentTools,
+    ReadOnlyKnowledgeAgent,
+)
 from .database import (
     AgentRunRecord,
     AgentStepRecord,
@@ -51,6 +56,7 @@ from .evaluation import (
     normalized_unique,
 )
 from .evaluation_import import EvaluationImportRow
+from .knowledge_router import KnowledgeAnswerRouter
 from .llm import LLMProvider, TemplateLLMProvider
 from .models import (
     ArtifactModel,
@@ -507,7 +513,6 @@ class SqlChatRepository:
         self._agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
                 search_knowledge=self._search_routed_knowledge_chunks,
-                inspect_document=self.list_knowledge_chunks,
             ),
             llm_provider=self._llm_provider,
         )
@@ -1560,10 +1565,10 @@ class SqlChatRepository:
         *,
         evaluation_case_id: str | None = None,
         relevant_chunk_ids: tuple[str, ...] = (),
-    ) -> list[KnowledgeSearchHitModel]:
+    ) -> AgentSearchResult:
         if self.retrieval_router is None or self._retrieval_scope_provider is None:
-            return self.search_knowledge_chunks(query, limit)
-        from .retrieval_models import RetrievalRequest
+            return AgentSearchResult(hits=tuple(self.search_knowledge_chunks(query, limit)))
+        from .retrieval_models import EvidenceExpansionPolicy, RetrievalRequest
 
         resolution = self._retrieval_scope_provider.resolve()
         if resolution.scope is None:
@@ -1575,7 +1580,10 @@ class SqlChatRepository:
                 routing_key=routing_key,
                 fallback_reason=RetrievalFallbackReason.RETRIEVAL_SCOPE_UNAVAILABLE,
             )
-            return list(outcome.hits)
+            return AgentSearchResult(
+                hits=tuple(outcome.hits),
+                fallback_reason=outcome.fallback_reason,
+            )
         outcome = self.retrieval_router.search(
             RetrievalRequest(
                 query=query,
@@ -1584,9 +1592,13 @@ class SqlChatRepository:
                 scope=resolution.scope,
                 evaluation_case_id=evaluation_case_id,
                 relevant_chunk_ids=relevant_chunk_ids,
+                expansion_policy=EvidenceExpansionPolicy.BOUNDED_ADJACENCY,
             )
         )
-        return list(outcome.hits)
+        return AgentSearchResult(
+            hits=tuple(outcome.hits),
+            fallback_reason=outcome.fallback_reason,
+        )
 
     def _search_evaluation_case(
         self,
@@ -1601,13 +1613,14 @@ class SqlChatRepository:
                 minimum_score=minimum_score,
             )
         relevant_chunk_ids = self._evaluation_relevant_chunk_ids(case.expected_source_ids)
-        hits = self._search_routed_knowledge_chunks(
+        search_result = self._search_routed_knowledge_chunks(
             case.question,
             case.top_k,
             case.id,
             evaluation_case_id=case.id,
             relevant_chunk_ids=relevant_chunk_ids,
         )
+        hits = list(search_result.hits)
         if minimum_score is None:
             return hits
         threshold = resolve_effective_retrieval_min_score(minimum_score)

@@ -16,6 +16,11 @@ class RetrievalMode(StrEnum):
     QWEN3 = "qwen3"
 
 
+class EvidenceExpansionPolicy(StrEnum):
+    NONE = "none"
+    BOUNDED_ADJACENCY = "bounded_adjacency"
+
+
 @dataclass(frozen=True, slots=True)
 class RetrievalScope:
     knowledge_base_id: str
@@ -45,8 +50,11 @@ class RetrievalRequest:
     scope: RetrievalScope
     evaluation_case_id: str | None = None
     relevant_chunk_ids: tuple[str, ...] = ()
+    expansion_policy: EvidenceExpansionPolicy = EvidenceExpansionPolicy.BOUNDED_ADJACENCY
 
     def __post_init__(self) -> None:
+        if not isinstance(self.expansion_policy, EvidenceExpansionPolicy):
+            raise TypeError("expansion_policy must be an EvidenceExpansionPolicy")
         if self.evaluation_case_id is not None and (
             not isinstance(self.evaluation_case_id, str)
             or _IDENTIFIER_PATTERN.fullmatch(self.evaluation_case_id) is None

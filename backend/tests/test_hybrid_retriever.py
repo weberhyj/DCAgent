@@ -14,7 +14,12 @@ from app.hybrid_retriever import (
 )
 from app.models import knowledge_search_hit_from_candidate
 from app.reranker_client import RerankerBusy, RerankerResponseError, RerankerServiceError
-from app.retrieval_models import RetrievalCandidate, RetrievalRequest, RetrievalScope
+from app.retrieval_models import (
+    EvidenceExpansionPolicy,
+    RetrievalCandidate,
+    RetrievalRequest,
+    RetrievalScope,
+)
 from app.retrieval_publication import deterministic_point_id
 from app.retrieval_settings import RerankerModelSettings
 from app.sparse_embedding import SparseVector
@@ -63,7 +68,12 @@ def candidate(
     )
 
 
-def request(query: str = "policy", *, limit: int = 8) -> RetrievalRequest:
+def request(
+    query: str = "policy",
+    *,
+    limit: int = 8,
+    expansion_policy: EvidenceExpansionPolicy = EvidenceExpansionPolicy.BOUNDED_ADJACENCY,
+) -> RetrievalRequest:
     return RetrievalRequest(
         query=query,
         limit=limit,
@@ -73,6 +83,7 @@ def request(query: str = "policy", *, limit: int = 8) -> RetrievalRequest:
             permission_tags=("internal",),
             publication_version="v7",
         ),
+        expansion_policy=expansion_policy,
     )
 
 
@@ -408,6 +419,42 @@ class HybridRetrieverTest(unittest.TestCase):
         self.assertTrue(propagated)
         self.assertTrue(all(timeout is not None and 0 < timeout <= 5.0 for timeout in propagated))
 
+    def test_skips_adjacency_when_expansion_policy_is_none(self) -> None:
+        top = candidate("c2", next_chunk_id="c3")
+        retriever = self.addCleanupFor(
+            build_retriever(
+                dense=(top,),
+                sparse=(top,),
+                adjacent=(candidate("c3", chunk_index=3),),
+            )
+        )
+
+        outcome = retriever.retrieve(
+            request(expansion_policy=EvidenceExpansionPolicy.NONE)
+        )
+
+        self.assertEqual(retriever.gateway.retrieve_calls, [])
+        self.assertEqual(outcome.stage_ms["adjacency"], 0.0)
+        self.assertEqual(retriever.reranker.batch_sizes, [1])
+
+    def test_document_policy_runs_reranker_before_bounded_adjacency(self) -> None:
+        top = candidate("c2", next_chunk_id="c3")
+        retriever = self.addCleanupFor(
+            build_retriever(
+                dense=(top,),
+                sparse=(top,),
+                adjacent=(candidate("c3", chunk_index=3),),
+            )
+        )
+
+        outcome = retriever.retrieve(
+            request(expansion_policy=EvidenceExpansionPolicy.BOUNDED_ADJACENCY)
+        )
+
+        self.assertEqual(retriever.reranker.batch_sizes, [1])
+        self.assertEqual(len(retriever.gateway.retrieve_calls), 1)
+        self.assertGreaterEqual(len(outcome.candidates), 1)
+
     def test_rrf_only_skips_reranker_and_preserves_fused_order(self) -> None:
         reranker = RecordingReranker()
         retriever = self.addCleanupFor(
@@ -483,6 +530,7 @@ class HybridRetrieverTest(unittest.TestCase):
         self.assertEqual(reranker.batch_sizes, [24])
         self.assertEqual(len(outcome.candidates), 8)
         self.assertTrue(all(item.rerank_score is None for item in outcome.candidates))
+        self.assertEqual(outcome.fallback_reason, "reranker_service_error")
 
     def test_degrades_to_rrf_candidates_when_reranker_response_is_invalid(self) -> None:
         reranker = InvalidResponseReranker()

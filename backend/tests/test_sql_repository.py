@@ -16,7 +16,12 @@ from app.database import Database, KnowledgeFactRecord, KnowledgeSourceRecord
 from app.embedding_fingerprint import EmbeddingFingerprint
 from app.models import ChatMessageModel, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
-from app.retrieval_models import RetrievalMode, RetrievalRequest, RetrievalScope
+from app.retrieval_models import (
+    EvidenceExpansionPolicy,
+    RetrievalMode,
+    RetrievalRequest,
+    RetrievalScope,
+)
 from app.retrieval_router import (
     RetrievalFallbackReason,
     RetrievalRouter,
@@ -25,8 +30,8 @@ from app.retrieval_router import (
 from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.seed import build_seed_state
 from app.sql_repository import SqlChatRepository
-from app.word_facts import KnowledgeFactModel, WordFactualIntent, normalize_fact_key
 from app.word_fact_answer import WordFactAnswerService
+from app.word_facts import KnowledgeFactModel, WordFactualIntent, normalize_fact_key
 
 TEST_EMBEDDING_FINGERPRINT = EmbeddingFingerprint(
     model_name="qwen2.5:0.5b",
@@ -1022,7 +1027,6 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertIsInstance(sql.search_knowledge_chunks("policy"), list)
 
     def test_repository_word_facts_require_explicit_service_configuration(self) -> None:
-        intent = WordFactualIntent("张三", "张三", "年龄", "年龄")
         fact = KnowledgeFactModel.create(
             id="fact-1", source_id="kb-people", chunk_id="chunk-1", entity="张三",
             field="年龄", value="28岁", confidence=1.0, locator={}
@@ -1114,7 +1118,14 @@ class SqlRepositoryTest(unittest.TestCase):
             [item.scope.publication_version for item in router.requests],
             ["v1", "v2"],
         )
-        self.assertEqual(fallback, [])
+        self.assertTrue(
+            all(
+                item.expansion_policy is EvidenceExpansionPolicy.BOUNDED_ADJACENCY
+                for item in router.requests
+            )
+        )
+        self.assertEqual(fallback.hits, ())
+        self.assertEqual(fallback.fallback_reason, "retrieval_scope_unavailable")
         self.assertEqual(
             router.fallbacks,
             [
@@ -1239,7 +1250,8 @@ class SqlRepositoryTest(unittest.TestCase):
             loguru_logger.remove(record_sink)
             loguru_logger.remove(rendered_sink)
 
-        self.assertEqual(actual, expected)
+        self.assertEqual(list(actual.hits), expected)
+        self.assertEqual(actual.fallback_reason, "retrieval_scope_unavailable")
         routed_search.assert_not_called()
         self.assertEqual(hybrid.calls, 0)
         completions = [record for record in records if record["message"] == "retrieval completed"]

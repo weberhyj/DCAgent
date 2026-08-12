@@ -657,6 +657,7 @@ class RetrievalRouter:
                     mode=RetrievalMode.QWEN3,
                     hits=tuple(qwen.hits),
                     stage_ms=dict(qwen.stage_ms),
+                    fallback_reason=qwen.fallback_reason,
                 ),
                 {"qwen": len(qwen.candidates), "legacy": 0},
             )
@@ -676,6 +677,7 @@ class RetrievalRouter:
                 mode=RetrievalMode.QWEN3,
                 hits=(),
                 stage_ms=dict(qwen.stage_ms),
+                fallback_reason=qwen.fallback_reason,
             ),
             {"qwen": len(qwen.candidates), "legacy": 0},
         )
