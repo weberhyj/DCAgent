@@ -22,6 +22,12 @@ def test_frontends_use_one_yarn_workspace_and_node_modules_linker() -> None:
     assert not (ROOT / "pnpm-lock.yaml").exists()
     assert not list(ROOT.glob("*/package-lock.json"))
 
+    for workspace_name in root_manifest["workspaces"]:
+        workspace_manifest = json.loads(
+            (ROOT / workspace_name / "package.json").read_text(encoding="utf-8")
+        )
+        assert workspace_manifest["devDependencies"]["@vue/compiler-dom"] == "^3.5.13"
+
 
 def test_frontend_smoke_entrypoints_use_yarn_workspaces() -> None:
     commands = {

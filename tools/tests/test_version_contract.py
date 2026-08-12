@@ -23,18 +23,19 @@ def test_repository_versions_are_independently_valid() -> None:
     }
 
     root_manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-    assert re.fullmatch(r"pnpm@\d+\.\d+\.\d+", root_manifest["packageManager"])
+    assert root_manifest["packageManager"] == "yarn@4.9.2"
+    assert root_manifest["workspaces"] == ["frontend", "admin-frontend"]
 
-    workspace = (ROOT / "pnpm-workspace.yaml").read_text(encoding="utf-8")
-    lock = (ROOT / "pnpm-lock.yaml").read_text(encoding="utf-8")
+    lock = (ROOT / "yarn.lock").read_text(encoding="utf-8")
     for component in ("frontend", "admin-frontend"):
         manifest_version = json.loads(
             (ROOT / component / "package.json").read_text(encoding="utf-8")
         )["version"]
         assert re.fullmatch(r"\d+\.\d+\.\d+", manifest_version)
-        assert f"  - {component}" in workspace
-        assert f"  {component}:" in lock
+        assert f"dc-agent-{component}@workspace:{component}" in lock
         assert not (ROOT / component / "package-lock.json").exists()
+    assert not (ROOT / "pnpm-workspace.yaml").exists()
+    assert not (ROOT / "pnpm-lock.yaml").exists()
 
     backend_gitignore = (ROOT / "backend" / ".gitignore").read_text(encoding="utf-8")
     assert "*.swp" in backend_gitignore.splitlines()
