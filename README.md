@@ -11,7 +11,7 @@ python tools/bump_version.py admin-frontend patch
 cd backend && uv lock
 ```
 
-只执行本次涉及的应用命令；仅后端版本变化时才需要重新运行 `uv lock`。前端版本号不写入 pnpm 锁文件，因此单纯升级前端版本无需重新生成 `pnpm-lock.yaml`。需要发布新功能或不兼容变更时，分别使用 `minor`、`major`，也可以传入明确的 `X.Y.Z` 版本号。提交前运行 `uv run --project backend pytest tools/tests/test_version_contract.py -q` 检查各应用版本契约。
+只执行本次涉及的应用命令；仅后端版本变化时才需要重新运行 `uv lock`。前端版本号不写入 Yarn 锁文件，因此单纯升级前端版本无需重新生成 `yarn.lock`。需要发布新功能或不兼容变更时，分别使用 `minor`、`major`，也可以传入明确的 `X.Y.Z` 版本号。提交前运行 `uv run --project backend pytest tools/tests/test_version_contract.py -q` 检查各应用版本契约。
 
 DC-Agent 是一个公司内部只读知识 Agent。管理员把制度、合同、会议纪要、经营数据等资料上传到知识库后，DCAgent 会围绕用户问题执行有界的多步检索、资料深挖和证据对比，再基于已索引资料生成回答。
 
@@ -27,18 +27,18 @@ DC-Agent 是一个公司内部只读知识 Agent。管理员把制度、合同�
 
 - Python 3.12.x（不支持 3.13）
 - Node.js 20.19 或更高版本
-- pnpm 11.16.0（通过根目录 `packageManager` 固定）
+- Yarn 4.9.2（通过根目录 `packageManager` 和 `.yarnrc.yml` 固定）
 - PostgreSQL，本地默认库名为 `dc_agent`
 
-两个前端由根目录 pnpm workspace 统一管理。首次安装依赖和常用命令：
+两个前端由根目录 Yarn workspace 统一管理。首次安装依赖和常用命令：
 
 ```bash
 corepack enable
-pnpm install --frozen-lockfile
-pnpm dev:frontend
-pnpm dev:admin
-pnpm build
-pnpm test
+corepack yarn install --immutable
+corepack yarn dev:frontend
+corepack yarn dev:admin
+corepack yarn build
+corepack yarn test
 ```
 
 后端默认数据库连接：
@@ -444,7 +444,7 @@ Phase 6；在这些门禁完成前，反向代理和网络 ACL 不能替代应�
 
 1. 一台符合运行手册要求的 Linux 主机、rootful Docker 和 Compose v2。
 2. 已审核并预置的内部基础镜像、Python wheelhouse、解析/Sparse artifact 和镜像 digest。
-   两个前端还需要预构建静态产物，或可用的 pnpm 离线 store/公司内部 npm 源；仓库本身不包含
+   两个前端还需要预构建静态产物，或可用的 Yarn 离线 cache/公司内部 npm 源；仓库本身不包含
    所有运行所需 artifact。
 3. PostgreSQL、ClickHouse、Qdrant、Redis、ClamAV、Embedding Service 和 Reranker Service
    所需的数据目录、权限、校验和和 Secret 文件；Embedding/Reranker 权重由公司内网 Ollama

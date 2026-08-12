@@ -79,7 +79,7 @@ export HOST_MODEL_ROOT=/absolute/model/root
 ## 1. 当前状态与适用范围
 
 - 目标环境是 Ubuntu 20.04、Bash、rootful Docker Engine、Docker Compose v2、本地 `default` Docker context。
-- Python 3.12 是支持的基线；Node.js 20.19+ 与 pnpm 11.16.0 用于两个前端的本地开发和 UI smoke。
+- Python 3.12 是支持的基线；Node.js 20.19+ 与 Yarn 4.9.2 用于两个前端的本地开发和 UI smoke。
 - 本阶段启动 API、PostgreSQL、schema migration、ClickHouse、Qdrant、Redis、ClamAV 和一个私有 Embedding 服务。`indexing` 与 `generation` profile 默认关闭。
 - 生产 Compose 的唯一宿主端口是 `127.0.0.1:8000:8000/tcp`。内部服务只能通过 Compose 网络和 `exec` 检查访问。
 - 当前开发机没有 Docker，也没有目标 Linux 的内部 wheelhouse、模型和镜像，因此本机只能运行单元测试，不能提供真实 Compose smoke、镜像构建或容量结果。

@@ -27,6 +27,8 @@ def test_frontends_use_one_yarn_workspace_and_node_modules_linker() -> None:
             (ROOT / workspace_name / "package.json").read_text(encoding="utf-8")
         )
         assert workspace_manifest["devDependencies"]["@vue/compiler-dom"] == "^3.5.13"
+    assert root_manifest["scripts"]["build"] == "yarn workspaces foreach --all run build"
+    assert root_manifest["scripts"]["test"] == "yarn workspaces foreach --all run test:run"
 
 
 def test_frontend_smoke_entrypoints_use_yarn_workspaces() -> None:
@@ -41,3 +43,18 @@ def test_frontend_smoke_entrypoints_use_yarn_workspaces() -> None:
         re.search(r"(?m)^\s*(?:npm|pnpm)(?:\.cmd)?\s", command) is None
         for command in commands.values()
     )
+
+
+def test_frontend_docs_use_yarn_commands() -> None:
+    documents = [
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+        (ROOT / "deploy" / "ubuntu" / "ADMIN_FRONTEND_SUBPATH.md").read_text(
+            encoding="utf-8"
+        ),
+        (ROOT / "docs" / "offline-platform-runbook.md").read_text(encoding="utf-8"),
+    ]
+    combined = "\n".join(documents)
+    assert "Yarn 4.9.2" in combined
+    assert "pnpm" not in combined
+    assert "yarn install --immutable" in combined
+    assert "yarn workspace dc-agent-admin-frontend build" in combined

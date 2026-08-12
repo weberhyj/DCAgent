@@ -8,14 +8,14 @@
 
 ```bash
 corepack enable
-pnpm install --frozen-lockfile
-VITE_ADMIN_BASE_PATH=/admin/ pnpm --filter dc-agent-admin-frontend build
+corepack yarn install --immutable
+VITE_ADMIN_BASE_PATH=/admin/ corepack yarn workspace dc-agent-admin-frontend build
 ```
 
 如果需要使用其他子路径，例如 `/operations/`：
 
 ```bash
-VITE_ADMIN_BASE_PATH=/operations/ pnpm --filter dc-agent-admin-frontend build
+VITE_ADMIN_BASE_PATH=/operations/ corepack yarn workspace dc-agent-admin-frontend build
 ```
 
 构建路径必须与 Nginx 的 `location` 完全一致。没有设置 `VITE_ADMIN_BASE_PATH` 时，默认值为 `/admin/`。

@@ -12,7 +12,7 @@
   "scripts": {
     "dev:frontend": "yarn workspace dc-agent-frontend dev",
     "dev:admin": "yarn workspace dc-agent-admin-frontend dev",
-    "build": "yarn workspaces foreach run build",
-    "test": "yarn workspaces foreach run test:run"
+    "build": "yarn workspaces foreach --all run build",
+    "test": "yarn workspaces foreach --all run test:run"
   }
 }
