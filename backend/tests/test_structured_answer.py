@@ -35,7 +35,7 @@ from app.knowledge_route_models import KnowledgeRouteType
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
-from app.structured_models import StructuredClarification
+from app.structured_models import StructuredClarification, StructuredUnavailable
 from app.structured_query import UnsafeStructuredQueryError
 from app.structured_repository import StructuredRepository
 from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
@@ -961,6 +961,22 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         assert result is not None
         self.assertEqual(len(result.route_metadata.target_fields), 32)
         self.assertEqual(result.route_metadata.target_fields[:3], ("销售额", "成本", "利润"))
+        result.route_metadata.to_dict()
+
+    def test_unavailable_multi_metrics_preserves_known_display_fields(self) -> None:
+        service = StructuredAnswerService(lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway())
+        with patch("app.structured_answer.resolve_structured_intent", return_value=StructuredUnavailable(
+            "unavailable", "ds-sales", ("销售额", "成本", "利润"), ("kb-sales",), "excel_multi_aggregate"
+        )):
+            result = service.try_answer("conv-1", "地区为华东的销售额、成本、利润汇总", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertEqual(result.route_metadata.degradation_reason, "intent_unavailable")
         result.route_metadata.to_dict()
 
     def test_single_field_clarification_records_filtered_origin(self) -> None:

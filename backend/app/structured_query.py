@@ -565,7 +565,7 @@ def resolve_structured_intent(
 ) -> StructuredIntentResolution:
     dataset_result = _parse_dataset_clause(question, catalog)
     if dataset_result.issue is not None:
-        return dataset_result.issue
+        return _with_dataset_issue_context(question, catalog, dataset_result.issue)
     assert dataset_result.value is not None
     dataset = dataset_result.value
 
@@ -621,7 +621,12 @@ def resolve_structured_intent(
         if _DATE_RANGE_RE.search(remaining) or re.search(
             r"大于|不少于|小于|不超过|为|=", remaining
         ):
-            return _with_route_context(StructuredUnavailable("结构化查询包含未识别的筛选条件"), dataset, origin_route="excel_filtered_aggregate")
+            return _with_route_context(
+                StructuredUnavailable("结构化查询包含未识别的筛选条件"),
+                dataset,
+                origin_route=("excel_multi_aggregate" if len(metrics) > 1 else "excel_filtered_aggregate"),
+                target_fields=tuple(column.display_name for column in metrics),
+            )
         if len(metrics) == 1:
             return StructuredIntent(
                 dataset_id=dataset.schema.dataset_id,
@@ -677,7 +682,13 @@ def resolve_structured_intent(
             if column.allow_aggregate and column.data_type in _NUMERIC_TYPES
         )
         if not implicit_columns:
-            return StructuredUnavailable("没有可汇总的已授权数值列")
+            return StructuredUnavailable(
+                "没有可汇总的已授权数值列",
+                dataset.schema.dataset_id,
+                (),
+                (dataset.schema.source_id,),
+                "excel_multi_aggregate",
+            )
         capped_columns = implicit_columns[:MAX_STRUCTURED_ROUTE_FIELDS]
         if len(implicit_columns) > implicit_summary_max_metrics:
             return StructuredClarification(
@@ -744,6 +755,7 @@ def _with_route_context(
     dataset: StructuredDatasetCatalog,
     *,
     origin_route: str,
+    target_fields: tuple[str, ...] = (),
 ) -> StructuredClarification | StructuredUnavailable:
     candidates = issue.candidates if isinstance(issue, StructuredClarification) else ()
     fields = tuple(
@@ -757,12 +769,35 @@ def _with_route_context(
         )
         for candidate in candidates
     )
+    fields = target_fields or fields
     if isinstance(issue, StructuredClarification):
         return StructuredClarification(issue.message, issue.candidates, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route)
     return StructuredUnavailable(issue.message, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route)
 
 
 _with_clarification_context = _with_route_context
+
+
+def _with_dataset_issue_context(
+    question: str,
+    catalog: StructuredCatalog,
+    issue: StructuredClarification | StructuredUnavailable,
+) -> StructuredClarification | StructuredUnavailable:
+    candidates = issue.candidates if isinstance(issue, StructuredClarification) else ()
+    datasets = tuple(
+        dataset for dataset in catalog.datasets if dataset.schema.dataset_id in candidates
+    )
+    source_ids = tuple(dataset.schema.source_id for dataset in datasets[:MAX_STRUCTURED_ROUTE_FIELDS])
+    is_multi = any(word in _normalize(question) for word in _SUMMARY_WORDS) or "、" in question
+    origin_route = "excel_multi_aggregate" if is_multi else "excel_filtered_aggregate"
+    if isinstance(issue, StructuredClarification):
+        return StructuredClarification(
+            issue.message,
+            issue.candidates[:MAX_STRUCTURED_ROUTE_FIELDS],
+            candidate_source_ids=source_ids,
+            origin_route=origin_route,
+        )
+    return StructuredUnavailable(issue.message, origin_route=origin_route)
 
 
 def _parse_metric_list(
