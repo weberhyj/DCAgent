@@ -666,7 +666,12 @@ def resolve_structured_intent(
         if _DATE_RANGE_RE.search(remaining) or re.search(
             r"大于|不少于|小于|不超过|为|=", remaining
         ):
-            return _with_route_context(StructuredUnavailable("结构化查询包含未识别的筛选条件"), dataset, origin_route="excel_filtered_aggregate")
+            return _with_route_context(
+                StructuredUnavailable("结构化查询包含未识别的筛选条件"),
+                dataset,
+                origin_route="excel_filtered_aggregate",
+                target_fields=(() if metric is None else (metric.display_name,)),
+            )
 
         return StructuredIntent(
             dataset_id=dataset.schema.dataset_id,

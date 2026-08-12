@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from app.agent import AgentRunResult, AgentStep
+from app.agent import (
+    AgentRunResult,
+    AgentStep,
+    KnowledgeAgentTools,
+    ReadOnlyKnowledgeAgent,
+)
 from app.knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from app.knowledge_router import (
     KnowledgeAnswerRouter,
@@ -10,6 +15,8 @@ from app.knowledge_router import (
     classify_document_route,
 )
 from app.models import ChatMessageModel, ResponseParagraphModel
+from app.structured_answer import StructuredAnswerService
+from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
 
 
 def run_result(
@@ -85,6 +92,47 @@ class RecordingWordFacts:
         return self._result
 
 
+class FailingStructuredFallbackDependencies:
+    def __init__(self) -> None:
+        self.word_calls = 0
+        self.search_calls = 0
+        self.document_calls = 0
+        self.agent_calls = 0
+        self.llm_calls = 0
+
+    def try_answer(self, *_args: object, **_kwargs: object) -> AgentRunResult | None:
+        self.word_calls += 1
+        raise AssertionError("Excel clarification must not fall through to Word")
+
+    def search(self, *_args: object, **_kwargs: object):
+        self.search_calls += 1
+        raise AssertionError("Excel clarification must not search documents")
+
+    def inspect_document(self, *_args: object, **_kwargs: object):
+        self.document_calls += 1
+        raise AssertionError("Excel clarification must not inspect documents")
+
+    def generate_reply(self, *_args: object, **_kwargs: object) -> ChatMessageModel:
+        self.llm_calls += 1
+        raise AssertionError("Excel clarification must not call the LLM")
+
+    def agent(self) -> ReadOnlyKnowledgeAgent:
+        dependencies = self
+
+        class RecordingFailingAgent(ReadOnlyKnowledgeAgent):
+            def run(self, **kwargs: object) -> AgentRunResult:
+                dependencies.agent_calls += 1
+                return super().run(**kwargs)
+
+        return RecordingFailingAgent(
+            KnowledgeAgentTools(
+                search_knowledge=self.search,
+                inspect_document=self.inspect_document,
+            ),
+            self,
+        )
+
+
 def excel_unavailable_run() -> AgentRunResult:
     return run_result(
         route_type=KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE,
@@ -131,6 +179,75 @@ class KnowledgeAnswerRouterTests(unittest.TestCase):
 
         self.assertEqual(result.route_metadata.degradation_reason, "clickhouse_unavailable")
         self.assertEqual(self.calls, ["greeting", "excel"])
+
+    def test_real_single_excel_clarification_is_terminal_across_services(self) -> None:
+        dependencies = FailingStructuredFallbackDependencies()
+        result = KnowledgeAnswerRouter(
+            agent=dependencies.agent(),
+            structured_service=StructuredAnswerService(
+                lambda: sample_catalog(ambiguous=True),
+                object(),
+            ),
+            word_fact_service=dependencies,
+        ).answer("conv-1", "平均金额", "deep", [])
+
+        self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertEqual(
+            result.route_metadata.origin_route,
+            KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE,
+        )
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("净金额", "订单金额"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertTrue(result.route_metadata.validation_passed)
+        self.assertEqual(dependencies.word_calls, 0)
+        self.assertEqual(dependencies.search_calls, 0)
+        self.assertEqual(dependencies.document_calls, 0)
+        self.assertEqual(dependencies.agent_calls, 0)
+        self.assertEqual(dependencies.llm_calls, 0)
+
+    def test_real_multi_excel_clarification_is_terminal_across_services(self) -> None:
+        dependencies = FailingStructuredFallbackDependencies()
+        result = KnowledgeAnswerRouter(
+            agent=dependencies.agent(),
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(metric_count=13),
+                object(),
+            ),
+            word_fact_service=dependencies,
+        ).answer("conv-1", "汇总", "deep", [])
+
+        self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertEqual(
+            result.route_metadata.origin_route,
+            KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+        )
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(
+            result.route_metadata.target_fields,
+            (
+                "销售额",
+                "成本",
+                "利润",
+                "指标04",
+                "指标05",
+                "指标06",
+                "指标07",
+                "指标08",
+                "指标09",
+                "指标10",
+                "指标11",
+                "指标12",
+                "指标13",
+            ),
+        )
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertTrue(result.route_metadata.validation_passed)
+        self.assertEqual(dependencies.word_calls, 0)
+        self.assertEqual(dependencies.search_calls, 0)
+        self.assertEqual(dependencies.document_calls, 0)
+        self.assertEqual(dependencies.agent_calls, 0)
+        self.assertEqual(dependencies.llm_calls, 0)
 
     def test_word_not_found_is_terminal_and_never_calls_document_agent(self) -> None:
         result = self.router(word_result=word_not_found_run()).answer(

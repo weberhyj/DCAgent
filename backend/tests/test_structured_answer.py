@@ -979,6 +979,37 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(result.route_metadata.degradation_reason, "intent_unavailable")
         result.route_metadata.to_dict()
 
+    def test_unavailable_inferred_single_metric_preserves_known_display_field(self) -> None:
+        from app import structured_query
+
+        parse_filter_clause = structured_query._parse_filter_clause
+
+        def parse_supported_filter_prefix(_question, columns, excluded_spans):
+            return parse_filter_clause("订单金额大于100的总和", columns, excluded_spans)
+
+        with patch.object(
+            structured_query,
+            "_parse_filter_clause",
+            side_effect=parse_supported_filter_prefix,
+        ):
+            result = StructuredAnswerService(
+                lambda: sample_catalog(), RecordingClickHouseGateway()
+            ).try_answer(
+                "conv-1",
+                "订单金额大于100的总和为华东",
+                "quick",
+                [],
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("订单金额",))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertEqual(result.route_metadata.degradation_reason, "intent_unavailable")
+        result.route_metadata.to_dict()
+
     def test_single_field_clarification_records_filtered_origin(self) -> None:
         catalog = sample_catalog()
         with patch(
