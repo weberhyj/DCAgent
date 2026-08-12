@@ -150,6 +150,19 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["access-control-allow-origin"], "http://127.0.0.1:5174")
 
+    def test_agent_audit_api_exposes_bounded_route_fields(self) -> None:
+        _, conversation_id, _ = self.repository.create_conversation()
+        self.repository.send_message(conversation_id, "你好", "quick")
+
+        response = self.client.get("/api/admin/agent/runs")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()[0]
+        self.assertEqual(payload["routeType"], "greeting")
+        self.assertTrue(payload["routeMetadata"]["validation_passed"])
+        self.assertNotIn("chunkText", payload["routeMetadata"])
+        self.assertNotIn("password", str(payload).casefold())
+
     def test_creates_empty_conversation_and_saves_first_exchange(self) -> None:
         create_response = self.client.post("/api/conversations")
 

@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.agent import GREETING_REPLY, AgentRunResult
 from app.database import Database, KnowledgeFactRecord, KnowledgeSourceRecord
 from app.embedding_fingerprint import EmbeddingFingerprint
+from app.knowledge_route_models import KnowledgeRouteType
 from app.models import ChatMessageModel, KnowledgeChunkModel
 from app.repository import InMemoryChatRepository
 from app.retrieval_models import (
@@ -558,6 +559,25 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertTrue(all(step.read_only for step in runs[0].steps))
         self.assertIn("search_knowledge", [step.tool_name for step in runs[0].steps])
         self.assertIn("compose_answer", [step.tool_name for step in runs[0].steps])
+
+    def test_sql_agent_run_round_trips_route_audit(self) -> None:
+        self._add_fact_source(
+            self.repository,
+            source_id="kb-route-audit",
+            source_name="route-audit.docx",
+        )
+        self.repository.configure_answer_services(
+            word_fact_service=WordFactAnswerService(self.repository)
+        )
+        _, conversation_id, _ = self.repository.create_conversation()
+
+        self.repository.send_message(conversation_id, "张三几岁", "quick")
+
+        run = self.repository.list_agent_runs(1)[0]
+        self.assertEqual(run.route_type, KnowledgeRouteType.WORD_FACTUAL)
+        self.assertEqual(run.route_metadata.entity, "张三")
+        self.assertEqual(run.route_metadata.target_fields, ("年龄",))
+        self.assertTrue(run.route_metadata.validation_passed)
 
     def test_adds_knowledge_source(self) -> None:
         sources = self.repository.add_knowledge_source("董事会纪要.pdf", "PDF", "内部·机密")

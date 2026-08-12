@@ -17,6 +17,7 @@ from .agent import (
     KnowledgeAgentTools,
     ReadOnlyKnowledgeAgent,
 )
+from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .database import (
     AgentRunRecord,
     AgentStepRecord,
@@ -341,6 +342,8 @@ def agent_run_from_record(record: AgentRunRecord) -> AgentRunAudit:
         evidence_count=record.evidence_count,
         source_count=record.source_count,
         steps=[agent_step_from_record(step) for step in record.steps],
+        route_type=KnowledgeRouteType(record.route_type),
+        route_metadata=KnowledgeRouteMetadata.from_dict(record.route_metadata),
     )
 
 
@@ -1680,6 +1683,8 @@ class SqlChatRepository:
             answer_message_id=run.answer_message_id,
             evidence_count=run.evidence_count,
             source_count=run.source_count,
+            route_type=run.route_type.value,
+            route_metadata=run.route_metadata.to_dict(),
         )
         record.steps = [
             AgentStepRecord(
