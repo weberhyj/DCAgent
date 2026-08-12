@@ -1,5 +1,10 @@
 node_modules/
 .pnpm-store/
+.yarn/install-state.gz
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/patches/
 .worktrees/
 dist/
 .vite/
