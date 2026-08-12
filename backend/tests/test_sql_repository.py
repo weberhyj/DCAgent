@@ -26,6 +26,7 @@ from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.seed import build_seed_state
 from app.sql_repository import SqlChatRepository
 from app.word_facts import KnowledgeFactModel, WordFactualIntent, normalize_fact_key
+from app.word_fact_answer import WordFactAnswerService
 
 TEST_EMBEDDING_FINGERPRINT = EmbeddingFingerprint(
     model_name="qwen2.5:0.5b",
@@ -1019,6 +1020,29 @@ class SqlRepositoryTest(unittest.TestCase):
         self.assertIsNone(sql.retrieval_router)
         self.assertIsInstance(memory.search_knowledge_chunks("policy"), list)
         self.assertIsInstance(sql.search_knowledge_chunks("policy"), list)
+
+    def test_repository_word_facts_require_explicit_service_configuration(self) -> None:
+        intent = WordFactualIntent("张三", "张三", "年龄", "年龄")
+        fact = KnowledgeFactModel.create(
+            id="fact-1", source_id="kb-people", chunk_id="chunk-1", entity="张三",
+            field="年龄", value="28岁", confidence=1.0, locator={}
+        )
+        memory = InMemoryChatRepository(build_seed_state())
+        _, memory_conversation, _ = memory.create_conversation()
+        _, _, default_messages = memory.send_message(memory_conversation, "张三几岁", "quick")
+        self.assertNotEqual(default_messages[-1].paragraphs[0].text, "张三的年龄是28岁。")
+
+        class Facts:
+            def find_knowledge_facts(self, received, *, permission_tags=()):
+                del received, permission_tags
+                from app.word_facts import WordFactMatch
+                return [WordFactMatch(fact, "people", "internal")]
+
+        enabled = InMemoryChatRepository(build_seed_state())
+        enabled.configure_answer_services(word_fact_service=WordFactAnswerService(Facts()))
+        _, enabled_conversation, _ = enabled.create_conversation()
+        _, _, enabled_messages = enabled.send_message(enabled_conversation, "张三几岁", "quick")
+        self.assertEqual(enabled_messages[-1].paragraphs[0].text, "张三的年龄是28岁。")
 
     def test_sql_repository_allows_one_startup_retrieval_configuration(self) -> None:
         repository = SqlChatRepository(self.database)

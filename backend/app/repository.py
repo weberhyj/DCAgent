@@ -498,10 +498,6 @@ class InMemoryChatRepository:
             ),
             llm_provider=self._llm_provider,
         )
-        if word_fact_service is None:
-            from .word_fact_answer import WordFactAnswerService
-
-            word_fact_service = WordFactAnswerService(self)
         self._word_fact_service = word_fact_service
         self._answer_router = KnowledgeAnswerRouter(
             self._agent,

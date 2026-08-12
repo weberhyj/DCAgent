@@ -186,6 +186,8 @@ class WordFactAnswerService:
                 resolution.message,
                 route_type=KnowledgeRouteType.CLARIFICATION,
                 route_metadata=KnowledgeRouteMetadata(
+                    entity=resolution.entity,
+                    target_fields=resolution.target_fields,
                     origin_route=KnowledgeRouteType.WORD_FACTUAL,
                     validation_passed=True,
                 ),

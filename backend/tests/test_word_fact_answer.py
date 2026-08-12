@@ -183,6 +183,18 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         self.assertEqual(result.reply.paragraphs[0].text, "未找到张三的年龄。")
         self.assertEqual(result.evidence_count, 0)
 
+    def test_multiple_field_clarification_records_known_entity_and_candidates(self) -> None:
+        result = WordFactAnswerService(FakeFacts([])).try_answer(
+            "conv-1", "张三的年龄和性别是什么", "quick", []
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertEqual(result.route_metadata.entity, "张三")
+        self.assertEqual(result.route_metadata.target_fields, ("年龄", "性别"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ())
+
     def test_duplicate_records_in_one_source_use_one_value_and_citation(self) -> None:
         service = WordFactAnswerService(
             FakeFacts(

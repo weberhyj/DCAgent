@@ -208,6 +208,7 @@ def create_default_repository(
         structured_service=structured_service,
         owns_database=True,
     )
+    repository.configure_answer_services(word_fact_service=WordFactAnswerService(repository))
     return repository
 
 
@@ -417,6 +418,12 @@ def create_production_app(
                     llm_provider=llm_provider,  # type: ignore[arg-type]
                     structured_service=structured_service,
                     retrieval_permission_tags=retrieval_settings.permission_tags,
+                )
+                repository.configure_answer_services(  # type: ignore[attr-defined]
+                    word_fact_service=WordFactAnswerService(
+                        repository,
+                        permission_tags=retrieval_settings.permission_tags,
+                    )
                 )
             else:
                 repository = repository_factory()

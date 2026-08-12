@@ -171,6 +171,10 @@ class StructuredMultiAggregateIntent:
 class StructuredClarification:
     message: str
     candidates: tuple[str, ...]
+    dataset_id: str | None = None
+    target_fields: tuple[str, ...] = ()
+    candidate_source_ids: tuple[str, ...] = ()
+    origin_route: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

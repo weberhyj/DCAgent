@@ -606,7 +606,11 @@ def resolve_structured_intent(
         consumed,
     )
     if metric_list_result.issue is not None:
-        return metric_list_result.issue
+        return _with_clarification_context(
+            metric_list_result.issue,
+            dataset,
+            origin_route="excel_filtered_aggregate",
+        )
     assert metric_list_result.value is not None
     metrics = metric_list_result.value
 
@@ -644,7 +648,11 @@ def resolve_structured_intent(
             consumed,
         )
         if metric_result.issue is not None:
-            return metric_result.issue
+            return _with_clarification_context(
+                metric_result.issue,
+                dataset,
+                origin_route="excel_filtered_aggregate",
+            )
         metric = metric_result.value
 
         consumed = (*consumed, *metric_result.consumed_spans)
@@ -673,6 +681,10 @@ def resolve_structured_intent(
             return StructuredClarification(
                 f"可汇总指标超过上限，最多可汇总 {implicit_summary_max_metrics} 个指标，请选择",
                 tuple(column.display_name for column in implicit_columns),
+                dataset_id=dataset.schema.dataset_id,
+                target_fields=tuple(column.display_name for column in implicit_columns),
+                candidate_source_ids=(dataset.schema.source_id,),
+                origin_route="excel_multi_aggregate",
             )
         return StructuredMultiAggregateIntent(
             dataset_id=dataset.schema.dataset_id,
@@ -717,6 +729,41 @@ def _parse_aggregate_clause(
         if allow_missing:
             return _ClauseParseResult()
         return _ClauseParseResult(issue=StructuredUnavailable("未识别到受支持的聚合意图"))
+    aggregate = next(iter(matches))
+    return _ClauseParseResult(
+        value=aggregate,
+        consumed_spans=_merge_spans(matches[aggregate]),
+        count_all_hint=count_all_hint,
+    )
+
+
+def _with_clarification_context(
+    issue: StructuredClarification | StructuredUnavailable,
+    dataset: StructuredDatasetCatalog,
+    *,
+    origin_route: str,
+) -> StructuredClarification | StructuredUnavailable:
+    if not isinstance(issue, StructuredClarification):
+        return issue
+    fields = tuple(
+        next(
+            (
+                column.display_name
+                for column in dataset.schema.columns
+                if column.physical_name == candidate
+            ),
+            candidate,
+        )
+        for candidate in issue.candidates
+    )
+    return StructuredClarification(
+        issue.message,
+        issue.candidates,
+        dataset_id=dataset.schema.dataset_id,
+        target_fields=fields,
+        candidate_source_ids=(dataset.schema.source_id,),
+        origin_route=origin_route,
+    )
     aggregate = next(iter(matches))
     return _ClauseParseResult(
         value=aggregate,

@@ -768,6 +768,13 @@ def _clarification_route_metadata(
     catalog: StructuredCatalog,
     clarification: StructuredClarification,
 ) -> dict[str, object]:
+    if clarification.origin_route is not None:
+        return {
+            "dataset_id": clarification.dataset_id,
+            "target_fields": clarification.target_fields,
+            "candidate_source_ids": clarification.candidate_source_ids,
+            "origin_route": KnowledgeRouteType(clarification.origin_route),
+        }
     candidates = set(clarification.candidates)
     matches = [
         dataset

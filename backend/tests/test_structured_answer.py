@@ -35,6 +35,7 @@ from app.knowledge_route_models import KnowledgeRouteType
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
+from app.structured_models import StructuredClarification
 from app.structured_query import UnsafeStructuredQueryError
 from app.structured_repository import StructuredRepository
 from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
@@ -949,6 +950,30 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
         self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
         self.assertEqual(len(result.route_metadata.target_fields), 13)
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+
+    def test_single_field_clarification_records_filtered_origin(self) -> None:
+        catalog = sample_catalog()
+        with patch(
+            "app.structured_answer.resolve_structured_intent",
+            return_value=StructuredClarification(
+                "choose one",
+                ("订单金额",),
+                dataset_id="ds-sales",
+                target_fields=("订单金额",),
+                candidate_source_ids=("kb-sales",),
+                origin_route="excel_filtered_aggregate",
+            ),
+        ):
+            result = StructuredAnswerService(lambda: catalog, RecordingClickHouseGateway()).try_answer(
+                "conv-1", "sales订单金额平均值", "quick", []
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
         self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
 
     def test_multi_plan_rejection_keeps_intended_route_metadata(self) -> None:

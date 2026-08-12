@@ -133,6 +133,8 @@ class WordFactualIntent:
 class WordFactClarification:
     message: str
     candidates: tuple[str, ...]
+    entity: str | None = None
+    target_fields: tuple[str, ...] = ()
 
 
 WordFactualResolution = WordFactualIntent | WordFactClarification | None
@@ -287,10 +289,19 @@ def resolve_word_factual_intent(question: str) -> WordFactualResolution:
         return None
     entity, fields = query_match
     if len(fields) != 1:
-        return WordFactClarification("一次只能查询一个事实字段，请选择", fields)
+        return WordFactClarification(
+            "一次只能查询一个事实字段，请选择",
+            fields,
+            entity=entity or None,
+            target_fields=fields,
+        )
     candidates = _entity_list_candidates(entity)
     if candidates is not None:
-        return WordFactClarification("一次只能查询一个实体，请选择", candidates)
+        return WordFactClarification(
+            "一次只能查询一个实体，请选择",
+            candidates,
+            target_fields=fields,
+        )
     if not entity:
         return WordFactClarification("请指定一个实体", ())
     field = fields[0]
