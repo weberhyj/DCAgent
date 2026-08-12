@@ -19,6 +19,7 @@ from .retrieval import (
     resolve_hybrid_evidence_limit,
 )
 from .retrieval_models import (
+    EvidenceExpansionPolicy,
     RetrievalCandidate,
     RetrievalMode,
     RetrievalRequest,
@@ -301,12 +302,13 @@ class HybridRetriever:
         self._require_time(deadline)
         stage_ms["rrf"] = _elapsed_ms(stage_started, self._monotonic())
 
+        fallback_reason: str | None = None
         if self.reranker is None:
             reranked = fused
             stage_ms["reranker"] = 0.0
         else:
             stage_started = self._monotonic()
-            reranked = self._rerank(
+            reranked, fallback_reason = self._rerank(
                 query,
                 fused,
                 deadline=deadline,
@@ -314,19 +316,23 @@ class HybridRetriever:
             )
             stage_ms["reranker"] = _elapsed_ms(stage_started, self._monotonic())
 
-        stage_started = self._monotonic()
         evidence_limit = resolve_hybrid_evidence_limit(
             requested_limit,
             final_top_k=self._final_top_k,
         )
-        evidence = self._expand_adjacency(
-            reranked[:evidence_limit],
-            scope=request.scope,
-            limit=evidence_limit,
-            deadline=deadline,
-            generation=generation,
-        )
-        stage_ms["adjacency"] = _elapsed_ms(stage_started, self._monotonic())
+        if request.expansion_policy is EvidenceExpansionPolicy.NONE:
+            evidence = tuple(reranked[:evidence_limit])
+            stage_ms["adjacency"] = 0.0
+        else:
+            stage_started = self._monotonic()
+            evidence = self._expand_adjacency(
+                reranked[:evidence_limit],
+                scope=request.scope,
+                limit=evidence_limit,
+                deadline=deadline,
+                generation=generation,
+            )
+            stage_ms["adjacency"] = _elapsed_ms(stage_started, self._monotonic())
         hits = tuple(
             knowledge_search_hit_from_candidate(item, rank=index)
             for index, item in enumerate(evidence, 1)
@@ -336,6 +342,7 @@ class HybridRetriever:
             candidates=evidence,
             hits=hits,
             stage_ms=stage_ms,
+            fallback_reason=fallback_reason,
         )
 
     def _embed_query(self, query: str, *, deadline: float | None = None) -> list[float]:
@@ -356,12 +363,12 @@ class HybridRetriever:
         *,
         deadline: float,
         generation: _ExecutorGeneration,
-    ) -> tuple[RetrievalCandidate, ...]:
+    ) -> tuple[tuple[RetrievalCandidate, ...], str | None]:
         if self.reranker is None or self._reranker_metadata is None:
             raise RuntimeError("reranker is disabled")
         candidates = tuple(fused[: self._rerank_top_k])
         if not candidates:
-            return ()
+            return (), None
         try:
             scores = self._run_one(
                 lambda: self.reranker.rerank(
@@ -386,10 +393,16 @@ class HybridRetriever:
                     deadline=deadline,
                     generation=generation,
                 )
-            except (RerankerBusy, RerankerResponseError, RerankerServiceError):
-                return candidates
-        except (RerankerResponseError, RerankerServiceError):
-            return candidates[: self._degraded_rerank_top_k]
+            except RerankerBusy:
+                return candidates, "reranker_busy"
+            except RerankerResponseError:
+                return candidates, "reranker_response_error"
+            except RerankerServiceError:
+                return candidates, "reranker_service_error"
+        except RerankerResponseError:
+            return candidates[: self._degraded_rerank_top_k], "reranker_response_error"
+        except RerankerServiceError:
+            return candidates[: self._degraded_rerank_top_k], "reranker_service_error"
         if len(scores) != len(candidates):
             raise ValueError("reranker returned an unexpected score count")
         scored: list[tuple[int, RetrievalCandidate]] = []
@@ -409,7 +422,7 @@ class HybridRetriever:
                 pair[1].chunk_id,
             )
         )
-        return tuple(item for _, item in scored)
+        return tuple(item for _, item in scored), None
 
     def _expand_adjacency(
         self,

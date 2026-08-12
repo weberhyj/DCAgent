@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import httpx
@@ -29,7 +30,11 @@ from app.models import (
     ResponseParagraphModel,
 )
 from app.repository import STATUS_INDEXED, InMemoryChatRepository
+from app.retrieval_models import RetrievalMode, RetrievalScope
+from app.retrieval_router import RoutedRetrievalOutcome
 from app.seed import build_seed_state
+from app.structured_answer import StructuredAnswerService
+from tests.support.structured_fakes import sample_multi_metric_catalog
 
 
 class RecordingLLMProvider:
@@ -191,6 +196,186 @@ class RecordingPhysocClient:
 
 
 class LLMProviderTest(unittest.TestCase):
+    def test_cold_catalog_failure_implicit_summary_never_reaches_retrieval_or_llm(
+        self,
+    ) -> None:
+        class RecordingRetrievalRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, _request: object) -> RoutedRetrievalOutcome:
+                self.calls += 1
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.LEGACY,
+                    hits=(),
+                    stage_ms={},
+                )
+
+        def failing_catalog():
+            raise RuntimeError("catalog down")
+
+        for question in ("汇总", "统计"):
+            with self.subTest(question=question):
+                rag_search = RecordingRetrievalRouter()
+                provider = RecordingLLMProvider()
+                repository = InMemoryChatRepository(
+                    ChatState(
+                        conversations=[],
+                        messages_by_conversation={},
+                        knowledge_sources=[],
+                    ),
+                    llm_provider=provider,
+                    structured_service=StructuredAnswerService(
+                        failing_catalog,
+                        object(),
+                    ),
+                    retrieval_router=rag_search,
+                    retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                _, _, messages = repository.send_message(conversation_id, question, "deep")
+
+                self.assertIn("结构化查询服务不可用", messages[-1].paragraphs[0].text)
+                self.assertEqual(rag_search.calls, 0)
+                self.assertIsNone(provider.request)
+
+    def test_implicit_summary_with_zero_or_multiple_publications_stays_structured(
+        self,
+    ) -> None:
+        class RecordingRetrievalRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, request: object) -> object:
+                self.calls += 1
+                raise AssertionError(f"implicit summary reached retrieval: {request}")
+
+        class NoQueryGateway:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def query(self, statement: str, parameters: object) -> object:
+                self.calls += 1
+                raise AssertionError(
+                    f"unresolved implicit summary reached ClickHouse: {statement} {parameters}"
+                )
+
+        base = sample_multi_metric_catalog()
+        first = base.datasets[0]
+        assert first.active_publication is not None
+        second_dataset_id = "ds-sales-2"
+        second = replace(
+            first,
+            schema=replace(
+                first.schema,
+                dataset_id=second_dataset_id,
+                source_id="kb-sales-2",
+                worksheet_name="明细2",
+            ),
+            source_name="sales-2.xlsx",
+            active_publication=replace(
+                first.active_publication,
+                publication_id="pub-sales-2",
+                dataset_id=second_dataset_id,
+                physical_table_name="structured_sales_2",
+            ),
+        )
+        cases = (
+            (
+                "zero",
+                replace(base, datasets=(replace(first, active_publication=None),)),
+                "没有已确认并发布的结构化数据集",
+            ),
+            (
+                "multiple",
+                replace(base, datasets=(first, second)),
+                "请指定要查询的数据集",
+            ),
+        )
+
+        for label, catalog, expected_message in cases:
+            with self.subTest(label=label):
+                rag_search = RecordingRetrievalRouter()
+                provider = RecordingLLMProvider()
+                gateway = NoQueryGateway()
+                structured_service = StructuredAnswerService(lambda: catalog, gateway)
+                structured_result = structured_service.try_answer(
+                    "conv-structured-regression",
+                    "汇总",
+                    "deep",
+                    [],
+                )
+                self.assertIsNotNone(structured_result)
+                repository = InMemoryChatRepository(
+                    ChatState(
+                        conversations=[],
+                        messages_by_conversation={},
+                        knowledge_sources=[],
+                    ),
+                    llm_provider=provider,
+                    structured_service=structured_service,
+                    retrieval_router=rag_search,
+                    retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+                )
+                _, conversation_id, _ = repository.create_conversation()
+
+                _, _, messages = repository.send_message(
+                    conversation_id,
+                    "汇总",
+                    "deep",
+                )
+
+                self.assertIn(expected_message, messages[-1].paragraphs[0].text)
+                self.assertEqual(rag_search.calls, 0)
+                self.assertIsNone(provider.request)
+                self.assertEqual(gateway.calls, 0)
+                runs = repository.list_agent_runs()
+                self.assertEqual(len(runs), 1)
+                self.assertEqual(runs[0].steps[0].tool_name, "query_structured_data")
+
+    def test_clickhouse_failure_after_excel_route_never_searches_word_documents(self) -> None:
+        class FailingClickHouseGateway:
+            def __init__(self) -> None:
+                self.queries: list[tuple[str, object]] = []
+
+            def query(self, statement: str, parameters: object) -> object:
+                self.queries.append((statement, parameters))
+                raise RuntimeError("clickhouse offline")
+
+        class RecordingRetrievalRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, request: object) -> object:
+                self.calls += 1
+                raise AssertionError(f"structured request reached retrieval: {request}")
+
+        gateway = FailingClickHouseGateway()
+        rag_search = RecordingRetrievalRouter()
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[]),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(), gateway
+            ),
+            retrieval_router=rag_search,
+            retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "地区为华东的销售额、成本汇总",
+            "deep",
+        )
+
+        self.assertIn("结构化查询服务不可用", messages[-1].paragraphs[0].text)
+        self.assertEqual(len(gateway.queries), 1)
+        self.assertEqual(rag_search.calls, 0)
+        self.assertIsNone(provider.request)
+
     def test_build_knowledge_context_exposes_only_numbered_chunk_text(self) -> None:
         context = build_knowledge_context([indexed_hit(score=8.75, rank=1)])
 

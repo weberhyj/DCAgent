@@ -10,7 +10,14 @@ from sqlalchemy import and_, delete, func, select, text, update
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.sql.dml import Update
 
-from .agent import AgentRunAudit, AgentStep, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
+from .agent import (
+    AgentRunAudit,
+    AgentSearchResult,
+    AgentStep,
+    KnowledgeAgentTools,
+    ReadOnlyKnowledgeAgent,
+)
+from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .database import (
     AgentRunRecord,
     AgentStepRecord,
@@ -22,6 +29,7 @@ from .database import (
     EvaluationImportBatchRecord,
     EvaluationRunRecord,
     KnowledgeChunkRecord,
+    KnowledgeFactRecord,
     KnowledgeSourceRecord,
     MessageRecord,
     RetrievalSourceIndexRecord,
@@ -49,6 +57,7 @@ from .evaluation import (
     normalized_unique,
 )
 from .evaluation_import import EvaluationImportRow
+from .knowledge_router import KnowledgeAnswerRouter, LegacyKnowledgeAnswerRouter
 from .llm import LLMProvider, TemplateLLMProvider
 from .models import (
     ArtifactModel,
@@ -84,12 +93,14 @@ from .repository import (
 )
 from .retrieval import is_reliable_knowledge_score, resolve_effective_retrieval_min_score
 from .retrieval_scope import StaticRetrievalScopeProvider
+from .word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
 
 if TYPE_CHECKING:
     from .retrieval_models import RetrievalScope
     from .retrieval_router import RetrievalRouter
     from .retrieval_scope import RetrievalScopeProvider
     from .structured_answer import StructuredAnswerService
+    from .word_fact_answer import WordFactAnswerService
 
 
 def _required_permission_tag(value: object) -> str:
@@ -259,6 +270,50 @@ def knowledge_chunk_from_record(record: KnowledgeChunkRecord) -> KnowledgeChunkM
     )
 
 
+def knowledge_fact_from_record(record: KnowledgeFactRecord) -> KnowledgeFactModel:
+    return KnowledgeFactModel(
+        id=record.id,
+        source_id=record.source_id,
+        chunk_id=record.chunk_id,
+        entity=record.entity,
+        entity_normalized=record.entity_normalized,
+        field=record.field,
+        field_normalized=record.field_normalized,
+        value=record.value,
+        confidence=record.confidence,
+        locator=dict(record.locator or {}),
+    )
+
+
+def knowledge_fact_to_record(fact: KnowledgeFactModel) -> KnowledgeFactRecord:
+    return KnowledgeFactRecord(
+        id=fact.id,
+        source_id=fact.source_id,
+        chunk_id=fact.chunk_id,
+        entity=fact.entity,
+        entity_normalized=fact.entity_normalized,
+        field=fact.field,
+        field_normalized=fact.field_normalized,
+        value=fact.value,
+        confidence=fact.confidence,
+        locator=dict(fact.locator),
+    )
+
+
+def validate_knowledge_facts(
+    source_id: str,
+    chunk_ids: set[str],
+    facts: Sequence[KnowledgeFactModel],
+) -> list[KnowledgeFactModel]:
+    fact_list = list(facts)
+    for fact in fact_list:
+        if fact.source_id != source_id:
+            raise ValueError("fact source_id must match the indexed source")
+        if fact.chunk_id not in chunk_ids:
+            raise ValueError("fact chunk_id must belong to the indexed source bundle")
+    return fact_list
+
+
 def agent_step_from_record(record: AgentStepRecord) -> AgentStep:
     return AgentStep(
         id=record.id,
@@ -287,6 +342,8 @@ def agent_run_from_record(record: AgentRunRecord) -> AgentRunAudit:
         evidence_count=record.evidence_count,
         source_count=record.source_count,
         steps=[agent_step_from_record(step) for step in record.steps],
+        route_type=KnowledgeRouteType(record.route_type),
+        route_metadata=KnowledgeRouteMetadata.from_dict(record.route_metadata),
     )
 
 
@@ -428,8 +485,11 @@ class SqlChatRepository:
         database: Database,
         llm_provider: LLMProvider | None = None,
         structured_service: StructuredAnswerService | None = None,
+        word_fact_service: WordFactAnswerService | None = None,
         *,
         owns_database: bool = False,
+        unified_knowledge_routing_enabled: bool = True,
+        word_factual_qa_enabled: bool = True,
         retrieval_permission_tags: Sequence[str] = (),
         retrieval_router: RetrievalRouter | None = None,
         retrieval_scope: RetrievalScope | None = None,
@@ -458,10 +518,13 @@ class SqlChatRepository:
         self._agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
                 search_knowledge=self._search_routed_knowledge_chunks,
-                inspect_document=self.list_knowledge_chunks,
             ),
             llm_provider=self._llm_provider,
         )
+        self._word_fact_service = word_fact_service
+        self._unified_knowledge_routing_enabled = unified_knowledge_routing_enabled
+        self._word_factual_qa_enabled = word_factual_qa_enabled
+        self._answer_router = self._build_answer_router()
 
     def close(self) -> None:
         with self._close_lock:
@@ -476,6 +539,50 @@ class SqlChatRepository:
         finally:
             if self._owns_database:
                 self._database.engine.dispose()
+
+    def configure_answer_services(
+        self,
+        *,
+        structured_service: StructuredAnswerService | None = None,
+        word_fact_service: WordFactAnswerService | None = None,
+    ) -> None:
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("repository is closed")
+            if structured_service is not None:
+                self._structured_service = structured_service
+            if word_fact_service is not None:
+                self._word_fact_service = word_fact_service
+            self._answer_router = self._build_answer_router()
+
+    def configure_knowledge_routing(
+        self,
+        *,
+        unified_enabled: bool,
+        word_factual_enabled: bool,
+    ) -> None:
+        if word_factual_enabled and not unified_enabled:
+            raise ValueError("Word factual QA requires unified knowledge routing")
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("repository is closed")
+            self._unified_knowledge_routing_enabled = unified_enabled
+            self._word_factual_qa_enabled = word_factual_enabled
+            self._answer_router = self._build_answer_router()
+
+    def _build_answer_router(self) -> KnowledgeAnswerRouter | LegacyKnowledgeAnswerRouter:
+        if not self._unified_knowledge_routing_enabled:
+            return LegacyKnowledgeAnswerRouter(
+                self._agent,
+                structured_service=self._structured_service,
+            )
+        return KnowledgeAnswerRouter(
+            self._agent,
+            structured_service=self._structured_service,
+            word_fact_service=(
+                self._word_fact_service if self._word_factual_qa_enabled else None
+            ),
+        )
 
     def configure_retrieval(
         self,
@@ -601,25 +708,12 @@ class SqlChatRepository:
             ).all()
             previous_messages = [message_from_record(record) for record in previous_records]
 
-        agent_result = self._agent.try_answer_greeting(
+        agent_result = self._answer_router.answer(
             conversation_id=conversation_id,
             content=clean_content,
             mode=mode,
+            previous_messages=previous_messages,
         )
-        if agent_result is None and self._structured_service is not None:
-            agent_result = self._structured_service.try_answer(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
-        if agent_result is None:
-            agent_result = self._agent.run(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
         user_message = ChatMessageModel(
             id=f"msg-{uuid4().hex[:8]}",
             role="user",
@@ -1260,6 +1354,9 @@ class SqlChatRepository:
         with self._database.session() as session:
             source = self._get_knowledge_source_record(session, source_id)
             deleted = knowledge_source_from_record(source)
+            session.execute(
+                delete(KnowledgeFactRecord).where(KnowledgeFactRecord.source_id == source_id)
+            )
             session.delete(source)
 
         return self.list_knowledge_sources(), deleted
@@ -1268,13 +1365,23 @@ class SqlChatRepository:
         self,
         source_id: str,
         chunks: list[KnowledgeChunkModel],
+        *,
+        facts: Sequence[KnowledgeFactModel] = (),
     ) -> KnowledgeSourceModel:
         with self._database.session() as session:
             source = self._get_knowledge_source_record(session, source_id)
             session.execute(
+                delete(KnowledgeFactRecord).where(KnowledgeFactRecord.source_id == source_id)
+            )
+            session.execute(
                 delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id)
             )
             embedded_chunks = ensure_chunk_embeddings(chunks)
+            fact_list = validate_knowledge_facts(
+                source_id,
+                {chunk.id for chunk in embedded_chunks},
+                facts,
+            )
             for chunk in embedded_chunks:
                 session.add(
                     KnowledgeChunkRecord(
@@ -1287,11 +1394,72 @@ class SqlChatRepository:
                         chunk_metadata=chunk.metadata,
                     )
                 )
+            session.flush()
+            for fact in fact_list:
+                session.add(knowledge_fact_to_record(fact))
             source.records = len(embedded_chunks)
             source.status = STATUS_INDEXED
             source.error_message = None
             source.updated_at = today_label()
             return knowledge_source_from_record(source)
+
+    def replace_knowledge_facts(
+        self,
+        source_id: str,
+        facts: Sequence[KnowledgeFactModel],
+    ) -> None:
+        with self._database.session() as session:
+            self._get_knowledge_source_record(session, source_id)
+            chunk_ids = set(
+                session.scalars(
+                    select(KnowledgeChunkRecord.id).where(
+                        KnowledgeChunkRecord.source_id == source_id
+                    )
+                ).all()
+            )
+            fact_list = validate_knowledge_facts(source_id, chunk_ids, facts)
+            session.execute(
+                delete(KnowledgeFactRecord).where(KnowledgeFactRecord.source_id == source_id)
+            )
+            for fact in fact_list:
+                session.add(knowledge_fact_to_record(fact))
+
+    def find_knowledge_facts(
+        self,
+        intent: WordFactualIntent,
+        *,
+        permission_tags: Sequence[str] = (),
+    ) -> list[WordFactMatch]:
+        if isinstance(permission_tags, (str, bytes, bytearray)):
+            raise TypeError("permission_tags must be a sequence")
+        effective_permission_tags = tuple(_required_permission_tag(tag) for tag in permission_tags)
+        with self._database.session() as session:
+            statement = (
+                select(KnowledgeFactRecord, KnowledgeSourceRecord)
+                .join(
+                    KnowledgeSourceRecord,
+                    KnowledgeFactRecord.source_id == KnowledgeSourceRecord.id,
+                )
+                .where(
+                    KnowledgeSourceRecord.status == STATUS_INDEXED,
+                    KnowledgeFactRecord.entity_normalized == intent.entity_normalized,
+                    KnowledgeFactRecord.field_normalized == intent.field_normalized,
+                )
+                .order_by(KnowledgeSourceRecord.name, KnowledgeFactRecord.id)
+            )
+            if effective_permission_tags:
+                statement = statement.where(
+                    KnowledgeSourceRecord.classification.in_(effective_permission_tags)
+                )
+            rows = session.execute(statement).all()
+            return [
+                WordFactMatch(
+                    fact=knowledge_fact_from_record(fact_record),
+                    source_name=source_record.name,
+                    classification=source_record.classification,
+                )
+                for fact_record, source_record in rows
+            ]
 
     def fail_knowledge_source_indexing(
         self,
@@ -1300,6 +1468,9 @@ class SqlChatRepository:
     ) -> KnowledgeSourceModel:
         with self._database.session() as session:
             source = self._get_knowledge_source_record(session, source_id)
+            session.execute(
+                delete(KnowledgeFactRecord).where(KnowledgeFactRecord.source_id == source_id)
+            )
             session.execute(
                 delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id)
             )
@@ -1378,6 +1549,9 @@ class SqlChatRepository:
         with self._database.session() as session:
             source = self._get_knowledge_source_record(session, source_id)
             session.execute(
+                delete(KnowledgeFactRecord).where(KnowledgeFactRecord.source_id == source_id)
+            )
+            session.execute(
                 delete(KnowledgeChunkRecord).where(KnowledgeChunkRecord.source_id == source_id)
             )
             source.records = 0
@@ -1419,10 +1593,10 @@ class SqlChatRepository:
         *,
         evaluation_case_id: str | None = None,
         relevant_chunk_ids: tuple[str, ...] = (),
-    ) -> list[KnowledgeSearchHitModel]:
+    ) -> AgentSearchResult:
         if self.retrieval_router is None or self._retrieval_scope_provider is None:
-            return self.search_knowledge_chunks(query, limit)
-        from .retrieval_models import RetrievalRequest
+            return AgentSearchResult(hits=tuple(self.search_knowledge_chunks(query, limit)))
+        from .retrieval_models import EvidenceExpansionPolicy, RetrievalRequest
 
         resolution = self._retrieval_scope_provider.resolve()
         if resolution.scope is None:
@@ -1434,7 +1608,10 @@ class SqlChatRepository:
                 routing_key=routing_key,
                 fallback_reason=RetrievalFallbackReason.RETRIEVAL_SCOPE_UNAVAILABLE,
             )
-            return list(outcome.hits)
+            return AgentSearchResult(
+                hits=tuple(outcome.hits),
+                fallback_reason=outcome.fallback_reason,
+            )
         outcome = self.retrieval_router.search(
             RetrievalRequest(
                 query=query,
@@ -1443,9 +1620,13 @@ class SqlChatRepository:
                 scope=resolution.scope,
                 evaluation_case_id=evaluation_case_id,
                 relevant_chunk_ids=relevant_chunk_ids,
+                expansion_policy=EvidenceExpansionPolicy.BOUNDED_ADJACENCY,
             )
         )
-        return list(outcome.hits)
+        return AgentSearchResult(
+            hits=tuple(outcome.hits),
+            fallback_reason=outcome.fallback_reason,
+        )
 
     def _search_evaluation_case(
         self,
@@ -1460,13 +1641,14 @@ class SqlChatRepository:
                 minimum_score=minimum_score,
             )
         relevant_chunk_ids = self._evaluation_relevant_chunk_ids(case.expected_source_ids)
-        hits = self._search_routed_knowledge_chunks(
+        search_result = self._search_routed_knowledge_chunks(
             case.question,
             case.top_k,
             case.id,
             evaluation_case_id=case.id,
             relevant_chunk_ids=relevant_chunk_ids,
         )
+        hits = list(search_result.hits)
         if minimum_score is None:
             return hits
         threshold = resolve_effective_retrieval_min_score(minimum_score)
@@ -1526,6 +1708,8 @@ class SqlChatRepository:
             answer_message_id=run.answer_message_id,
             evidence_count=run.evidence_count,
             source_count=run.source_count,
+            route_type=run.route_type.value,
+            route_metadata=run.route_metadata.to_dict(),
         )
         record.steps = [
             AgentStepRecord(

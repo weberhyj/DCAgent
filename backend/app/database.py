@@ -120,6 +120,12 @@ class AgentRunRecord(Base):
     answer_message_id: Mapped[str] = mapped_column(String(64), nullable=False)
     evidence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     source_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    route_type: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="document_qa"
+    )
+    route_metadata: Mapped[dict[str, object]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default="{}"
+    )
 
     steps: Mapped[list[AgentStepRecord]] = relationship(
         back_populates="run",
@@ -308,6 +314,36 @@ class KnowledgeChunkRecord(Base):
     )
 
     source: Mapped[KnowledgeSourceRecord] = relationship(back_populates="chunks")
+
+
+class KnowledgeFactRecord(Base):
+    __tablename__ = "knowledge_facts"
+    __table_args__ = (
+        Index(
+            "ix_knowledge_facts_entity_field",
+            "entity_normalized",
+            "field_normalized",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_sources.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chunk_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_chunks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    entity: Mapped[str] = mapped_column(String(240), nullable=False)
+    entity_normalized: Mapped[str] = mapped_column(String(240), nullable=False)
+    field: Mapped[str] = mapped_column(String(120), nullable=False)
+    field_normalized: Mapped[str] = mapped_column(String(120), nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    locator: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
 
 
 class RetrievalPublicationRecord(Base):

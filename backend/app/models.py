@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+from .word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
+
 if TYPE_CHECKING:
     from .retrieval_models import RetrievalCandidate
 
@@ -177,3 +179,4 @@ class ChatState:
     messages_by_conversation: dict[str, list[ChatMessageModel]]
     knowledge_sources: list[KnowledgeSourceModel]
     knowledge_chunks_by_source: dict[str, list[KnowledgeChunkModel]] = field(default_factory=dict)
+    knowledge_facts_by_source: dict[str, list[KnowledgeFactModel]] = field(default_factory=dict)

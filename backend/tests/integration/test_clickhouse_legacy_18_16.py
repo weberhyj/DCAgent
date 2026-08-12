@@ -633,7 +633,12 @@ class TestClickHouseLegacy1816Acceptance:
             ClickHouseCompatibilityProfile,
         )
         from app.structured_ingestion import ArrowParquetSink, SpreadsheetPublisher
-        from app.structured_models import StructuredFilter, StructuredIntent
+        from app.structured_models import (
+            StructuredFilter,
+            StructuredIntent,
+            StructuredMetricIntent,
+            StructuredMultiAggregateIntent,
+        )
         from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
 
         dataset_id = f"it18_16_small_{uuid.uuid4().hex}"
@@ -805,6 +810,36 @@ class TestClickHouseLegacy1816Acceptance:
                 sum_result.valid_count,
                 sum_result.null_count,
             ) == (3, 2, 1)
+
+            multi_plan = planner.plan_multi(
+                StructuredMultiAggregateIntent(
+                    dataset_id,
+                    (
+                        StructuredMetricIntent("sum", "amount"),
+                        StructuredMetricIntent("sum", "units"),
+                    ),
+                    (),
+                    False,
+                ),
+                publication,
+            )
+            assert multi_plan.sql.count("SELECT") == 1
+            assert "toDecimalString" not in multi_plan.sql
+            assert " WITH " not in f" {multi_plan.sql.upper()} "
+            assert " OVER " not in f" {multi_plan.sql.upper()} "
+            assert " JSON" not in multi_plan.sql.upper()
+
+            multi_result = executor.execute_multi(multi_plan)
+
+            assert multi_result.total_count == 3
+            assert [metric.value for metric in multi_result.metrics] == [
+                Decimal("2.200000000"),
+                Decimal("10"),
+            ]
+            assert [
+                (metric.valid_count, metric.null_count)
+                for metric in multi_result.metrics
+            ] == [(2, 1), (2, 1)]
 
     def test_publishes_100000_rows_with_bounded_insert_batches(self) -> None:
         _require_acceptance_dependencies()

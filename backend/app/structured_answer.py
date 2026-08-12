@@ -10,12 +10,20 @@ from typing import Literal
 from uuid import uuid4
 
 from .agent import AgentRunResult, AgentStep
+from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .clickhouse_compatibility import (
     ClickHouseCompatibilityMode,
     ClickHouseCompatibilityProfile,
 )
-from .models import ChatMessageModel, ComposerMode, ResponseParagraphModel
+from .models import (
+    ArtifactModel,
+    ChatMessageModel,
+    ComposerMode,
+    ResponseParagraphModel,
+    TableArtifactModel,
+)
 from .structured_models import (
+    MAX_STRUCTURED_ROUTE_FIELDS,
     StructuredAggregateResult,
     StructuredCatalog,
     StructuredClarification,
@@ -23,6 +31,8 @@ from .structured_models import (
     StructuredDatasetCatalog,
     StructuredFilter,
     StructuredIntent,
+    StructuredMultiAggregateIntent,
+    StructuredMultiAggregateResult,
     StructuredUnavailable,
 )
 from .structured_query import (
@@ -50,10 +60,13 @@ _CHINESE_AGGREGATE_TERMS = (
     "最小值",
     "最小",
     "最低",
+    "汇总",
+    "统计",
 )
 _IMPLICIT_ROW_COUNT_RE = re.compile(
     r"^(?:(?:总共|一共|共有)有?)?多少条(?:记录|数据|明细|行)?[？?。.]?$"
 )
+_IMPLICIT_SUMMARY_RE = re.compile(r"^(?:请)?(?:汇总|统计)[？?。.]?$")
 _STRONG_AGGREGATE_SUFFIXES = tuple(
     sorted(
         (
@@ -70,6 +83,8 @@ _STRONG_AGGREGATE_SUFFIXES = tuple(
             "最小值",
             "最小",
             "最低",
+            "汇总",
+            "统计",
         ),
         key=len,
         reverse=True,
@@ -81,6 +96,17 @@ _HAS_EXPLICIT_FILTER_RE = re.compile(
 )
 _CONCEPT_ANYWHERE_PHRASES = ("什么是", "什么叫", "何为", "是什么意思")
 _CONCEPT_TERM_INTRODUCERS = ("解释一下", "讲讲", "介绍一下", "说明一下")
+_CONCEPT_COPULA_REQUEST_PREFIXES = ("请解释一下", "请介绍一下", "请说明")
+_CONCEPT_COPULA_PREDICATE_SUFFIXES = (
+    "指标",
+    "概念",
+    "术语",
+    "方法",
+    "统计量",
+    "度量",
+    "定义",
+    "含义",
+)
 _CONCEPT_TERM_SUFFIXES = (
     "是什么",
     "是什么意思",
@@ -115,12 +141,14 @@ class StructuredAnswerService:
         catalog_provider: Callable[[], StructuredCatalog],
         clickhouse_gateway: object,
         compatibility: ClickHouseCompatibilityProfile | None = None,
+        implicit_summary_max_metrics: int = 12,
     ) -> None:
         self._catalog_provider = catalog_provider
         self._clickhouse_gateway = clickhouse_gateway
         self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
             ClickHouseCompatibilityMode.MODERN
         )
+        self._implicit_summary_max_metrics = implicit_summary_max_metrics
         self._catalog_snapshot: StructuredCatalog | None = None
         self._catalog_snapshot_lock = Lock()
         self._catalog_request_generation = 0
@@ -151,20 +179,40 @@ class StructuredAnswerService:
             if catalog_snapshot is not None:
                 if not is_structured_candidate(question, catalog_snapshot):
                     return None
-            elif _classify_without_catalog(question) != "strong":
-                return None
+                outage_resolution = resolve_structured_intent(
+                    question,
+                    catalog_snapshot,
+                    implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+                )
+                outage_metadata = _catalog_outage_route_metadata(catalog_snapshot, outage_resolution)
+                outage_route = _route_for_catalog_outage_resolution(outage_resolution)
+            else:
+                if _classify_without_catalog(question) != "strong":
+                    return None
+                outage_metadata = {}
+                outage_route = KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
             return _structured_run(
                 conversation_id,
                 question,
                 mode,
                 "结构化查询服务不可用：无法读取已发布的数据目录。",
                 "catalog unavailable",
+                route_type=outage_route,
+                route_metadata=KnowledgeRouteMetadata(
+                    **outage_metadata,
+                    degradation_reason="catalog_unavailable",
+                    validation_passed=False,
+                ),
             )
         self._replace_catalog_snapshot(catalog, catalog_request_generation)
         if not is_structured_candidate(question, catalog):
             return None
 
-        resolution = resolve_structured_intent(question, catalog)
+        resolution = resolve_structured_intent(
+            question,
+            catalog,
+            implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+        )
         if isinstance(resolution, StructuredClarification):
             candidates = "、".join(resolution.candidates)
             suffix = f" 可选项：{candidates}。" if candidates else ""
@@ -174,6 +222,11 @@ class StructuredAnswerService:
                 mode,
                 f"需要澄清后才能查询结构化数据：{resolution.message}。{suffix}".strip(),
                 "structured clarification required",
+                route_type=KnowledgeRouteType.CLARIFICATION,
+                route_metadata=KnowledgeRouteMetadata(
+                    **_clarification_route_metadata(catalog, resolution),
+                    validation_passed=True,
+                ),
             )
         if isinstance(resolution, StructuredUnavailable):
             return _structured_run(
@@ -182,6 +235,12 @@ class StructuredAnswerService:
                 mode,
                 f"结构化查询服务不可用：{resolution.message}。",
                 "structured intent unavailable",
+                route_type=_route_for_parser_outcome(resolution),
+                route_metadata=KnowledgeRouteMetadata(
+                    **_unavailable_route_metadata(resolution),
+                    degradation_reason="intent_unavailable",
+                    validation_passed=False,
+                ),
             )
 
         publication = _active_publication(catalog, resolution)
@@ -192,11 +251,35 @@ class StructuredAnswerService:
                 mode,
                 "结构化查询服务不可用：数据集没有有效的活动发布版本。",
                 "active publication unavailable",
+                route_type=_route_for_intent(resolution),
+                route_metadata=KnowledgeRouteMetadata(
+                    **_intent_route_metadata(catalog, resolution),
+                    degradation_reason="publication_unavailable",
+                    validation_passed=False,
+                ),
             )
         try:
-            plan = StructuredQueryPlanner(catalog, self._compatibility).plan(
-                resolution, publication
-            )
+            if isinstance(resolution, StructuredMultiAggregateIntent):
+                plan = StructuredQueryPlanner(
+                    catalog,
+                    self._compatibility,
+                    implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+                ).plan_multi(resolution, publication)
+                result = StructuredQueryExecutor(
+                    catalog,
+                    self._clickhouse_gateway,
+                    compatibility=self._compatibility,
+                    implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+                ).execute_multi(plan)
+            else:
+                plan = StructuredQueryPlanner(catalog, self._compatibility).plan(
+                    resolution, publication
+                )
+                result = StructuredQueryExecutor(
+                    catalog,
+                    self._clickhouse_gateway,
+                    compatibility=self._compatibility,
+                ).execute(plan)
         except UnsafeStructuredQueryError:
             return _structured_run(
                 conversation_id,
@@ -204,12 +287,13 @@ class StructuredAnswerService:
                 mode,
                 "结构化查询服务不可用：查询计划未通过安全校验。",
                 "structured query planning failed",
+                route_type=_route_for_intent(resolution),
+                route_metadata=KnowledgeRouteMetadata(
+                    **_intent_route_metadata(catalog, resolution),
+                    degradation_reason="plan_rejected",
+                    validation_passed=False,
+                ),
             )
-        result = StructuredQueryExecutor(
-            catalog,
-            self._clickhouse_gateway,
-            compatibility=self._compatibility,
-        ).execute(plan)
         if isinstance(result, StructuredUnavailable):
             return _structured_run(
                 conversation_id,
@@ -217,6 +301,50 @@ class StructuredAnswerService:
                 mode,
                 f"结构化查询服务不可用：{result.message}。",
                 "structured query unavailable",
+                route_type=_route_for_intent(resolution),
+                route_metadata=KnowledgeRouteMetadata(
+                    **_intent_route_metadata(catalog, resolution),
+                    degradation_reason="clickhouse_unavailable",
+                    validation_passed=False,
+                ),
+            )
+        if isinstance(result, StructuredMultiAggregateResult):
+            paragraph = (
+                f"结构化汇总结果：{result.source_name} / {result.worksheet_name}，"
+                f"匹配 {result.total_count} 行，筛选条件：{_format_filters(result.filters)}。"
+            )
+            artifact = TableArtifactModel(
+                type="table",
+                title="结构化汇总结果",
+                source=result.source_name,
+                columns=["指标", "聚合", "值", "匹配行数", "有效值", "空值"],
+                rows=[
+                    [
+                        item.metric_display_name,
+                        item.aggregate,
+                        _format_numeric_value(item.value),
+                        str(result.total_count),
+                        str(item.valid_count),
+                        str(item.null_count),
+                    ]
+                    for item in result.metrics
+                ],
+            )
+            return _structured_run(
+                conversation_id,
+                question,
+                mode,
+                paragraph,
+                f"structured multi-aggregate completed; audit_id={result.audit_id}",
+                source_ids=[result.source_id],
+                artifacts=[artifact],
+                route_type=KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+                route_metadata=KnowledgeRouteMetadata(
+                    dataset_id=result.dataset_id,
+                    target_fields=tuple(item.metric_display_name for item in result.metrics),
+                    candidate_source_ids=(result.source_id,),
+                    validation_passed=True,
+                ),
             )
         return _structured_run(
             conversation_id,
@@ -224,7 +352,13 @@ class StructuredAnswerService:
             mode,
             _format_result(result),
             f"structured aggregate completed; audit_id={result.audit_id}",
-            source_ids=[result.dataset_id],
+            source_ids=[result.source_id],
+            route_metadata=KnowledgeRouteMetadata(
+                dataset_id=result.dataset_id,
+                target_fields=(result.metric_display_name or result.metric_physical_name or "all_rows",),
+                candidate_source_ids=(result.source_id,),
+                validation_passed=True,
+            ),
         )
 
     def _next_catalog_request_generation(self) -> int:
@@ -251,6 +385,8 @@ class StructuredAnswerService:
 def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     if not _has_aggregate_language(question):
         return False
+    if _is_implicit_summary(question):
+        return True
     if (
         _is_implicit_row_count(question)
         and len([dataset for dataset in catalog.datasets if dataset.active_publication is not None])
@@ -404,21 +540,31 @@ def _is_implicit_row_count(question: str) -> bool:
     return _IMPLICIT_ROW_COUNT_RE.fullmatch(question.strip()) is not None
 
 
+def _is_implicit_summary(question: str) -> bool:
+    return _IMPLICIT_SUMMARY_RE.fullmatch(question.strip()) is not None
+
+
 def _classify_without_catalog(question: str) -> Literal["weak", "strong", "concept"]:
     stripped = question.strip()
     normalized = _normalize(stripped)
     if not _has_aggregate_language(normalized):
         return "weak"
+    concept_body = _normalize(_strip_concept_question_tail(stripped))
+    if _has_prefixed_copula_concept_shape(concept_body):
+        return "concept"
     if _HAS_EXPLICIT_FILTER_RE.search(stripped) or _has_chinese_equality_filter(stripped):
         return "strong"
-    concept_body = _normalize(_strip_concept_question_tail(stripped))
     if _is_priority_aggregate_concept_shape(concept_body):
         return "concept"
     if _has_metric_qualified_concept_shape(normalized):
         return "strong"
     if _is_aggregate_concept_question(normalized):
         return "concept"
-    if _is_implicit_row_count(stripped) or _has_field_aggregate_suffix(normalized):
+    if (
+        _is_implicit_row_count(stripped)
+        or _is_implicit_summary(stripped)
+        or _has_field_aggregate_suffix(normalized)
+    ):
         return "strong"
     return "weak"
 
@@ -470,6 +616,23 @@ def _has_metric_qualified_concept_shape(normalized: str) -> bool:
     return False
 
 
+def _has_prefixed_copula_concept_shape(normalized: str) -> bool:
+    for prefix in _CONCEPT_COPULA_REQUEST_PREFIXES:
+        if not normalized.startswith(prefix):
+            continue
+        body = normalized[len(prefix) :]
+        for term in _AGGREGATE_CONCEPT_TERMS:
+            marker = f"{term}为"
+            if not body.startswith(marker):
+                continue
+            predicate = body[len(marker) :]
+            return any(
+                predicate.endswith(suffix)
+                for suffix in _CONCEPT_COPULA_PREDICATE_SUFFIXES
+            )
+    return False
+
+
 def _has_chinese_equality_filter(question: str) -> bool:
     for index, character in enumerate(question):
         context = _normalize(question[max(0, index - 2) : index + 1])
@@ -478,7 +641,10 @@ def _has_chinese_equality_filter(question: str) -> bool:
         field_start = max(question.rfind(item, 0, index) for item in _EQUALITY_FIELD_DELIMITERS) + 1
         field = question[field_start:index]
         value = question[index + 1 :]
-        if not _normalize(field) or not _normalize(value):
+        normalized_field = _normalize(field)
+        if not normalized_field or not _normalize(value):
+            continue
+        if normalized_field in _AGGREGATE_CONCEPT_TERMS:
             continue
         remaining = question[:field_start] + "_" * len(field) + question[index:]
         if _has_aggregate_language(remaining):
@@ -568,13 +734,120 @@ def _normalize(value: str) -> str:
     return re.sub(r"[\s\W]+", "", value.casefold(), flags=re.UNICODE)
 
 
-def _active_publication(catalog: StructuredCatalog, intent: StructuredIntent):
+def _active_publication(
+    catalog: StructuredCatalog,
+    intent: StructuredIntent | StructuredMultiAggregateIntent,
+):
     matches = [
         dataset.active_publication
         for dataset in catalog.datasets
         if dataset.schema.dataset_id == intent.dataset_id and dataset.active_publication is not None
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def _intent_route_metadata(
+    catalog: StructuredCatalog,
+    intent: StructuredIntent | StructuredMultiAggregateIntent,
+) -> dict[str, object]:
+    dataset = next(item for item in catalog.datasets if item.schema.dataset_id == intent.dataset_id)
+    physical_names = (
+        tuple(metric.metric_physical_name for metric in intent.metrics)
+        if isinstance(intent, StructuredMultiAggregateIntent)
+        else (intent.metric_physical_name,)
+    )
+    fields = tuple(
+        next(column.display_name for column in dataset.schema.columns if column.physical_name == name)
+        if name is not None else "all_rows"
+        for name in physical_names
+    )
+    return {
+        "dataset_id": dataset.schema.dataset_id,
+        "target_fields": fields,
+        "candidate_source_ids": (dataset.schema.source_id,),
+        "origin_route": _route_for_intent(intent),
+    }
+
+
+def _catalog_outage_route_metadata(
+    catalog: StructuredCatalog,
+    resolution: object,
+) -> dict[str, object]:
+    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent)):
+        return _intent_route_metadata(catalog, resolution)
+    if isinstance(resolution, StructuredClarification):
+        return _clarification_route_metadata(catalog, resolution)
+    if isinstance(resolution, StructuredUnavailable):
+        return _unavailable_route_metadata(resolution)
+    return {}
+
+
+def _route_for_catalog_outage_resolution(resolution: object) -> KnowledgeRouteType:
+    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent)):
+        return _route_for_intent(resolution)
+    if isinstance(resolution, StructuredClarification) and resolution.origin_route is not None:
+        return KnowledgeRouteType(resolution.origin_route)
+    if isinstance(resolution, StructuredUnavailable):
+        return _route_for_parser_outcome(resolution)
+    return KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
+
+
+def _route_for_intent(
+    intent: StructuredIntent | StructuredMultiAggregateIntent,
+) -> KnowledgeRouteType:
+    return (
+        KnowledgeRouteType.EXCEL_MULTI_AGGREGATE
+        if isinstance(intent, StructuredMultiAggregateIntent)
+        else KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
+    )
+
+
+def _clarification_route_metadata(
+    catalog: StructuredCatalog,
+    clarification: StructuredClarification,
+) -> dict[str, object]:
+    if clarification.origin_route is not None:
+        return {
+            "dataset_id": clarification.dataset_id,
+            "target_fields": clarification.target_fields,
+            "candidate_source_ids": clarification.candidate_source_ids,
+            "origin_route": KnowledgeRouteType(clarification.origin_route),
+        }
+    candidates = set(clarification.candidates)
+    matches = [
+        dataset
+        for dataset in catalog.datasets
+        if candidates
+        and candidates.issubset(
+            {column.display_name for column in dataset.schema.columns if column.allow_aggregate}
+        )
+    ]
+    if len(matches) == 1:
+        dataset = matches[0]
+        return {
+            "dataset_id": dataset.schema.dataset_id,
+            "target_fields": tuple(clarification.candidates),
+            "candidate_source_ids": (dataset.schema.source_id,),
+            "origin_route": KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+        }
+    return {"origin_route": KnowledgeRouteType.EXCEL_MULTI_AGGREGATE}
+
+
+def _unavailable_route_metadata(outcome: StructuredUnavailable) -> dict[str, object]:
+    return {
+        "dataset_id": outcome.dataset_id,
+        "target_fields": outcome.target_fields,
+        "candidate_source_ids": outcome.candidate_source_ids,
+        "origin_route": None if outcome.origin_route is None else KnowledgeRouteType(outcome.origin_route),
+    }
+
+
+def _route_for_parser_outcome(outcome: StructuredUnavailable) -> KnowledgeRouteType:
+    return (
+        KnowledgeRouteType(outcome.origin_route)
+        if outcome.origin_route is not None
+        else KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
+    )
 
 
 def _format_result(result: StructuredAggregateResult) -> str:
@@ -626,6 +899,9 @@ def _structured_run(
     output_summary: str,
     *,
     source_ids: list[str] | None = None,
+    artifacts: list[ArtifactModel] | None = None,
+    route_type: KnowledgeRouteType = KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE,
+    route_metadata: KnowledgeRouteMetadata | None = None,
 ) -> AgentRunResult:
     timestamp = display_datetime_label()
     run_id = f"agent-{uuid4().hex[:12]}"
@@ -634,6 +910,7 @@ def _structured_run(
         role="assistant",
         time=timestamp,
         paragraphs=[ResponseParagraphModel(text=answer)],
+        artifacts=artifacts or [],
     )
     step = AgentStep(
         id=f"step-{uuid4().hex[:12]}",
@@ -659,4 +936,9 @@ def _structured_run(
         steps=[step],
         evidence_count=0,
         source_count=len(set(source_ids or [])),
+        route_type=route_type,
+        route_metadata=route_metadata or KnowledgeRouteMetadata(
+            validation_passed=True,
+            adjacency_allowed=False,
+        ),
     )

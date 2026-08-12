@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
+from app.clickhouse_gateway import ClickHouseGateway
 from app.database import Database
 from app.main import create_app
 from app.models import ChatMessageModel, ResponseParagraphModel
@@ -22,9 +24,10 @@ from app.structured_answer import StructuredAnswerService
 from app.structured_ingestion import ArrowParquetSink, SpreadsheetPublisher
 from app.structured_repository import StructuredRepository
 from app.structured_worker import StructuredIngestionWorker
-from tests.support.structured_fakes import sample_catalog
+from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
 
 ROW_COUNT = 100_000
+MULTI_ROW_COUNT = 100_001
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
@@ -44,6 +47,48 @@ def _write_fixture(path: Path, rows: int = ROW_COUNT) -> Path:
     workbook.save(path)
     workbook.close()
     return path
+
+
+def _multi_fixture_row(index: int) -> tuple[str, Decimal | None, Decimal | None, Decimal | None]:
+    region = ("华东", "华南", "华北", "西部")[index % 4]
+    sales = None if index % 113 == 0 else Decimal((index * 17) % 100_000) / Decimal(100)
+    cost = None if index % 127 == 0 else Decimal((index * 11 + 7) % 80_000) / Decimal(100)
+    profit = None if index % 149 == 0 else Decimal((index * 5 - 13) % 40_000) / Decimal(100)
+    return region, sales, cost, profit
+
+
+def _write_multi_fixture(path: Path, rows: int = MULTI_ROW_COUNT) -> Path:
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet("明细")
+    sheet.append(("地区", "销售额", "成本", "利润"))
+    for index in range(rows):
+        sheet.append(_multi_fixture_row(index))
+    workbook.save(path)
+    workbook.close()
+    return path
+
+
+def _multi_decimal_reference(region: str) -> dict[str, Decimal | int | None]:
+    names = ("sales_amount", "cost_amount", "profit_amount")
+    sums = {name: Decimal(0) for name in names}
+    valid_counts = {name: 0 for name in names}
+    total_count = 0
+    for index in range(MULTI_ROW_COUNT):
+        row_region, sales, cost, profit = _multi_fixture_row(index)
+        if row_region != region:
+            continue
+        total_count += 1
+        for name, value in zip(names, (sales, cost, profit), strict=True):
+            if value is not None:
+                sums[name] += value
+                valid_counts[name] += 1
+
+    result: dict[str, Decimal | int | None] = {"total_count": total_count}
+    for name in names:
+        result[f"{name}_value"] = sums[name] if valid_counts[name] else None
+        result[f"{name}_valid_count"] = valid_counts[name]
+        result[f"{name}_null_count"] = total_count - valid_counts[name]
+    return result
 
 
 class PhysocFake:
@@ -181,6 +226,81 @@ class InMemoryAggregateGateway:
         return None
 
 
+class LargeMultiSummaryGateway:
+    """Precomputed one-row fake for structure/resource acceptance only.
+
+    The query method intentionally does not evaluate SQL or parameters, so this fake cannot prove
+    ClickHouse filtering or Decimal arithmetic. The opt-in target-host gate below provides that
+    database evidence.
+    """
+
+    def __init__(self, result: dict[str, object]) -> None:
+        self.result = result
+        self.query_calls = 0
+        self.returned_row_count = 0
+        self.inserted_row_count = 0
+        self.batch_rows: list[int] = []
+        self.statements: list[str] = []
+        self.fail_with: Exception | None = None
+
+    def prepare_publication(
+        self,
+        _schema: object,
+        _publication_id: str,
+        content_hash: str,
+        **_kwargs: object,
+    ) -> object:
+        self.inserted_row_count = 0
+        self.batch_rows.clear()
+        return SimpleNamespace(
+            physical_table_name="structured_e2e_large_multi",
+            staging_table="structured_e2e_large_multi_staging",
+            content_hash=content_hash,
+        )
+
+    def insert_batch(self, _target: object, batch: object) -> None:
+        self.inserted_row_count += batch.num_rows
+        self.batch_rows.append(batch.num_rows)
+
+    def validate_and_promote(self, target: object, **statistics: object) -> str:
+        if statistics["row_count"] != self.inserted_row_count:
+            raise AssertionError("published row count does not match inserted rows")
+        return target.physical_table_name
+
+    def discard_publication(self, _target: object) -> None:
+        self.inserted_row_count = 0
+
+    def query(self, statement: str, _parameters: object) -> dict[str, object]:
+        self.query_calls += 1
+        self.statements.append(statement)
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.returned_row_count = 1
+        return dict(self.result)
+
+    def close(self) -> None:
+        return None
+
+
+class CountingClickHouseGateway:
+    def __init__(self, delegate: ClickHouseGateway) -> None:
+        self.delegate = delegate
+        self.query_calls = 0
+        self.returned_row_count = 0
+        self.statements: list[str] = []
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.delegate, name)
+
+    def query(self, statement: str, parameters: object) -> object:
+        self.query_calls += 1
+        self.statements.append(statement)
+        result = self.delegate.query(statement, parameters)
+        rows = getattr(result, "result_rows", None)
+        self.returned_row_count = 1 if rows is None else len(rows)
+        return result
+
+
 def _reference(
     aggregate: str,
     predicate,
@@ -208,6 +328,113 @@ def _reference(
 
 
 class StructuredAggregationEndToEndTest(unittest.TestCase):
+    def test_large_summary_structure_resource_and_single_row_contract(self) -> None:
+        expected = _multi_decimal_reference("华东")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = _write_multi_fixture(root / "structured-multi-100001.xlsx")
+            catalog = sample_multi_metric_catalog()
+            schema = replace(
+                catalog.datasets[0].schema,
+                columns=catalog.datasets[0].schema.columns[:4],
+            )
+            # Injecting the independently calculated baseline verifies deterministic rendering and
+            # the one-result-row/no-LLM resource contract, not ClickHouse numeric correctness.
+            gateway = LargeMultiSummaryGateway(
+                {
+                    "total_count": expected["total_count"],
+                    "metric_0_value": expected["sales_amount_value"],
+                    "metric_0_valid_count": expected["sales_amount_valid_count"],
+                    "metric_0_null_count": expected["sales_amount_null_count"],
+                    "metric_1_value": expected["cost_amount_value"],
+                    "metric_1_valid_count": expected["cost_amount_valid_count"],
+                    "metric_1_null_count": expected["cost_amount_null_count"],
+                    "metric_2_value": expected["profit_amount_value"],
+                    "metric_2_valid_count": expected["profit_amount_valid_count"],
+                    "metric_2_null_count": expected["profit_amount_null_count"],
+                }
+            )
+            publication = SpreadsheetPublisher(
+                sink=ArrowParquetSink(root / "parquet"),
+                clickhouse=gateway,
+                batch_rows=25_000,
+            ).publish(fixture, schema, "pub-large-multi")
+            active_publication = replace(
+                catalog.datasets[0].active_publication,
+                publication_id=publication.publication_id,
+                physical_table_name=publication.physical_table_name,
+                row_count=publication.row_count,
+                content_hash=publication.content_hash,
+            )
+            catalog = replace(
+                catalog,
+                datasets=(
+                    replace(
+                        catalog.datasets[0],
+                        schema=schema,
+                        active_publication=active_publication,
+                    ),
+                ),
+            )
+            physoc = PhysocFake()
+            database = Database("sqlite+pysqlite:///:memory:")
+            database.create_schema()
+            repository = SqlChatRepository(
+                database,
+                llm_provider=physoc,
+                structured_service=StructuredAnswerService(lambda: catalog, gateway),
+            )
+            app = create_app(repository=repository, upload_dir=root / "uploads")
+            try:
+                with TestClient(app) as client:
+                    conversation_id = client.post("/api/conversations").json()[
+                        "activeConversationId"
+                    ]
+                    response = client.post(
+                        f"/api/conversations/{conversation_id}/messages",
+                        json={
+                            "content": "地区为华东的销售额、成本、利润汇总",
+                            "mode": "source",
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 200, response.text)
+                artifact = response.json()["messages"][-1]["artifacts"][0]
+                values = {
+                    row[0]: Decimal(row[2].replace(",", ""))
+                    for row in artifact["rows"]
+                }
+                rows_by_metric = {row[0]: row for row in artifact["rows"]}
+                self.assertEqual(values["销售额"], expected["sales_amount_value"])
+                self.assertEqual(values["成本"], expected["cost_amount_value"])
+                self.assertEqual(values["利润"], expected["profit_amount_value"])
+                self.assertTrue(
+                    all(row[3] == str(expected["total_count"]) for row in artifact["rows"])
+                )
+                for display_name, field_name in (
+                    ("销售额", "sales_amount"),
+                    ("成本", "cost_amount"),
+                    ("利润", "profit_amount"),
+                ):
+                    self.assertEqual(
+                        rows_by_metric[display_name][4],
+                        str(expected[f"{field_name}_valid_count"]),
+                    )
+                    self.assertEqual(
+                        rows_by_metric[display_name][5],
+                        str(expected[f"{field_name}_null_count"]),
+                    )
+                self.assertEqual(gateway.query_calls, 1)
+                self.assertEqual(gateway.returned_row_count, 1)
+                self.assertEqual(gateway.statements[0].upper().count("SELECT"), 1)
+                for alias in ("metric_0_value", "metric_1_value", "metric_2_value"):
+                    self.assertIn(alias, gateway.statements[0])
+                self.assertEqual(gateway.inserted_row_count, MULTI_ROW_COUNT)
+                self.assertNotIn("rows", vars(gateway))
+                self.assertEqual(physoc.calls, 0)
+            finally:
+                database.engine.dispose()
+
     def test_upload_publish_query_and_fail_closed_routing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -541,6 +768,142 @@ _TARGET_HOST_MISSING = _target_host_missing_configuration()
     "target-host gate missing explicit configuration: " + ", ".join(_TARGET_HOST_MISSING),
 )
 class StructuredAggregationTargetHostGateTest(unittest.TestCase):
+    def test_large_filtered_multi_summary_matches_decimal_reference(self) -> None:
+        import clickhouse_connect
+
+        expected = _multi_decimal_reference("华东")
+        host = os.environ["CLICKHOUSE_HOST"]
+        port = int(os.getenv("CLICKHOUSE_PORT", "8123"))
+        ingest, query = _create_target_host_clients(
+            clickhouse_connect.get_client,
+            {
+                "host": host,
+                "port": port,
+                "username": os.getenv("CLICKHOUSE_INGEST_USER", "structured_ingest"),
+                "password": require_secret_file(
+                    Path(os.environ["CLICKHOUSE_INGEST_PASSWORD_FILE"]),
+                    "CLICKHOUSE_INGEST_PASSWORD_FILE",
+                ),
+            },
+            {
+                "host": host,
+                "port": port,
+                "username": os.getenv("CLICKHOUSE_QUERY_USER", "structured_query"),
+                "password": require_secret_file(
+                    Path(os.environ["CLICKHOUSE_QUERY_PASSWORD_FILE"]),
+                    "CLICKHOUSE_QUERY_PASSWORD_FILE",
+                ),
+                "autogenerate_session_id": False,
+            },
+        )
+        primary_error: BaseException | None = None
+        published_table = ""
+        database: Database | None = None
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                fixture = _write_multi_fixture(root / "target-multi-100001.xlsx")
+                catalog = sample_multi_metric_catalog()
+                schema = replace(
+                    catalog.datasets[0].schema,
+                    dataset_id=f"ds_target_{uuid.uuid4().hex}",
+                    source_id=f"kb_target_{uuid.uuid4().hex}",
+                    columns=catalog.datasets[0].schema.columns[:4],
+                )
+                gateway = CountingClickHouseGateway(
+                    ClickHouseGateway(ingest, query_client=query, max_result_rows=1)
+                )
+                publication = SpreadsheetPublisher(
+                    sink=ArrowParquetSink(root / "parquet"),
+                    clickhouse=gateway,
+                    batch_rows=25_000,
+                ).publish(fixture, schema, f"pub-target-{uuid.uuid4().hex}")
+                published_table = publication.physical_table_name
+                active_publication = replace(
+                    catalog.datasets[0].active_publication,
+                    publication_id=publication.publication_id,
+                    dataset_id=schema.dataset_id,
+                    physical_table_name=publication.physical_table_name,
+                    row_count=publication.row_count,
+                    content_hash=publication.content_hash,
+                )
+                catalog = replace(
+                    catalog,
+                    datasets=(
+                        replace(
+                            catalog.datasets[0],
+                            schema=schema,
+                            active_publication=active_publication,
+                        ),
+                    ),
+                )
+                physoc = PhysocFake()
+                database = Database("sqlite+pysqlite:///:memory:")
+                database.create_schema()
+                repository = SqlChatRepository(
+                    database,
+                    llm_provider=physoc,
+                    structured_service=StructuredAnswerService(lambda: catalog, gateway),
+                )
+                app = create_app(repository=repository, upload_dir=root / "uploads")
+                with TestClient(app) as client:
+                    conversation_id = client.post("/api/conversations").json()[
+                        "activeConversationId"
+                    ]
+                    response = client.post(
+                        f"/api/conversations/{conversation_id}/messages",
+                        json={
+                            "content": "地区为华东的销售额、成本、利润汇总",
+                            "mode": "source",
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 200, response.text)
+                artifact = response.json()["messages"][-1]["artifacts"][0]
+                rows_by_metric = {row[0]: row for row in artifact["rows"]}
+                for display_name, field_name in (
+                    ("销售额", "sales_amount"),
+                    ("成本", "cost_amount"),
+                    ("利润", "profit_amount"),
+                ):
+                    row = rows_by_metric[display_name]
+                    self.assertEqual(
+                        Decimal(row[2].replace(",", "")),
+                        expected[f"{field_name}_value"],
+                    )
+                    self.assertEqual(row[3], str(expected["total_count"]))
+                    self.assertEqual(row[4], str(expected[f"{field_name}_valid_count"]))
+                    self.assertEqual(row[5], str(expected[f"{field_name}_null_count"]))
+                self.assertEqual(gateway.query_calls, 1)
+                self.assertEqual(gateway.returned_row_count, 1)
+                self.assertEqual(gateway.statements[0].upper().count("SELECT"), 1)
+                self.assertEqual(physoc.calls, 0)
+                stored_count = query.query(
+                    f"SELECT count() FROM {published_table}"
+                ).result_rows[0][0]
+                self.assertEqual(stored_count, MULTI_ROW_COUNT)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if database is not None:
+                database.engine.dispose()
+            if published_table:
+                cleanup_error = _cleanup_target_host_clients(
+                    ingest,
+                    query,
+                    f"{published_table}_cleanup_staging",
+                    published_table,
+                )
+            else:
+                cleanup_error = None
+                for client in (query, ingest):
+                    try:
+                        client.close()
+                    except BaseException as error:
+                        cleanup_error = cleanup_error or error
+            _raise_or_note_cleanup(primary_error, cleanup_error)
+
     def test_clickhouse_target_publishes_and_queries_with_separate_identities(self) -> None:
         import clickhouse_connect
 

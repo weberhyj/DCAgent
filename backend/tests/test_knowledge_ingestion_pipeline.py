@@ -5,13 +5,15 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from docx import Document
 from fastapi.testclient import TestClient
 
 from app.ingestion import KnowledgeIndexUnavailableError, KnowledgeIngestionQueue
 from app.main import create_app
 from app.repository import InMemoryChatRepository
 from app.seed import build_seed_state
-from app.text_parser import parse_knowledge_file
+from app.text_parser import parse_knowledge_file, parse_knowledge_file_result
+from app.word_facts import WordFactualIntent, normalize_fact_key
 
 
 class KnowledgeIngestionPipelineTest(unittest.TestCase):
@@ -83,6 +85,16 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         self.assertIn("差旅制度", chunks[0].text)
         self.assertIn("审批流程", chunks[0].text)
 
+    def test_non_docx_parse_result_keeps_chunk_compatibility_without_facts(self) -> None:
+        path = Path(self.temp_dir.name) / "plain-note.txt"
+        path.write_text("plain searchable passage", encoding="utf-8")
+
+        result = parse_knowledge_file_result(path, source_id="kb-plain", source_type="TXT")
+
+        self.assertIsInstance(result.chunks, tuple)
+        self.assertEqual(result.facts, ())
+        self.assertEqual([chunk.text for chunk in result.chunks], ["plain searchable passage"])
+
     def test_new_document_updates_postgres_then_active_qdrant_collection(self) -> None:
         events = []
 
@@ -121,6 +133,88 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
 
         self.assertEqual(events, [("qdrant", 1), "postgres-indexed", "fence-release"])
         self.assertEqual(self.repository.get_source_index_status(source_id), "indexed")
+
+    def test_docx_queue_persists_facts_before_qdrant_publication(self) -> None:
+        events: list[str] = []
+        source_id = "kb-ingestion-facts"
+        path = Path(self.temp_dir.name) / "people.docx"
+        document = Document()
+        document.add_paragraph("姓名：张三，年龄：28岁，性别：女")
+        document.save(path)
+        self.repository.add_uploaded_knowledge_source(
+            source_id,
+            "people.docx",
+            "文档",
+            "公开",
+            0,
+            str(path),
+            path.stat().st_size,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        original_complete = self.repository.complete_knowledge_source_indexing
+
+        def complete_with_fact_event(*args, **kwargs):
+            result = original_complete(*args, **kwargs)
+            matches = self.repository.find_knowledge_facts(
+                WordFactualIntent(
+                    entity="张三",
+                    entity_normalized=normalize_fact_key("张三"),
+                    field="年龄",
+                    field_normalized=normalize_fact_key("年龄"),
+                )
+            )
+            if matches:
+                events.append("postgres-facts")
+            return result
+
+        self.repository.complete_knowledge_source_indexing = complete_with_fact_event
+
+        class RecordingLifecycle:
+            def upsert_source(inner_self, source_id, *, finalize=None, on_failure=None):
+                events.append("qdrant-upsert")
+                return "publication-1", 1
+
+        queue = KnowledgeIngestionQueue(
+            self.repository,
+            index_lifecycle=RecordingLifecycle(),
+        )
+
+        queue.process(source_id, path, "文档")
+
+        self.assertEqual(events, ["postgres-facts", "qdrant-upsert"])
+
+    def test_docx_queue_deduplicates_identical_source_facts_before_persistence(self) -> None:
+        source_id = "kb-ingestion-duplicate-facts"
+        path = Path(self.temp_dir.name) / "duplicate-people.docx"
+        document = Document()
+        document.add_paragraph("姓名：张三，年龄：28岁")
+        document.add_paragraph("说明" * 400)
+        document.add_paragraph("姓名：张三，年龄：28岁")
+        document.save(path)
+        self.repository.add_uploaded_knowledge_source(
+            source_id,
+            "duplicate-people.docx",
+            "文档",
+            "公开",
+            0,
+            str(path),
+            path.stat().st_size,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        self.queue.process(source_id, path, "文档")
+
+        matches = self.repository.find_knowledge_facts(
+            WordFactualIntent(
+                entity="张三",
+                entity_normalized=normalize_fact_key("张三"),
+                field="年龄",
+                field_normalized=normalize_fact_key("年龄"),
+            )
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].fact.locator, {"paragraph": 0})
 
     def test_qdrant_failure_does_not_delete_postgres_chunks(self) -> None:
         class FailingLifecycle:

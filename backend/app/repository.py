@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from threading import Lock
@@ -9,7 +10,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-from .agent import AgentRunAudit, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
+from .agent import AgentRunAudit, AgentSearchResult, KnowledgeAgentTools, ReadOnlyKnowledgeAgent
 from .embeddings import (
     DEFAULT_EMBEDDING_PROVIDER,
     EmbeddingProvider,
@@ -32,6 +33,7 @@ from .evaluation import (
     normalized_unique,
 )
 from .evaluation_import import EvaluationImportRow
+from .knowledge_router import KnowledgeAnswerRouter, LegacyKnowledgeAnswerRouter
 from .llm import LLMProvider, TemplateLLMProvider
 from .models import (
     ChatMessageModel,
@@ -51,12 +53,14 @@ from .retrieval import (
 )
 from .retrieval_scope import StaticRetrievalScopeProvider
 from .time_utils import display_datetime_label
+from .word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
 
 if TYPE_CHECKING:
     from .retrieval_models import RetrievalScope
     from .retrieval_router import RetrievalRouter
     from .retrieval_scope import RetrievalScopeProvider
     from .structured_answer import StructuredAnswerService
+    from .word_fact_answer import WordFactAnswerService
 
 STATUS_INDEXED = "已索引"
 STATUS_INDEXING = "解析中"
@@ -293,6 +297,13 @@ def build_knowledge_paragraph(hits: list[KnowledgeSearchHitModel]) -> ResponsePa
 
 
 class ChatRepository(Protocol):
+    def configure_knowledge_routing(
+        self,
+        *,
+        unified_enabled: bool,
+        word_factual_enabled: bool,
+    ) -> None: ...
+
     def list_conversations(self) -> list[ConversationModel]: ...
 
     def create_conversation(
@@ -341,7 +352,22 @@ class ChatRepository(Protocol):
         self,
         source_id: str,
         chunks: list[KnowledgeChunkModel],
+        *,
+        facts: Sequence[KnowledgeFactModel] = (),
     ) -> KnowledgeSourceModel: ...
+
+    def replace_knowledge_facts(
+        self,
+        source_id: str,
+        facts: Sequence[KnowledgeFactModel],
+    ) -> None: ...
+
+    def find_knowledge_facts(
+        self,
+        intent: WordFactualIntent,
+        *,
+        permission_tags: Sequence[str] = (),
+    ) -> list[WordFactMatch]: ...
 
     def fail_knowledge_source_indexing(
         self,
@@ -446,7 +472,10 @@ class InMemoryChatRepository:
         state: ChatState,
         llm_provider: LLMProvider | None = None,
         structured_service: StructuredAnswerService | None = None,
+        word_fact_service: WordFactAnswerService | None = None,
         *,
+        unified_knowledge_routing_enabled: bool = True,
+        word_factual_qa_enabled: bool = True,
         retrieval_router: RetrievalRouter | None = None,
         retrieval_scope: RetrievalScope | None = None,
         retrieval_scope_provider: RetrievalScopeProvider | None = None,
@@ -474,15 +503,56 @@ class InMemoryChatRepository:
         self._agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
                 search_knowledge=self._search_routed_knowledge_chunks,
-                inspect_document=self.list_knowledge_chunks,
             ),
             llm_provider=self._llm_provider,
         )
+        self._word_fact_service = word_fact_service
+        self._unified_knowledge_routing_enabled = unified_knowledge_routing_enabled
+        self._word_factual_qa_enabled = word_factual_qa_enabled
+        self._answer_router = self._build_answer_router()
 
     def close(self) -> None:
         close = getattr(self._structured_service, "close", None)
         if callable(close):
             close()
+
+    def configure_answer_services(
+        self,
+        *,
+        structured_service: StructuredAnswerService | None = None,
+        word_fact_service: WordFactAnswerService | None = None,
+    ) -> None:
+        if structured_service is not None:
+            self._structured_service = structured_service
+        if word_fact_service is not None:
+            self._word_fact_service = word_fact_service
+        self._answer_router = self._build_answer_router()
+
+    def configure_knowledge_routing(
+        self,
+        *,
+        unified_enabled: bool,
+        word_factual_enabled: bool,
+    ) -> None:
+        if word_factual_enabled and not unified_enabled:
+            raise ValueError("Word factual QA requires unified knowledge routing")
+        self._unified_knowledge_routing_enabled = unified_enabled
+        self._word_factual_qa_enabled = word_factual_enabled
+        self._answer_router = self._build_answer_router()
+
+    def _build_answer_router(self) -> KnowledgeAnswerRouter | LegacyKnowledgeAnswerRouter:
+        if not self._unified_knowledge_routing_enabled:
+            return LegacyKnowledgeAnswerRouter(
+                self._agent,
+                structured_service=self._structured_service,
+            )
+        return KnowledgeAnswerRouter(
+            self._agent,
+            structured_service=self._structured_service,
+            word_fact_service=(
+                self._word_fact_service if self._word_factual_qa_enabled else None
+            ),
+        )
 
     def configure_retrieval(
         self,
@@ -559,25 +629,12 @@ class InMemoryChatRepository:
             self._find_conversation(conversation_id)
             previous_messages = deepcopy(self._messages_for(conversation_id))
 
-        agent_result = self._agent.try_answer_greeting(
+        agent_result = self._answer_router.answer(
             conversation_id=conversation_id,
             content=clean_content,
             mode=mode,
+            previous_messages=previous_messages,
         )
-        if agent_result is None and self._structured_service is not None:
-            agent_result = self._structured_service.try_answer(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
-        if agent_result is None:
-            agent_result = self._agent.run(
-                conversation_id=conversation_id,
-                content=clean_content,
-                mode=mode,
-                previous_messages=previous_messages,
-            )
 
         with self._lock:
             conversation = self._find_conversation(conversation_id)
@@ -980,22 +1037,85 @@ class InMemoryChatRepository:
                 source for source in self._state.knowledge_sources if source.id != source_id
             ]
             self._state.knowledge_chunks_by_source.pop(source_id, None)
+            self._state.knowledge_facts_by_source.pop(source_id, None)
             return deepcopy(self._state.knowledge_sources), deleted
 
     def complete_knowledge_source_indexing(
         self,
         source_id: str,
         chunks: list[KnowledgeChunkModel],
+        *,
+        facts: Sequence[KnowledgeFactModel] = (),
     ) -> KnowledgeSourceModel:
         with self._lock:
             source = self._find_knowledge_source(source_id)
             embedded_chunks = ensure_chunk_embeddings(chunks)
+            fact_list = self._validate_knowledge_facts(
+                source_id,
+                {chunk.id for chunk in embedded_chunks},
+                facts,
+            )
             source.records = len(embedded_chunks)
             source.status = STATUS_INDEXED
             source.error_message = None
             source.updated_at = today_label()
             self._state.knowledge_chunks_by_source[source_id] = deepcopy(embedded_chunks)
+            self._state.knowledge_facts_by_source[source_id] = deepcopy(fact_list)
             return deepcopy(source)
+
+    def replace_knowledge_facts(
+        self,
+        source_id: str,
+        facts: Sequence[KnowledgeFactModel],
+    ) -> None:
+        with self._lock:
+            self._find_knowledge_source(source_id)
+            chunk_ids = {
+                chunk.id for chunk in self._state.knowledge_chunks_by_source.get(source_id, [])
+            }
+            fact_list = self._validate_knowledge_facts(source_id, chunk_ids, facts)
+            self._state.knowledge_facts_by_source[source_id] = deepcopy(fact_list)
+
+    def find_knowledge_facts(
+        self,
+        intent: WordFactualIntent,
+        *,
+        permission_tags: Sequence[str] = (),
+    ) -> list[WordFactMatch]:
+        if isinstance(permission_tags, (str, bytes, bytearray)):
+            raise TypeError("permission_tags must be a sequence")
+        effective_permission_tags = {
+            tag.strip()
+            for tag in permission_tags
+            if isinstance(tag, str) and tag.strip()
+        }
+        with self._lock:
+            matches: list[WordFactMatch] = []
+            for source in sorted(self._state.knowledge_sources, key=lambda item: item.name):
+                if source.status != STATUS_INDEXED:
+                    continue
+                if (
+                    effective_permission_tags
+                    and source.classification not in effective_permission_tags
+                ):
+                    continue
+                facts = sorted(
+                    self._state.knowledge_facts_by_source.get(source.id, []),
+                    key=lambda fact: fact.id,
+                )
+                for fact in facts:
+                    if (
+                        fact.entity_normalized == intent.entity_normalized
+                        and fact.field_normalized == intent.field_normalized
+                    ):
+                        matches.append(
+                            WordFactMatch(
+                                fact=fact,
+                                source_name=source.name,
+                                classification=source.classification,
+                            )
+                        )
+            return deepcopy(matches)
 
     def fail_knowledge_source_indexing(
         self,
@@ -1009,6 +1129,7 @@ class InMemoryChatRepository:
             source.error_message = error_message
             source.updated_at = today_label()
             self._state.knowledge_chunks_by_source[source_id] = []
+            self._state.knowledge_facts_by_source.pop(source_id, None)
             return deepcopy(source)
 
     def complete_retrieval_source_indexing(
@@ -1056,6 +1177,7 @@ class InMemoryChatRepository:
             source.error_message = None
             source.updated_at = today_label()
             self._state.knowledge_chunks_by_source[source_id] = []
+            self._state.knowledge_facts_by_source.pop(source_id, None)
             return deepcopy(source)
 
     def list_knowledge_chunks(self, source_id: str) -> list[KnowledgeChunkModel]:
@@ -1087,10 +1209,10 @@ class InMemoryChatRepository:
         *,
         evaluation_case_id: str | None = None,
         relevant_chunk_ids: tuple[str, ...] = (),
-    ) -> list[KnowledgeSearchHitModel]:
+    ) -> AgentSearchResult:
         if self.retrieval_router is None or self._retrieval_scope_provider is None:
-            return self.search_knowledge_chunks(query, limit)
-        from .retrieval_models import RetrievalRequest
+            return AgentSearchResult(hits=tuple(self.search_knowledge_chunks(query, limit)))
+        from .retrieval_models import EvidenceExpansionPolicy, RetrievalRequest
 
         resolution = self._retrieval_scope_provider.resolve()
         if resolution.scope is None:
@@ -1102,7 +1224,10 @@ class InMemoryChatRepository:
                 routing_key=routing_key,
                 fallback_reason=RetrievalFallbackReason.RETRIEVAL_SCOPE_UNAVAILABLE,
             )
-            return list(outcome.hits)
+            return AgentSearchResult(
+                hits=tuple(outcome.hits),
+                fallback_reason=outcome.fallback_reason,
+            )
         outcome = self.retrieval_router.search(
             RetrievalRequest(
                 query=query,
@@ -1111,9 +1236,13 @@ class InMemoryChatRepository:
                 scope=resolution.scope,
                 evaluation_case_id=evaluation_case_id,
                 relevant_chunk_ids=relevant_chunk_ids,
+                expansion_policy=EvidenceExpansionPolicy.BOUNDED_ADJACENCY,
             )
         )
-        return list(outcome.hits)
+        return AgentSearchResult(
+            hits=tuple(outcome.hits),
+            fallback_reason=outcome.fallback_reason,
+        )
 
     def _search_evaluation_case(
         self,
@@ -1128,13 +1257,14 @@ class InMemoryChatRepository:
                 minimum_score=minimum_score,
             )
         relevant_chunk_ids = self._evaluation_relevant_chunk_ids(case.expected_source_ids)
-        hits = self._search_routed_knowledge_chunks(
+        search_result = self._search_routed_knowledge_chunks(
             case.question,
             case.top_k,
             case.id,
             evaluation_case_id=case.id,
             relevant_chunk_ids=relevant_chunk_ids,
         )
+        hits = list(search_result.hits)
         if minimum_score is None:
             return hits
         threshold = resolve_effective_retrieval_min_score(minimum_score)
@@ -1167,6 +1297,20 @@ class InMemoryChatRepository:
             if source.id == source_id:
                 return source
         raise HTTPException(status_code=404, detail="Knowledge source not found")
+
+    @staticmethod
+    def _validate_knowledge_facts(
+        source_id: str,
+        chunk_ids: set[str],
+        facts: Sequence[KnowledgeFactModel],
+    ) -> list[KnowledgeFactModel]:
+        fact_list = list(facts)
+        for fact in fact_list:
+            if fact.source_id != source_id:
+                raise ValueError("fact source_id must match the indexed source")
+            if fact.chunk_id not in chunk_ids:
+                raise ValueError("fact chunk_id must belong to the indexed source bundle")
+        return fact_list
 
     def _find_evaluation_batch(self, batch_id: str) -> EvaluationBatchModel:
         for batch in self._evaluation_batches:

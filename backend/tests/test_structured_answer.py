@@ -31,11 +31,14 @@ from app.main import (
     create_production_app,
 )
 from app.models import ChatMessageModel, ChatState, ResponseParagraphModel
+from app.knowledge_route_models import KnowledgeRouteType
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
+from app.structured_models import StructuredClarification, StructuredUnavailable
+from app.structured_query import UnsafeStructuredQueryError
 from app.structured_repository import StructuredRepository
-from tests.support.structured_fakes import sample_catalog
+from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
 
 
 class RecordingLLMProvider:
@@ -848,6 +851,242 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertEqual([step.tool_name for step in runs[0].steps], ["query_structured_data"])
 
+    def test_filtered_multi_summary_uses_clickhouse_once_and_never_calls_llm(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway(
+            result={
+                "total_count": 4,
+                "metric_0_value": Decimal("350.50"),
+                "metric_0_valid_count": 3,
+                "metric_0_null_count": 1,
+                "metric_1_value": Decimal("200"),
+                "metric_1_valid_count": 4,
+                "metric_1_null_count": 0,
+                "metric_2_value": None,
+                "metric_2_valid_count": 0,
+                "metric_2_null_count": 4,
+            }
+        )
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(), gateway
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "地区为华东的销售额、成本、利润汇总",
+            "deep",
+        )
+
+        self.assertEqual(len(gateway.calls), 1)
+        self.assertEqual(provider.calls, 0)
+        runs = repository.list_agent_runs()
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].steps[0].tool_name, "query_structured_data")
+        self.assertEqual(runs[0].steps[0].source_ids, ["kb-sales"])
+        reply = messages[-1]
+        self.assertEqual(
+            reply.paragraphs[0].text,
+            "结构化汇总结果：sales.xlsx / 明细，匹配 4 行，筛选条件：region:eq:华东。",
+        )
+        self.assertEqual(len(reply.artifacts), 1)
+        artifact = reply.artifacts[0]
+        self.assertEqual(artifact.type, "table")
+        self.assertEqual(artifact.title, "结构化汇总结果")
+        self.assertEqual(artifact.source, "sales.xlsx")
+        self.assertEqual(
+            artifact.columns,
+            ["指标", "聚合", "值", "匹配行数", "有效值", "空值"],
+        )
+        self.assertEqual(
+            artifact.rows,
+            [
+                ["销售额", "sum", "350.50", "4", "3", "1"],
+                ["成本", "sum", "200", "4", "4", "0"],
+                ["利润", "sum", "null", "4", "0", "4"],
+            ],
+        )
+
+    def test_excel_multi_result_records_dataset_fields_and_validation(self) -> None:
+        result = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(),
+            RecordingClickHouseGateway(
+                result={
+                    "total_count": 4,
+                    "metric_0_value": Decimal("1"),
+                    "metric_0_valid_count": 4,
+                    "metric_0_null_count": 0,
+                    "metric_1_value": Decimal("2"),
+                    "metric_1_valid_count": 4,
+                    "metric_1_null_count": 0,
+                    "metric_2_value": Decimal("3"),
+                    "metric_2_valid_count": 4,
+                    "metric_2_null_count": 0,
+                }
+            ),
+        ).try_answer("conv-1", "地区为华东的销售额、成本、利润汇总", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertTrue(result.route_metadata.validation_passed)
+        self.assertFalse(result.route_metadata.adjacency_allowed)
+
+    def test_structured_clarification_records_multi_origin_and_known_metadata(self) -> None:
+        result = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(metric_count=13), RecordingClickHouseGateway()
+        ).try_answer("conv-1", "汇总", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(len(result.route_metadata.target_fields), 13)
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+
+    def test_implicit_clarification_caps_metadata_fields_at_thirty_two(self) -> None:
+        result = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(metric_count=40), RecordingClickHouseGateway()
+        ).try_answer("conv-1", "汇总", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(len(result.route_metadata.target_fields), 32)
+        self.assertEqual(result.route_metadata.target_fields[:3], ("销售额", "成本", "利润"))
+        result.route_metadata.to_dict()
+
+    def test_unavailable_multi_metrics_preserves_known_display_fields(self) -> None:
+        service = StructuredAnswerService(lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway())
+        with patch("app.structured_answer.resolve_structured_intent", return_value=StructuredUnavailable(
+            "unavailable", "ds-sales", ("销售额", "成本", "利润"), ("kb-sales",), "excel_multi_aggregate"
+        )):
+            result = service.try_answer("conv-1", "地区为华东的销售额、成本、利润汇总", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertEqual(result.route_metadata.degradation_reason, "intent_unavailable")
+        result.route_metadata.to_dict()
+
+    def test_unavailable_inferred_single_metric_preserves_known_display_field(self) -> None:
+        from app import structured_query
+
+        parse_filter_clause = structured_query._parse_filter_clause
+
+        def parse_supported_filter_prefix(_question, columns, excluded_spans):
+            return parse_filter_clause("订单金额大于100的总和", columns, excluded_spans)
+
+        with patch.object(
+            structured_query,
+            "_parse_filter_clause",
+            side_effect=parse_supported_filter_prefix,
+        ):
+            result = StructuredAnswerService(
+                lambda: sample_catalog(), RecordingClickHouseGateway()
+            ).try_answer(
+                "conv-1",
+                "订单金额大于100的总和为华东",
+                "quick",
+                [],
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("订单金额",))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertEqual(result.route_metadata.degradation_reason, "intent_unavailable")
+        result.route_metadata.to_dict()
+
+    def test_single_field_clarification_records_filtered_origin(self) -> None:
+        catalog = sample_catalog()
+        with patch(
+            "app.structured_answer.resolve_structured_intent",
+            return_value=StructuredClarification(
+                "choose one",
+                ("订单金额",),
+                dataset_id="ds-sales",
+                target_fields=("订单金额",),
+                candidate_source_ids=("kb-sales",),
+                origin_route="excel_filtered_aggregate",
+            ),
+        ):
+            result = StructuredAnswerService(lambda: catalog, RecordingClickHouseGateway()).try_answer(
+                "conv-1", "sales订单金额平均值", "quick", []
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
+        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+
+    def test_multi_plan_rejection_keeps_intended_route_metadata(self) -> None:
+        service = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway()
+        )
+        with patch("app.structured_answer.StructuredQueryPlanner.plan_multi", side_effect=UnsafeStructuredQueryError):
+            result = service.try_answer(
+                "conv-1", "地区为华东的销售额、成本、利润汇总", "quick", []
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertEqual(result.route_metadata.degradation_reason, "plan_rejected")
+
+    def test_implicit_limit_clarification_executes_neither_clickhouse_nor_llm(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(metric_count=13),
+                gateway,
+                implicit_summary_max_metrics=12,
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(conversation_id, "汇总", "quick")
+
+        self.assertIn("最多可汇总 12 个指标", messages[-1].paragraphs[0].text)
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(provider.calls, 0)
+
+    def test_single_metric_existing_answer_format_remains_supported(self) -> None:
+        gateway = RecordingClickHouseGateway()
+        result = StructuredAnswerService(lambda: sample_catalog(), gateway).try_answer(
+            "conv-1",
+            "华东地区订单金额总和",
+            "quick",
+            [],
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("aggregate=sum", result.reply.paragraphs[0].text)
+        self.assertEqual(result.reply.artifacts, [])
+        self.assertEqual(result.steps[0].source_ids, ["kb-sales"])
+
     def test_structured_decimal_value_uses_deterministic_thousands_separator(self) -> None:
         gateway = RecordingClickHouseGateway(
             result={
@@ -989,6 +1228,26 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(provider.calls, 0)
         self.assertIn("不可用", messages[-1].paragraphs[0].text)
 
+    def test_catalog_outage_preserves_warm_multi_route_context(self) -> None:
+        provider = SwitchableCatalogProvider(sample_multi_metric_catalog())
+        service = StructuredAnswerService(provider, RecordingClickHouseGateway())
+        self.assertIsNotNone(service.try_answer("warm", "地区为华东的汇总", "quick", []))
+        provider.error = RuntimeError("catalog down")
+
+        result = service.try_answer(
+            "outage", "地区为华东的销售额、成本、利润汇总", "quick", []
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
+        self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
+        self.assertEqual(result.route_metadata.degradation_reason, "catalog_unavailable")
+        self.assertFalse(result.route_metadata.validation_passed)
+        result.route_metadata.to_dict()
+
     def test_catalog_failure_keeps_weak_document_count_question_on_legacy_path(self) -> None:
         provider = RecordingLLMProvider()
         gateway = RecordingClickHouseGateway()
@@ -1100,6 +1359,20 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         for question in questions:
             with self.subTest(question=question):
                 self._assert_catalog_failure_uses_legacy_path(question)
+
+    def test_catalog_failure_prefixed_copula_concept_remains_on_legacy_path(self) -> None:
+        for question in (
+            "请说明平均值为常用统计指标",
+            "请解释一下平均值为常用统计指标",
+            "请介绍一下平均值为常用统计指标",
+        ):
+            with self.subTest(question=question):
+                self._assert_catalog_failure_uses_legacy_path(question)
+
+    def test_catalog_failure_field_name_before_copula_remains_structured(self) -> None:
+        self._assert_catalog_failure_is_strong_candidate(
+            "产品说明平均值为10的销售额总和"
+        )
 
     def test_catalog_failure_explicit_filter_grammars_are_strong_candidates(self) -> None:
         questions = (

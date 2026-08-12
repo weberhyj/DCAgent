@@ -6,6 +6,7 @@ from io import StringIO
 from pathlib import Path
 from uuid import uuid4
 
+from .docx_parser import KnowledgeParseResult, parse_docx_knowledge_file
 from .models import KnowledgeChunkModel
 
 CHUNK_SIZE = 600
@@ -13,8 +14,20 @@ CHUNK_OVERLAP = 120
 
 
 def parse_knowledge_file(path: Path, source_id: str, source_type: str) -> list[KnowledgeChunkModel]:
-    text = extract_text(path, source_type)
-    return chunk_text(source_id, text)
+    return list(parse_knowledge_file_result(path, source_id, source_type).chunks)
+
+
+def parse_knowledge_file_result(
+    path: Path,
+    source_id: str,
+    source_type: str,
+) -> KnowledgeParseResult:
+    if path.suffix.lower() == ".docx":
+        return parse_docx_knowledge_file(path, source_id)
+    return KnowledgeParseResult(
+        chunks=tuple(chunk_text(source_id, extract_text(path, source_type))),
+        facts=(),
+    )
 
 
 def extract_text(path: Path, source_type: str) -> str:

@@ -18,6 +18,7 @@ from .clickhouse_compatibility import (
     ClickHouseCompatibilityProfile,
 )
 from .structured_models import (
+    MAX_STRUCTURED_ROUTE_FIELDS,
     StructuredAggregateResult,
     StructuredCatalog,
     StructuredClarification,
@@ -26,12 +27,22 @@ from .structured_models import (
     StructuredDatasetCatalog,
     StructuredFilter,
     StructuredIntent,
+    StructuredMetricIntent,
+    StructuredMetricResult,
+    StructuredMultiAggregateIntent,
+    StructuredMultiAggregatePlan,
+    StructuredMultiAggregateResult,
     StructuredPublication,
     StructuredQueryPlan,
     StructuredUnavailable,
 )
 
-StructuredIntentResolution = StructuredIntent | StructuredClarification | StructuredUnavailable
+StructuredIntentResolution = (
+    StructuredIntent
+    | StructuredMultiAggregateIntent
+    | StructuredClarification
+    | StructuredUnavailable
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -63,6 +74,10 @@ _AGGREGATE_WORDS = (
     ("max", ("最大", "最高")),
     ("min", ("最小", "最低")),
 )
+_SUMMARY_WORDS = ("汇总", "统计")
+_NUMERIC_TYPES = frozenset(
+    {StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL}
+)
 _COMPARISON_OPERATORS = {"大于": "gt", "不少于": "gte", "小于": "lt", "不超过": "lte"}
 _DATE_RANGE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\s*至\s*(\d{4}-\d{2}-\d{2})")
 _NUMBER_RE = r"-?\d+(?:\.\d+)?"
@@ -80,11 +95,14 @@ class StructuredQueryPlanner:
         self,
         catalog: StructuredCatalog,
         compatibility: ClickHouseCompatibilityProfile | None = None,
+        *,
+        implicit_summary_max_metrics: int = 12,
     ) -> None:
         self._catalog = catalog
         self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
             ClickHouseCompatibilityMode.MODERN
         )
+        self._implicit_summary_max_metrics = implicit_summary_max_metrics
 
     def plan(
         self,
@@ -186,6 +204,114 @@ class StructuredQueryPlanner:
             filters=intent.filters,
         )
 
+    def plan_multi(
+        self,
+        intent: StructuredMultiAggregateIntent,
+        publication: StructuredPublication,
+    ) -> StructuredMultiAggregatePlan:
+        dataset = self._require_dataset(intent.dataset_id)
+        active = dataset.active_publication
+        if active is None:
+            raise UnsafeStructuredQueryError("structured dataset is not published")
+        if publication != active:
+            raise UnsafeStructuredQueryError("publication is not the active catalog publication")
+        if not intent.metrics:
+            raise UnsafeStructuredQueryError("multi-metric summary requires at least one metric")
+        if (
+            intent.implicit
+            and len(intent.metrics) > self._implicit_summary_max_metrics
+        ):
+            raise UnsafeStructuredQueryError("implicit metric count exceeds configured limit")
+
+        table_name = _require_identifier(publication.physical_table_name)
+        columns = {column.physical_name: column for column in dataset.schema.columns}
+        projections = ["count() AS total_count"]
+        seen_columns: set[str] = set()
+        for index, metric_intent in enumerate(intent.metrics):
+            aggregate = metric_intent.aggregate
+            if aggregate not in _ALLOWED_AGGREGATES:
+                raise UnsafeStructuredQueryError("unsupported aggregate")
+            name = _require_identifier(metric_intent.metric_physical_name)
+            if name in seen_columns:
+                raise UnsafeStructuredQueryError("duplicate metric column")
+            seen_columns.add(name)
+            metric = columns.get(name)
+            if metric is None:
+                raise UnsafeStructuredQueryError("unknown metric column")
+            if aggregate != "count" and not metric.allow_aggregate:
+                raise UnsafeStructuredQueryError("disallowed aggregate column")
+            aggregate_expression = f"{aggregate}({name})"
+            projections.extend(
+                (
+                    f"{aggregate_expression} AS metric_{index}_value",
+                    f"count({name}) AS metric_{index}_valid_count",
+                    f"count() - count({name}) AS metric_{index}_null_count",
+                )
+            )
+
+        parameters: dict[str, object] = {}
+        predicates = []
+        for index, item in enumerate(intent.filters):
+            column = columns.get(item.physical_name)
+            if column is None or not column.allow_filter:
+                raise UnsafeStructuredQueryError("unknown or disallowed filter column")
+            name = _require_identifier(column.physical_name)
+            parameter_name = f"filter_{index}"
+            parameter_type = self._compatibility.parameter_type(column.data_type)
+            parameters[parameter_name] = _convert_parameter(
+                item.value, column.data_type, self._compatibility
+            )
+            placeholder = f"{{{parameter_name}:{parameter_type}}}"
+            if item.operator == "between":
+                if item.upper_value is None:
+                    raise UnsafeStructuredQueryError("between filter requires an upper value")
+                upper_name = f"filter_{index}_upper"
+                upper_value = _convert_parameter(
+                    item.upper_value, column.data_type, self._compatibility
+                )
+                upper_operator = "<="
+                if column.data_type is StructuredColumnType.DATETIME and re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}", item.upper_value
+                ):
+                    upper_value = upper_value + timedelta(days=1)
+                    upper_operator = "<"
+                parameters[upper_name] = upper_value
+                upper_placeholder = f"{{{upper_name}:{parameter_type}}}"
+                predicates.append(
+                    f"({name} >= {placeholder} AND {name} {upper_operator} {upper_placeholder})"
+                )
+            else:
+                operator = {
+                    "eq": "=",
+                    "gt": ">",
+                    "gte": ">=",
+                    "lt": "<",
+                    "lte": "<=",
+                }.get(item.operator)
+                if operator is None:
+                    raise UnsafeStructuredQueryError("unsupported filter operator")
+                if item.upper_value is not None:
+                    raise UnsafeStructuredQueryError("non-range filter cannot have an upper value")
+                predicates.append(f"{name} {operator} {placeholder}")
+
+        sql = f"SELECT {', '.join(projections)} FROM {table_name}"
+        if predicates:
+            sql += " WHERE " + " AND ".join(predicates)
+        _validate_generated_select(
+            sql,
+            table_name=table_name,
+            allowed_columns=frozenset(columns),
+        )
+        return StructuredMultiAggregatePlan(
+            publication_id=publication.publication_id,
+            dataset_id=intent.dataset_id,
+            metrics=intent.metrics,
+            sql=sql,
+            parameters=parameters,
+            filters=intent.filters,
+            implicit=intent.implicit,
+        )
+
     def _require_dataset(self, dataset_id: str) -> StructuredDatasetCatalog:
         matches = [
             dataset for dataset in self._catalog.datasets if dataset.schema.dataset_id == dataset_id
@@ -202,6 +328,7 @@ class StructuredQueryExecutor:
         clickhouse_gateway: object,
         *,
         compatibility: ClickHouseCompatibilityProfile | None = None,
+        implicit_summary_max_metrics: int = 12,
         clock: Callable[[], float] = time.perf_counter,
         audit_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> None:
@@ -210,6 +337,7 @@ class StructuredQueryExecutor:
         self._compatibility = compatibility or ClickHouseCompatibilityProfile.for_mode(
             ClickHouseCompatibilityMode.MODERN
         )
+        self._implicit_summary_max_metrics = implicit_summary_max_metrics
         self._clock = clock
         self._audit_id_factory = audit_id_factory
 
@@ -255,10 +383,18 @@ class StructuredQueryExecutor:
 
         try:
             row = _aggregate_row(raw_result)
-            value = _aggregate_value(row["aggregate_value"], plan.aggregate)
-            total_count = int(row["total_count"])
-            valid_count = int(row["valid_count"])
-            null_count = int(row["null_count"])
+            _require_exact_result_aliases(
+                row,
+                ("aggregate_value", "total_count", "valid_count", "null_count"),
+            )
+            total_count = _strict_integer(row["total_count"])
+            valid_count = _strict_integer(row["valid_count"])
+            null_count = _strict_integer(row["null_count"])
+            value = _aggregate_value(
+                row["aggregate_value"],
+                plan.aggregate,
+                valid_count=valid_count,
+            )
         except (KeyError, TypeError, ValueError, IndexError, ArithmeticError):
             return StructuredUnavailable("结构化查询返回了无效结果")
         if min(total_count, valid_count, null_count) < 0 or valid_count + null_count != total_count:
@@ -274,6 +410,7 @@ class StructuredQueryExecutor:
         )
         return StructuredAggregateResult(
             dataset_id=dataset.schema.dataset_id,
+            source_id=dataset.schema.source_id,
             schema_version=dataset.schema.schema_version,
             aggregate=plan.aggregate,
             metric_physical_name=plan.metric_physical_name,
@@ -290,8 +427,115 @@ class StructuredQueryExecutor:
             audit_id=self._audit_id_factory(),
         )
 
+    def execute_multi(
+        self, plan: StructuredMultiAggregatePlan
+    ) -> StructuredMultiAggregateResult | StructuredUnavailable:
+        dataset = self._require_active_dataset(plan)
+        if isinstance(dataset, StructuredUnavailable):
+            return dataset
+        publication = dataset.active_publication
+        assert publication is not None
+
+        try:
+            expected = StructuredQueryPlanner(
+                self._catalog,
+                self._compatibility,
+                implicit_summary_max_metrics=self._implicit_summary_max_metrics,
+            ).plan_multi(
+                StructuredMultiAggregateIntent(
+                    dataset_id=plan.dataset_id,
+                    metrics=plan.metrics,
+                    filters=plan.filters,
+                    implicit=plan.implicit,
+                ),
+                publication,
+            )
+        except UnsafeStructuredQueryError:
+            return StructuredUnavailable("结构化查询计划已失效")
+        if plan.sql != expected.sql or dict(plan.parameters) != dict(expected.parameters):
+            return StructuredUnavailable("结构化查询计划未通过安全校验")
+
+        query = getattr(self._clickhouse, "query", None)
+        if query is None:
+            return StructuredUnavailable("结构化查询服务暂时不可用")
+        started = self._clock()
+        try:
+            raw_result = query(plan.sql, plan.parameters)
+        except Exception as error:
+            if (
+                isinstance(error, TimeoutError)
+                or "timeout" in str(error).casefold()
+                or "timed out" in str(error).casefold()
+            ):
+                return StructuredUnavailable("结构化查询超时，请稍后重试")
+            return StructuredUnavailable("结构化查询服务暂时不可用")
+        elapsed_ms = max(0.0, (self._clock() - started) * 1000.0)
+
+        try:
+            row = _multi_aggregate_row(raw_result, len(plan.metrics))
+            _require_exact_result_aliases(
+                row,
+                _multi_aggregate_aliases(len(plan.metrics)),
+            )
+            total_count = _strict_integer(row["total_count"])
+            metric_results: list[StructuredMetricResult] = []
+            for index, metric_intent in enumerate(plan.metrics):
+                valid_count = _strict_integer(row[f"metric_{index}_valid_count"])
+                null_count = _strict_integer(row[f"metric_{index}_null_count"])
+                if (
+                    min(total_count, valid_count, null_count) < 0
+                    or valid_count + null_count != total_count
+                ):
+                    return StructuredUnavailable("结构化查询返回了不一致的计数")
+                metric = next(
+                    (
+                        column
+                        for column in dataset.schema.columns
+                        if column.physical_name == metric_intent.metric_physical_name
+                    ),
+                    None,
+                )
+                if metric is None:
+                    return StructuredUnavailable("结构化查询返回了无效结果")
+                if metric_intent.aggregate == "count":
+                    value = _strict_integer(row[f"metric_{index}_value"])
+                    if value < 0 or value != valid_count:
+                        return StructuredUnavailable("结构化查询返回了不一致的计数")
+                else:
+                    value = _aggregate_value(
+                        row[f"metric_{index}_value"],
+                        metric_intent.aggregate,
+                        valid_count=valid_count,
+                    )
+                metric_results.append(
+                    StructuredMetricResult(
+                        aggregate=metric_intent.aggregate,
+                        metric_physical_name=metric_intent.metric_physical_name,
+                        metric_display_name=metric.display_name,
+                        value=value,
+                        valid_count=valid_count,
+                        null_count=null_count,
+                    )
+                )
+        except (KeyError, TypeError, ValueError, IndexError, ArithmeticError):
+            return StructuredUnavailable("结构化查询返回了无效结果")
+
+        return StructuredMultiAggregateResult(
+            dataset_id=dataset.schema.dataset_id,
+            source_id=dataset.schema.source_id,
+            schema_version=dataset.schema.schema_version,
+            metrics=tuple(metric_results),
+            total_count=total_count,
+            source_name=dataset.source_name,
+            worksheet_name=dataset.schema.worksheet_name,
+            publication_id=publication.publication_id,
+            filters=plan.filters,
+            elapsed_ms=elapsed_ms,
+            audit_id=self._audit_id_factory(),
+        )
+
     def _require_active_dataset(
-        self, plan: StructuredQueryPlan
+        self, plan: StructuredQueryPlan | StructuredMultiAggregatePlan
     ) -> StructuredDatasetCatalog | StructuredUnavailable:
         matches = [
             dataset
@@ -314,11 +558,14 @@ def parse_structured_intent(
 
 
 def resolve_structured_intent(
-    question: str, catalog: StructuredCatalog
+    question: str,
+    catalog: StructuredCatalog,
+    *,
+    implicit_summary_max_metrics: int = 12,
 ) -> StructuredIntentResolution:
     dataset_result = _parse_dataset_clause(question, catalog)
     if dataset_result.issue is not None:
-        return dataset_result.issue
+        return _with_dataset_issue_context(question, catalog, dataset_result.issue)
     assert dataset_result.value is not None
     dataset = dataset_result.value
 
@@ -328,7 +575,7 @@ def resolve_structured_intent(
         dataset_result.consumed_spans,
     )
     if filter_result.issue is not None:
-        return filter_result.issue
+        return _with_route_context(filter_result.issue, dataset, origin_route="excel_filtered_aggregate")
     assert filter_result.value is not None
 
     consumed = (*dataset_result.consumed_spans, *filter_result.consumed_spans)
@@ -336,43 +583,158 @@ def resolve_structured_intent(
         question,
         dataset.schema.columns,
         consumed,
+        allow_missing=True,
     )
     if aggregate_result.issue is not None:
-        return aggregate_result.issue
-    assert aggregate_result.value is not None
-    aggregate = aggregate_result.value
+        return _with_route_context(aggregate_result.issue, dataset, origin_route="excel_filtered_aggregate")
 
     consumed = (*consumed, *aggregate_result.consumed_spans)
-    metric_result = _parse_metric_clause(
+    available = _mask_spans(question, consumed)
+    field_spans = _column_name_spans(available, dataset.schema.columns)
+    has_summary_word = any(
+        not any(_contains(field_span, span) for field_span in field_spans)
+        for word in _SUMMARY_WORDS
+        for span in _find_normalized_spans(available, word)
+    )
+    if aggregate_result.value is None and not has_summary_word:
+            return _with_route_context(StructuredUnavailable("未识别到受支持的聚合意图"), dataset, origin_route="excel_filtered_aggregate")
+    aggregate = aggregate_result.value or "sum"
+
+    metric_list_result = _parse_metric_list(
         question,
         dataset.schema.columns,
         aggregate,
-        filter_result.value,
-        filter_result.shared_columns,
-        aggregate_result.count_all_hint,
         consumed,
     )
-    if metric_result.issue is not None:
-        return metric_result.issue
-    metric = metric_result.value
+    if metric_list_result.issue is not None:
+        return _with_clarification_context(
+            metric_list_result.issue,
+            dataset,
+            origin_route="excel_filtered_aggregate",
+        )
+    assert metric_list_result.value is not None
+    metrics = metric_list_result.value
 
-    consumed = (*consumed, *metric_result.consumed_spans)
-    remaining = _mask_spans(question, consumed)
-    if _DATE_RANGE_RE.search(remaining) or re.search(r"大于|不少于|小于|不超过|为|=", remaining):
-        return StructuredUnavailable("结构化查询包含未识别的筛选条件")
+    if metrics:
+        consumed = (*consumed, *metric_list_result.consumed_spans)
+        if len(metrics) > MAX_STRUCTURED_ROUTE_FIELDS:
+            return _with_clarification_context(
+                StructuredClarification(
+                    f"一次最多只能汇总 {MAX_STRUCTURED_ROUTE_FIELDS} 个指标，请减少选择",
+                    tuple(column.display_name for column in metrics[:MAX_STRUCTURED_ROUTE_FIELDS]),
+                ),
+                dataset,
+                origin_route="excel_multi_aggregate",
+                target_fields=tuple(
+                    column.display_name for column in metrics[:MAX_STRUCTURED_ROUTE_FIELDS]
+                ),
+            )
+        remaining = _mask_spans(question, consumed)
+        if _DATE_RANGE_RE.search(remaining) or re.search(
+            r"大于|不少于|小于|不超过|为|=", remaining
+        ):
+            return _with_route_context(
+                StructuredUnavailable("结构化查询包含未识别的筛选条件"),
+                dataset,
+                origin_route=("excel_multi_aggregate" if len(metrics) > 1 else "excel_filtered_aggregate"),
+                target_fields=tuple(column.display_name for column in metrics),
+            )
+        if len(metrics) == 1:
+            return StructuredIntent(
+                dataset_id=dataset.schema.dataset_id,
+                aggregate=aggregate,
+                metric_physical_name=metrics[0].physical_name,
+                filters=filter_result.value,
+            )
+        return StructuredMultiAggregateIntent(
+            dataset_id=dataset.schema.dataset_id,
+            metrics=tuple(
+                StructuredMetricIntent(aggregate, column.physical_name) for column in metrics
+            ),
+            filters=filter_result.value,
+            implicit=False,
+        )
 
-    return StructuredIntent(
-        dataset_id=dataset.schema.dataset_id,
-        aggregate=aggregate,
-        metric_physical_name=None if metric is None else metric.physical_name,
-        filters=filter_result.value,
-    )
+    if aggregate_result.value is not None:
+        metric_result = _parse_metric_clause(
+            question,
+            dataset.schema.columns,
+            aggregate,
+            filter_result.value,
+            filter_result.shared_columns,
+            aggregate_result.count_all_hint,
+            consumed,
+        )
+        if metric_result.issue is not None:
+            return _with_clarification_context(
+                metric_result.issue,
+                dataset,
+                origin_route="excel_filtered_aggregate",
+            )
+        metric = metric_result.value
+
+        consumed = (*consumed, *metric_result.consumed_spans)
+        remaining = _mask_spans(question, consumed)
+        if _DATE_RANGE_RE.search(remaining) or re.search(
+            r"大于|不少于|小于|不超过|为|=", remaining
+        ):
+            return _with_route_context(
+                StructuredUnavailable("结构化查询包含未识别的筛选条件"),
+                dataset,
+                origin_route="excel_filtered_aggregate",
+                target_fields=(() if metric is None else (metric.display_name,)),
+            )
+
+        return StructuredIntent(
+            dataset_id=dataset.schema.dataset_id,
+            aggregate=aggregate,
+            metric_physical_name=None if metric is None else metric.physical_name,
+            filters=filter_result.value,
+        )
+
+    if has_summary_word:
+        implicit_columns = tuple(
+            column
+            for column in dataset.schema.columns
+            if column.allow_aggregate and column.data_type in _NUMERIC_TYPES
+        )
+        if not implicit_columns:
+            return StructuredUnavailable(
+                "没有可汇总的已授权数值列",
+                dataset.schema.dataset_id,
+                (),
+                (dataset.schema.source_id,),
+                "excel_multi_aggregate",
+            )
+        capped_columns = implicit_columns[:MAX_STRUCTURED_ROUTE_FIELDS]
+        if len(implicit_columns) > implicit_summary_max_metrics:
+            return StructuredClarification(
+                f"可汇总指标超过上限，最多可汇总 {implicit_summary_max_metrics} 个指标，请选择",
+                tuple(column.display_name for column in capped_columns),
+                dataset_id=dataset.schema.dataset_id,
+                target_fields=tuple(column.display_name for column in capped_columns),
+                candidate_source_ids=(dataset.schema.source_id,),
+                origin_route="excel_multi_aggregate",
+            )
+        return StructuredMultiAggregateIntent(
+            dataset_id=dataset.schema.dataset_id,
+            metrics=tuple(
+                StructuredMetricIntent("sum", column.physical_name)
+                for column in implicit_columns
+            ),
+            filters=filter_result.value,
+            implicit=True,
+        )
+
+    return StructuredUnavailable("未识别到受支持的聚合意图")
 
 
 def _parse_aggregate_clause(
     question: str,
     columns: tuple[StructuredColumnSchema, ...],
     excluded_spans: tuple[_TextSpan, ...],
+    *,
+    allow_missing: bool = False,
 ) -> _ClauseParseResult[str]:
     available = _mask_spans(question, excluded_spans)
     field_spans = _column_name_spans(available, columns)
@@ -394,12 +756,146 @@ def _parse_aggregate_clause(
             )
         )
     if not matches:
+        if allow_missing:
+            return _ClauseParseResult()
         return _ClauseParseResult(issue=StructuredUnavailable("未识别到受支持的聚合意图"))
     aggregate = next(iter(matches))
     return _ClauseParseResult(
         value=aggregate,
         consumed_spans=_merge_spans(matches[aggregate]),
         count_all_hint=count_all_hint,
+    )
+
+
+def _with_route_context(
+    issue: StructuredClarification | StructuredUnavailable,
+    dataset: StructuredDatasetCatalog,
+    *,
+    origin_route: str,
+    target_fields: tuple[str, ...] = (),
+) -> StructuredClarification | StructuredUnavailable:
+    candidates = issue.candidates if isinstance(issue, StructuredClarification) else ()
+    fields = tuple(
+        next(
+            (
+                column.display_name
+                for column in dataset.schema.columns
+                if column.physical_name == candidate
+            ),
+            candidate,
+        )
+        for candidate in candidates
+    )
+    fields = target_fields or fields
+    if isinstance(issue, StructuredClarification):
+        return StructuredClarification(issue.message, issue.candidates, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route)
+    return StructuredUnavailable(issue.message, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route)
+
+
+_with_clarification_context = _with_route_context
+
+
+def _with_dataset_issue_context(
+    question: str,
+    catalog: StructuredCatalog,
+    issue: StructuredClarification | StructuredUnavailable,
+) -> StructuredClarification | StructuredUnavailable:
+    candidates = issue.candidates if isinstance(issue, StructuredClarification) else ()
+    datasets = tuple(
+        dataset for dataset in catalog.datasets if dataset.schema.dataset_id in candidates
+    )
+    source_ids = tuple(dataset.schema.source_id for dataset in datasets[:MAX_STRUCTURED_ROUTE_FIELDS])
+    is_multi = any(word in _normalize(question) for word in _SUMMARY_WORDS) or "、" in question
+    origin_route = "excel_multi_aggregate" if is_multi else "excel_filtered_aggregate"
+    if isinstance(issue, StructuredClarification):
+        return StructuredClarification(
+            issue.message,
+            issue.candidates[:MAX_STRUCTURED_ROUTE_FIELDS],
+            candidate_source_ids=source_ids,
+            origin_route=origin_route,
+        )
+    return StructuredUnavailable(issue.message, origin_route=origin_route)
+
+
+def _parse_metric_list(
+    question: str,
+    columns: tuple[StructuredColumnSchema, ...],
+    aggregate: str,
+    excluded_spans: tuple[_TextSpan, ...],
+) -> _ClauseParseResult[tuple[StructuredColumnSchema, ...]]:
+    available = _mask_spans(question, excluded_spans)
+    raw_matches: list[tuple[_TextSpan, int, StructuredColumnSchema]] = []
+    for column in columns:
+        for _, name in _resolution_names(column):
+            normalized_name = _normalize(name)
+            if not normalized_name:
+                continue
+            for span in _find_normalized_spans(available, name):
+                raw_matches.append((span, len(normalized_name), column))
+
+    by_span: dict[_TextSpan, list[tuple[int, StructuredColumnSchema]]] = {}
+    for span, match_length, column in raw_matches:
+        by_span.setdefault(span, []).append((match_length, column))
+
+    span_groups: list[
+        tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]
+    ] = []
+    for span, span_matches in by_span.items():
+        finalists = {column.physical_name: column for _, column in span_matches}
+        span_groups.append(
+            (
+                span,
+                max(match_length for match_length, _ in span_matches),
+                finalists,
+            )
+        )
+
+    non_overlapping: list[
+        tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]
+    ] = []
+    for match in sorted(
+        span_groups,
+        key=lambda item: (-item[1], item[0].start, item[0].end),
+    ):
+        span = match[0]
+        if any(
+            span.start < selected_span.end and selected_span.start < span.end
+            for selected_span, _, _ in non_overlapping
+        ):
+            continue
+        non_overlapping.append(match)
+
+    selected: list[StructuredColumnSchema] = []
+    selected_names: set[str] = set()
+    selected_spans: list[_TextSpan] = []
+    for span, _, finalists in sorted(non_overlapping, key=lambda item: item[0]):
+        if len(finalists) > 1:
+            return _ClauseParseResult(
+                issue=StructuredClarification(
+                    "字段名称存在歧义，请选择一个",
+                    tuple(sorted(finalists)),
+                )
+            )
+        column = next(iter(finalists.values()))
+        if column.physical_name not in selected_names:
+            selected.append(column)
+            selected_names.add(column.physical_name)
+        selected_spans.append(span)
+
+    disallowed = tuple(
+        column for column in selected if aggregate != "count" and not column.allow_aggregate
+    )
+    if disallowed:
+        return _ClauseParseResult(
+            issue=StructuredUnavailable(
+                "指标列未授权用于聚合: "
+                + "、".join(column.display_name for column in disallowed)
+            )
+        )
+
+    return _ClauseParseResult(
+        value=tuple(selected),
+        consumed_spans=tuple(selected_spans),
     )
 
 
@@ -1077,16 +1573,20 @@ def _aggregate_row(result: object) -> Mapping[str, object]:
     named_results = getattr(result, "named_results", None)
     if named_results is not None:
         rows = list(named_results())
-        if rows and isinstance(rows[0], Mapping):
+        if len(rows) == 1 and isinstance(rows[0], Mapping):
             return rows[0]
+        raise ValueError("aggregate query must return exactly one named row")
     column_names = getattr(result, "column_names", None)
     result_rows = getattr(result, "result_rows", None)
-    if column_names and result_rows:
-        return dict(zip(column_names, result_rows[0], strict=True))
+    if column_names is not None and result_rows is not None:
+        rows = list(result_rows)
+        if len(rows) != 1:
+            raise ValueError("aggregate query must return exactly one result row")
+        return dict(zip(column_names, rows[0], strict=True))
     if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
         rows = list(result)
-        if not rows:
-            raise ValueError("empty aggregate result")
+        if len(rows) != 1:
+            raise ValueError("aggregate query must return exactly one result row")
         first = rows[0]
         if isinstance(first, Mapping):
             return first
@@ -1101,11 +1601,103 @@ def _aggregate_row(result: object) -> Mapping[str, object]:
     raise TypeError("unsupported ClickHouse aggregate result shape")
 
 
-def _aggregate_value(value: object, aggregate: Literal["avg", "sum", "count", "min", "max"]):
-    if value is None:
-        return None
+def _strict_integer(value: object) -> int:
+    if isinstance(value, bool):
+        raise TypeError("boolean is not an integer result")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite() or value != value.to_integral_value():
+            raise ValueError("non-integral decimal result")
+        return int(value)
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("non-integral float result")
+        return int(value)
+    if isinstance(value, str):
+        if re.fullmatch(r"[+-]?\d+", value) is None:
+            raise ValueError("non-integral string result")
+        return int(value)
+    raise TypeError("unsupported integer result type")
+
+
+def _multi_aggregate_row(
+    result: object,
+    metric_count: int,
+) -> Mapping[str, object]:
+    if isinstance(result, Mapping):
+        return result
+    named_results = getattr(result, "named_results", None)
+    if named_results is not None:
+        rows = list(named_results())
+        if len(rows) != 1 or not isinstance(rows[0], Mapping):
+            raise ValueError("multi-aggregate query must return exactly one named row")
+        return rows[0]
+    column_names = getattr(result, "column_names", None)
+    result_rows = getattr(result, "result_rows", None)
+    if column_names is not None and result_rows is not None:
+        rows = list(result_rows)
+        if len(rows) != 1:
+            raise ValueError("multi-aggregate query must return exactly one result row")
+        return dict(zip(column_names, rows[0], strict=True))
+    if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
+        rows = list(result)
+        if len(rows) != 1:
+            raise ValueError("multi-aggregate query must return exactly one result row")
+        first = rows[0]
+        if isinstance(first, Mapping):
+            return first
+        if isinstance(first, Sequence) and not isinstance(
+            first, (str, bytes, bytearray)
+        ):
+            return dict(zip(_multi_aggregate_aliases(metric_count), first, strict=True))
+    raise TypeError("unsupported ClickHouse multi-aggregate result shape")
+
+
+def _multi_aggregate_aliases(metric_count: int) -> tuple[str, ...]:
+    aliases = ["total_count"]
+    for index in range(metric_count):
+        aliases.extend(
+            (
+                f"metric_{index}_value",
+                f"metric_{index}_valid_count",
+                f"metric_{index}_null_count",
+            )
+        )
+    return tuple(aliases)
+
+
+def _require_exact_result_aliases(
+    row: Mapping[str, object],
+    expected_aliases: tuple[str, ...],
+) -> None:
+    actual_aliases = tuple(row)
+    if len(actual_aliases) != len(expected_aliases) or set(actual_aliases) != set(expected_aliases):
+        raise ValueError("aggregate result aliases do not match the generated projection")
+
+
+def _aggregate_value(
+    value: object,
+    aggregate: Literal["avg", "sum", "count", "min", "max"],
+    *,
+    valid_count: int,
+):
     if aggregate == "count":
         return int(value)
-    if isinstance(value, (int, Decimal)):
+    if value is None:
+        if valid_count == 0:
+            return None
+        raise ValueError("non-empty aggregate result cannot be null")
+    if isinstance(value, bool):
+        raise TypeError("boolean is not a numeric aggregate result")
+    if isinstance(value, int):
         return value
-    return Decimal(str(value))
+    if isinstance(value, Decimal):
+        numeric = value
+    elif isinstance(value, (float, str)):
+        numeric = Decimal(str(value))
+    else:
+        raise TypeError("unsupported aggregate result type")
+    if not numeric.is_finite():
+        raise ValueError("aggregate result must be finite")
+    return numeric

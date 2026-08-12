@@ -626,7 +626,7 @@ benchmark = [
 ]
 dev = [
     { name = "fastapi-cli", specifier = ">=0.0.32" },
-    { name = "pytest", specifier = ">=9.1,<10" },
+    { name = "pytest", specifier = ">=9.1" },
 ]
 offline = [
     { name = "docling", specifier = ">=2.40" },

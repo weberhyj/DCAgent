@@ -1,21 +1,35 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Sequence
 
 from app.agent import (
     GREETING_REPLY,
+    AgentSearchResult,
     KnowledgeAgentTools,
     ReadOnlyKnowledgeAgent,
     is_greeting_message,
 )
+from app.knowledge_route_models import KnowledgeRouteType
 from app.llm import LLMRequest
 from app.models import (
     ChatMessageModel,
+    ChatState,
     KnowledgeChunkModel,
     KnowledgeSearchHitModel,
     KnowledgeSourceModel,
     ResponseParagraphModel,
 )
+from app.repository import InMemoryChatRepository
+from app.retrieval_models import (
+    EvidenceExpansionPolicy,
+    RetrievalMode,
+    RetrievalRequest,
+    RetrievalScope,
+)
+from app.retrieval_router import RoutedRetrievalOutcome
+from app.word_fact_answer import WordFactAnswerService
+from app.word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
 
 
 def source(source_id: str, name: str) -> KnowledgeSourceModel:
@@ -68,6 +82,56 @@ class RecordingProvider:
         )
 
 
+def word_fact_match(
+    entity: str,
+    field: str,
+    value: str,
+) -> WordFactMatch:
+    fact = KnowledgeFactModel.create(
+        id=f"fact-{entity}-{field}-{value}",
+        source_id="kb-people",
+        chunk_id="chunk-people-1",
+        entity=entity,
+        field=field,
+        value=value,
+        confidence=0.98,
+        locator={"paragraph": 1},
+    )
+    return WordFactMatch(
+        fact=fact,
+        source_name="people.docx",
+        classification="内部",
+    )
+
+
+class FakeFacts:
+    def __init__(self, matches: Sequence[WordFactMatch]) -> None:
+        self._matches = list(matches)
+
+    def find_knowledge_facts(
+        self,
+        _intent: WordFactualIntent,
+        *,
+        permission_tags: Sequence[str] = (),
+    ) -> list[WordFactMatch]:
+        del permission_tags
+        return list(self._matches)
+
+
+class RecordingRouteProvider:
+    def __init__(self) -> None:
+        self.generation_calls = 0
+
+    def generate_reply(self, _request: LLMRequest) -> ChatMessageModel:
+        self.generation_calls += 1
+        return ChatMessageModel(
+            id=f"msg-route-{self.generation_calls}",
+            role="assistant",
+            time="2026-08-11 12:00:00",
+            paragraphs=[ResponseParagraphModel(text="hybrid RAG answer")],
+        )
+
+
 class AgentTest(unittest.TestCase):
     def test_pure_greeting_builds_welcome_run_without_external_dependencies(self) -> None:
         def unexpected_call(*args: object, **kwargs: object) -> None:
@@ -78,10 +142,7 @@ class AgentTest(unittest.TestCase):
                 raise AssertionError("greeting must not call external dependencies")
 
         agent = ReadOnlyKnowledgeAgent(
-            tools=KnowledgeAgentTools(
-                search_knowledge=unexpected_call,
-                inspect_document=unexpected_call,
-            ),
+            tools=KnowledgeAgentTools(search_knowledge=unexpected_call),
             llm_provider=UnexpectedProvider(),
         )
 
@@ -134,8 +195,7 @@ class AgentTest(unittest.TestCase):
     def test_greeting_with_substantive_question_falls_through(self) -> None:
         agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
-                search_knowledge=lambda query, limit, routing_key: [],
-                inspect_document=lambda source_id: [],
+                search_knowledge=lambda query, limit, routing_key: AgentSearchResult(hits=()),
             ),
             llm_provider=RecordingProvider(),
         )
@@ -161,19 +221,16 @@ class AgentTest(unittest.TestCase):
             query: str,
             limit: int,
             routing_key: str,
-        ) -> list[KnowledgeSearchHitModel]:
+        ) -> AgentSearchResult:
             search_calls.append(query)
             routing_keys.append(routing_key)
             if len(search_calls) == 1:
-                return [hit(policy, policy_chunk, 0.8)]
-            return [hit(finance, finance_chunk, 8.2)]
+                return AgentSearchResult(hits=(hit(policy, policy_chunk, 0.8),))
+            return AgentSearchResult(hits=(hit(finance, finance_chunk, 8.2),))
 
         provider = RecordingProvider()
         agent = ReadOnlyKnowledgeAgent(
-            tools=KnowledgeAgentTools(
-                search_knowledge=search,
-                inspect_document=lambda source_id: [],
-            ),
+            tools=KnowledgeAgentTools(search_knowledge=search),
             llm_provider=provider,
         )
 
@@ -197,24 +254,17 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(len(search_steps), 2)
         self.assertTrue(all(step.read_only for step in result.steps))
 
-    def test_agent_inspects_documents_and_compares_multiple_sources(self) -> None:
+    def test_agent_never_inspects_documents_after_reranked_search(self) -> None:
         policy = source("kb-policy", "差旅制度.txt")
         finance = source("kb-finance", "财务规则.txt")
         policy_hit = hit(policy, chunk("kb-policy", 0, "差旅材料需在五日内提交。"), 9.2)
         finance_hit = hit(finance, chunk("kb-finance", 0, "财务要求提交发票。"), 8.8)
-        inspected: list[str] = []
-
-        def inspect(source_id: str) -> list[KnowledgeChunkModel]:
-            inspected.append(source_id)
-            if source_id == "kb-policy":
-                return [chunk(source_id, 1, "差旅材料还需要行程单和审批记录。")]
-            return [chunk(source_id, 1, "缺少发票时财务会退回补充。")]
-
         provider = RecordingProvider()
         agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
-                search_knowledge=lambda query, limit, routing_key: [policy_hit, finance_hit],
-                inspect_document=inspect,
+                search_knowledge=lambda query, limit, routing_key: AgentSearchResult(
+                    hits=(policy_hit, finance_hit)
+                ),
             ),
             llm_provider=provider,
         )
@@ -226,8 +276,7 @@ class AgentTest(unittest.TestCase):
             previous_messages=[],
         )
 
-        self.assertEqual(set(inspected), {"kb-policy", "kb-finance"})
-        self.assertIn("inspect_document", [step.tool_name for step in result.steps])
+        self.assertNotIn("inspect_document", [step.tool_name for step in result.steps])
         self.assertIn("compare_evidence", [step.tool_name for step in result.steps])
         self.assertIsNotNone(provider.request)
         self.assertIn("多来源", provider.request.agent_context)
@@ -235,14 +284,50 @@ class AgentTest(unittest.TestCase):
         self.assertIn("财务规则.txt", provider.request.agent_context)
         self.assertGreaterEqual(len(provider.request.knowledge_hits), 2)
 
+    def test_document_route_records_first_degradation_and_sorted_sources(self) -> None:
+        policy = source("kb-policy", "policy.txt")
+        finance = source("kb-finance", "finance.txt")
+        search_calls = 0
+
+        def search(query: str, limit: int, routing_key: str) -> AgentSearchResult:
+            nonlocal search_calls
+            search_calls += 1
+            if search_calls == 1:
+                return AgentSearchResult(
+                    hits=(hit(policy, chunk("kb-policy", 0, "policy evidence"), 0.8),),
+                    fallback_reason="reranker_service_error",
+                )
+            return AgentSearchResult(
+                hits=(hit(finance, chunk("kb-finance", 0, "finance evidence"), 8.8),),
+                fallback_reason="reranker_response_error",
+            )
+
+        agent = ReadOnlyKnowledgeAgent(
+            tools=KnowledgeAgentTools(search_knowledge=search),
+            llm_provider=RecordingProvider(),
+        )
+
+        result = agent.run(
+            conversation_id="conv-agent",
+            content="reimbursement workflow",
+            mode="deep",
+            previous_messages=[],
+            route_type=KnowledgeRouteType.DOCUMENT_QA,
+        )
+
+        self.assertEqual(search_calls, 2)
+        self.assertEqual(result.route_metadata.degradation_reason, "reranker_service_error")
+        self.assertEqual(
+            result.route_metadata.candidate_source_ids,
+            ("kb-finance", "kb-policy"),
+        )
+        self.assertTrue(result.route_metadata.adjacency_allowed)
+
     def test_agent_stops_without_mutating_tools_when_no_evidence_exists(self) -> None:
         provider = RecordingProvider()
         agent = ReadOnlyKnowledgeAgent(
             tools=KnowledgeAgentTools(
-                search_knowledge=lambda query, limit, routing_key: [],
-                inspect_document=lambda source_id: self.fail(
-                    "empty search must not inspect a document"
-                ),
+                search_knowledge=lambda query, limit, routing_key: AgentSearchResult(hits=()),
             ),
             llm_provider=provider,
         )
@@ -261,6 +346,153 @@ class AgentTest(unittest.TestCase):
         )
         self.assertIsNotNone(provider.request)
         self.assertEqual(provider.request.knowledge_hits, [])
+
+
+class WordFactRouteRepositoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.recording_llm = RecordingRouteProvider()
+        self.fact_service = WordFactAnswerService(
+            FakeFacts([word_fact_match("张三", "年龄", "28岁")])
+        )
+        self.recorded_retrieval_requests: list[RetrievalRequest] = []
+
+    def build_repository(
+        self,
+        *,
+        word_fact_service: WordFactAnswerService | None = None,
+    ) -> tuple[InMemoryChatRepository, str]:
+        recorded_requests = self.recorded_retrieval_requests
+
+        class RecordingRouter:
+            def search(self, request: RetrievalRequest) -> RoutedRetrievalOutcome:
+                recorded_requests.append(request)
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.LEGACY,
+                    hits=(),
+                    stage_ms={"legacy": 0.0},
+                )
+
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[]),
+            llm_provider=self.recording_llm,
+            word_fact_service=word_fact_service,
+            retrieval_router=RecordingRouter(),
+            retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+        return repository, conversation_id
+
+    def test_fact_route_precedes_agent_and_llm(self) -> None:
+        repository, conversation_id = self.build_repository(
+            word_fact_service=self.fact_service
+        )
+
+        _, _, messages = repository.send_message(conversation_id, "张三几岁", "deep")
+
+        self.assertEqual(messages[-1].paragraphs[0].text, "张三的年龄是28岁。")
+        self.assertEqual(self.recording_llm.generation_calls, 0)
+        self.assertEqual(self.recorded_retrieval_requests, [])
+        run = repository.list_agent_runs(1)[0]
+        self.assertFalse(run.route_metadata.adjacency_allowed)
+
+    def test_open_word_question_continues_to_hybrid_rag(self) -> None:
+        repository, conversation_id = self.build_repository(
+            word_fact_service=self.fact_service
+        )
+
+        repository.send_message(conversation_id, "介绍张三", "deep")
+
+        self.assertGreater(len(self.recorded_retrieval_requests), 0)
+        self.assertTrue(
+            all(
+                request.expansion_policy is EvidenceExpansionPolicy.BOUNDED_ADJACENCY
+                for request in self.recorded_retrieval_requests
+            )
+        )
+        self.assertEqual(self.recording_llm.generation_calls, 1)
+
+    def test_document_route_preserves_router_degradation_metadata(self) -> None:
+        document_source = source("kb-policy", "policy.txt")
+        document_hit = hit(
+            document_source,
+            chunk("kb-policy", 0, "reimbursement evidence"),
+            9.2,
+        )
+        recorded_requests = self.recorded_retrieval_requests
+
+        class DegradedRouter:
+            def search(self, request: RetrievalRequest) -> RoutedRetrievalOutcome:
+                recorded_requests.append(request)
+                return RoutedRetrievalOutcome(
+                    mode=RetrievalMode.QWEN3,
+                    hits=(document_hit,),
+                    stage_ms={"reranker": 1.0, "adjacency": 1.0},
+                    fallback_reason="reranker_service_error",
+                )
+
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[]),
+            llm_provider=self.recording_llm,
+            retrieval_router=DegradedRouter(),
+            retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        repository.send_message(conversation_id, "reimbursement workflow", "quick")
+
+        self.assertEqual(len(recorded_requests), 1)
+        self.assertIs(
+            recorded_requests[0].expansion_policy,
+            EvidenceExpansionPolicy.BOUNDED_ADJACENCY,
+        )
+        run = repository.list_agent_runs(1)[0]
+        self.assertEqual(run.route_metadata.degradation_reason, "reranker_service_error")
+        self.assertEqual(run.route_metadata.candidate_source_ids, ("kb-policy",))
+        self.assertTrue(run.route_metadata.adjacency_allowed)
+
+    def test_open_questions_with_field_vocabulary_continue_to_hybrid_rag(self) -> None:
+        for question in (
+            "介绍财务部门",
+            "公司的岗位职责是什么",
+            "张三的年龄变化趋势是什么",
+        ):
+            with self.subTest(question=question):
+                self.recording_llm = RecordingRouteProvider()
+                self.recorded_retrieval_requests = []
+                repository, conversation_id = self.build_repository(
+                    word_fact_service=self.fact_service
+                )
+
+                repository.send_message(conversation_id, question, "deep")
+
+                self.assertGreater(len(self.recorded_retrieval_requests), 0)
+                self.assertEqual(self.recording_llm.generation_calls, 1)
+
+    def test_malformed_fact_is_safe_terminal_and_never_calls_rag(self) -> None:
+        repository, conversation_id = self.build_repository(
+            word_fact_service=WordFactAnswerService(
+                FakeFacts([word_fact_match("张三", "年龄", "28岁 性别：女")])
+            )
+        )
+
+        _, _, messages = repository.send_message(conversation_id, "张三几岁", "deep")
+
+        self.assertEqual(
+            messages[-1].paragraphs[0].text,
+            "无法安全返回张三的年龄，请核对来源数据。",
+        )
+        self.assertNotIn("女", messages[-1].paragraphs[0].text)
+        self.assertEqual(self.recording_llm.generation_calls, 0)
+        self.assertEqual(self.recorded_retrieval_requests, [])
+
+    def test_missing_fact_is_terminal_and_never_inspects_document(self) -> None:
+        repository, conversation_id = self.build_repository(
+            word_fact_service=WordFactAnswerService(FakeFacts([]))
+        )
+
+        repository.send_message(conversation_id, "张三几岁", "deep")
+
+        self.assertEqual(self.recorded_retrieval_requests, [])
 
 
 if __name__ == "__main__":

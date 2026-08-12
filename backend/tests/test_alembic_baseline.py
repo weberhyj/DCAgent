@@ -15,6 +15,8 @@ REVISION = "20260715_00"
 QWEN3_RETRIEVAL_REVISION = "20260727_04"
 SHADOW_EVALUATION_LABELS_REVISION = "20260728_05"
 EMBEDDING_FINGERPRINT_REVISION = "20260730_06"
+WORD_FACTS_REVISION = "20260811_07"
+KNOWLEDGE_ROUTE_AUDIT_REVISION = "20260811_08"
 
 EXPECTED_COLUMNS: dict[str, tuple[tuple[str, str, bool, bool], ...]] = {
     "agent_runs": (
@@ -228,6 +230,11 @@ class AlembicBaselineTest(unittest.TestCase):
                 }
                 self.assertFalse(chunk_columns["metadata"]["nullable"])
                 self.assertIn("{}", chunk_columns["metadata"]["default"])
+                agent_run_columns = {
+                    column["name"]: column for column in inspector.get_columns("agent_runs")
+                }
+                self.assertFalse(agent_run_columns["route_type"]["nullable"])
+                self.assertFalse(agent_run_columns["route_metadata"]["nullable"])
 
                 expected_columns = {
                     "retrieval_publications": (
@@ -379,7 +386,7 @@ class AlembicBaselineTest(unittest.TestCase):
                 self.assertIn(("request_id",), shadow_unique_constraints)
                 with engine.connect() as connection:
                     self.assertEqual(
-                        EMBEDDING_FINGERPRINT_REVISION,
+                        KNOWLEDGE_ROUTE_AUDIT_REVISION,
                         connection.scalar(text("SELECT version_num FROM alembic_version")),
                     )
             finally:
@@ -451,6 +458,47 @@ class AlembicBaselineTest(unittest.TestCase):
                         )
                     )
                 self.assertEqual(legacy_version, "old-qwen3-v1")
+            finally:
+                engine.dispose()
+
+    def test_route_audit_migration_backfills_legacy_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite+pysqlite:///{(Path(temp_dir) / 'route-audit.db').as_posix()}"
+            config = make_config(database_url)
+            command.upgrade(config, WORD_FACTS_REVISION)
+            engine = create_engine(database_url)
+            try:
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "INSERT INTO agent_runs "
+                            "(id, conversation_id, query, mode, status, started_at, completed_at, "
+                            "answer_message_id, evidence_count, source_count) "
+                            "VALUES ('legacy-route', 'conversation-1', 'legacy question', 'quick', "
+                            "'completed', '2026-08-11 00:00:00', '2026-08-11 00:00:01', "
+                            "'message-1', 0, 0)"
+                        )
+                    )
+            finally:
+                engine.dispose()
+
+            command.upgrade(config, KNOWLEDGE_ROUTE_AUDIT_REVISION)
+            engine = create_engine(database_url)
+            try:
+                columns = {
+                    column["name"]: column for column in inspect(engine).get_columns("agent_runs")
+                }
+                self.assertFalse(columns["route_type"]["nullable"])
+                self.assertFalse(columns["route_metadata"]["nullable"])
+                with engine.connect() as connection:
+                    row = connection.execute(
+                        text(
+                            "SELECT route_type, route_metadata FROM agent_runs "
+                            "WHERE id = 'legacy-route'"
+                        )
+                    ).one()
+                self.assertEqual(row.route_type, "document_qa")
+                self.assertEqual(row.route_metadata, "{}")
             finally:
                 engine.dispose()
 

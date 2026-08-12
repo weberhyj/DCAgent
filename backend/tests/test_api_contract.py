@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from app.database import Database
+from app.knowledge_route_models import KnowledgeRouteType
 from app.llm import LLMProviderError, LLMRequest
 from app.main import create_app
 from app.models import (
@@ -19,6 +21,8 @@ from app.models import (
 )
 from app.repository import InMemoryChatRepository
 from app.seed import build_seed_state
+from app.sql_repository import SqlChatRepository
+from app.word_fact_answer import WordFactAnswerService
 
 DISPLAY_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
@@ -149,6 +153,58 @@ class ApiContractTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["access-control-allow-origin"], "http://127.0.0.1:5174")
+
+    def test_agent_audit_api_exposes_bounded_route_fields(self) -> None:
+        _, conversation_id, _ = self.repository.create_conversation()
+        self.repository.send_message(conversation_id, "你好", "quick")
+
+        response = self.client.get("/api/admin/agent/runs")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()[0]
+        self.assertEqual(payload["routeType"], "greeting")
+        self.assertTrue(payload["routeMetadata"]["validation_passed"])
+        self.assertNotIn("chunkText", payload["routeMetadata"])
+        self.assertNotIn("password", str(payload).casefold())
+
+    def test_overlong_exact_entity_api_is_terminal_and_persists_bounded_audit(self) -> None:
+        class FailingLLMProvider:
+            def generate_reply(self, *_args: object, **_kwargs: object):
+                raise AssertionError("oversized factual requests must not call the LLM")
+
+        class TerminalOnlySqlRepository(SqlChatRepository):
+            def _search_routed_knowledge_chunks(self, *_args: object, **_kwargs: object):
+                raise AssertionError("oversized factual requests must not retrieve documents")
+
+        database = Database("sqlite+pysqlite:///:memory:")
+        database.create_schema()
+        repository = TerminalOnlySqlRepository(
+            database, llm_provider=FailingLLMProvider()
+        )
+        repository.configure_answer_services(
+            word_fact_service=WordFactAnswerService(repository)
+        )
+        client = TestClient(create_app(repository), raise_server_exceptions=False)
+        conversation_id = client.post("/api/conversations").json()["activeConversationId"]
+
+        response = client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "张" * 301 + "几岁", "mode": "quick"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        assistant = payload["messages"][-1]
+        self.assertIn("实体名称过长", assistant["paragraphs"][0]["text"])
+        self.assertLessEqual(len(assistant["paragraphs"][0]["text"]), 256)
+        self.assertEqual(
+            repository.list_agent_runs(1)[0].route_type,
+            KnowledgeRouteType.CLARIFICATION,
+        )
+        metadata = repository.list_agent_runs(1)[0].route_metadata
+        self.assertIsNone(metadata.entity)
+        self.assertEqual(metadata.target_fields, ("年龄",))
+        self.assertEqual(metadata.to_dict()["target_fields"], ["年龄"])
 
     def test_creates_empty_conversation_and_saves_first_exchange(self) -> None:
         create_response = self.client.post("/api/conversations")

@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from .agent import AgentRunAudit as AgentRunAuditModel
+from .knowledge_route_models import KnowledgeRouteType
 from .agent import AgentStep as AgentStepModel
 from .answer_text import remove_inline_citation_markers
 from .evaluation import (
@@ -668,6 +669,8 @@ class AgentRunAudit(ApiModel):
     evidence_count: int = Field(alias="evidenceCount")
     source_count: int = Field(alias="sourceCount")
     steps: list[AgentStepAudit] = Field(default_factory=list)
+    route_type: KnowledgeRouteType = Field(alias="routeType")
+    route_metadata: dict[str, object] = Field(alias="routeMetadata")
 
     @classmethod
     def from_model(cls, run: AgentRunAuditModel) -> AgentRunAudit:
@@ -683,6 +686,8 @@ class AgentRunAudit(ApiModel):
             evidenceCount=run.evidence_count,
             sourceCount=run.source_count,
             steps=[AgentStepAudit.from_model(step) for step in run.steps],
+            routeType=run.route_type,
+            routeMetadata=run.route_metadata.to_dict(),
         )
 
 

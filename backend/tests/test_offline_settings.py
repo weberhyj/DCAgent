@@ -16,6 +16,48 @@ from app.offline_settings import (
 
 
 class OfflineSettingsTest(unittest.TestCase):
+    def test_routing_flags_default_off_and_parse_explicit_true(self) -> None:
+        defaults = OfflineSettings.from_environ({})
+        self.assertFalse(defaults.unified_knowledge_routing_enabled)
+        self.assertFalse(defaults.word_factual_qa_enabled)
+
+        enabled = OfflineSettings.from_environ(
+            {
+                "UNIFIED_KNOWLEDGE_ROUTING_ENABLED": "true",
+                "WORD_FACTUAL_QA_ENABLED": "true",
+            }
+        )
+
+        self.assertTrue(enabled.unified_knowledge_routing_enabled)
+        self.assertTrue(enabled.word_factual_qa_enabled)
+
+    def test_word_factual_qa_requires_unified_routing(self) -> None:
+        with self.assertRaisesRegex(
+            OfflineSettingsError,
+            "WORD_FACTUAL_QA_ENABLED.*UNIFIED_KNOWLEDGE_ROUTING_ENABLED",
+        ):
+            OfflineSettings.from_environ(
+                {
+                    "UNIFIED_KNOWLEDGE_ROUTING_ENABLED": "false",
+                    "WORD_FACTUAL_QA_ENABLED": "true",
+                }
+            )
+
+    def test_implicit_summary_limit_defaults_to_twelve(self) -> None:
+        settings = OfflineSettings.from_environ({})
+        self.assertEqual(settings.structured_implicit_summary_max_metrics, 12)
+
+    def test_implicit_summary_limit_is_bounded(self) -> None:
+        for value in ("0", "51", "not-an-integer"):
+            with self.subTest(value=value), self.assertRaises(OfflineSettingsError):
+                OfflineSettings.from_environ(
+                    {"STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS": value}
+                )
+        settings = OfflineSettings.from_environ(
+            {"STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS": "20"}
+        )
+        self.assertEqual(settings.structured_implicit_summary_max_metrics, 20)
+
     def test_settings_parse_legacy_clickhouse_mode(self) -> None:
         settings = OfflineSettings.from_environ(
             {"CLICKHOUSE_COMPATIBILITY_MODE": "legacy_18_16"}

@@ -68,12 +68,16 @@ def candidate(chunk_id: str) -> RetrievalCandidate:
     )
 
 
-def hybrid_outcome(*chunk_ids: str) -> HybridRetrievalOutcome:
+def hybrid_outcome(
+    *chunk_ids: str,
+    fallback_reason: str | None = None,
+) -> HybridRetrievalOutcome:
     return HybridRetrievalOutcome(
         mode=RetrievalMode.QWEN3,
         candidates=tuple(candidate(chunk_id) for chunk_id in chunk_ids),
         hits=tuple(hit(chunk_id) for chunk_id in chunk_ids),
         stage_ms={"embedding": 1.0, "qdrant": 2.0},
+        fallback_reason=fallback_reason,
     )
 
 
@@ -323,6 +327,25 @@ class RetrievalRouterTest(unittest.TestCase):
         self.assertEqual(result.mode, RetrievalMode.QWEN3)
         self.assertEqual([item.chunk.id for item in result.hits], ["qwen-a", "qwen-b"])
         self.assertIsNone(result.fallback_reason)
+
+    def test_qwen_success_preserves_bounded_degradation_reason(self) -> None:
+        router = self.build_router(
+            mode="qwen3",
+            hybrid=RecordingHybrid(
+                [
+                    hybrid_outcome(
+                        "qwen-a",
+                        fallback_reason="reranker_service_error",
+                    )
+                ]
+            ),
+            canary_percent=100,
+        )
+
+        result = router.search(request())
+
+        self.assertEqual(result.mode, RetrievalMode.QWEN3)
+        self.assertEqual(result.fallback_reason, "reranker_service_error")
 
     def test_empty_qwen_results_use_nonempty_legacy_results(self) -> None:
         router = self.build_router(

@@ -576,6 +576,73 @@ ClickHouse connect/read path. The indexing worker does not inherit that limit; p
 the storage gateway's independent 30-second execution default until a dedicated publish setting is
 introduced.
 
+### Filtered Excel summaries
+
+- Existing published Excel/CSV datasets do not need to be uploaded or published again.
+- “汇总”/“统计” sums all `allowAggregate` integer/decimal columns and returns matched/valid/null counts.
+- `STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS` defaults to 12; over-limit questions ask the user to choose fields.
+- All metrics in one answer are calculated by one ClickHouse `SELECT`.
+- ClickHouse or parsing failures return a structured error and never search Word/PDF chunks.
+
+This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.
+
+### Word factual-answer reindexing
+
+Word factual answers use extracted `knowledge_facts`; existing Word sources must be reindexed, while
+published Excel tables do not require re-uploading.
+
+Knowledge routing is independently gated by `UNIFIED_KNOWLEDGE_ROUTING_ENABLED=false` and
+`WORD_FACTUAL_QA_ENABLED=false`. Enable unified routing first; the API refuses startup if Word
+factual QA is enabled without it. The non-Docker Ubuntu/Supervisor cutover and rollback procedure is
+documented in [`../ubuntu/KNOWLEDGE_ROUTING_ROLLOUT.md`](../ubuntu/KNOWLEDGE_ROUTING_ROLLOUT.md).
+
+1. Apply Alembic revision 20260811_07.
+2. Confirm every existing Word source still has a readable file_path.
+3. POST /api/knowledge/sources/{source_id}/reindex once for each Word source.
+4. Keep the old retrieval publication active until the normal Qdrant publication fence completes.
+5. Verify records > 0, knowledge_facts contains rows, and “张三几岁” returns only age.
+6. If conflicts appear, disable the factual route and inspect extracted facts; do not route the question to unrelated Word RAG.
+
+The in-process `LargeMultiSummaryGateway` case injects a precomputed aggregate row. It is useful for
+batching, response-shape, one-row-return, and no-LLM resource checks, but it is not evidence that a
+database executed the filter or Decimal aggregates.
+
+Before release, the approved target host must pass the real 100,001-row ClickHouse gate below. Set
+all listed variables before importing the test module; the two password variables must point to
+readable absolute secret-file paths. A skipped test, `Ran 0 tests`, or a run against an in-memory
+gateway is not a live green result.
+
+```bash
+set -Eeuo pipefail
+export RUN_OFFLINE_INTEGRATION=1
+export CLICKHOUSE_HOST='<private-target-host>'
+export CLICKHOUSE_PORT='8123'
+export CLICKHOUSE_INGEST_USER='structured_ingest'
+export CLICKHOUSE_QUERY_USER='structured_query'
+export CLICKHOUSE_INGEST_PASSWORD_FILE='/absolute/path/to/ingest-password-file'
+export CLICKHOUSE_QUERY_PASSWORD_FILE='/absolute/path/to/query-password-file'
+
+test "$RUN_OFFLINE_INTEGRATION" = '1'
+test -n "$CLICKHOUSE_HOST"
+test -n "$CLICKHOUSE_INGEST_USER"
+test -n "$CLICKHOUSE_QUERY_USER"
+test -f "$CLICKHOUSE_INGEST_PASSWORD_FILE"
+test -f "$CLICKHOUSE_QUERY_PASSWORD_FILE"
+
+(
+  cd backend
+  uv run --project . --group dev --group offline python -m unittest \
+    tests.integration.test_structured_aggregation_e2e.StructuredAggregationTargetHostGateTest.test_large_filtered_multi_summary_matches_decimal_reference \
+    -v
+)
+```
+
+The hard gate publishes all 100,001 rows to the configured ClickHouse target, executes the actual
+parameterized `地区为华东` multi-summary, compares the three database-returned Decimal sums and
+matched/valid/null counts with an independent reference, verifies exactly one `SELECT` and one
+returned aggregate row, and confirms that Physoc is never called. The command must finish with one
+executed test, zero failures, and zero skips.
+
 Rollback is configuration-only and preserves published data. Set
 `STRUCTURED_QUERY_ENABLED=false`, stop the current topology, and restart without the indexing
 profile. The worker refuses to start while the feature flag is false, so rollback cannot continue

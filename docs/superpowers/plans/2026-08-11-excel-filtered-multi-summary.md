@@ -495,12 +495,21 @@ Do not loop over metrics with separate gateway calls. Do not use Python to sum, 
 Push-Location backend
 uv run --project . --group dev --group offline python -m unittest tests.test_structured_query -v
 $env:RUN_OFFLINE_INTEGRATION = "1"
-uv run --project . --group dev --group offline python -m unittest tests.integration.test_structured_query_clickhouse tests.integration.test_clickhouse_legacy_18_16 -v
+uv run --project . --group dev --group offline python -m unittest tests.integration.test_structured_query_clickhouse -v
 Remove-Item Env:RUN_OFFLINE_INTEGRATION -ErrorAction SilentlyContinue
+uv run --project . --group dev --group offline python -m pytest tests/integration/test_clickhouse_legacy_18_16.py -v
 Pop-Location
 git add backend/app/structured_query.py backend/tests/test_structured_query.py backend/tests/integration/test_structured_query_clickhouse.py backend/tests/integration/test_clickhouse_legacy_18_16.py
 git commit -m "feat: execute multi-metric ClickHouse summaries"
 ```
+
+The pytest command must collect the legacy module; `python -m unittest` is not a valid runner for
+this pytest-style file and a `Ran 0 tests` result is a failed gate. Without a configured target, the
+guard tests pass and the three live acceptance cases skip accurately. A release claim for legacy
+compatibility requires rerunning the same pytest command on an explicitly opted-in private
+ClickHouse 18.16.1 target with `RUN_CLICKHOUSE_18_16=1`,
+`CLICKHOUSE_COMPATIBILITY_MODE=legacy_18_16`, `CLICKHOUSE_URL`, distinct ingest/query users, and both
+password-file variables configured; the live acceptance cases must report zero skips.
 
 ### Task 4: Render deterministic multi-metric answers and block RAG fallback
 
@@ -707,7 +716,8 @@ Do not add a deployment step that rebuilds Qdrant or reindexes Word documents fo
 
 ```powershell
 Push-Location backend
-uv run --project . --group dev --group offline python -m unittest tests.test_structured_query tests.test_structured_answer tests.test_offline_settings tests.integration.test_structured_aggregation_e2e tests.integration.test_structured_query_clickhouse tests.integration.test_clickhouse_legacy_18_16 -v
+uv run --project . --group dev --group offline python -m unittest tests.test_structured_query tests.test_structured_answer tests.test_offline_settings tests.integration.test_structured_aggregation_e2e tests.integration.test_structured_query_clickhouse -v
+uv run --project . --group dev --group offline python -m pytest tests/integration/test_clickhouse_legacy_18_16.py -v
 uv run --project . --group dev ruff format --check app tests
 uv run --project . --group dev ruff check app tests
 Pop-Location
@@ -716,4 +726,9 @@ git add backend/tests/integration/test_structured_aggregation_e2e.py backend/tes
 git commit -m "test: verify filtered Excel multi-summaries"
 ```
 
-Expected: all focused tests pass; the integration fixture returns exact values and one result row; no LLM, Qdrant, or Word inspection call occurs for any recognized Excel query.
+Expected: all focused tests pass; pytest collects the legacy module instead of reporting `Ran 0
+tests`; unconfigured modern, 18.16.1, and target-host cases are recorded as real skips rather than
+live green evidence. The in-process 100,001-row fake verifies structure/resource behavior and one
+returned aggregate row only. Exact ClickHouse filtering and Decimal arithmetic require the opt-in
+target-host test documented in `deploy/offline/README.md`. No LLM, Qdrant, or Word inspection call
+occurs for any recognized Excel query.

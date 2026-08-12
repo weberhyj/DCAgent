@@ -224,7 +224,9 @@ execution default, and the default bounded ingestion batch is 50,000 rows.
 The feature is usable only after an administrator has approved a confirmed schema for the XLSX/CSV
 dataset and the offline `--profile indexing` worker has published that schema version. See
 [`deploy/offline/README.md`](deploy/offline/README.md) for migration, worker startup, smoke aggregate,
-rollback, and ClickHouse failure handling.
+rollback, ClickHouse failure handling, and the mandatory live 100,001-row filtered-summary gate.
+The in-process large-sheet fake only proves batching, deterministic response structure, one returned
+aggregate row, and LLM isolation; it does not prove ClickHouse filtering or Decimal arithmetic.
 
 ## 当前真实架构与能力边界
 
@@ -352,6 +354,35 @@ Legacy 结果或模板文本伪装成模型答案。
 这条路线称为 `ClickHouse complete-data aggregation`。Spreadsheet averages must not be
 calculated from RAG chunks；Qdrant 中只保存表结构、字段和安全摘要，绝不把局部切片平均值当作
 完整数据结果。
+
+### Filtered Excel summaries
+
+- Existing published Excel/CSV datasets do not need to be uploaded or published again.
+- “汇总”/“统计” sums all `allowAggregate` integer/decimal columns and returns matched/valid/null counts.
+- `STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS` defaults to 12; over-limit questions ask the user to choose fields.
+- All metrics in one answer are calculated by one ClickHouse `SELECT`.
+- ClickHouse or parsing failures return a structured error and never search Word/PDF chunks.
+
+This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.
+
+### Word factual-answer reindexing
+
+Word factual answers use extracted `knowledge_facts`; existing Word sources must be reindexed, while
+published Excel tables do not require re-uploading.
+
+The routing rollout is disabled by default with
+`UNIFIED_KNOWLEDGE_ROUTING_ENABLED=false` and `WORD_FACTUAL_QA_ENABLED=false`. Unified routing may
+be enabled first without enabling Word facts; Word factual QA must never be enabled while unified
+routing is disabled. For the Ubuntu/Supervisor deployment sequence, route-audit smoke checks, and
+configuration-only rollback, follow
+[`deploy/ubuntu/KNOWLEDGE_ROUTING_ROLLOUT.md`](deploy/ubuntu/KNOWLEDGE_ROUTING_ROLLOUT.md).
+
+1. Apply Alembic revision 20260811_07.
+2. Confirm every existing Word source still has a readable file_path.
+3. POST /api/knowledge/sources/{source_id}/reindex once for each Word source.
+4. Keep the old retrieval publication active until the normal Qdrant publication fence completes.
+5. Verify records > 0, knowledge_facts contains rows, and “张三几岁” returns only age.
+6. If conflicts appear, disable the factual route and inspect extracted facts; do not route the question to unrelated Word RAG.
 
 这里的“精确统计”只承诺覆盖通过校验的 publication，不等同于无条件覆盖原工作簿中的每个
 单元格。空值、错误值、公式结果、隐藏行、多 Sheet 合并方式和类型转换规则仍需在目标业务

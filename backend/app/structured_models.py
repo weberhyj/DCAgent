@@ -6,6 +6,9 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
+
+MAX_STRUCTURED_ROUTE_FIELDS = 32
+
 MAX_STRUCTURED_ALIASES_PER_COLUMN = 20
 MAX_STRUCTURED_ALIAS_LENGTH = 80
 
@@ -25,6 +28,9 @@ class StructuredDatasetStatus(StrEnum):
     IMPORTING = "importing"
     PUBLISHED = "published"
     FAILED = "failed"
+
+
+StructuredAggregateName = Literal["avg", "sum", "count", "min", "max"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,20 +151,42 @@ class StructuredFilter:
 @dataclass(frozen=True, slots=True)
 class StructuredIntent:
     dataset_id: str
-    aggregate: Literal["avg", "sum", "count", "min", "max"]
+    aggregate: StructuredAggregateName
     metric_physical_name: str | None
     filters: tuple[StructuredFilter, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredMetricIntent:
+    aggregate: StructuredAggregateName
+    metric_physical_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredMultiAggregateIntent:
+    dataset_id: str
+    metrics: tuple[StructuredMetricIntent, ...]
+    filters: tuple[StructuredFilter, ...]
+    implicit: bool
 
 
 @dataclass(frozen=True, slots=True)
 class StructuredClarification:
     message: str
     candidates: tuple[str, ...]
+    dataset_id: str | None = None
+    target_fields: tuple[str, ...] = ()
+    candidate_source_ids: tuple[str, ...] = ()
+    origin_route: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class StructuredUnavailable:
     message: str
+    dataset_id: str | None = None
+    target_fields: tuple[str, ...] = ()
+    candidate_source_ids: tuple[str, ...] = ()
+    origin_route: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,21 +196,58 @@ class StructuredQueryPlan:
     metric_physical_name: str | None
     sql: str
     parameters: Mapping[str, object]
-    aggregate: Literal["avg", "sum", "count", "min", "max"]
+    aggregate: StructuredAggregateName
     filters: tuple[StructuredFilter, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredMultiAggregatePlan:
+    publication_id: str
+    dataset_id: str
+    metrics: tuple[StructuredMetricIntent, ...]
+    sql: str
+    parameters: Mapping[str, object]
+    filters: tuple[StructuredFilter, ...]
+    implicit: bool
 
 
 @dataclass(frozen=True, slots=True)
 class StructuredAggregateResult:
     dataset_id: str
     schema_version: int
-    aggregate: Literal["avg", "sum", "count", "min", "max"]
+    aggregate: StructuredAggregateName
     metric_physical_name: str | None
     metric_display_name: str | None
     value: Decimal | int | None
     total_count: int
     valid_count: int
     null_count: int
+    source_name: str
+    worksheet_name: str
+    publication_id: str
+    filters: tuple[StructuredFilter, ...]
+    elapsed_ms: float
+    audit_id: str
+    source_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredMetricResult:
+    aggregate: StructuredAggregateName
+    metric_physical_name: str
+    metric_display_name: str
+    value: Decimal | int | None
+    valid_count: int
+    null_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredMultiAggregateResult:
+    dataset_id: str
+    source_id: str
+    schema_version: int
+    metrics: tuple[StructuredMetricResult, ...]
+    total_count: int
     source_name: str
     worksheet_name: str
     publication_id: str

@@ -118,6 +118,8 @@ def require_private_url(value: str, field: str) -> str:
 class OfflineSettings:
     offline_mode: bool
     structured_query_enabled: bool
+    unified_knowledge_routing_enabled: bool
+    word_factual_qa_enabled: bool
     database_url: str
     clickhouse_url: str
     clickhouse_query_user: str
@@ -125,6 +127,7 @@ class OfflineSettings:
     clickhouse_ingest_user: str
     clickhouse_ingest_password_file: Path | None
     structured_query_timeout_seconds: int
+    structured_implicit_summary_max_metrics: int
     qdrant_url: str
     redis_url: str
     clamav_host: str
@@ -145,6 +148,17 @@ class OfflineSettings:
         structured_query_enabled = parse_bool(
             environ.get("STRUCTURED_QUERY_ENABLED"), default=False
         )
+        unified_knowledge_routing_enabled = parse_bool(
+            environ.get("UNIFIED_KNOWLEDGE_ROUTING_ENABLED"), default=False
+        )
+        word_factual_qa_enabled = parse_bool(
+            environ.get("WORD_FACTUAL_QA_ENABLED"), default=False
+        )
+        if word_factual_qa_enabled and not unified_knowledge_routing_enabled:
+            raise OfflineSettingsError(
+                "WORD_FACTUAL_QA_ENABLED=true requires "
+                "UNIFIED_KNOWLEDGE_ROUTING_ENABLED=true"
+            )
         compatibility_value = environ.get("CLICKHOUSE_COMPATIBILITY_MODE", "modern")
         try:
             clickhouse_compatibility_mode = ClickHouseCompatibilityMode(compatibility_value)
@@ -201,9 +215,24 @@ class OfflineSettings:
                 "STRUCTURED_QUERY_TIMEOUT_SECONDS must be between 1 and 60 seconds"
             )
 
+        try:
+            structured_implicit_summary_max_metrics = int(
+                environ.get("STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS", "12")
+            )
+        except ValueError as error:
+            raise OfflineSettingsError(
+                "STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS must be between 1 and 50"
+            ) from error
+        if not 1 <= structured_implicit_summary_max_metrics <= 50:
+            raise OfflineSettingsError(
+                "STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS must be between 1 and 50"
+            )
+
         return cls(
             offline_mode=offline_mode,
             structured_query_enabled=structured_query_enabled,
+            unified_knowledge_routing_enabled=unified_knowledge_routing_enabled,
+            word_factual_qa_enabled=word_factual_qa_enabled,
             clamav_host=environ.get("CLAMAV_HOST", "127.0.0.1"),
             clickhouse_query_user=_clickhouse_user(
                 environ, "CLICKHOUSE_QUERY_USER", "dc_agent_query"
@@ -214,6 +243,7 @@ class OfflineSettings:
             ),
             clickhouse_ingest_password_file=ingest_password_file,
             structured_query_timeout_seconds=structured_query_timeout_seconds,
+            structured_implicit_summary_max_metrics=structured_implicit_summary_max_metrics,
             raw_data_root=Path(environ.get("RAW_DATA_ROOT", "./data/raw")),
             parquet_root=Path(environ.get("PARQUET_ROOT", "./data/parquet")),
             structured_ingest_batch_rows=structured_ingest_batch_rows,
