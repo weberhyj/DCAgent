@@ -41,6 +41,9 @@ EXPECTED_OLLAMA_MODERN_BGE_EMBEDDING_ENCODING_PROFILE_SHA256 = (
         "/api/embed", "bge-large-zh-v1.5"
     )
 )
+EXPECTED_LLAMA_CPP_EMBEDDING_ENCODING_PROFILE_SHA256 = (
+    embedding_service.llama_cpp_embedding_encoding_profile_sha256()
+)
 
 
 class FakeEmbeddingBackend:
@@ -376,6 +379,32 @@ class EmbeddingServiceTest(unittest.TestCase):
             "TOKENIZERS_PARALLELISM",
         ):
             self.assertNotIn(name, environ)
+
+    def test_production_app_selects_llama_cpp_embedding_runtime(self) -> None:
+        environ = production_environment(
+            EMBEDDING_RUNTIME="llama_cpp",
+            EMBEDDING_MODEL_NAME="bge-m3-Q4_K_M.gguf",
+            EMBEDDING_MODEL_VERSION="llama-cpp-bge-m3-q4km-v1",
+            EMBEDDING_ENCODING_PROFILE_SHA256=EXPECTED_LLAMA_CPP_EMBEDDING_ENCODING_PROFILE_SHA256,
+            LLAMA_CPP_EMBEDDING_URL="http://127.0.0.1:8083",
+            LLAMA_CPP_EMBEDDING_PATH="/v1/embeddings",
+            LLAMA_CPP_EMBEDDING_MODEL="bge-m3-Q4_K_M.gguf",
+            LLAMA_CPP_EMBEDDING_TIMEOUT_SECONDS="15",
+            LLAMA_CPP_EMBEDDING_BATCH_MAX_ITEMS="32",
+        )
+        backend = CloseTrackingEmbeddingBackend()
+        loader_calls: list[str] = []
+
+        def load_backend(values: object, pinned: EmbeddingModelMetadata) -> CloseTrackingEmbeddingBackend:
+            loader_calls.append(str(values["EMBEDDING_RUNTIME"]))  # type: ignore[index]
+            return backend
+
+        with patch.object(embedding_service, "_load_llama_cpp_embedding_backend", load_backend):
+            app = create_production_app(environ=environ)
+            with TestClient(app):
+                pass
+
+        self.assertEqual(loader_calls, ["llama_cpp"])
 
     def test_production_startup_aborts_when_backend_dimensions_do_not_match(self) -> None:
         backend = CloseTrackingEmbeddingBackend(dimensions=3)

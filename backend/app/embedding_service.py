@@ -32,6 +32,11 @@ from .embedding_contracts import (
 )
 from .inference_batching import DynamicBatcher, InferenceQueueFull
 from .offline_artifacts import is_local_filesystem_path
+from .llama_cpp_embedding_backend import (
+    LlamaCppEmbeddingBackend,
+    SyncLlamaCppEmbeddingClient,
+    llama_cpp_embedding_encoding_profile_sha256,
+)
 from .ollama_client import SyncOllamaClient
 from .ollama_embedding_backend import (
     OllamaEmbeddingBackend,
@@ -343,7 +348,12 @@ def create_production_app(
             max_items = _positive_int(target, "EMBEDDING_BATCH_MAX_ITEMS", MAX_EMBEDDING_TEXTS)
             max_queue_items = _positive_int(target, "EMBEDDING_QUEUE_MAX_ITEMS", 256)
             wait_ms = _nonnegative_float(target, "EMBEDDING_BATCH_WAIT_MS", 10.0)
-            loader = _load_ollama_embedding_backend if backend_loader is None else backend_loader
+            if backend_loader is not None:
+                loader = backend_loader
+            elif _embedding_runtime(target.get("EMBEDDING_RUNTIME", "ollama")) == "llama_cpp":
+                loader = _load_llama_cpp_embedding_backend
+            else:
+                loader = _load_ollama_embedding_backend
             backend = await run_in_threadpool(loader, target, metadata)
             await run_in_threadpool(
                 _validate_embedding_backend_startup,
@@ -457,13 +467,20 @@ def _load_environment_metadata(environ: Mapping[str, str]) -> EmbeddingModelMeta
         raise ValueError(
             "EMBEDDING_ENCODING_PROFILE_SHA256 must be exactly 64 lowercase hexadecimal characters"
         )
-    path = _required_environment_value(environ, "OLLAMA_EMBEDDING_PATH")
-    query_profile = _required_environment_value(environ, "OLLAMA_EMBEDDING_QUERY_PROFILE")
-    ollama_embedding_query_prefix(query_profile)
-    expected_profile_sha256 = ollama_embedding_encoding_profile_sha256(path, query_profile)
+    runtime = _embedding_runtime(environ.get("EMBEDDING_RUNTIME", "ollama"))
+    if runtime == "llama_cpp":
+        path = _required_environment_value(environ, "LLAMA_CPP_EMBEDDING_PATH")
+        if path != "/v1/embeddings":
+            raise ValueError("LLAMA_CPP_EMBEDDING_PATH must be /v1/embeddings")
+        expected_profile_sha256 = llama_cpp_embedding_encoding_profile_sha256()
+    else:
+        path = _required_environment_value(environ, "OLLAMA_EMBEDDING_PATH")
+        query_profile = _required_environment_value(environ, "OLLAMA_EMBEDDING_QUERY_PROFILE")
+        ollama_embedding_query_prefix(query_profile)
+        expected_profile_sha256 = ollama_embedding_encoding_profile_sha256(path, query_profile)
     if not hmac.compare_digest(encoding_profile_sha256, expected_profile_sha256):
         raise ValueError(
-            "EMBEDDING_ENCODING_PROFILE_SHA256 must match the Ollama embedding encoding profile"
+            f"EMBEDDING_ENCODING_PROFILE_SHA256 must match the {runtime} embedding encoding profile"
         )
     protocol_version = _required_environment_value(environ, "EMBEDDING_PROTOCOL_VERSION")
     return EmbeddingModelMetadata(
@@ -511,6 +528,39 @@ def _load_ollama_embedding_backend(
         raise
 
 
+def _load_llama_cpp_embedding_backend(
+    environ: Mapping[str, str],
+    metadata: EmbeddingModelMetadata,
+) -> EmbeddingBackend:
+    model = _required_environment_value(environ, "LLAMA_CPP_EMBEDDING_MODEL")
+    if model != metadata.name:
+        raise ValueError("LLAMA_CPP_EMBEDDING_MODEL must equal EMBEDDING_MODEL_NAME")
+    path = _required_environment_value(environ, "LLAMA_CPP_EMBEDDING_PATH")
+    if path != "/v1/embeddings":
+        raise ValueError("LLAMA_CPP_EMBEDDING_PATH must be /v1/embeddings")
+    base_url = _required_environment_value(environ, "LLAMA_CPP_EMBEDDING_URL")
+    timeout_seconds = _required_positive_float(environ, "LLAMA_CPP_EMBEDDING_TIMEOUT_SECONDS")
+    batch_max_items = _positive_int(
+        environ,
+        "LLAMA_CPP_EMBEDDING_BATCH_MAX_ITEMS",
+        32,
+    )
+    client = SyncLlamaCppEmbeddingClient(base_url, timeout_seconds=timeout_seconds)
+    try:
+        return LlamaCppEmbeddingBackend(
+            client,
+            base_path=path,
+            model=model,
+            dimensions=metadata.dimensions,
+            normalized=metadata.normalized,
+            batch_max_items=batch_max_items,
+        )
+    except Exception:
+        with suppress(Exception):
+            client.close()
+        raise
+
+
 def _required_positive_int(environ: Mapping[str, str], name: str) -> int:
     raw_value = environ.get(name)
     if isinstance(raw_value, bool) or not isinstance(raw_value, str):
@@ -539,8 +589,10 @@ def _required_positive_float(environ: Mapping[str, str], name: str) -> float:
 
 def _embedding_runtime(value: object) -> str:
     normalized = str(value).strip().lower()
-    if normalized not in {"openvino", "onnxruntime", "torch"}:
-        raise ValueError("EMBEDDING_RUNTIME must be openvino, onnxruntime, or torch")
+    if normalized not in {"ollama", "llama_cpp", "openvino", "onnxruntime", "torch"}:
+        raise ValueError(
+            "EMBEDDING_RUNTIME must be ollama, llama_cpp, openvino, onnxruntime, or torch"
+        )
     return normalized
 
 

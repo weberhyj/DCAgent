@@ -203,6 +203,23 @@ _OLLAMA_PROBE = (
     "method='GET' if p is None else 'POST'); "
     "r=urllib.request.urlopen(q, timeout=45); r.read(131072); assert 200 <= r.status < 300"
 )
+_LLAMA_CPP_EMBED_PROBE = (
+    "import json,sys,urllib.request; "
+    "u=sys.argv[1]; p={'model':sys.argv[2],'input':['DC-Agent gate health check']}; "
+    "r=urllib.request.urlopen(urllib.request.Request(u,data=json.dumps(p).encode(),headers={'Content-Type':'application/json'},method='POST'),timeout=45); "
+    "body=json.loads(r.read(131072)); assert 200 <= r.status < 300; assert isinstance(body.get('data'),list) and body['data']"
+)
+_LLAMA_CPP_RERANK_PROBE = (
+    "import json,sys,urllib.request; "
+    "u=sys.argv[1]; p={'model':sys.argv[2],'query':'DC-Agent gate health check','documents':['DC-Agent gate health check','unrelated']}; "
+    "r=urllib.request.urlopen(urllib.request.Request(u,data=json.dumps(p).encode(),headers={'Content-Type':'application/json'},method='POST'),timeout=45); "
+    "body=json.loads(r.read(131072)); assert 200 <= r.status < 300; assert isinstance(body.get('results'),list) and len(body['results']) == 2"
+)
+_LLAMA_CPP_METADATA_PROBE = (
+    "import json,sys,urllib.request; "
+    "r=urllib.request.urlopen(sys.argv[1],timeout=45); body=json.loads(r.read(131072)); "
+    "assert 200 <= r.status < 300; assert body.get('modelName')"
+)
 _PHYSOC_PROBE = (
     "import json,sys,urllib.request; "
     "q=urllib.request.Request(sys.argv[1], "
@@ -256,6 +273,103 @@ def _configured_url(repo_root: Path, endpoint: str) -> str:
     return (
         _read_setting(repo_root, "OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/") + endpoint
     )
+
+
+def _model_runtime(repo_root: Path, key: str, *, default: str = "ollama") -> str:
+    return _read_setting(repo_root, key, default).strip().lower().replace("-", "_")
+
+
+def _model_url(
+    repo_root: Path,
+    *,
+    runtime_key: str,
+    url_key: str,
+    path_key: str,
+    default_url: str,
+    default_path: str,
+    path_override: str | None = None,
+) -> str:
+    runtime = _model_runtime(repo_root, runtime_key)
+    if runtime == "llama_cpp":
+        base = _read_setting(repo_root, url_key, default_url)
+        path = path_override or _read_setting(repo_root, path_key, default_path)
+    else:
+        base = _read_setting(repo_root, "OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+        path = default_path
+    return base.rstrip("/") + path
+
+
+def _probe_for_runtime(
+    repo_root: Path,
+    *,
+    runtime_key: str,
+    llama_script: str,
+    ollama_endpoint: str,
+    url_key: str,
+    path_key: str,
+    default_url: str,
+    default_path: str,
+    model_key: str,
+) -> list[str]:
+    runtime = _model_runtime(repo_root, runtime_key)
+    if runtime == "llama_cpp":
+        return [
+            _probe_command(
+                llama_script,
+                _model_url(
+                    repo_root,
+                    runtime_key=runtime_key,
+                    url_key=url_key,
+                    path_key=path_key,
+                    default_url=default_url,
+                    default_path=default_path,
+                ),
+                _read_setting(repo_root, model_key, "gate"),
+            )
+        ]
+    return [
+        _probe_command(
+            _OLLAMA_PROBE,
+            _configured_url(repo_root, ollama_endpoint),
+            json.dumps(
+                {
+                    "model": _read_setting(repo_root, model_key, "gate"),
+                    "input": ["DC-Agent gate health check"],
+                }
+            ),
+        )
+    ]
+
+
+def _reranker_probe_for_runtime(repo_root: Path) -> list[str]:
+    if _model_runtime(repo_root, "RERANKER_RUNTIME") == "llama_cpp":
+        return [
+            _probe_command(
+                _LLAMA_CPP_RERANK_PROBE,
+                _model_url(
+                    repo_root,
+                    runtime_key="RERANKER_RUNTIME",
+                    url_key="LLAMA_CPP_RERANKER_URL",
+                    path_key="LLAMA_CPP_RERANKER_PATH",
+                    default_url="http://127.0.0.1:8080",
+                    default_path="/v1/rerank",
+                ),
+                _read_setting(repo_root, "RERANKER_MODEL_NAME", "gate"),
+            )
+        ]
+    return [
+        _probe_command(
+            _OLLAMA_PROBE,
+            _configured_url(repo_root, "/api/generate"),
+            json.dumps(
+                {
+                    "model": _read_setting(repo_root, "OLLAMA_RERANKER_MODEL", "gate"),
+                    "prompt": "DC-Agent gate health check",
+                    "stream": False,
+                }
+            ),
+        )
+    ]
 
 
 def _setting_path(repo_root: Path, key: str) -> Path:
@@ -954,44 +1068,50 @@ def run_gate(
             ),
             (
                 "ollama_embed",
-                [
-                    _probe_command(
-                        _OLLAMA_PROBE,
-                        _configured_url(config.repo_root, "/api/embed"),
-                        json.dumps(
-                            {
-                                "model": _read_setting(
-                                    config.repo_root, "OLLAMA_EMBEDDING_MODEL", "gate"
-                                ),
-                                "input": ["DC-Agent gate health check"],
-                            }
-                        ),
-                    )
-                ],
+                _probe_for_runtime(
+                    config.repo_root,
+                    runtime_key="EMBEDDING_RUNTIME",
+                    llama_script=_LLAMA_CPP_EMBED_PROBE,
+                    ollama_endpoint="/api/embed",
+                    url_key="LLAMA_CPP_EMBEDDING_URL",
+                    path_key="LLAMA_CPP_EMBEDDING_PATH",
+                    default_url="http://127.0.0.1:8083",
+                    default_path="/v1/embeddings",
+                    model_key=(
+                        "EMBEDDING_MODEL_NAME"
+                        if _model_runtime(config.repo_root, "EMBEDDING_RUNTIME") == "llama_cpp"
+                        else "OLLAMA_EMBEDDING_MODEL"
+                    ),
+                ),
             ),
             (
                 "ollama_generate",
                 []
                 if not reranker_enabled
                 else [
-                    _probe_command(
-                        _OLLAMA_PROBE,
-                        _configured_url(config.repo_root, "/api/generate"),
-                        json.dumps(
-                            {
-                                "model": _read_setting(
-                                    config.repo_root, "OLLAMA_RERANKER_MODEL", "gate"
-                                ),
-                                "prompt": "DC-Agent gate health check",
-                                "stream": False,
-                            }
-                        ),
-                    )
+                    *_reranker_probe_for_runtime(config.repo_root),
                 ],
             ),
             (
                 "ollama_tags",
-                [_probe_command(_OLLAMA_PROBE, _configured_url(config.repo_root, "/api/tags"))],
+                (
+                    [
+                        _probe_command(
+                            _LLAMA_CPP_METADATA_PROBE,
+                            _model_url(
+                                config.repo_root,
+                                runtime_key="EMBEDDING_RUNTIME",
+                                url_key="LLAMA_CPP_EMBEDDING_URL",
+                                path_key="LLAMA_CPP_EMBEDDING_PATH",
+                                default_url="http://127.0.0.1:8083",
+                                default_path="/v1/metadata",
+                                path_override="/v1/metadata",
+                            ),
+                        )
+                    ]
+                    if _model_runtime(config.repo_root, "EMBEDDING_RUNTIME") == "llama_cpp"
+                    else [_probe_command(_OLLAMA_PROBE, _configured_url(config.repo_root, "/api/tags"))]
+                ),
             ),
             (
                 "metadata",

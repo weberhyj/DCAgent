@@ -977,7 +977,7 @@ class ComposeSmokeTest(unittest.TestCase):
             return match.group("body")
 
         self.assertNotRegex(block("embedding-service"), r"(?m)^\s+profiles:")
-        self.assertIn('profiles: ["reranker"]', block("reranker-service"))
+        self.assertNotRegex(block("reranker-service"), r"(?m)^\s+profiles:")
         for consumer in ("api", "ingestion-worker"):
             depends_on = re.search(
                 r"(?ms)^    depends_on:\n(?P<body>.*?)(?=^    [a-z_]+:|\Z)",

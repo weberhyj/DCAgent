@@ -29,23 +29,37 @@ def valid_artifact() -> dict[str, str]:
 
 
 class OfflineArtifactManifestTest(unittest.TestCase):
-    def test_embedding_compose_environment_pins_bge_query_profile(self) -> None:
+    def test_embedding_compose_environment_pins_llama_cpp_bge_m3_profile(self) -> None:
         repository = Path(__file__).resolve().parents[2]
         compose = (repository / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         example = (repository / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
         self.assertIn(
-            "OLLAMA_EMBEDDING_QUERY_PROFILE: "
-            "${OLLAMA_EMBEDDING_QUERY_PROFILE:?OLLAMA_EMBEDDING_QUERY_PROFILE is required}",
+            "LLAMA_CPP_EMBEDDING_PATH: "
+            "${LLAMA_CPP_EMBEDDING_PATH:?LLAMA_CPP_EMBEDDING_PATH is required}",
             compose,
         )
         for line in (
-            "EMBEDDING_MODEL_NAME=bge-large-zh-v1.5:latest",
-            "EMBEDDING_MODEL_VERSION=ollama-bge-large-zh-v15-v1",
+            "EMBEDDING_RUNTIME=llama_cpp",
+            "EMBEDDING_MODEL_NAME=bge-m3-Q4_K_M.gguf",
+            "EMBEDDING_MODEL_VERSION=llama-cpp-bge-m3-q4km-v1",
             "EMBEDDING_MODEL_DIMENSIONS=1024",
             "EMBEDDING_ENCODING_PROFILE_SHA256="
-            "3d5db261732d456b51fa4f9aa89cb15054c21772c0809a50a31f0911eb960170",
-            "OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest",
-            "OLLAMA_EMBEDDING_QUERY_PROFILE=bge-large-zh-v1.5",
+            "52fd367c0a46ecfffc3fcf7f688d0a9e6c80f26cacf772eeeee78cc7f6c16254",
+            "LLAMA_CPP_EMBEDDING_MODEL=bge-m3-Q4_K_M.gguf",
+        ):
+            self.assertIn(line, example)
+
+    def test_compose_environment_pins_llama_cpp_bge_reranker(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        example = (repository / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
+        for line in (
+            "RERANKER_ENABLED=true",
+            "RERANKER_RUNTIME=llama_cpp",
+            "RERANKER_MODEL_NAME=bge-reranker-v2-m3-Q4_K_M.gguf",
+            "RERANKER_MODEL_VERSION=llama-cpp-bge-reranker-v2-m3-q4km-v1",
+            "RERANKER_PROMPT_PROFILE_SHA256=6f7fb308e56ddbdb5e2cf8536141b9d038e5fe69e12791c9a5142e6e68ef0cc9",
+            "LLAMA_CPP_RERANKER_PATH=/v1/rerank",
+            "LLAMA_CPP_RERANKER_MODEL=bge-reranker-v2-m3-Q4_K_M.gguf",
         ):
             self.assertIn(line, example)
 

@@ -1593,10 +1593,18 @@ class SqlChatRepository:
         *,
         evaluation_case_id: str | None = None,
         relevant_chunk_ids: tuple[str, ...] = (),
+        expansion_policy: object | None = None,
     ) -> AgentSearchResult:
         if self.retrieval_router is None or self._retrieval_scope_provider is None:
             return AgentSearchResult(hits=tuple(self.search_knowledge_chunks(query, limit)))
         from .retrieval_models import EvidenceExpansionPolicy, RetrievalRequest
+        selected_expansion_policy = (
+            EvidenceExpansionPolicy.BOUNDED_ADJACENCY
+            if expansion_policy is None
+            else expansion_policy
+        )
+        if not isinstance(selected_expansion_policy, EvidenceExpansionPolicy):
+            raise TypeError("expansion_policy must be an EvidenceExpansionPolicy")
 
         resolution = self._retrieval_scope_provider.resolve()
         if resolution.scope is None:
@@ -1620,7 +1628,7 @@ class SqlChatRepository:
                 scope=resolution.scope,
                 evaluation_case_id=evaluation_case_id,
                 relevant_chunk_ids=relevant_chunk_ids,
-                expansion_policy=EvidenceExpansionPolicy.BOUNDED_ADJACENCY,
+                expansion_policy=selected_expansion_policy,
             )
         )
         return AgentSearchResult(

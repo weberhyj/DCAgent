@@ -4,6 +4,14 @@ This runbook applies to the non-Docker deployment at `/opt/DCAgent`. Keep the st
 running throughout the knowledge-routing cutover so Excel imports and ClickHouse publication work
 continue normally.
 
+Before this rollout, install and probe the two independent llama.cpp model processes described in
+[`LLAMA_CPP_EMBEDDING.md`](./LLAMA_CPP_EMBEDDING.md). Do not rebuild or switch the Qdrant alias until
+the BGE-M3 embedding dimension and both GGUF checksums have been recorded.
+
+The production default is `RETRIEVAL_MODE=qwen3` with `RERANKER_ENABLED=true`. Exact Excel and
+Word factual routes remain deterministic and do not call Embedding, Reranker, or LLM; only ordinary
+document routes use the BGE-M3 -> Qdrant/BM25 -> BGE-Reranker-v2-M3 -> Physoc chain.
+
 ## 1. Deploy code, dependencies, and migrations
 
 Run this sequence exactly:
@@ -31,6 +39,11 @@ Confirm both Supervisor programs are `RUNNING`. Do not stop `dcagent-structured-
 responsible for structured Excel imports.
 
 ## 2. Reindex Word sources before enabling factual QA
+
+First create a new Qdrant collection for the BGE-M3 embedding fingerprint. Reindex every ordinary
+document into that new collection, validate its vector dimension and sample retrieval results, and
+only then atomically switch `QDRANT_COLLECTION_ALIAS`. Never append BGE-M3 vectors to the previous
+Ollama/BGE-large collection; keep the old collection and alias target for rollback.
 
 Keep `WORD_FACTUAL_QA_ENABLED=false`. For every existing Word knowledge source, submit:
 

@@ -104,13 +104,36 @@ Rollback of the first stamp means restoring the database backup; do not run the 
 ## Profiles
 
 - The default topology starts data services, schema migration, the embedding service, and API.
-- `--profile reranker` explicitly enables the optional Reranker adapter.
+- The core topology starts the llama.cpp BGE-Reranker adapter by default. Set
+  `RERANKER_ENABLED=false` only for an explicit emergency RRF-only rollback.
 - `--profile generation` enables the private llama.cpp service after its locked local model is installed.
 - `--profile indexing` enables the structured spreadsheet worker (`app.structured_worker`). Keep it disabled while `STRUCTURED_QUERY_ENABLED=false`.
 
-## 默认 RRF-only 检索路线
+Current production model route (Ubuntu + Supervisor or Compose) is llama.cpp BGE-M3 plus
+BGE-Reranker-v2-M3:
 
-生产模板默认使用 `Dense + BM25 + RRF`，不启动 Reranker：
+```env
+RETRIEVAL_MODE=qwen3
+RERANKER_ENABLED=true
+EMBEDDING_RUNTIME=llama_cpp
+EMBEDDING_MODEL_NAME=bge-m3-Q4_K_M.gguf
+RERANKER_RUNTIME=llama_cpp
+RERANKER_MODEL_NAME=bge-reranker-v2-m3-Q4_K_M.gguf
+```
+
+Ubuntu/Supervisor production deployments that run BGE-M3 and BGE-Reranker-v2-M3 through llama.cpp
+must follow `deploy/ubuntu/LLAMA_CPP_EMBEDDING.md`. Embedding and Reranker are independent processes;
+switching Embedding models requires a new Qdrant collection and a verified alias cutover.
+
+## 当前生产：llama.cpp BGE-M3 + BGE-Reranker-v2-M3
+
+生产默认配置为 `RETRIEVAL_MODE=qwen3`、`RERANKER_ENABLED=true`，使用
+`bge-m3-Q4_K_M.gguf` 的 `/v1/embeddings` 和 `bge-reranker-v2-m3-Q4_K_M.gguf` 的 `/v1/rerank`。
+旧 Ollama/RRF-only 内容仅保留作兼容回滚参考。
+
+## 兼容回滚：RRF-only 检索路线
+
+只有设置 `RERANKER_ENABLED=false` 时才使用 `Dense + BM25 + RRF`，不启动 Reranker：
 
 ```env
 RETRIEVAL_MODE=qwen3
@@ -134,8 +157,8 @@ RERANKER_SERVICE_URL=http://reranker-service:8082
 
 ```bash
 set -Eeuo pipefail
-./tools/invoke_offline_compose.sh --profile reranker build reranker-service api
-./tools/invoke_offline_compose.sh --profile reranker up -d reranker-service api
+./tools/invoke_offline_compose.sh build reranker-service api
+./tools/invoke_offline_compose.sh up -d reranker-service api
 ```
 
 ## Ollama-backed BGE Chinese hybrid retrieval rollout and rollback

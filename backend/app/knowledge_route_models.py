@@ -14,6 +14,7 @@ class KnowledgeRouteType(StrEnum):
     GREETING = "greeting"
     EXCEL_FILTERED_AGGREGATE = "excel_filtered_aggregate"
     EXCEL_MULTI_AGGREGATE = "excel_multi_aggregate"
+    EXCEL_ROW_LOOKUP = "excel_row_lookup"
     WORD_FACTUAL = "word_factual"
     DOCUMENT_QA = "document_qa"
     SUMMARY_COMPARE = "summary_compare"

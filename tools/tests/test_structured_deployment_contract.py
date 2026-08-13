@@ -45,7 +45,6 @@ REQUIRED_ENV_KEYS = (
 REMOVED_LOCAL_ADAPTER_KEYS = (
     "EMBEDDING_MODEL_DIR",
     "EMBEDDING_MODEL_ROOT",
-    "EMBEDDING_RUNTIME",
     "EMBEDDING_THREADS",
     "RERANKER_MODEL_DIR",
     "RERANKER_MODEL_ROOT",
@@ -151,7 +150,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 self.assertEqual(values["STRUCTURED_QUERY_ENABLED"].lower(), "true")
                 self.assertEqual(values["STRUCTURED_QUERY_TIMEOUT_SECONDS"], "4")
                 self.assertEqual(values["STRUCTURED_INGEST_BATCH_ROWS"], "50000")
-                self.assertEqual(values["RETRIEVAL_MODE"], "shadow")
+                self.assertEqual(values["RETRIEVAL_MODE"], "qwen3")
                 self.assertEqual(values["RETRIEVAL_SHADOW_PERCENT"], "10")
                 self.assertEqual(values["RETRIEVAL_CANARY_PERCENT"], "0")
                 self.assertEqual(values["RETRIEVAL_PERMISSION_TAGS"], "公开")
@@ -160,79 +159,48 @@ class StructuredDeploymentContractTests(unittest.TestCase):
                 if offline_example:
                     self.assertEqual(values["RETRIEVAL_DEGRADED_RERANK_TOP_K"], "8")
                     self.assertEqual(values["RETRIEVAL_FINAL_TOP_K"], "8")
-                    self.assertEqual(values["RERANKER_ENABLED"], "false")
+                    self.assertEqual(values["RERANKER_ENABLED"], "true")
                 else:
                     self.assertEqual(values["RETRIEVAL_DEGRADED_RERANK_TOP_K"], "4")
                     self.assertEqual(values["RETRIEVAL_FINAL_TOP_K"], "4")
                 self.assertEqual(values["RETRIEVAL_TOTAL_TIMEOUT_SECONDS"], "20")
-                expected_embedding_name = (
-                    "bge-large-zh-v1.5:latest" if offline_example else "qwen2.5:0.5b"
-                )
-                expected_embedding_version = (
-                    "ollama-bge-large-zh-v15-v1" if offline_example else "ollama-qwen25-05b-v1"
-                )
+                expected_embedding_name = "bge-m3-Q4_K_M.gguf"
+                expected_embedding_version = "llama-cpp-bge-m3-q4km-v1"
                 self.assertEqual(values["EMBEDDING_MODEL_NAME"], expected_embedding_name)
                 self.assertEqual(values["EMBEDDING_MODEL_VERSION"], expected_embedding_version)
                 self.assertRegex(values["EMBEDDING_MODEL_SHA256"], r"^[0-9a-f]{64}$")
                 self.assertIn(
-                    "# Operator action: replace with the target Ollama /api/tags digest "
-                    f"for {expected_embedding_name}.",
+                    "# Operator action: replace with the sha256sum of the target BGE-M3 GGUF file.",
                     text,
                 )
                 dimensions = values["EMBEDDING_MODEL_DIMENSIONS"]
                 self.assertRegex(dimensions, r"^[1-9][0-9]*$")
                 self.assertGreater(int(dimensions), 0)
-                self.assertRegex(
-                    text,
-                    r"(?m)^# Operator action: before deployment, call the target "
-                    r"Ollama /api/embed endpoint\.\n"
-                    r"# Measure len\(embeddings\[0\]\) in the response and replace "
-                    r"the example value below\.\n"
-                    r"EMBEDDING_MODEL_DIMENSIONS=[1-9][0-9]*$",
-                )
+                self.assertIn("EMBEDDING_MODEL_DIMENSIONS=1024", text)
                 self.assertEqual(values["EMBEDDING_MODEL_NORMALIZED"], "true")
-                expected_profile_sha256 = (
-                    "3d5db261732d456b51fa4f9aa89cb15054c21772c0809a50a31f0911eb960170"
-                    if offline_example
-                    else "fc5141eb8e304cacf598a7ad39ba75dbed3f22fa144c81f918ec58cd1efa3d10"
-                )
+                expected_profile_sha256 = "52fd367c0a46ecfffc3fcf7f688d0a9e6c80f26cacf772eeeee78cc7f6c16254"
                 self.assertEqual(
                     values["EMBEDDING_ENCODING_PROFILE_SHA256"],
                     expected_profile_sha256,
                 )
-                expected_reranker_name = (
-                    "bge-reranker-v2-m3-Q4_K_M.gguf" if offline_example else "qwen2.5:3b"
-                )
-                expected_reranker_version = (
-                    "llama-cpp-bge-reranker-v2-m3-q4km-v1"
-                    if offline_example
-                    else "ollama-qwen25-3b-v1"
-                )
+                expected_reranker_name = "bge-reranker-v2-m3-Q4_K_M.gguf"
+                expected_reranker_version = "llama-cpp-bge-reranker-v2-m3-q4km-v1"
                 self.assertEqual(values["RERANKER_MODEL_NAME"], expected_reranker_name)
                 self.assertEqual(values["RERANKER_MODEL_VERSION"], expected_reranker_version)
                 self.assertRegex(values["RERANKER_MODEL_SHA256"], r"^[0-9a-f]{64}$")
-                if offline_example:
-                    self.assertEqual(values["RERANKER_RUNTIME"], "llama_cpp")
-                    self.assertEqual(values["LLAMA_CPP_RERANKER_MODEL"], expected_reranker_name)
-                else:
-                    self.assertRegex(
-                        text,
-                        r"(?m)^# Operator action: replace with the target Ollama "
-                        r"/api/tags digest for qwen2\.5:3b\.\n"
-                        r"# Store the normalized 64 lowercase hex characters without "
-                        r"the optional sha256: prefix\.\n"
-                        r"RERANKER_MODEL_SHA256=[0-9a-f]{64}$",
-                    )
+                self.assertEqual(values["RERANKER_RUNTIME"], "llama_cpp")
+                self.assertEqual(values["LLAMA_CPP_RERANKER_MODEL"], expected_reranker_name)
                 self.assertEqual(
                     values["RERANKER_PROMPT_PROFILE_SHA256"],
                     (
                         "6f7fb308e56ddbdb5e2cf8536141b9d038e5fe69e12791c9a5142e6e68ef0cc9"
-                        if offline_example
-                        else "e474bae5997a24385e95ae8fb3bef00ac066a9afe3999aa6e89ceae6d1c72bbd"
                     ),
                 )
-                self.assertEqual(values["OLLAMA_BASE_URL"], "http://172.16.0.10:11434")
-                self.assertEqual(values["OLLAMA_EMBEDDING_MODEL"], expected_embedding_name)
+                self.assertIn(values["OLLAMA_BASE_URL"], {"http://172.16.0.10:11434", "http://127.0.0.1:11434"})
+                self.assertEqual(
+                    values["OLLAMA_EMBEDDING_MODEL"],
+                    "bge-large-zh-v1.5:latest" if offline_example else "qwen2.5:0.5b",
+                )
                 self.assertEqual(values["OLLAMA_EMBEDDING_PATH"], "/api/embed")
                 self.assertEqual(values["OLLAMA_RERANKER_MODEL"], "qwen2.5:3b")
                 self.assertEqual(values["OLLAMA_GENERATE_PATH"], "/api/generate")
@@ -305,10 +273,7 @@ class StructuredDeploymentContractTests(unittest.TestCase):
     ) -> None:
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         self.assertNotRegex(service_block(compose, "embedding-service"), r"(?m)^\s+profiles:")
-        self.assertIn(
-            'profiles: ["reranker"]',
-            service_block(compose, "reranker-service"),
-        )
+        self.assertNotRegex(service_block(compose, "reranker-service"), r"(?m)^\s+profiles:")
         for consumer in ("api", "ingestion-worker"):
             block = service_block(compose, consumer)
             depends_on = re.search(

@@ -18,6 +18,8 @@ from app.structured_models import (
     StructuredMetricIntent,
     StructuredMultiAggregateIntent,
     StructuredMultiAggregateResult,
+    StructuredRowLookupIntent,
+    StructuredRowLookupResult,
     StructuredUnavailable,
 )
 from app.structured_query import parse_structured_intent, resolve_structured_intent
@@ -31,6 +33,21 @@ from tests.support.structured_fakes import (
 
 
 class StructuredIntentParsingTest(unittest.TestCase):
+    def test_parses_row_lookup_filter_and_selected_columns(self) -> None:
+        result = resolve_structured_intent(
+            "地区=华东，返回订单金额和订单日期",
+            sample_catalog(),
+        )
+
+        self.assertEqual(
+            result,
+            StructuredRowLookupIntent(
+                dataset_id="ds-sales",
+                filters=(StructuredFilter("region", "eq", "华东"),),
+                selected_physical_names=("order_amount", "order_date"),
+                limit=100,
+            ),
+        )
     def test_mixed_allowed_and_disallowed_metrics_never_degrade_to_single_metric(
         self,
     ) -> None:
@@ -1714,6 +1731,34 @@ class StructuredQueryPlannerTest(unittest.TestCase):
 
 
 class StructuredQueryExecutorTest(unittest.TestCase):
+    def test_row_lookup_plan_is_parameterized_bounded_and_preserves_rows(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_catalog()
+        intent = StructuredRowLookupIntent(
+            dataset_id="ds-sales",
+            filters=(StructuredFilter("region", "eq", "华东"),),
+            selected_physical_names=("order_amount", "order_date"),
+            limit=2,
+        )
+        plan = StructuredQueryPlanner(catalog).plan_row_lookup(intent, sample_publication())
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {"order_amount": "10.5", "order_date": "2026-01-01"},
+                {"order_amount": "20", "order_date": "2026-01-02"},
+                {"order_amount": "30", "order_date": "2026-01-03"},
+            ]
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_row_lookup(plan)
+
+        self.assertIn("region = {filter_0:String}", plan.sql)
+        self.assertIn("LIMIT 3", plan.sql)
+        self.assertEqual(plan.parameters, {"filter_0": "华东"})
+        self.assertIsInstance(result, StructuredRowLookupResult)
+        assert isinstance(result, StructuredRowLookupResult)
+        self.assertEqual(result.rows, (("10.5", "2026-01-01"), ("20", "2026-01-02")))
+        self.assertTrue(result.truncated)
     def test_multi_executor_returns_clickhouse_values_without_python_recalculation(
         self,
     ) -> None:

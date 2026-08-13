@@ -33,6 +33,8 @@ from .structured_models import (
     StructuredIntent,
     StructuredMultiAggregateIntent,
     StructuredMultiAggregateResult,
+    StructuredRowLookupIntent,
+    StructuredRowLookupResult,
     StructuredUnavailable,
 )
 from .structured_query import (
@@ -62,6 +64,13 @@ _CHINESE_AGGREGATE_TERMS = (
     "最低",
     "汇总",
     "统计",
+)
+_AGGREGATE_WORDS = (
+    ("avg", ("平均值", "平均", "均值")),
+    ("sum", ("总和", "合计", "求和")),
+    ("count", ("多少条", "数量", "计数")),
+    ("max", ("最大", "最高")),
+    ("min", ("最小", "最低")),
 )
 _IMPLICIT_ROW_COUNT_RE = re.compile(
     r"^(?:(?:总共|一共|共有)有?)?多少条(?:记录|数据|明细|行)?[？?。.]?$"
@@ -159,6 +168,11 @@ class StructuredAnswerService:
         if callable(close):
             close()
 
+    def catalog_snapshot(self) -> StructuredCatalog | None:
+        """Return the last successfully loaded catalog for route decisions."""
+
+        return self._get_catalog_snapshot()
+
     def try_answer(
         self,
         conversation_id: str,
@@ -168,7 +182,7 @@ class StructuredAnswerService:
     ) -> AgentRunResult | None:
         del previous_messages
         question = content.strip()
-        if not _has_aggregate_language(question):
+        if not _has_aggregate_language(question) and not _has_row_lookup_markers(question):
             return None
 
         catalog_request_generation = self._next_catalog_request_generation()
@@ -259,7 +273,16 @@ class StructuredAnswerService:
                 ),
             )
         try:
-            if isinstance(resolution, StructuredMultiAggregateIntent):
+            if isinstance(resolution, StructuredRowLookupIntent):
+                plan = StructuredQueryPlanner(catalog, self._compatibility).plan_row_lookup(
+                    resolution, publication
+                )
+                result = StructuredQueryExecutor(
+                    catalog,
+                    self._clickhouse_gateway,
+                    compatibility=self._compatibility,
+                ).execute_row_lookup(plan)
+            elif isinstance(resolution, StructuredMultiAggregateIntent):
                 plan = StructuredQueryPlanner(
                     catalog,
                     self._compatibility,
@@ -306,6 +329,31 @@ class StructuredAnswerService:
                     **_intent_route_metadata(catalog, resolution),
                     degradation_reason="clickhouse_unavailable",
                     validation_passed=False,
+                ),
+            )
+        if isinstance(result, StructuredRowLookupResult):
+            artifact = TableArtifactModel(
+                type="table",
+                title="Excel 行查询结果",
+                source=result.source_name,
+                columns=list(result.selected_display_names),
+                rows=[list(row) for row in result.rows],
+            )
+            suffix = "（结果已截断）" if result.truncated else ""
+            return _structured_run(
+                conversation_id,
+                question,
+                mode,
+                f"已从 {result.source_name} / {result.worksheet_name} 返回 {len(result.rows)} 行{suffix}。",
+                f"structured row lookup completed; audit_id={result.audit_id}",
+                source_ids=[result.source_id],
+                artifacts=[artifact],
+                route_type=KnowledgeRouteType.EXCEL_ROW_LOOKUP,
+                route_metadata=KnowledgeRouteMetadata(
+                    dataset_id=result.dataset_id,
+                    target_fields=result.selected_display_names,
+                    candidate_source_ids=(result.source_id,),
+                    validation_passed=True,
                 ),
             )
         if isinstance(result, StructuredMultiAggregateResult):
@@ -383,6 +431,8 @@ class StructuredAnswerService:
 
 
 def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
+    if _has_row_lookup_language(question, catalog):
+        return True
     if not _has_aggregate_language(question):
         return False
     if _is_implicit_summary(question):
@@ -419,6 +469,23 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
     }
     normalized = _normalize(_mask_aggregate_equality_values(question, filter_columns, metric_names))
     return _has_catalog_span_with_independent_aggregate(normalized, catalog_names)
+
+
+def _has_row_lookup_language(question: str, catalog: StructuredCatalog) -> bool:
+    if not _has_row_lookup_markers(question):
+        return False
+    if any(term in question for _, words in _AGGREGATE_WORDS for term in words):
+        return False
+    return any(
+        _normalize(value) in _normalize(question)
+        for dataset in catalog.datasets
+        for column in dataset.schema.columns
+        for value in (column.display_name, column.original_name, *column.aliases)
+    )
+
+
+def _has_row_lookup_markers(question: str) -> bool:
+    return any(marker in question for marker in ("返回", "查找", "显示", "列出", "给出", "其他列"))
 
 
 def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:
@@ -547,6 +614,8 @@ def _is_implicit_summary(question: str) -> bool:
 def _classify_without_catalog(question: str) -> Literal["weak", "strong", "concept"]:
     stripped = question.strip()
     normalized = _normalize(stripped)
+    if _has_row_lookup_markers(stripped):
+        return "strong"
     if not _has_aggregate_language(normalized):
         return "weak"
     concept_body = _normalize(_strip_concept_question_tail(stripped))
@@ -736,7 +805,7 @@ def _normalize(value: str) -> str:
 
 def _active_publication(
     catalog: StructuredCatalog,
-    intent: StructuredIntent | StructuredMultiAggregateIntent,
+    intent: StructuredIntent | StructuredMultiAggregateIntent | StructuredRowLookupIntent,
 ):
     matches = [
         dataset.active_publication
@@ -748,14 +817,15 @@ def _active_publication(
 
 def _intent_route_metadata(
     catalog: StructuredCatalog,
-    intent: StructuredIntent | StructuredMultiAggregateIntent,
+    intent: StructuredIntent | StructuredMultiAggregateIntent | StructuredRowLookupIntent,
 ) -> dict[str, object]:
     dataset = next(item for item in catalog.datasets if item.schema.dataset_id == intent.dataset_id)
-    physical_names = (
-        tuple(metric.metric_physical_name for metric in intent.metrics)
-        if isinstance(intent, StructuredMultiAggregateIntent)
-        else (intent.metric_physical_name,)
-    )
+    if isinstance(intent, StructuredRowLookupIntent):
+        physical_names = intent.selected_physical_names
+    elif isinstance(intent, StructuredMultiAggregateIntent):
+        physical_names = tuple(metric.metric_physical_name for metric in intent.metrics)
+    else:
+        physical_names = (intent.metric_physical_name,)
     fields = tuple(
         next(column.display_name for column in dataset.schema.columns if column.physical_name == name)
         if name is not None else "all_rows"
@@ -773,7 +843,7 @@ def _catalog_outage_route_metadata(
     catalog: StructuredCatalog,
     resolution: object,
 ) -> dict[str, object]:
-    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent)):
+    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent, StructuredRowLookupIntent)):
         return _intent_route_metadata(catalog, resolution)
     if isinstance(resolution, StructuredClarification):
         return _clarification_route_metadata(catalog, resolution)
@@ -783,7 +853,7 @@ def _catalog_outage_route_metadata(
 
 
 def _route_for_catalog_outage_resolution(resolution: object) -> KnowledgeRouteType:
-    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent)):
+    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent, StructuredRowLookupIntent)):
         return _route_for_intent(resolution)
     if isinstance(resolution, StructuredClarification) and resolution.origin_route is not None:
         return KnowledgeRouteType(resolution.origin_route)
@@ -793,8 +863,10 @@ def _route_for_catalog_outage_resolution(resolution: object) -> KnowledgeRouteTy
 
 
 def _route_for_intent(
-    intent: StructuredIntent | StructuredMultiAggregateIntent,
+    intent: StructuredIntent | StructuredMultiAggregateIntent | StructuredRowLookupIntent,
 ) -> KnowledgeRouteType:
+    if isinstance(intent, StructuredRowLookupIntent):
+        return KnowledgeRouteType.EXCEL_ROW_LOOKUP
     return (
         KnowledgeRouteType.EXCEL_MULTI_AGGREGATE
         if isinstance(intent, StructuredMultiAggregateIntent)

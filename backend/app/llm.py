@@ -48,6 +48,7 @@ class LLMRequest:
     knowledge_hits: list[KnowledgeSearchHitModel] = field(default_factory=list)
     previous_messages: list[ChatMessageModel] = field(default_factory=list)
     agent_context: str = ""
+    include_history: bool = True
 
 
 class LLMProvider:
@@ -361,7 +362,7 @@ def build_prompt(request: LLMRequest) -> str:
     history = "\n".join(
         f"{message.role}: {message.content or ' '.join(paragraph.text for paragraph in message.paragraphs)}"
         for message in request.previous_messages[-6:]
-    )
+    ) if request.include_history else ""
     return (
         "回答规则：\n"
         "- 仅基于可用知识片段回答，不要补充片段之外的事实。\n"

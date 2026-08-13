@@ -36,7 +36,7 @@ def service_block(compose: str, service: str) -> str:
 
 
 class ComposeContractTest(unittest.TestCase):
-    def test_operator_docs_describe_default_rrf_only_route(self) -> None:
+    def test_operator_docs_describe_llama_cpp_bge_route(self) -> None:
         for path in (
             REPO_ROOT / "README.md",
             REPO_ROOT / "deploy" / "offline" / "README.md",
@@ -44,26 +44,29 @@ class ComposeContractTest(unittest.TestCase):
         ):
             text = path.read_text(encoding="utf-8")
             with self.subTest(path=path.relative_to(REPO_ROOT)):
-                self.assertIn("RERANKER_ENABLED=false", text)
+                self.assertIn("bge-m3-Q4_K_M.gguf", text)
+                self.assertIn("bge-reranker-v2-m3-Q4_K_M.gguf", text)
+                self.assertIn("RERANKER_ENABLED=true", text)
                 self.assertIn("Dense + BM25 + RRF", text)
-                self.assertIn("kopens/bge-reranker-large:latest", text)
-                self.assertIn("1024", text)
 
-    def test_rrf_only_is_the_documented_default(self) -> None:
+    def test_llama_cpp_reranker_is_the_documented_default(self) -> None:
         env_text = (REPO_ROOT / "deploy" / "offline" / ".env.example").read_text(encoding="utf-8")
 
-        self.assertIn("RERANKER_ENABLED=false", env_text)
+        self.assertIn("RETRIEVAL_MODE=qwen3", env_text)
+        self.assertIn("RERANKER_ENABLED=true", env_text)
+        self.assertIn("RERANKER_RUNTIME=llama_cpp", env_text)
+        self.assertIn("RERANKER_MODEL_NAME=bge-reranker-v2-m3-Q4_K_M.gguf", env_text)
         self.assertIn("RETRIEVAL_FINAL_TOP_K=8", env_text)
 
-    def test_reranker_service_requires_explicit_profile(self) -> None:
+    def test_reranker_service_is_enabled_in_the_core_topology(self) -> None:
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         reranker = service_block(compose, "reranker-service")
         api = service_block(compose, "api")
         worker = service_block(compose, "ingestion-worker")
 
-        self.assertIn('profiles: ["reranker"]', reranker)
-        self.assertIn("RERANKER_ENABLED: ${RERANKER_ENABLED:-false}", api)
-        self.assertIn("RERANKER_ENABLED: ${RERANKER_ENABLED:-false}", worker)
+        self.assertNotIn('profiles: ["reranker"]', reranker)
+        self.assertIn("RERANKER_ENABLED: ${RERANKER_ENABLED:-true}", api)
+        self.assertIn("RERANKER_ENABLED: ${RERANKER_ENABLED:-true}", worker)
 
     def test_declares_required_offline_services_and_private_network(self) -> None:
         compose_path = REPO_ROOT / "deploy" / "offline" / "compose.yaml"
@@ -98,7 +101,13 @@ class ComposeContractTest(unittest.TestCase):
         compose = (REPO_ROOT / "deploy" / "offline" / "compose.yaml").read_text(encoding="utf-8")
         service_requirements = {
             "embedding-service": (
+                "EMBEDDING_RUNTIME",
                 "EMBEDDING_MODEL_SHA256",
+                "LLAMA_CPP_EMBEDDING_URL",
+                "LLAMA_CPP_EMBEDDING_PATH",
+                "LLAMA_CPP_EMBEDDING_MODEL",
+                "LLAMA_CPP_EMBEDDING_TIMEOUT_SECONDS",
+                "LLAMA_CPP_EMBEDDING_BATCH_MAX_ITEMS",
                 "OLLAMA_BASE_URL",
                 "OLLAMA_EMBEDDING_MODEL",
                 "OLLAMA_EMBEDDING_PATH",
@@ -142,8 +151,6 @@ class ComposeContractTest(unittest.TestCase):
                 self.assertNotRegex(block, r"(?m)^\s+volumes:")
                 self.assertNotIn("MODEL_ROOT", block)
                 self.assertNotIn("MODEL_DIR", block)
-                if service == "embedding-service":
-                    self.assertNotIn("EMBEDDING_RUNTIME", block)
                 self.assertNotIn("OMP_NUM_THREADS", block)
                 self.assertNotIn("OPENVINO_NUM_THREADS", block)
                 for variable in variables:
@@ -782,34 +789,47 @@ class ComposeContractTest(unittest.TestCase):
         optional_expansions = {
             "LLM_STREAM_PATH": ":-/api/physoc/deepseeks/stream",
             "LLM_API_KEY": ":-",
-            "RERANKER_ENABLED": ":-false",
+            "RERANKER_ENABLED": ":-true",
             "RERANKER_SERVICE_URL": ":-http://reranker-service:8082",
-            "RERANKER_MODEL_NAME": ":-",
-            "RERANKER_MODEL_VERSION": ":-",
-            "RERANKER_MODEL_SHA256": ":-",
-            "RERANKER_PROMPT_PROFILE_SHA256": ":-",
-            "RERANKER_PROTOCOL_VERSION": ":-",
-            "RERANKER_RUNTIME": ":-ollama",
+            "RERANKER_MODEL_NAME": (":-", ":?RERANKER_MODEL_NAME is required"),
+            "RERANKER_MODEL_VERSION": (":-", ":?RERANKER_MODEL_VERSION is required"),
+            "RERANKER_MODEL_SHA256": (":-", ":?RERANKER_MODEL_SHA256 is required"),
+            "RERANKER_PROMPT_PROFILE_SHA256": (":-", ":?RERANKER_PROMPT_PROFILE_SHA256 is required"),
+            "RERANKER_PROTOCOL_VERSION": (":-", ":?RERANKER_PROTOCOL_VERSION is required"),
+            "RERANKER_RUNTIME": ":?RERANKER_RUNTIME is required",
             "OLLAMA_RERANKER_MODEL": ":-",
             "OLLAMA_GENERATE_PATH": ":-",
             "OLLAMA_RERANK_FORMAT_JSON": ":-",
             "OLLAMA_RERANK_NUM_PREDICT": ":-",
             "OLLAMA_RERANK_BATCH_MAX_ITEMS": ":-",
-            "LLAMA_CPP_RERANKER_URL": ":-",
-            "LLAMA_CPP_RERANKER_PATH": ":-/v1/rerank",
-            "LLAMA_CPP_RERANKER_MODEL": ":-",
-            "LLAMA_CPP_RERANK_TIMEOUT_SECONDS": ":-10",
-            "LLAMA_CPP_RERANK_BATCH_MAX_ITEMS": ":-32",
+            "LLAMA_CPP_RERANKER_URL": ":?LLAMA_CPP_RERANKER_URL is required",
+            "LLAMA_CPP_RERANKER_PATH": ":?LLAMA_CPP_RERANKER_PATH is required",
+            "LLAMA_CPP_RERANKER_MODEL": ":?LLAMA_CPP_RERANKER_MODEL is required",
+            "LLAMA_CPP_RERANK_TIMEOUT_SECONDS": ":?LLAMA_CPP_RERANK_TIMEOUT_SECONDS is required",
+            "LLAMA_CPP_RERANK_BATCH_MAX_ITEMS": ":?LLAMA_CPP_RERANK_BATCH_MAX_ITEMS is required",
             "RERANKER_BATCH_MAX_ITEMS": ":-",
             "RERANKER_QUEUE_MAX_ITEMS": ":-",
             "RERANKER_BATCH_WAIT_MS": ":-",
             "RERANKER_CPU_LIMIT": ":-4.0",
             "RERANKER_MEMORY_LIMIT": ":-6g",
+            # Ollama embedding settings remain optional compatibility inputs.
+            # The production offline example selects llama.cpp and requires its
+            # endpoint/model settings explicitly.
+            "OLLAMA_BASE_URL": ":-http://127.0.0.1:11434",
+            "OLLAMA_EMBEDDING_MODEL": ":-",
+            "OLLAMA_EMBEDDING_PATH": ":-/api/embed",
+            "OLLAMA_EMBEDDING_QUERY_PROFILE": ":?OLLAMA_EMBEDDING_QUERY_PROFILE is required",
+            "OLLAMA_KEEP_ALIVE": ":-30m",
+            "OLLAMA_REQUEST_TIMEOUT_SECONDS": ":-15",
         }
         for name, suffix in expansions:
             with self.subTest(name=name, suffix=suffix):
                 if name in optional_expansions:
-                    self.assertEqual(optional_expansions[name], suffix)
+                    expected_suffix = optional_expansions[name]
+                    if isinstance(expected_suffix, tuple):
+                        self.assertIn(suffix, expected_suffix)
+                    else:
+                        self.assertEqual(expected_suffix, suffix)
                 else:
                     self.assertTrue(suffix.startswith(":?"))
         for required_name in (

@@ -32,6 +32,9 @@ from .structured_models import (
     StructuredMultiAggregateIntent,
     StructuredMultiAggregatePlan,
     StructuredMultiAggregateResult,
+    StructuredRowLookupIntent,
+    StructuredRowLookupPlan,
+    StructuredRowLookupResult,
     StructuredPublication,
     StructuredQueryPlan,
     StructuredUnavailable,
@@ -40,6 +43,7 @@ from .structured_models import (
 StructuredIntentResolution = (
     StructuredIntent
     | StructuredMultiAggregateIntent
+    | StructuredRowLookupIntent
     | StructuredClarification
     | StructuredUnavailable
 )
@@ -84,6 +88,7 @@ _NUMBER_RE = r"-?\d+(?:\.\d+)?"
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9_]+$")
 _ALLOWED_AGGREGATES = frozenset({"avg", "sum", "count", "min", "max"})
 _ALLOWED_SQL_FUNCTIONS = frozenset({"AVG", "SUM", "COUNT", "MIN", "MAX"})
+_ROW_LOOKUP_MARKERS = ("返回", "查找", "显示", "列出", "给出", "其他列")
 
 
 class UnsafeStructuredQueryError(ValueError):
@@ -312,6 +317,55 @@ class StructuredQueryPlanner:
             implicit=intent.implicit,
         )
 
+    def plan_row_lookup(
+        self,
+        intent: StructuredRowLookupIntent,
+        publication: StructuredPublication,
+    ) -> StructuredRowLookupPlan:
+        dataset = self._require_dataset(intent.dataset_id)
+        if dataset.active_publication != publication:
+            raise UnsafeStructuredQueryError("publication is not the active catalog publication")
+        if not 1 <= intent.limit <= 1000:
+            raise UnsafeStructuredQueryError("row lookup limit must be between 1 and 1000")
+        columns = {column.physical_name: column for column in dataset.schema.columns}
+        selected = []
+        for name in intent.selected_physical_names:
+            column = columns.get(name)
+            if column is None:
+                raise UnsafeStructuredQueryError("unknown row lookup column")
+            selected.append(column)
+        if not selected:
+            raise UnsafeStructuredQueryError("row lookup requires selected columns")
+        parameters: dict[str, object] = {}
+        predicates: list[str] = []
+        for index, item in enumerate(intent.filters):
+            column = columns.get(item.physical_name)
+            if column is None or not column.allow_filter:
+                raise UnsafeStructuredQueryError("unknown or disallowed filter column")
+            if item.operator != "eq" or item.upper_value is not None:
+                raise UnsafeStructuredQueryError("row lookup supports equality filters only")
+            name = _require_identifier(column.physical_name)
+            parameter_name = f"filter_{index}"
+            parameters[parameter_name] = _convert_parameter(item.value, column.data_type, self._compatibility)
+            predicates.append(
+                f"{name} = {{{parameter_name}:{self._compatibility.parameter_type(column.data_type)}}}"
+            )
+        table_name = _require_identifier(publication.physical_table_name)
+        sql = f"SELECT {', '.join(_require_identifier(column.physical_name) for column in selected)} FROM {table_name}"
+        if predicates:
+            sql += " WHERE " + " AND ".join(predicates)
+        sql += f" LIMIT {intent.limit + 1}"
+        _validate_generated_select(sql, table_name=table_name, allowed_columns=frozenset(columns))
+        return StructuredRowLookupPlan(
+            publication_id=publication.publication_id,
+            dataset_id=intent.dataset_id,
+            selected_physical_names=tuple(column.physical_name for column in selected),
+            sql=sql,
+            parameters=parameters,
+            filters=intent.filters,
+            limit=intent.limit,
+        )
+
     def _require_dataset(self, dataset_id: str) -> StructuredDatasetCatalog:
         matches = [
             dataset for dataset in self._catalog.datasets if dataset.schema.dataset_id == dataset_id
@@ -534,8 +588,77 @@ class StructuredQueryExecutor:
             audit_id=self._audit_id_factory(),
         )
 
+    def execute_row_lookup(
+        self, plan: StructuredRowLookupPlan
+    ) -> StructuredRowLookupResult | StructuredUnavailable:
+        dataset = self._require_active_dataset(plan)
+        if isinstance(dataset, StructuredUnavailable):
+            return dataset
+        publication = dataset.active_publication
+        assert publication is not None
+        try:
+            expected = StructuredQueryPlanner(self._catalog, self._compatibility).plan_row_lookup(
+                StructuredRowLookupIntent(
+                    dataset_id=plan.dataset_id,
+                    filters=plan.filters,
+                    selected_physical_names=plan.selected_physical_names,
+                    limit=plan.limit,
+                ),
+                publication,
+            )
+        except UnsafeStructuredQueryError:
+            return StructuredUnavailable("row lookup plan is no longer valid")
+        if plan.sql != expected.sql or dict(plan.parameters) != dict(expected.parameters):
+            return StructuredUnavailable("row lookup plan failed safety validation")
+        query = getattr(self._clickhouse, "query", None)
+        if query is None:
+            return StructuredUnavailable("structured query service is unavailable")
+        started = self._clock()
+        try:
+            raw_result = query(plan.sql, plan.parameters)
+            if isinstance(raw_result, Mapping):
+                raw_rows = [raw_result]
+            else:
+                raw_rows = list(raw_result)
+        except Exception:
+            return StructuredUnavailable("structured query service is unavailable")
+        elapsed_ms = max(0.0, (self._clock() - started) * 1000.0)
+        rows: list[tuple[str, ...]] = []
+        for raw_row in raw_rows[: plan.limit + 1]:
+            if isinstance(raw_row, Mapping):
+                try:
+                    rows.append(tuple(_format_row_value(raw_row[name]) for name in plan.selected_physical_names))
+                except KeyError:
+                    return StructuredUnavailable("structured query returned invalid columns")
+            elif isinstance(raw_row, (list, tuple)) and len(raw_row) == len(plan.selected_physical_names):
+                rows.append(tuple(_format_row_value(value) for value in raw_row))
+            else:
+                return StructuredUnavailable("structured query returned invalid rows")
+        truncated = len(rows) > plan.limit
+        rows = rows[: plan.limit]
+        selected_display_names = tuple(
+            next(column.display_name for column in dataset.schema.columns if column.physical_name == name)
+            for name in plan.selected_physical_names
+        )
+        return StructuredRowLookupResult(
+            dataset_id=dataset.schema.dataset_id,
+            source_id=dataset.schema.source_id,
+            schema_version=dataset.schema.schema_version,
+            selected_physical_names=plan.selected_physical_names,
+            selected_display_names=selected_display_names,
+            rows=tuple(rows),
+            total_count=len(rows),
+            truncated=truncated,
+            source_name=dataset.source_name,
+            worksheet_name=dataset.schema.worksheet_name,
+            publication_id=publication.publication_id,
+            filters=plan.filters,
+            elapsed_ms=elapsed_ms,
+            audit_id=self._audit_id_factory(),
+        )
+
     def _require_active_dataset(
-        self, plan: StructuredQueryPlan | StructuredMultiAggregatePlan
+        self, plan: StructuredQueryPlan | StructuredMultiAggregatePlan | StructuredRowLookupPlan
     ) -> StructuredDatasetCatalog | StructuredUnavailable:
         matches = [
             dataset
@@ -563,6 +686,9 @@ def resolve_structured_intent(
     *,
     implicit_summary_max_metrics: int = 12,
 ) -> StructuredIntentResolution:
+    row_lookup = _parse_row_lookup_intent(question, catalog)
+    if row_lookup is not None:
+        return row_lookup
     dataset_result = _parse_dataset_clause(question, catalog)
     if dataset_result.issue is not None:
         return _with_dataset_issue_context(question, catalog, dataset_result.issue)
@@ -727,6 +853,74 @@ def resolve_structured_intent(
         )
 
     return StructuredUnavailable("未识别到受支持的聚合意图")
+
+
+def _parse_row_lookup_intent(
+    question: str,
+    catalog: StructuredCatalog,
+) -> StructuredRowLookupIntent | StructuredClarification | StructuredUnavailable | None:
+    if not any(marker in question for marker in _ROW_LOOKUP_MARKERS):
+        return None
+    if any(term in question for _, words in _AGGREGATE_WORDS for term in words) or any(
+        term in question for term in _SUMMARY_WORDS
+    ):
+        return None
+    dataset_result = _parse_dataset_clause(question, catalog)
+    if dataset_result.issue is not None:
+        return None
+    assert dataset_result.value is not None
+    dataset = dataset_result.value
+    filter_result = _parse_filter_clause(
+        question,
+        dataset.schema.columns,
+        dataset_result.consumed_spans,
+    )
+    if filter_result.issue is not None:
+        return _with_route_context(
+            filter_result.issue,
+            dataset,
+            origin_route="excel_row_lookup",
+        )
+    marker_positions = [question.find(marker) for marker in _ROW_LOOKUP_MARKERS if question.find(marker) >= 0]
+    if not marker_positions:
+        return None
+    marker_start = min(marker_positions)
+    selected_text = question[marker_start:]
+    selected = _resolve_multiple_columns(selected_text, dataset.schema.columns)
+    if isinstance(selected, StructuredClarification):
+        return _with_clarification_context(
+            selected,
+            dataset,
+            origin_route="excel_row_lookup",
+        )
+    selected = tuple(column for column in selected if column.physical_name not in {item.physical_name for item in filter_result.value or ()})
+    if not selected:
+        return _with_route_context(
+            StructuredUnavailable(
+                "未识别到要返回的列",
+                dataset.schema.dataset_id,
+                (),
+                (dataset.schema.source_id,),
+                "excel_row_lookup",
+            ),
+            dataset,
+            origin_route="excel_row_lookup",
+        )
+    if len(selected) > MAX_STRUCTURED_ROUTE_FIELDS:
+        return _with_clarification_context(
+            StructuredClarification(
+                f"一次最多返回 {MAX_STRUCTURED_ROUTE_FIELDS} 个列",
+                tuple(column.display_name for column in selected[:MAX_STRUCTURED_ROUTE_FIELDS]),
+            ),
+            dataset,
+            origin_route="excel_row_lookup",
+        )
+    return StructuredRowLookupIntent(
+        dataset_id=dataset.schema.dataset_id,
+        filters=filter_result.value or (),
+        selected_physical_names=tuple(column.physical_name for column in selected),
+        limit=100,
+    )
 
 
 def _parse_aggregate_clause(
@@ -1399,6 +1593,53 @@ def _resolve_columns(
     return _unique_or_clarification(selected)
 
 
+def _resolve_multiple_columns(
+    question: str,
+    columns: Iterable[StructuredColumnSchema],
+) -> tuple[StructuredColumnSchema, ...] | StructuredClarification:
+    candidates = tuple(columns)
+    normalized_question = _normalize(question)
+    matches: list[tuple[int, int, int, int, StructuredColumnSchema]] = []
+    for column in candidates:
+        for priority, name in _resolution_names(column):
+            normalized_name = _normalize(name)
+            if not normalized_name:
+                continue
+            start = normalized_question.find(normalized_name)
+            while start >= 0:
+                matches.append((priority, len(normalized_name), start, start + len(normalized_name), column))
+                start = normalized_question.find(normalized_name, start + 1)
+    if not matches:
+        return ()
+    independent = [
+        match
+        for match in matches
+        if not any(
+            other_length > match[1]
+            and other_start <= match[2]
+            and match[3] <= other_end
+            for _, other_length, other_start, other_end, _ in matches
+        )
+    ]
+    by_span: dict[tuple[int, int], list[tuple[int, StructuredColumnSchema]]] = {}
+    for priority, _, start, end, column in independent:
+        by_span.setdefault((start, end), []).append((priority, column))
+    selected: list[tuple[int, StructuredColumnSchema]] = []
+    for span, span_matches in by_span.items():
+        best_priority = min(priority for priority, _ in span_matches)
+        finalists = tuple({column.physical_name: column for priority, column in span_matches if priority == best_priority}.values())
+        if len(finalists) > 1:
+            return StructuredClarification(
+                "字段名称存在歧义，请选择一个字段",
+                tuple(sorted(column.physical_name for column in finalists)),
+            )
+        selected.append((span[0], finalists[0]))
+    by_name: dict[str, tuple[int, StructuredColumnSchema]] = {}
+    for start, column in selected:
+        by_name.setdefault(column.physical_name, (start, column))
+    return tuple(column for _, column in sorted(by_name.values(), key=lambda item: item[0]))
+
+
 def _column_name_spans(
     question: str,
     columns: Iterable[StructuredColumnSchema],
@@ -1452,6 +1693,16 @@ def _field_pattern(name: str, *, normalized: bool) -> str:
 
 def _normalize(value: str) -> str:
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.casefold())
+
+
+def _format_row_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (date, datetime)):
+        return value.isoformat(sep=" ") if isinstance(value, datetime) else value.isoformat()
+    return str(value)
 
 
 def _normalize_with_positions(value: str) -> tuple[str, tuple[int, ...]]:

@@ -157,6 +157,14 @@ class WordFactContractTests(unittest.TestCase):
 
 
 class WordFactualIntentTests(unittest.TestCase):
+    def test_natural_gender_question_resolves_to_only_gender_field(self) -> None:
+        resolution = resolve_word_factual_intent("张三是男是女")
+
+        self.assertEqual(
+            resolution,
+            WordFactualIntent("张三", "张三", "性别", "性别"),
+        )
+
     def test_age_and_job_aliases_resolve_canonical_fields(self) -> None:
         self.assertEqual(
             resolve_word_factual_intent("张三几岁"),

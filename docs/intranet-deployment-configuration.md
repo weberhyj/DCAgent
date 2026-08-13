@@ -164,19 +164,29 @@ fi
 
 探针返回非零状态时，不要切换生产流量。
 
-## 4. 配置 Ollama Embedding（默认 RRF-only）
+## 当前生产模型链路
 
-默认检索链路为 `Dense + BM25 + RRF → Top 8 → 邻接扩展 → Physoc DeepSeek 总结`：
+Ubuntu + Supervisor 生产默认使用 `RETRIEVAL_MODE=qwen3`、`RERANKER_ENABLED=true`，
+Embedding 为 `bge-m3-Q4_K_M.gguf`，Reranker 为 `bge-reranker-v2-m3-Q4_K_M.gguf`，两者均通过 llama.cpp
+的 `/v1/embeddings` 与 `/v1/rerank` 提供服务。下方 Ollama/RRF-only 章节仅用于旧环境兼容和应急回滚。
+
+## 4. 配置 Ollama Embedding（兼容回滚）
+
+> 当前 Ubuntu + Supervisor 生产方案已切换为 llama.cpp BGE-M3 Q4 Embedding 和
+> BGE-Reranker-v2-M3 Q4。请优先执行
+> `deploy/ubuntu/LLAMA_CPP_EMBEDDING.md`；本节 Ollama 内容仅保留给旧环境兼容与回滚。
+
+默认检索链路为 `Dense + BM25 + RRF + BGE-Reranker-v2-M3 → Top 8 → 邻接扩展 → Physoc DeepSeek 总结`：
 
 ```env
 RETRIEVAL_MODE=qwen3
-RERANKER_ENABLED=false
+RERANKER_ENABLED=true
 RETRIEVAL_FINAL_TOP_K=8
 OLLAMA_BASE_URL=http://ollama.inner:11434
 OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
 ```
 
-默认部署不构建、不启动、不探测 Reranker，也不要求任何 Reranker 模型元数据。
+默认部署构建、启动并探测 llama.cpp Reranker；只有明确设置 `RERANKER_ENABLED=false` 才进入 RRF-only 应急回滚。
 
 在 Ollama 服务器上只准备 Embedding 模型：
 
@@ -271,8 +281,8 @@ RERANKER_PROTOCOL_VERSION=v1
 
 ```bash
 set -Eeuo pipefail
-./tools/invoke_offline_compose.sh --profile reranker build reranker-service api
-./tools/invoke_offline_compose.sh --profile reranker up -d reranker-service api
+./tools/invoke_offline_compose.sh build reranker-service api
+./tools/invoke_offline_compose.sh up -d reranker-service api
 ```
 
 ## 5. 配置数据库和内部服务
@@ -424,7 +434,7 @@ RETRIEVAL_CANARY_PERCENT=100
 QDRANT_COLLECTION_ALIAS=knowledge_chunks_current
 ```
 
-`qwen3` 是为兼容既有 collection、数据库记录和环境变量保留的路由名称，当前默认实际链路是 BGE 中文 Embedding + BM25 + RRF，Reranker 关闭。
+`qwen3` 是为兼容既有 collection、数据库记录和环境变量保留的路由名称，当前默认实际链路是 BGE-M3 + BM25 + RRF + BGE-Reranker-v2-M3。
 
 更换 Embedding 模型、digest、向量维度、endpoint 或 query profile 后，必须使用从未使用过的新 collection 名称并重新构建全部 Word/PDF/TXT/Excel 向量，不能复用旧向量。
 

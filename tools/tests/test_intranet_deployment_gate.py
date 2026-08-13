@@ -13,6 +13,7 @@ from unittest import mock
 from tools.intranet_deployment_gate import (
     GateConfig,
     GateError,
+    _probe_for_runtime,
     _write_report_atomically,
     main,
     run_gate,
@@ -73,6 +74,33 @@ class RaisingRunner(RecordingRunner):
 
 
 class IntranetDeploymentGateTests(unittest.TestCase):
+    def test_model_probe_switches_to_llama_cpp_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = root / "deploy" / "offline" / ".env"
+            env.parent.mkdir(parents=True)
+            env.write_text(
+                "EMBEDDING_RUNTIME=llama_cpp\n"
+                "LLAMA_CPP_EMBEDDING_URL=http://127.0.0.1:8083\n"
+                "LLAMA_CPP_EMBEDDING_PATH=/v1/embeddings\n"
+                "EMBEDDING_MODEL_NAME=bge-m3-Q4_K_M.gguf\n",
+                encoding="utf-8",
+            )
+            command = _probe_for_runtime(
+                root,
+                runtime_key="EMBEDDING_RUNTIME",
+                llama_script="llama-script",
+                ollama_endpoint="/api/embed",
+                url_key="LLAMA_CPP_EMBEDDING_URL",
+                path_key="LLAMA_CPP_EMBEDDING_PATH",
+                default_url="http://127.0.0.1:8083",
+                default_path="/v1/embeddings",
+                model_key="EMBEDDING_MODEL_NAME",
+            )[0]
+
+        self.assertEqual(command[1:3], ["-c", "llama-script"])
+        self.assertIn("http://127.0.0.1:8083/v1/embeddings", command)
+        self.assertIn("bge-m3-Q4_K_M.gguf", command)
     def config(self, directory: Path, *, mode: str = "fresh") -> GateConfig:
         return GateConfig(
             repo_root=directory,

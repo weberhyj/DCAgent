@@ -257,7 +257,7 @@ flowchart TD
     O -->|"legacy"| P0["PostgreSQL Legacy 检索"]
     O -->|"shadow / qwen3"| P1["BGE Chinese Embedding adapter + BM25"]
     P1 --> P2["Qdrant Dense + Sparse"]
-    P2 --> P3["RRF 融合（默认不启用 Reranker）"]
+    P2 --> P3["RRF 融合 + BGE-Reranker-v2-M3"]
     P3 --> P["Top 8 授权证据"]
     P0 --> P
     P -.->|"无可靠证据"| Y["拒绝回答，不调用模型"]
@@ -266,13 +266,29 @@ flowchart TD
     Q -.->|"超时、非 2xx 或异常 SSE"| Z["HTTP 502"]
 ```
 
-### Ollama BGE 中文混合检索链路（保留 qwen3 兼容命名）
+### 当前生产：llama.cpp BGE-M3 + BGE-Reranker-v2-M3
 
-普通文档问答默认采用 `Dense + BM25 + RRF`，完整配置如下：
+生产默认配置为 `RETRIEVAL_MODE=qwen3`、`RERANKER_ENABLED=true`：
+
+```env
+EMBEDDING_RUNTIME=llama_cpp
+EMBEDDING_MODEL_NAME=bge-m3-Q4_K_M.gguf
+RERANKER_RUNTIME=llama_cpp
+RERANKER_MODEL_NAME=bge-reranker-v2-m3-Q4_K_M.gguf
+```
+
+llama.cpp 分别提供 `/v1/embeddings` 和 `/v1/rerank`。Excel 行查询与 Word 字段事实问答走确定性路由，
+不调用 Embedding、Reranker 或 LLM；普通文档问题才走 Dense + BM25 + RRF + Reranker + Physoc。
+
+旧 Ollama/RRF-only 内容仅保留作兼容回滚参考。
+
+### Ollama BGE 中文混合检索链路（兼容回滚）
+
+普通文档问答默认采用 `Dense + BM25 + RRF + BGE-Reranker-v2-M3`，完整配置如下：
 
 ```env
 RETRIEVAL_MODE=qwen3
-RERANKER_ENABLED=false
+RERANKER_ENABLED=true
 RETRIEVAL_FINAL_TOP_K=8
 OLLAMA_BASE_URL=http://ollama.inner:11434
 OLLAMA_EMBEDDING_MODEL=bge-large-zh-v1.5:latest
@@ -288,7 +304,7 @@ DeepSeek 基于证据归纳答案。
    文本保持原文。维度必须以目标 `/api/embed` 的 `len(embeddings[0])` 实测值为准；本项目示例为 1024。
    本地 BM25 生成 Sparse query vector。
 3. 两路检索都先应用 knowledge-base、permission-tag 和 publication filters，各取 Top 50。
-4. RRF（`k=60`）融合候选；默认 `RERANKER_ENABLED=false`，直接保持 RRF 顺序并取
+4. RRF（`k=60`）融合候选；默认启用 BGE-Reranker-v2-M3，异常时才按受控策略降级到 RRF 顺序并取
    `RETRIEVAL_FINAL_TOP_K=8`，最终只给 Agent 提供有界授权证据。
 5. Agent 把授权证据、调查摘要和近期会话组成完整 RAG 提示词，再通过
    `POST /api/physoc/deepseeks/stream` 交给私有 Physoc DeepSeek 归纳。
@@ -325,7 +341,7 @@ RERANKER_SERVICE_URL=http://reranker-service:8082
 llama.cpp `bge-reranker-v2-m3-Q4_K_M.gguf` 的部署配置与原生 `/v1/rerank`
 适配说明见 [deploy/offline/LLAMA_CPP_RERANKER.md](deploy/offline/LLAMA_CPP_RERANKER.md)。
 
-并使用 `./tools/invoke_offline_compose.sh --profile reranker up -d reranker-service api` 启动可选服务。
+并使用 `./tools/invoke_offline_compose.sh up -d reranker-service api` 启动核心服务。
 旧的 `qwen2.5:3b` `/api/generate` 生成式 rerank 仅为兼容模式，不等价于专用 cross-encoder；
 重新启用前必须完成目标服务器 15 并发容量测试并观测 429/503、延迟和 controlled fallback。
 `/v1/rerank` 的 wire contract 始终接受 1–32 个 passages；`RERANKER_BATCH_MAX_ITEMS=32`

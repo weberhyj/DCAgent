@@ -171,6 +171,14 @@ class StructuredMultiAggregateIntent:
 
 
 @dataclass(frozen=True, slots=True)
+class StructuredRowLookupIntent:
+    dataset_id: str
+    filters: tuple[StructuredFilter, ...]
+    selected_physical_names: tuple[str, ...]
+    limit: int = 100
+
+
+@dataclass(frozen=True, slots=True)
 class StructuredClarification:
     message: str
     candidates: tuple[str, ...]
@@ -212,6 +220,17 @@ class StructuredMultiAggregatePlan:
 
 
 @dataclass(frozen=True, slots=True)
+class StructuredRowLookupPlan:
+    publication_id: str
+    dataset_id: str
+    selected_physical_names: tuple[str, ...]
+    sql: str
+    parameters: Mapping[str, object]
+    filters: tuple[StructuredFilter, ...]
+    limit: int
+
+
+@dataclass(frozen=True, slots=True)
 class StructuredAggregateResult:
     dataset_id: str
     schema_version: int
@@ -248,6 +267,24 @@ class StructuredMultiAggregateResult:
     schema_version: int
     metrics: tuple[StructuredMetricResult, ...]
     total_count: int
+    source_name: str
+    worksheet_name: str
+    publication_id: str
+    filters: tuple[StructuredFilter, ...]
+    elapsed_ms: float
+    audit_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredRowLookupResult:
+    dataset_id: str
+    source_id: str
+    schema_version: int
+    selected_physical_names: tuple[str, ...]
+    selected_display_names: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+    total_count: int
+    truncated: bool
     source_name: str
     worksheet_name: str
     publication_id: str

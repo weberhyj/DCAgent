@@ -193,6 +193,27 @@ def empty_state() -> ChatState:
 
 
 class StructuredAnswerServiceTest(unittest.TestCase):
+    def test_row_lookup_question_returns_table_without_aggregate_word(self) -> None:
+        gateway = RecordingClickHouseGateway(
+            result=[
+                {"order_amount": "10", "order_date": "2026-01-01"},
+                {"order_amount": "20", "order_date": "2026-01-02"},
+            ]
+        )
+        service = StructuredAnswerService(lambda: sample_catalog(), gateway)
+
+        result = service.try_answer(
+            "conv-1",
+            "地区=华东，返回订单金额和订单日期",
+            "quick",
+            [],
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_ROW_LOOKUP)
+        self.assertEqual(result.reply.artifacts[0].columns, ["订单金额", "订单日期"])
+        self.assertEqual(result.reply.artifacts[0].rows, [["10", "2026-01-01"], ["20", "2026-01-02"]])
     @staticmethod
     def _catalog_with_aggregate_field(field_name: str):
         catalog = sample_catalog()

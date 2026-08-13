@@ -18,6 +18,7 @@ from .models import (
     ResponseParagraphModel,
 )
 from .time_utils import display_datetime_label
+from .retrieval_models import EvidenceExpansionPolicy
 
 AgentRunStatus = Literal["completed", "failed"]
 AgentStepStatus = Literal["completed", "failed"]
@@ -104,7 +105,7 @@ class AgentSearchResult:
 
 @dataclass(slots=True)
 class KnowledgeAgentTools:
-    search_knowledge: Callable[[str, int, str], AgentSearchResult]
+    search_knowledge: Callable[..., AgentSearchResult]
 
 
 class AgentState(TypedDict):
@@ -112,6 +113,7 @@ class AgentState(TypedDict):
     conversation_id: str
     content: str
     mode: ComposerMode
+    route_type: KnowledgeRouteType
     previous_messages: list[ChatMessageModel]
     started_at: str
     search_queries: list[str]
@@ -266,6 +268,7 @@ class ReadOnlyKnowledgeAgent:
                 conversation_id=conversation_id,
                 content=content.strip(),
                 mode=mode,
+                route_type=route_type,
                 previous_messages=previous_messages,
                 started_at=started_at,
                 search_queries=[],
@@ -298,7 +301,10 @@ class ReadOnlyKnowledgeAgent:
             route_metadata=KnowledgeRouteMetadata(
                 candidate_source_ids=tuple(sorted({hit.source.id for hit in hits})),
                 degradation_reason=fallback_reasons[0] if fallback_reasons else None,
-                adjacency_allowed=True,
+                adjacency_allowed=route_type in {
+                    KnowledgeRouteType.DOCUMENT_QA,
+                    KnowledgeRouteType.SUMMARY_COMPARE,
+                },
             ),
         )
 
@@ -359,11 +365,32 @@ class ReadOnlyKnowledgeAgent:
 
     def _search(self, state: AgentState) -> dict:
         query = state["search_queries"][state["query_index"]]
-        search_result = self.tools.search_knowledge(
-            query,
-            self.max_hits,
-            state["conversation_id"],
+        expansion_policy = (
+            EvidenceExpansionPolicy.NONE
+            if state["route_type"]
+            in {
+                KnowledgeRouteType.WORD_FACTUAL,
+                KnowledgeRouteType.EXCEL_ROW_LOOKUP,
+                KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE,
+                KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+            }
+            else EvidenceExpansionPolicy.BOUNDED_ADJACENCY
         )
+        try:
+            search_result = self.tools.search_knowledge(
+                query,
+                self.max_hits,
+                state["conversation_id"],
+                expansion_policy=expansion_policy,
+            )
+        except TypeError as error:
+            if "expansion_policy" not in str(error):
+                raise
+            search_result = self.tools.search_knowledge(
+                query,
+                self.max_hits,
+                state["conversation_id"],
+            )
         hits = search_result.hits
         merged = merge_ranked_hits(state["knowledge_hits"], hits, self.max_hits)
         fallback_reasons = list(state["fallback_reasons"])
@@ -433,6 +460,12 @@ class ReadOnlyKnowledgeAgent:
                 knowledge_hits=state["knowledge_hits"],
                 previous_messages=state["previous_messages"],
                 agent_context=context,
+                include_history=state["route_type"] not in {
+                    KnowledgeRouteType.WORD_FACTUAL,
+                    KnowledgeRouteType.EXCEL_ROW_LOOKUP,
+                    KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE,
+                    KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+                },
             )
         )
         step = self._step(
