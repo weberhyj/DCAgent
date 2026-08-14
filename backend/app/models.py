@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from .word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
+from .word_facts import KnowledgeFactModel
 
 if TYPE_CHECKING:
     from .retrieval_models import RetrievalCandidate

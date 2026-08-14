@@ -191,13 +191,10 @@ def create_default_repository(
     unified_knowledge_routing_enabled = parse_bool(
         source.get("UNIFIED_KNOWLEDGE_ROUTING_ENABLED"), default=False
     )
-    word_factual_qa_enabled = parse_bool(
-        source.get("WORD_FACTUAL_QA_ENABLED"), default=False
-    )
+    word_factual_qa_enabled = parse_bool(source.get("WORD_FACTUAL_QA_ENABLED"), default=False)
     if word_factual_qa_enabled and not unified_knowledge_routing_enabled:
         raise OfflineSettingsError(
-            "WORD_FACTUAL_QA_ENABLED=true requires "
-            "UNIFIED_KNOWLEDGE_ROUTING_ENABLED=true"
+            "WORD_FACTUAL_QA_ENABLED=true requires UNIFIED_KNOWLEDGE_ROUTING_ENABLED=true"
         )
     query_password = (
         require_secret_file(
@@ -437,9 +434,7 @@ def create_production_app(
                     database,  # type: ignore[arg-type]
                     llm_provider=llm_provider,  # type: ignore[arg-type]
                     structured_service=structured_service,
-                    unified_knowledge_routing_enabled=(
-                        settings.unified_knowledge_routing_enabled
-                    ),
+                    unified_knowledge_routing_enabled=(settings.unified_knowledge_routing_enabled),
                     word_factual_qa_enabled=settings.word_factual_qa_enabled,
                     retrieval_permission_tags=retrieval_settings.permission_tags,
                 )
@@ -638,9 +633,7 @@ def _create_structured_answer_service(
             settings.clickhouse_query_password_file,
             "CLICKHOUSE_QUERY_PASSWORD_FILE",
         )
-    compatibility = ClickHouseCompatibilityProfile.for_mode(
-        settings.clickhouse_compatibility_mode
-    )
+    compatibility = ClickHouseCompatibilityProfile.for_mode(settings.clickhouse_compatibility_mode)
     gateway = _LazyStructuredQueryGateway(
         clickhouse_client_factory,
         settings.clickhouse_url,
@@ -846,7 +839,7 @@ def _configure_retrieval_runtime(
 
 
 def _configure_factory_answer_services(
-    configure_answer_services: object,
+    configure_answer_services: Callable,
     *,
     structured_service: object | None,
     structured_query_enabled: bool,
@@ -864,14 +857,9 @@ def _configure_factory_answer_services(
         return
     if not callable(configure_answer_services):
         missing = next(iter(service_kwargs))
-        feature = (
-            "Word factual QA"
-            if missing == "word_fact_service"
-            else "structured query"
-        )
+        feature = "Word factual QA" if missing == "word_fact_service" else "structured query"
         raise TypeError(
-            f"{feature} requires repository_factory to accept "
-            "configure_answer_services"
+            f"{feature} requires repository_factory to accept configure_answer_services"
         )
     try:
         signature = inspect.signature(configure_answer_services)
@@ -884,11 +872,7 @@ def _configure_factory_answer_services(
         for parameter in signature.parameters.values()
     )
     if not accepts_kwargs:
-        unsupported = [
-            name
-            for name in service_kwargs
-            if name not in signature.parameters
-        ]
+        unsupported = [name for name in service_kwargs if name not in signature.parameters]
         if unsupported:
             if "word_fact_service" in unsupported:
                 raise TypeError(

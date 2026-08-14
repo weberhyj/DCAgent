@@ -32,11 +32,11 @@ from .structured_models import (
     StructuredMultiAggregateIntent,
     StructuredMultiAggregatePlan,
     StructuredMultiAggregateResult,
+    StructuredPublication,
+    StructuredQueryPlan,
     StructuredRowLookupIntent,
     StructuredRowLookupPlan,
     StructuredRowLookupResult,
-    StructuredPublication,
-    StructuredQueryPlan,
     StructuredUnavailable,
 )
 
@@ -79,9 +79,7 @@ _AGGREGATE_WORDS = (
     ("min", ("最小", "最低")),
 )
 _SUMMARY_WORDS = ("汇总", "统计")
-_NUMERIC_TYPES = frozenset(
-    {StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL}
-)
+_NUMERIC_TYPES = frozenset({StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL})
 _COMPARISON_OPERATORS = {"大于": "gt", "不少于": "gte", "小于": "lt", "不超过": "lte"}
 _DATE_RANGE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\s*至\s*(\d{4}-\d{2}-\d{2})")
 _NUMBER_RE = r"-?\d+(?:\.\d+)?"
@@ -222,10 +220,7 @@ class StructuredQueryPlanner:
             raise UnsafeStructuredQueryError("publication is not the active catalog publication")
         if not intent.metrics:
             raise UnsafeStructuredQueryError("multi-metric summary requires at least one metric")
-        if (
-            intent.implicit
-            and len(intent.metrics) > self._implicit_summary_max_metrics
-        ):
+        if intent.implicit and len(intent.metrics) > self._implicit_summary_max_metrics:
             raise UnsafeStructuredQueryError("implicit metric count exceeds configured limit")
 
         table_name = _require_identifier(publication.physical_table_name)
@@ -346,7 +341,9 @@ class StructuredQueryPlanner:
                 raise UnsafeStructuredQueryError("row lookup supports equality filters only")
             name = _require_identifier(column.physical_name)
             parameter_name = f"filter_{index}"
-            parameters[parameter_name] = _convert_parameter(item.value, column.data_type, self._compatibility)
+            parameters[parameter_name] = _convert_parameter(
+                item.value, column.data_type, self._compatibility
+            )
             predicates.append(
                 f"{name} = {{{parameter_name}:{self._compatibility.parameter_type(column.data_type)}}}"
             )
@@ -616,10 +613,7 @@ class StructuredQueryExecutor:
         started = self._clock()
         try:
             raw_result = query(plan.sql, plan.parameters)
-            if isinstance(raw_result, Mapping):
-                raw_rows = [raw_result]
-            else:
-                raw_rows = list(raw_result)
+            raw_rows = [raw_result] if isinstance(raw_result, Mapping) else list(raw_result)
         except Exception:
             return StructuredUnavailable("structured query service is unavailable")
         elapsed_ms = max(0.0, (self._clock() - started) * 1000.0)
@@ -627,17 +621,28 @@ class StructuredQueryExecutor:
         for raw_row in raw_rows[: plan.limit + 1]:
             if isinstance(raw_row, Mapping):
                 try:
-                    rows.append(tuple(_format_row_value(raw_row[name]) for name in plan.selected_physical_names))
+                    rows.append(
+                        tuple(
+                            _format_row_value(raw_row[name])
+                            for name in plan.selected_physical_names
+                        )
+                    )
                 except KeyError:
                     return StructuredUnavailable("structured query returned invalid columns")
-            elif isinstance(raw_row, (list, tuple)) and len(raw_row) == len(plan.selected_physical_names):
+            elif isinstance(raw_row, (list, tuple)) and len(raw_row) == len(
+                plan.selected_physical_names
+            ):
                 rows.append(tuple(_format_row_value(value) for value in raw_row))
             else:
                 return StructuredUnavailable("structured query returned invalid rows")
         truncated = len(rows) > plan.limit
         rows = rows[: plan.limit]
         selected_display_names = tuple(
-            next(column.display_name for column in dataset.schema.columns if column.physical_name == name)
+            next(
+                column.display_name
+                for column in dataset.schema.columns
+                if column.physical_name == name
+            )
             for name in plan.selected_physical_names
         )
         return StructuredRowLookupResult(
@@ -701,7 +706,9 @@ def resolve_structured_intent(
         dataset_result.consumed_spans,
     )
     if filter_result.issue is not None:
-        return _with_route_context(filter_result.issue, dataset, origin_route="excel_filtered_aggregate")
+        return _with_route_context(
+            filter_result.issue, dataset, origin_route="excel_filtered_aggregate"
+        )
     assert filter_result.value is not None
 
     consumed = (*dataset_result.consumed_spans, *filter_result.consumed_spans)
@@ -712,7 +719,9 @@ def resolve_structured_intent(
         allow_missing=True,
     )
     if aggregate_result.issue is not None:
-        return _with_route_context(aggregate_result.issue, dataset, origin_route="excel_filtered_aggregate")
+        return _with_route_context(
+            aggregate_result.issue, dataset, origin_route="excel_filtered_aggregate"
+        )
 
     consumed = (*consumed, *aggregate_result.consumed_spans)
     available = _mask_spans(question, consumed)
@@ -723,7 +732,11 @@ def resolve_structured_intent(
         for span in _find_normalized_spans(available, word)
     )
     if aggregate_result.value is None and not has_summary_word:
-            return _with_route_context(StructuredUnavailable("未识别到受支持的聚合意图"), dataset, origin_route="excel_filtered_aggregate")
+        return _with_route_context(
+            StructuredUnavailable("未识别到受支持的聚合意图"),
+            dataset,
+            origin_route="excel_filtered_aggregate",
+        )
     aggregate = aggregate_result.value or "sum"
 
     metric_list_result = _parse_metric_list(
@@ -762,7 +775,9 @@ def resolve_structured_intent(
             return _with_route_context(
                 StructuredUnavailable("结构化查询包含未识别的筛选条件"),
                 dataset,
-                origin_route=("excel_multi_aggregate" if len(metrics) > 1 else "excel_filtered_aggregate"),
+                origin_route=(
+                    "excel_multi_aggregate" if len(metrics) > 1 else "excel_filtered_aggregate"
+                ),
                 target_fields=tuple(column.display_name for column in metrics),
             )
         if len(metrics) == 1:
@@ -845,8 +860,7 @@ def resolve_structured_intent(
         return StructuredMultiAggregateIntent(
             dataset_id=dataset.schema.dataset_id,
             metrics=tuple(
-                StructuredMetricIntent("sum", column.physical_name)
-                for column in implicit_columns
+                StructuredMetricIntent("sum", column.physical_name) for column in implicit_columns
             ),
             filters=filter_result.value,
             implicit=True,
@@ -881,7 +895,9 @@ def _parse_row_lookup_intent(
             dataset,
             origin_route="excel_row_lookup",
         )
-    marker_positions = [question.find(marker) for marker in _ROW_LOOKUP_MARKERS if question.find(marker) >= 0]
+    marker_positions = [
+        question.find(marker) for marker in _ROW_LOOKUP_MARKERS if question.find(marker) >= 0
+    ]
     if not marker_positions:
         return None
     marker_start = min(marker_positions)
@@ -893,7 +909,11 @@ def _parse_row_lookup_intent(
             dataset,
             origin_route="excel_row_lookup",
         )
-    selected = tuple(column for column in selected if column.physical_name not in {item.physical_name for item in filter_result.value or ()})
+    selected = tuple(
+        column
+        for column in selected
+        if column.physical_name not in {item.physical_name for item in filter_result.value or ()}
+    )
     if not selected:
         return _with_route_context(
             StructuredUnavailable(
@@ -982,8 +1002,17 @@ def _with_route_context(
     )
     fields = target_fields or fields
     if isinstance(issue, StructuredClarification):
-        return StructuredClarification(issue.message, issue.candidates, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route)
-    return StructuredUnavailable(issue.message, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route)
+        return StructuredClarification(
+            issue.message,
+            issue.candidates,
+            dataset.schema.dataset_id,
+            fields,
+            (dataset.schema.source_id,),
+            origin_route,
+        )
+    return StructuredUnavailable(
+        issue.message, dataset.schema.dataset_id, fields, (dataset.schema.source_id,), origin_route
+    )
 
 
 _with_clarification_context = _with_route_context
@@ -998,7 +1027,9 @@ def _with_dataset_issue_context(
     datasets = tuple(
         dataset for dataset in catalog.datasets if dataset.schema.dataset_id in candidates
     )
-    source_ids = tuple(dataset.schema.source_id for dataset in datasets[:MAX_STRUCTURED_ROUTE_FIELDS])
+    source_ids = tuple(
+        dataset.schema.source_id for dataset in datasets[:MAX_STRUCTURED_ROUTE_FIELDS]
+    )
     is_multi = any(word in _normalize(question) for word in _SUMMARY_WORDS) or "、" in question
     origin_route = "excel_multi_aggregate" if is_multi else "excel_filtered_aggregate"
     if isinstance(issue, StructuredClarification):
@@ -1031,9 +1062,7 @@ def _parse_metric_list(
     for span, match_length, column in raw_matches:
         by_span.setdefault(span, []).append((match_length, column))
 
-    span_groups: list[
-        tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]
-    ] = []
+    span_groups: list[tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]] = []
     for span, span_matches in by_span.items():
         finalists = {column.physical_name: column for _, column in span_matches}
         span_groups.append(
@@ -1044,9 +1073,7 @@ def _parse_metric_list(
             )
         )
 
-    non_overlapping: list[
-        tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]
-    ] = []
+    non_overlapping: list[tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]] = []
     for match in sorted(
         span_groups,
         key=lambda item: (-item[1], item[0].start, item[0].end),
@@ -1082,8 +1109,7 @@ def _parse_metric_list(
     if disallowed:
         return _ClauseParseResult(
             issue=StructuredUnavailable(
-                "指标列未授权用于聚合: "
-                + "、".join(column.display_name for column in disallowed)
+                "指标列未授权用于聚合: " + "、".join(column.display_name for column in disallowed)
             )
         )
 
@@ -1607,7 +1633,9 @@ def _resolve_multiple_columns(
                 continue
             start = normalized_question.find(normalized_name)
             while start >= 0:
-                matches.append((priority, len(normalized_name), start, start + len(normalized_name), column))
+                matches.append(
+                    (priority, len(normalized_name), start, start + len(normalized_name), column)
+                )
                 start = normalized_question.find(normalized_name, start + 1)
     if not matches:
         return ()
@@ -1615,9 +1643,7 @@ def _resolve_multiple_columns(
         match
         for match in matches
         if not any(
-            other_length > match[1]
-            and other_start <= match[2]
-            and match[3] <= other_end
+            other_length > match[1] and other_start <= match[2] and match[3] <= other_end
             for _, other_length, other_start, other_end, _ in matches
         )
     ]
@@ -1627,7 +1653,13 @@ def _resolve_multiple_columns(
     selected: list[tuple[int, StructuredColumnSchema]] = []
     for span, span_matches in by_span.items():
         best_priority = min(priority for priority, _ in span_matches)
-        finalists = tuple({column.physical_name: column for priority, column in span_matches if priority == best_priority}.values())
+        finalists = tuple(
+            {
+                column.physical_name: column
+                for priority, column in span_matches
+                if priority == best_priority
+            }.values()
+        )
         if len(finalists) > 1:
             return StructuredClarification(
                 "字段名称存在歧义，请选择一个字段",
@@ -1898,9 +1930,7 @@ def _multi_aggregate_row(
         first = rows[0]
         if isinstance(first, Mapping):
             return first
-        if isinstance(first, Sequence) and not isinstance(
-            first, (str, bytes, bytearray)
-        ):
+        if isinstance(first, Sequence) and not isinstance(first, (str, bytes, bytearray)):
             return dict(zip(_multi_aggregate_aliases(metric_count), first, strict=True))
     raise TypeError("unsupported ClickHouse multi-aggregate result shape")
 

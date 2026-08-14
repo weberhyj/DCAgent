@@ -15,7 +15,6 @@ from pydantic import (
 )
 
 from .agent import AgentRunAudit as AgentRunAuditModel
-from .knowledge_route_models import KnowledgeRouteType
 from .agent import AgentStep as AgentStepModel
 from .answer_text import remove_inline_citation_markers
 from .evaluation import (
@@ -42,6 +41,7 @@ from .evaluation_import import (
     EvaluationImportPreview,
     EvaluationImportRow,
 )
+from .knowledge_route_models import KnowledgeRouteType
 from .models import (
     ChatMessageModel,
     CitationModel,

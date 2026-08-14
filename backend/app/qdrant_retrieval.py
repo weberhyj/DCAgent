@@ -544,7 +544,7 @@ def _nonnegative_integer(value: object, *, name: str) -> int:
 
 __all__ = [
     "DENSE_VECTOR_NAME",
+    "SPARSE_VECTOR_NAME",
     "IndexMaintenanceScope",
     "QdrantRetrievalGateway",
-    "SPARSE_VECTOR_NAME",
 ]

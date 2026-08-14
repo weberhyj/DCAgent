@@ -260,9 +260,7 @@ def find_longest_field_aliases(normalized_question: str) -> tuple[FieldAliasMatc
         candidates,
         key=lambda item: (-(item.end - item.start), item.start, item.field, item.alias),
     ):
-        if any(
-            candidate.start < item.end and item.start < candidate.end for item in selected
-        ):
+        if any(candidate.start < item.end and item.start < candidate.end for item in selected):
             continue
         selected.append(candidate)
     return tuple(sorted(selected, key=lambda item: (item.start, item.end, item.field)))
@@ -376,11 +374,7 @@ def _match_multi_field_query(question: str) -> tuple[str, tuple[str, ...]] | Non
         fields: list[str] = []
         while cursor < len(question):
             alias_match = next(
-                (
-                    (alias, field)
-                    for alias, field in aliases
-                    if question.startswith(alias, cursor)
-                ),
+                ((alias, field) for alias, field in aliases if question.startswith(alias, cursor)),
                 None,
             )
             if alias_match is None:
@@ -404,7 +398,7 @@ def _match_multi_field_query(question: str) -> tuple[str, tuple[str, ...]] | Non
 
 
 def _strip_entity_connector(entity: str) -> str:
-    return entity[:-1] if entity.endswith("的") else entity
+    return entity.removesuffix("的")
 
 
 def _entity_list_candidates(entity: str) -> tuple[str, ...] | None:
@@ -416,9 +410,7 @@ def _entity_list_candidates(entity: str) -> tuple[str, ...] | None:
     if "和" not in entity:
         return None
     candidates = tuple(part for part in entity.split("和") if part)
-    if len(candidates) > 1 and all(
-        _looks_like_bounded_he_list_member(item) for item in candidates
-    ):
+    if len(candidates) > 1 and all(_looks_like_bounded_he_list_member(item) for item in candidates):
         return candidates
     return None
 
@@ -530,9 +522,7 @@ def _contains_fact_alias(display_text: str, alias: str) -> bool:
 
 
 class WordFactRepository(Protocol):
-    def replace_knowledge_facts(
-        self, source_id: str, facts: Sequence[KnowledgeFactModel]
-    ) -> None:
+    def replace_knowledge_facts(self, source_id: str, facts: Sequence[KnowledgeFactModel]) -> None:
         raise NotImplementedError
 
     def find_knowledge_facts(

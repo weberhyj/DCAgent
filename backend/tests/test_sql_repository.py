@@ -1063,8 +1063,14 @@ class SqlRepositoryTest(unittest.TestCase):
 
     def test_repository_word_facts_require_explicit_service_configuration(self) -> None:
         fact = KnowledgeFactModel.create(
-            id="fact-1", source_id="kb-people", chunk_id="chunk-1", entity="张三",
-            field="年龄", value="28岁", confidence=1.0, locator={}
+            id="fact-1",
+            source_id="kb-people",
+            chunk_id="chunk-1",
+            entity="张三",
+            field="年龄",
+            value="28岁",
+            confidence=1.0,
+            locator={},
         )
         memory = InMemoryChatRepository(build_seed_state())
         _, memory_conversation, _ = memory.create_conversation()
@@ -1075,6 +1081,7 @@ class SqlRepositoryTest(unittest.TestCase):
             def find_knowledge_facts(self, received, *, permission_tags=()):
                 del received, permission_tags
                 from app.word_facts import WordFactMatch
+
                 return [WordFactMatch(fact, "people", "internal")]
 
         enabled = InMemoryChatRepository(build_seed_state())

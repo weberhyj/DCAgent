@@ -197,8 +197,7 @@ def chunk_docx_blocks(
     if not chunks:
         append_chunk("空白文件", [], ())
     return tuple(chunks), {
-        block_index: tuple(spans)
-        for block_index, spans in mutable_block_spans.items()
+        block_index: tuple(spans) for block_index, spans in mutable_block_spans.items()
     }
 
 
@@ -377,9 +376,7 @@ def _chunk_id_for_range(
     value_end: int,
 ) -> str:
     fully_containing = [
-        span
-        for span in spans
-        if span.start <= value_start and value_end <= span.end
+        span for span in spans if span.start <= value_start and value_end <= span.end
     ]
     if fully_containing:
         return min(
@@ -415,9 +412,7 @@ def _stable_chunk_id(
 def _estimate_token_count(text: str) -> int:
     ascii_words = re.findall(r"[A-Za-z0-9_]+", text)
     non_ascii_chars = [
-        character
-        for character in text
-        if ord(character) > 127 and not character.isspace()
+        character for character in text if ord(character) > 127 and not character.isspace()
     ]
     return max(1, len(ascii_words) + len(non_ascii_chars))
 

@@ -6,16 +6,16 @@ import unittest
 from dataclasses import replace
 from decimal import Decimal
 
+from app.clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
 from app.clickhouse_gateway import (
     ClickHouseGateway,
     ClickHousePublicationTarget,
     StructuredStorageError,
     StructuredValidationStatistics,
     _validation_query,
-)
-from app.clickhouse_compatibility import (
-    ClickHouseCompatibilityMode,
-    ClickHouseCompatibilityProfile,
 )
 from app.structured_models import StructuredColumnType
 from tests.support.structured_fakes import sample_columns
@@ -103,7 +103,7 @@ def empty_content_observation() -> tuple[str, dict[str, int]]:
 class ClickHouseGatewayTest(unittest.TestCase):
     def test_legacy_gateway_uses_datetime_and_never_emits_forbidden_tokens(self) -> None:
         ingest = RecordingIngestClient()
-        query = RecordingQueryClient([[('18.16.1',)], [(1,)], [('1.000000000',)]])
+        query = RecordingQueryClient([[("18.16.1",)], [(1,)], [("1.000000000",)]])
         gateway = ClickHouseGateway(
             ingest,
             query_client=query,
@@ -126,14 +126,16 @@ class ClickHouseGatewayTest(unittest.TestCase):
         self.assertEqual(query.queries[0][1]["readonly"], 2)
         self.assertEqual(query.queries[1][1]["readonly"], 2)
         validation = _validation_query(
-            ClickHousePublicationTarget(schema, "structured_sales_staging", "structured_sales", "a" * 64),
+            ClickHousePublicationTarget(
+                schema, "structured_sales_staging", "structured_sales", "a" * 64
+            ),
             "structured_sales",
             ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16),
         )
         self.assertNotIn("toDecimalString", validation)
 
     def test_preflight_rejects_non_18_16_in_legacy_mode_before_work(self) -> None:
-        query = RecordingQueryClient([[('22.8.1',)]])
+        query = RecordingQueryClient([[("22.8.1",)]])
         gateway = ClickHouseGateway(
             RecordingIngestClient(),
             query_client=query,
@@ -145,7 +147,7 @@ class ClickHouseGatewayTest(unittest.TestCase):
             gateway.preflight()
 
     def test_legacy_preflight_requires_exact_scale_nine_decimal_rendering(self) -> None:
-        query = RecordingQueryClient([[('18.16.1',)], [(1,)], [('1',)]])
+        query = RecordingQueryClient([[("18.16.1",)], [(1,)], [("1",)]])
         gateway = ClickHouseGateway(
             RecordingIngestClient(),
             query_client=query,

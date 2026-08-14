@@ -8,7 +8,7 @@ from unittest.mock import patch
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-import app.retrieval_audit as retrieval_audit
+from app import retrieval_audit
 from app.database import Database, RetrievalPublicationRecord
 from app.embedding_fingerprint import EmbeddingFingerprint
 from app.retrieval_audit import (

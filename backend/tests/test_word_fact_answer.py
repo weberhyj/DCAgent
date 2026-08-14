@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 from collections.abc import Sequence
 
-from app.word_fact_answer import WordFactAnswerService
 from app.knowledge_route_models import KnowledgeRouteType
+from app.word_fact_answer import WordFactAnswerService
 from app.word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
 
 
@@ -115,9 +115,7 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         self.assertNotIn("多个年龄值", result.reply.paragraphs[0].text)
 
     def test_malformed_match_fails_closed_without_leaking_value(self) -> None:
-        service = WordFactAnswerService(
-            FakeFacts([match("张三", "年龄", "28岁 性别：女")])
-        )
+        service = WordFactAnswerService(FakeFacts([match("张三", "年龄", "28岁 性别：女")]))
 
         result = service.try_answer("conv-1", "张三几岁", "quick", [])
 
@@ -145,13 +143,9 @@ class WordFactAnswerServiceTests(unittest.TestCase):
             "message: queued",
         ):
             with self.subTest(value=value):
-                service = WordFactAnswerService(
-                    FakeFacts([match("张三", "职务", value)])
-                )
+                service = WordFactAnswerService(FakeFacts([match("张三", "职务", value)]))
 
-                result = service.try_answer(
-                    "conv-1", "张三的职务是什么", "quick", []
-                )
+                result = service.try_answer("conv-1", "张三的职务是什么", "quick", [])
 
                 self.assertIsNotNone(result)
                 assert result is not None
@@ -162,9 +156,7 @@ class WordFactAnswerServiceTests(unittest.TestCase):
                 self.assertEqual(result.evidence_count, 1)
 
     def test_independent_english_other_field_label_fails_closed(self) -> None:
-        service = WordFactAnswerService(
-            FakeFacts([match("张三", "职务", "engineer age 28")])
-        )
+        service = WordFactAnswerService(FakeFacts([match("张三", "职务", "engineer age 28")]))
 
         result = service.try_answer("conv-1", "张三的职务是什么", "quick", [])
 
@@ -179,9 +171,7 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         self.assertEqual(result.evidence_count, 0)
 
     def test_missing_target_field_returns_not_found_not_rag(self) -> None:
-        result = WordFactAnswerService(FakeFacts([])).try_answer(
-            "conv-1", "张三几岁", "deep", []
-        )
+        result = WordFactAnswerService(FakeFacts([])).try_answer("conv-1", "张三几岁", "deep", [])
 
         self.assertIsNotNone(result)
         assert result is not None
@@ -226,11 +216,11 @@ class WordFactAnswerServiceTests(unittest.TestCase):
 
         self.assertEqual(facts.calls[0][1], ("内部", "机密"))
 
-    def test_overlong_exact_entity_returns_bounded_terminal_clarification_without_lookup(self) -> None:
+    def test_overlong_exact_entity_returns_bounded_terminal_clarification_without_lookup(
+        self,
+    ) -> None:
         facts = FakeFacts([])
-        result = WordFactAnswerService(facts).try_answer(
-            "conv-1", "张" * 301 + "几岁", "quick", []
-        )
+        result = WordFactAnswerService(facts).try_answer("conv-1", "张" * 301 + "几岁", "quick", [])
 
         self.assertIsNotNone(result)
         assert result is not None
@@ -241,9 +231,7 @@ class WordFactAnswerServiceTests(unittest.TestCase):
         self.assertEqual(facts.calls, [])
 
     def test_fact_repository_failure_is_terminal_and_bounded(self) -> None:
-        result = WordFactAnswerService(FailingFacts()).try_answer(
-            "conv-1", "张三几岁", "quick", []
-        )
+        result = WordFactAnswerService(FailingFacts()).try_answer("conv-1", "张三几岁", "quick", [])
 
         self.assertIsNotNone(result)
         assert result is not None

@@ -563,7 +563,9 @@ class StructuredWorkerTest(unittest.TestCase):
 
         self.assertTrue(worker.run_once())
         self.assertEqual(observed, [2, 4, 5])
-        self.assertEqual(self.repository.get_structured_status(self.source_id, job.id).job.checkpoint_row, 5)
+        self.assertEqual(
+            self.repository.get_structured_status(self.source_id, job.id).job.checkpoint_row, 5
+        )
 
     def test_structured_publication_indexes_only_after_clickhouse_completion(self) -> None:
         events = []
@@ -976,7 +978,9 @@ class StructuredWorkerTest(unittest.TestCase):
         claim.assert_not_called()
         self.assertEqual([client.close_calls for client in clients], [1, 1])
 
-    def test_worker_factory_forwards_selected_compatibility_profile_to_gateway_and_publisher(self) -> None:
+    def test_worker_factory_forwards_selected_compatibility_profile_to_gateway_and_publisher(
+        self,
+    ) -> None:
         ingest_password = Path(self.temp_dir.name) / "legacy-profile-password"
         ingest_password.write_text("ingest-secret", encoding="utf-8")
         clients: list[PreflightClient] = []
@@ -1002,7 +1006,9 @@ class StructuredWorkerTest(unittest.TestCase):
         gateway = worker._publisher.clickhouse
         self.assertEqual(gateway._compatibility.mode, ClickHouseCompatibilityMode.LEGACY_18_16)
         self.assertIs(worker._publisher.compatibility, gateway._compatibility)
-        self.assertEqual(worker._publisher.compatibility.mode, ClickHouseCompatibilityMode.LEGACY_18_16)
+        self.assertEqual(
+            worker._publisher.compatibility.mode, ClickHouseCompatibilityMode.LEGACY_18_16
+        )
 
     def test_worker_factory_injects_real_metadata_indexer_in_qwen3_mode(self) -> None:
         ingest_password = Path(self.temp_dir.name) / "qwen-ingest-password"

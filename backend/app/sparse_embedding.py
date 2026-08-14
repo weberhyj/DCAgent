@@ -328,8 +328,8 @@ def _vector_component(raw_vector: object, name: str) -> Any:
 
 
 __all__ = [
-    "LocalBm25Encoder",
     "OFFLINE_SPARSE_ENVIRONMENT",
     "SPARSE_MODEL_NAME",
+    "LocalBm25Encoder",
     "SparseVector",
 ]

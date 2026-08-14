@@ -36,14 +36,10 @@ class KnowledgeRouteMetadata:
         dataset_id = _optional_string(self.dataset_id, "dataset_id")
         entity = _optional_string(self.entity, "entity")
         target_fields = _string_tuple(self.target_fields, "target_fields")
-        candidate_source_ids = _string_tuple(
-            self.candidate_source_ids, "candidate_source_ids"
-        )
+        candidate_source_ids = _string_tuple(self.candidate_source_ids, "candidate_source_ids")
         if self.origin_route is not None and not isinstance(self.origin_route, KnowledgeRouteType):
             raise ValueError("route metadata origin_route must be a string or None")
-        degradation_reason = _optional_string(
-            self.degradation_reason, "degradation_reason"
-        )
+        degradation_reason = _optional_string(self.degradation_reason, "degradation_reason")
         validation_passed = _optional_bool(self.validation_passed, "validation_passed")
         adjacency_allowed = _required_bool(self.adjacency_allowed, "adjacency_allowed")
         return {
@@ -74,9 +70,7 @@ class KnowledgeRouteMetadata:
             degradation_reason=_optional_string(
                 payload.get("degradation_reason"), "degradation_reason"
             ),
-            validation_passed=_optional_bool(
-                payload.get("validation_passed"), "validation_passed"
-            ),
+            validation_passed=_optional_bool(payload.get("validation_passed"), "validation_passed"),
             adjacency_allowed=_required_bool(
                 payload.get("adjacency_allowed", False), "adjacency_allowed"
             ),

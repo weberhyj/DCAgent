@@ -107,7 +107,7 @@ class RetrievalQualityGateResult:
     ndcg_improvement_target_met: bool
 
 
-def ratio(numerator: int | float, denominator: int | float) -> float:
+def ratio(numerator: float, denominator: float) -> float:
     if denominator == 0:
         return 0.0
     return round(numerator / denominator, 4)

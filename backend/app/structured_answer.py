@@ -10,11 +10,11 @@ from typing import Literal
 from uuid import uuid4
 
 from .agent import AgentRunResult, AgentStep
-from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .clickhouse_compatibility import (
     ClickHouseCompatibilityMode,
     ClickHouseCompatibilityProfile,
 )
+from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .models import (
     ArtifactModel,
     ChatMessageModel,
@@ -23,7 +23,6 @@ from .models import (
     TableArtifactModel,
 )
 from .structured_models import (
-    MAX_STRUCTURED_ROUTE_FIELDS,
     StructuredAggregateResult,
     StructuredCatalog,
     StructuredClarification,
@@ -198,7 +197,9 @@ class StructuredAnswerService:
                     catalog_snapshot,
                     implicit_summary_max_metrics=self._implicit_summary_max_metrics,
                 )
-                outage_metadata = _catalog_outage_route_metadata(catalog_snapshot, outage_resolution)
+                outage_metadata = _catalog_outage_route_metadata(
+                    catalog_snapshot, outage_resolution
+                )
                 outage_route = _route_for_catalog_outage_resolution(outage_resolution)
             else:
                 if _classify_without_catalog(question) != "strong":
@@ -403,7 +404,9 @@ class StructuredAnswerService:
             source_ids=[result.source_id],
             route_metadata=KnowledgeRouteMetadata(
                 dataset_id=result.dataset_id,
-                target_fields=(result.metric_display_name or result.metric_physical_name or "all_rows",),
+                target_fields=(
+                    result.metric_display_name or result.metric_physical_name or "all_rows",
+                ),
                 candidate_source_ids=(result.source_id,),
                 validation_passed=True,
             ),
@@ -586,8 +589,7 @@ def _metric_aggregate_start(normalized_value: str, metric_names: set[str]) -> in
     candidates: list[tuple[int, int]] = []
     for start, end in maximal_spans:
         suffix = normalized_value[end:]
-        if suffix.startswith("的"):
-            suffix = suffix[1:]
+        suffix = suffix.removeprefix("的")
         suffix = _strip_natural_aggregate_tail(suffix)
         if _matching_aggregate_suffix(suffix) == suffix:
             candidates.append((start, end))
@@ -695,10 +697,7 @@ def _has_prefixed_copula_concept_shape(normalized: str) -> bool:
             if not body.startswith(marker):
                 continue
             predicate = body[len(marker) :]
-            return any(
-                predicate.endswith(suffix)
-                for suffix in _CONCEPT_COPULA_PREDICATE_SUFFIXES
-            )
+            return any(predicate.endswith(suffix) for suffix in _CONCEPT_COPULA_PREDICATE_SUFFIXES)
     return False
 
 
@@ -727,8 +726,7 @@ def _has_field_aggregate_suffix(normalized: str) -> bool:
     if suffix is None:
         return False
     prefix = base[: -len(suffix)]
-    if prefix.endswith("的"):
-        prefix = prefix[:-1]
+    prefix = prefix.removesuffix("的")
     return bool(prefix)
 
 
@@ -827,8 +825,11 @@ def _intent_route_metadata(
     else:
         physical_names = (intent.metric_physical_name,)
     fields = tuple(
-        next(column.display_name for column in dataset.schema.columns if column.physical_name == name)
-        if name is not None else "all_rows"
+        next(
+            column.display_name for column in dataset.schema.columns if column.physical_name == name
+        )
+        if name is not None
+        else "all_rows"
         for name in physical_names
     )
     return {
@@ -843,7 +844,9 @@ def _catalog_outage_route_metadata(
     catalog: StructuredCatalog,
     resolution: object,
 ) -> dict[str, object]:
-    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent, StructuredRowLookupIntent)):
+    if isinstance(
+        resolution, (StructuredIntent, StructuredMultiAggregateIntent, StructuredRowLookupIntent)
+    ):
         return _intent_route_metadata(catalog, resolution)
     if isinstance(resolution, StructuredClarification):
         return _clarification_route_metadata(catalog, resolution)
@@ -853,7 +856,9 @@ def _catalog_outage_route_metadata(
 
 
 def _route_for_catalog_outage_resolution(resolution: object) -> KnowledgeRouteType:
-    if isinstance(resolution, (StructuredIntent, StructuredMultiAggregateIntent, StructuredRowLookupIntent)):
+    if isinstance(
+        resolution, (StructuredIntent, StructuredMultiAggregateIntent, StructuredRowLookupIntent)
+    ):
         return _route_for_intent(resolution)
     if isinstance(resolution, StructuredClarification) and resolution.origin_route is not None:
         return KnowledgeRouteType(resolution.origin_route)
@@ -910,7 +915,9 @@ def _unavailable_route_metadata(outcome: StructuredUnavailable) -> dict[str, obj
         "dataset_id": outcome.dataset_id,
         "target_fields": outcome.target_fields,
         "candidate_source_ids": outcome.candidate_source_ids,
-        "origin_route": None if outcome.origin_route is None else KnowledgeRouteType(outcome.origin_route),
+        "origin_route": None
+        if outcome.origin_route is None
+        else KnowledgeRouteType(outcome.origin_route),
     }
 
 
@@ -1009,7 +1016,8 @@ def _structured_run(
         evidence_count=0,
         source_count=len(set(source_ids or [])),
         route_type=route_type,
-        route_metadata=route_metadata or KnowledgeRouteMetadata(
+        route_metadata=route_metadata
+        or KnowledgeRouteMetadata(
             validation_passed=True,
             adjacency_allowed=False,
         ),

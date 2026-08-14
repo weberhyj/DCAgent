@@ -17,7 +17,6 @@ from .agent import (
     KnowledgeAgentTools,
     ReadOnlyKnowledgeAgent,
 )
-from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .database import (
     AgentRunRecord,
     AgentStepRecord,
@@ -57,6 +56,7 @@ from .evaluation import (
     normalized_unique,
 )
 from .evaluation_import import EvaluationImportRow
+from .knowledge_route_models import KnowledgeRouteMetadata, KnowledgeRouteType
 from .knowledge_router import KnowledgeAnswerRouter, LegacyKnowledgeAnswerRouter
 from .llm import LLMProvider, TemplateLLMProvider
 from .models import (
@@ -579,9 +579,7 @@ class SqlChatRepository:
         return KnowledgeAnswerRouter(
             self._agent,
             structured_service=self._structured_service,
-            word_fact_service=(
-                self._word_fact_service if self._word_factual_qa_enabled else None
-            ),
+            word_fact_service=(self._word_fact_service if self._word_factual_qa_enabled else None),
         )
 
     def configure_retrieval(
@@ -1598,6 +1596,7 @@ class SqlChatRepository:
         if self.retrieval_router is None or self._retrieval_scope_provider is None:
             return AgentSearchResult(hits=tuple(self.search_knowledge_chunks(query, limit)))
         from .retrieval_models import EvidenceExpansionPolicy, RetrievalRequest
+
         selected_expansion_policy = (
             EvidenceExpansionPolicy.BOUNDED_ADJACENCY
             if expansion_policy is None

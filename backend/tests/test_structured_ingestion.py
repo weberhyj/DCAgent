@@ -10,13 +10,13 @@ from threading import Event, Thread
 
 import pyarrow as pa
 
+from app.clickhouse_compatibility import ClickHouseCompatibilityMode, ClickHouseCompatibilityProfile
 from app.structured_ingestion import (
     ArrowParquetSink,
     SpreadsheetPublisher,
     StructuredIngestionError,
     _canonical_row,
 )
-from app.clickhouse_compatibility import ClickHouseCompatibilityMode, ClickHouseCompatibilityProfile
 from app.structured_models import StructuredColumnType, StructuredPublicationResult
 from tests.support.structured_fakes import (
     RecordingParquetSink,
@@ -103,9 +103,7 @@ class StructuredIngestionTest(unittest.TestCase):
         self.temp_dir_context.cleanup()
 
     def test_legacy_datetime_canonicalization_matches_clickhouse_seconds_contract(self) -> None:
-        profile = ClickHouseCompatibilityProfile.for_mode(
-            ClickHouseCompatibilityMode.LEGACY_18_16
-        )
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
 
         canonical = _canonical_row(
             {"order_date": datetime(2026, 1, 1, 10, 11, 12, 987654)},
@@ -176,7 +174,10 @@ class StructuredIngestionTest(unittest.TestCase):
         )
         path = write_csv(
             self.temp_dir / "legacy-datetime.csv",
-            [[column.original_name for column in schema.columns], ["10", "east", "2026-01-01T10:11:12.987654"]],
+            [
+                [column.original_name for column in schema.columns],
+                ["10", "east", "2026-01-01T10:11:12.987654"],
+            ],
         )
         sink = RecordingParquetSink(self.temp_dir / "parquet-legacy-datetime")
 

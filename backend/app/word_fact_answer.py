@@ -99,9 +99,7 @@ def build_word_fact_run(
         paragraphs=[
             ResponseParagraphModel(
                 text=answer,
-                citations=(
-                    _fact_citations(intent, safe_matches) if intent is not None else []
-                ),
+                citations=(_fact_citations(intent, safe_matches) if intent is not None else []),
             )
         ],
     )
@@ -130,7 +128,8 @@ def build_word_fact_run(
         evidence_count=len(safe_matches),
         source_count=len(unique_source_ids),
         route_type=route_type,
-        route_metadata=route_metadata or KnowledgeRouteMetadata(
+        route_metadata=route_metadata
+        or KnowledgeRouteMetadata(
             entity=intent.entity if intent is not None else None,
             target_fields=(intent.field,) if intent is not None else (),
             candidate_source_ids=candidate_source_ids,

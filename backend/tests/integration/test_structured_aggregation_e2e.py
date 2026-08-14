@@ -400,10 +400,7 @@ class StructuredAggregationEndToEndTest(unittest.TestCase):
 
                 self.assertEqual(response.status_code, 200, response.text)
                 artifact = response.json()["messages"][-1]["artifacts"][0]
-                values = {
-                    row[0]: Decimal(row[2].replace(",", ""))
-                    for row in artifact["rows"]
-                }
+                values = {row[0]: Decimal(row[2].replace(",", "")) for row in artifact["rows"]}
                 rows_by_metric = {row[0]: row for row in artifact["rows"]}
                 self.assertEqual(values["销售额"], expected["sales_amount_value"])
                 self.assertEqual(values["成本"], expected["cost_amount_value"])
@@ -878,9 +875,9 @@ class StructuredAggregationTargetHostGateTest(unittest.TestCase):
                 self.assertEqual(gateway.returned_row_count, 1)
                 self.assertEqual(gateway.statements[0].upper().count("SELECT"), 1)
                 self.assertEqual(physoc.calls, 0)
-                stored_count = query.query(
-                    f"SELECT count() FROM {published_table}"
-                ).result_rows[0][0]
+                stored_count = query.query(f"SELECT count() FROM {published_table}").result_rows[0][
+                    0
+                ]
                 self.assertEqual(stored_count, MULTI_ROW_COUNT)
         except BaseException as error:
             primary_error = error
@@ -943,12 +940,12 @@ class StructuredAggregationTargetHostGateTest(unittest.TestCase):
             )
             ingest.insert(
                 staging,
-                [[Decimal("10")], [None], [Decimal("30")]],
+                [[Decimal(10)], [None], [Decimal(30)]],
                 column_names=("amount",),
             )
             ingest.command(f"RENAME TABLE {staging} TO {table}")
             result = query.query(f"SELECT count(), avg(amount) FROM {table}").result_rows[0]
-            self.assertEqual(result, (3, Decimal("20")))
+            self.assertEqual(result, (3, Decimal(20)))
         except BaseException as error:
             primary_error = error
             raise

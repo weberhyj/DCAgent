@@ -82,8 +82,7 @@ class ClickHouseCompatibilityProfile:
     def validate_server_version(self, version: str) -> None:
         if not _VERSION_PATTERN.fullmatch(version.strip()):
             raise ValueError(f"Invalid ClickHouse server version: {version}")
-        if (
-            self.mode is ClickHouseCompatibilityMode.LEGACY_18_16
-            and not version.startswith("18.16.")
+        if self.mode is ClickHouseCompatibilityMode.LEGACY_18_16 and not version.startswith(
+            "18.16."
         ):
             raise ValueError(f"ClickHouse legacy_18_16 mode requires 18.16.x, got {version}")

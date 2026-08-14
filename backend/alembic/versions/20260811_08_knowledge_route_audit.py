@@ -26,11 +26,7 @@ def upgrade() -> None:
         "agent_runs",
         sa.Column("route_metadata", sa.JSON(), nullable=True),
     )
-    op.execute(
-        sa.text(
-            "UPDATE agent_runs SET route_type = 'document_qa' WHERE route_type IS NULL"
-        )
-    )
+    op.execute(sa.text("UPDATE agent_runs SET route_type = 'document_qa' WHERE route_type IS NULL"))
     op.execute(sa.text("UPDATE agent_runs SET route_metadata = '{}' WHERE route_metadata IS NULL"))
     with op.batch_alter_table("agent_runs") as batch_op:
         batch_op.alter_column("route_type", existing_type=sa.String(length=40), nullable=False)

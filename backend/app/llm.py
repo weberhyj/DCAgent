@@ -359,10 +359,14 @@ def build_knowledge_paragraph(hits: list[KnowledgeSearchHitModel]) -> ResponsePa
 
 
 def build_prompt(request: LLMRequest) -> str:
-    history = "\n".join(
-        f"{message.role}: {message.content or ' '.join(paragraph.text for paragraph in message.paragraphs)}"
-        for message in request.previous_messages[-6:]
-    ) if request.include_history else ""
+    history = (
+        "\n".join(
+            f"{message.role}: {message.content or ' '.join(paragraph.text for paragraph in message.paragraphs)}"
+            for message in request.previous_messages[-6:]
+        )
+        if request.include_history
+        else ""
+    )
     return (
         "回答规则：\n"
         "- 仅基于可用知识片段回答，不要补充片段之外的事实。\n"

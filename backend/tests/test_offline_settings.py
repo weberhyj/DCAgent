@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from app.llm import create_llm_provider
 from app.clickhouse_compatibility import ClickHouseCompatibilityMode
+from app.llm import create_llm_provider
 from app.offline_settings import (
     OfflineSettings,
     OfflineSettingsError,
@@ -50,18 +50,12 @@ class OfflineSettingsTest(unittest.TestCase):
     def test_implicit_summary_limit_is_bounded(self) -> None:
         for value in ("0", "51", "not-an-integer"):
             with self.subTest(value=value), self.assertRaises(OfflineSettingsError):
-                OfflineSettings.from_environ(
-                    {"STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS": value}
-                )
-        settings = OfflineSettings.from_environ(
-            {"STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS": "20"}
-        )
+                OfflineSettings.from_environ({"STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS": value})
+        settings = OfflineSettings.from_environ({"STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS": "20"})
         self.assertEqual(settings.structured_implicit_summary_max_metrics, 20)
 
     def test_settings_parse_legacy_clickhouse_mode(self) -> None:
-        settings = OfflineSettings.from_environ(
-            {"CLICKHOUSE_COMPATIBILITY_MODE": "legacy_18_16"}
-        )
+        settings = OfflineSettings.from_environ({"CLICKHOUSE_COMPATIBILITY_MODE": "legacy_18_16"})
         self.assertIs(
             settings.clickhouse_compatibility_mode,
             ClickHouseCompatibilityMode.LEGACY_18_16,
@@ -74,9 +68,7 @@ class OfflineSettingsTest(unittest.TestCase):
     def test_settings_reject_clickhouse_mode_case_and_whitespace_variants(self) -> None:
         for value in ("MODERN", " legacy_18_16 "):
             with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    OfflineSettingsError, "CLICKHOUSE_COMPATIBILITY_MODE"
-                ):
+                with self.assertRaisesRegex(OfflineSettingsError, "CLICKHOUSE_COMPATIBILITY_MODE"):
                     OfflineSettings.from_environ({"CLICKHOUSE_COMPATIBILITY_MODE": value})
 
     def test_parse_bool_supports_offline_environment_values(self) -> None:

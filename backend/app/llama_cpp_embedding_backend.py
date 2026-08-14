@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import math
 import hashlib
+import math
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
@@ -82,7 +82,11 @@ class LlamaCppEmbeddingBackend:
         normalized: bool = True,
         batch_max_items: int = DEFAULT_LLAMA_CPP_EMBEDDING_BATCH_MAX_ITEMS,
     ) -> None:
-        if not isinstance(base_path, str) or not base_path.startswith("/") or base_path.endswith("/"):
+        if (
+            not isinstance(base_path, str)
+            or not base_path.startswith("/")
+            or base_path.endswith("/")
+        ):
             raise ValueError("llama.cpp embedding path must be an absolute path")
         if not isinstance(model, str) or not model.strip():
             raise ValueError("llama.cpp embedding model must be a nonblank string")
@@ -197,8 +201,8 @@ def validate_llama_cpp_embedding_url(value: str) -> str:
 __all__ = [
     "DEFAULT_LLAMA_CPP_EMBEDDING_BATCH_MAX_ITEMS",
     "DEFAULT_LLAMA_CPP_EMBEDDING_PATH",
-    "LlamaCppEmbeddingBackend",
     "LLAMA_CPP_EMBEDDING_ENCODING_PROFILE_SHA256",
+    "LlamaCppEmbeddingBackend",
     "SyncLlamaCppEmbeddingClient",
     "llama_cpp_embedding_encoding_profile_sha256",
     "validate_llama_cpp_embedding_url",

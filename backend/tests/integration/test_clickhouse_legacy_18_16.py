@@ -18,7 +18,7 @@ import tempfile
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
@@ -26,7 +26,6 @@ from urllib.parse import urlparse
 import pytest
 
 from app.offline_settings import OfflineSettingsError, read_secret_file, require_private_url
-
 
 _LEGACY_MODE = "legacy_18_16"
 _SAFE_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
@@ -58,9 +57,7 @@ def _validate_target_environment(environ: Mapping[str, str]) -> _TargetEnvironme
             "set RUN_CLICKHOUSE_18_16=1 for an explicit ClickHouse 18.16.1 target"
         )
     if environ.get("CLICKHOUSE_COMPATIBILITY_MODE", "").strip() != _LEGACY_MODE:
-        raise TargetConfigurationError(
-            "CLICKHOUSE_COMPATIBILITY_MODE must be exactly legacy_18_16"
-        )
+        raise TargetConfigurationError("CLICKHOUSE_COMPATIBILITY_MODE must be exactly legacy_18_16")
 
     raw_url = environ.get("CLICKHOUSE_URL", "").strip()
     if not raw_url:
@@ -256,9 +253,7 @@ class TestLegacy1816AcceptanceGuards:
                 globals(), "_validate_target_environment", target_validation_must_not_run
             )
 
-            assert _acceptance_collection_guard(
-                environ, dependencies_must_not_be_imported
-            ) == (
+            assert _acceptance_collection_guard(environ, dependencies_must_not_be_imported) == (
                 "ClickHouse 18.16.1 target guard: "
                 "set RUN_CLICKHOUSE_18_16=1 for an explicit ClickHouse 18.16.1 target"
             )
@@ -299,7 +294,15 @@ class TestLegacy1816AcceptanceGuards:
 
     @pytest.mark.parametrize(
         "version",
-        ("18.16.2", "18.16.10", "18.16.1.42", "18.16.1-stable", "18.16.1-", "18.16.1+build", "v18.16.1"),
+        (
+            "18.16.2",
+            "18.16.10",
+            "18.16.1.42",
+            "18.16.1-stable",
+            "18.16.1-",
+            "18.16.1+build",
+            "v18.16.1",
+        ),
     )
     def test_rejects_non_target_server_versions(self, version: str) -> None:
         with pytest.raises(AssertionError, match="18.16.1"):
@@ -425,7 +428,7 @@ class _RecordingIngestClient:
                 self.created_tables.update((source, target))
 
     def insert_arrow(self, table: str, batch: object, **kwargs: object) -> object:
-        self.batch_sizes.append(int(getattr(batch, "num_rows")))
+        self.batch_sizes.append(int(batch.num_rows))
         return self._client.insert_arrow(table, batch, **kwargs)
 
     def close(self) -> object:
@@ -496,11 +499,14 @@ def _legacy_gateway() -> Iterator[tuple[object, _RecordingIngestClient]]:
         from app.clickhouse_gateway import ClickHouseGateway
 
         profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
-        yield ClickHouseGateway(
+        yield (
+            ClickHouseGateway(
+                tracking_ingest,
+                query_client=query_client,
+                compatibility=profile,
+            ),
             tracking_ingest,
-            query_client=query_client,
-            compatibility=profile,
-        ), tracking_ingest
+        )
     except BaseException as error:
         primary_error = error
         raise
@@ -834,12 +840,12 @@ class TestClickHouseLegacy1816Acceptance:
             assert multi_result.total_count == 3
             assert [metric.value for metric in multi_result.metrics] == [
                 Decimal("2.200000000"),
-                Decimal("10"),
+                Decimal(10),
             ]
-            assert [
-                (metric.valid_count, metric.null_count)
-                for metric in multi_result.metrics
-            ] == [(2, 1), (2, 1)]
+            assert [(metric.valid_count, metric.null_count) for metric in multi_result.metrics] == [
+                (2, 1),
+                (2, 1),
+            ]
 
     def test_publishes_100000_rows_with_bounded_insert_batches(self) -> None:
         _require_acceptance_dependencies()

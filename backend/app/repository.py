@@ -549,9 +549,7 @@ class InMemoryChatRepository:
         return KnowledgeAnswerRouter(
             self._agent,
             structured_service=self._structured_service,
-            word_fact_service=(
-                self._word_fact_service if self._word_factual_qa_enabled else None
-            ),
+            word_fact_service=(self._word_fact_service if self._word_factual_qa_enabled else None),
         )
 
     def configure_retrieval(
@@ -1085,9 +1083,7 @@ class InMemoryChatRepository:
         if isinstance(permission_tags, (str, bytes, bytearray)):
             raise TypeError("permission_tags must be a sequence")
         effective_permission_tags = {
-            tag.strip()
-            for tag in permission_tags
-            if isinstance(tag, str) and tag.strip()
+            tag.strip() for tag in permission_tags if isinstance(tag, str) and tag.strip()
         }
         with self._lock:
             matches: list[WordFactMatch] = []
@@ -1214,6 +1210,7 @@ class InMemoryChatRepository:
         if self.retrieval_router is None or self._retrieval_scope_provider is None:
             return AgentSearchResult(hits=tuple(self.search_knowledge_chunks(query, limit)))
         from .retrieval_models import EvidenceExpansionPolicy, RetrievalRequest
+
         selected_expansion_policy = (
             EvidenceExpansionPolicy.BOUNDED_ADJACENCY
             if expansion_policy is None

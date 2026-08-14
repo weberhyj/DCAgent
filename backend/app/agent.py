@@ -17,8 +17,8 @@ from .models import (
     KnowledgeSearchHitModel,
     ResponseParagraphModel,
 )
-from .time_utils import display_datetime_label
 from .retrieval_models import EvidenceExpansionPolicy
+from .time_utils import display_datetime_label
 
 AgentRunStatus = Literal["completed", "failed"]
 AgentStepStatus = Literal["completed", "failed"]
@@ -301,7 +301,8 @@ class ReadOnlyKnowledgeAgent:
             route_metadata=KnowledgeRouteMetadata(
                 candidate_source_ids=tuple(sorted({hit.source.id for hit in hits})),
                 degradation_reason=fallback_reasons[0] if fallback_reasons else None,
-                adjacency_allowed=route_type in {
+                adjacency_allowed=route_type
+                in {
                     KnowledgeRouteType.DOCUMENT_QA,
                     KnowledgeRouteType.SUMMARY_COMPARE,
                 },
@@ -460,7 +461,8 @@ class ReadOnlyKnowledgeAgent:
                 knowledge_hits=state["knowledge_hits"],
                 previous_messages=state["previous_messages"],
                 agent_context=context,
-                include_history=state["route_type"] not in {
+                include_history=state["route_type"]
+                not in {
                     KnowledgeRouteType.WORD_FACTUAL,
                     KnowledgeRouteType.EXCEL_ROW_LOOKUP,
                     KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE,

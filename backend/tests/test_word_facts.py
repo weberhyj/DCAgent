@@ -59,13 +59,9 @@ class WordFactContractTests(unittest.TestCase):
     def test_ascii_field_alias_requires_identifier_boundaries(self) -> None:
         for value in ("https://example.com/page:1", "message: queued"):
             with self.subTest(value=value):
-                self.assertFalse(
-                    fact_value_has_embedded_key_value(value, field="职务")
-                )
+                self.assertFalse(fact_value_has_embedded_key_value(value, field="职务"))
         self.assertTrue(fact_value_has_embedded_key_value("age: 28", field="职务"))
-        self.assertTrue(
-            fact_value_has_embedded_key_value("28岁 性别：女", field="年龄")
-        )
+        self.assertTrue(fact_value_has_embedded_key_value("28岁 性别：女", field="年龄"))
 
     def test_answer_validation_preserves_ascii_token_boundaries(self) -> None:
         intent = WordFactualIntent("张三", "张三", "职务", "职务")

@@ -156,10 +156,10 @@ def validate_llama_cpp_url(value: str) -> str:
 
 
 __all__ = [
-    "DEFAULT_LLAMA_CPP_RERANK_BATCH_MAX_ITEMS",
     "DEFAULT_LLAMA_CPP_RERANKER_PATH",
-    "LlamaCppRerankerBackend",
+    "DEFAULT_LLAMA_CPP_RERANK_BATCH_MAX_ITEMS",
     "LLAMA_CPP_RERANK_PROFILE_SHA256",
+    "LlamaCppRerankerBackend",
     "SyncLlamaCppRerankClient",
     "validate_llama_cpp_url",
 ]

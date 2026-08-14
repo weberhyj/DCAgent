@@ -40,7 +40,6 @@ from app.word_fact_answer import WordFactAnswerService
 from app.word_facts import KnowledgeFactModel
 from tests.support.structured_fakes import sample_multi_metric_catalog
 
-
 EMBEDDING_METADATA = EmbeddingModelMetadata(
     name="Qwen/Qwen3-Embedding-0.6B",
     version="acceptance-v1",
@@ -141,7 +140,7 @@ class AcceptanceClickHouse:
                 "metric_0_value": Decimal("350.50"),
                 "metric_0_valid_count": 4,
                 "metric_0_null_count": 0,
-                "metric_1_value": Decimal("200"),
+                "metric_1_value": Decimal(200),
                 "metric_1_valid_count": 4,
                 "metric_1_null_count": 0,
             }
@@ -329,9 +328,7 @@ class RagAcceptanceTest(unittest.TestCase):
             retrieval_router=rag_search,
             retrieval_scope=RetrievalScope("default", ("internal",), "v1"),
         )
-        client = TestClient(
-            create_app(repository=repository, upload_dir=Path(self.temp_dir.name))
-        )
+        client = TestClient(create_app(repository=repository, upload_dir=Path(self.temp_dir.name)))
         conversation_id = client.post("/api/conversations").json()["activeConversationId"]
 
         response = client.post(
@@ -586,8 +583,9 @@ class UnifiedKnowledgeRoutingAcceptanceTest(unittest.TestCase):
             "WORD_FACTUAL_QA_ENABLED": "true",
         }
 
-        with patch.dict(os.environ, environ, clear=True), patch(
-            "app.main.load_runtime_environment"
+        with (
+            patch.dict(os.environ, environ, clear=True),
+            patch("app.main.load_runtime_environment"),
         ):
             app = create_app()
 

@@ -31,12 +31,12 @@ from .embedding_contracts import (
     EmbeddingResponse,
 )
 from .inference_batching import DynamicBatcher, InferenceQueueFull
-from .offline_artifacts import is_local_filesystem_path
 from .llama_cpp_embedding_backend import (
     LlamaCppEmbeddingBackend,
     SyncLlamaCppEmbeddingClient,
     llama_cpp_embedding_encoding_profile_sha256,
 )
+from .offline_artifacts import is_local_filesystem_path
 from .ollama_client import SyncOllamaClient
 from .ollama_embedding_backend import (
     OllamaEmbeddingBackend,

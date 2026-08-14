@@ -609,9 +609,7 @@ def _arrow_type(
         StructuredColumnType.DECIMAL: pa.decimal128(38, 9),
         StructuredColumnType.DATE: pa.date32(),
         StructuredColumnType.DATETIME: pa.timestamp(
-            "s"
-            if profile.mode is ClickHouseCompatibilityMode.LEGACY_18_16
-            else "ms"
+            "s" if profile.mode is ClickHouseCompatibilityMode.LEGACY_18_16 else "ms"
         ),
         StructuredColumnType.BOOLEAN: pa.bool_(),
     }[column_type]

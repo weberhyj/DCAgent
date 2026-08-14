@@ -429,9 +429,7 @@ class HybridRetrieverTest(unittest.TestCase):
             )
         )
 
-        outcome = retriever.retrieve(
-            request(expansion_policy=EvidenceExpansionPolicy.NONE)
-        )
+        outcome = retriever.retrieve(request(expansion_policy=EvidenceExpansionPolicy.NONE))
 
         self.assertEqual(retriever.gateway.retrieve_calls, [])
         self.assertEqual(outcome.stage_ms["adjacency"], 0.0)

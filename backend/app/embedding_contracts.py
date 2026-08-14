@@ -259,6 +259,9 @@ EmbeddingMetadataPayload = EmbeddingMetadataResponse
 
 
 __all__ = [
+    "MAX_EMBEDDING_REQUEST_BYTES",
+    "MAX_EMBEDDING_TEXTS",
+    "MAX_EMBEDDING_TEXT_BYTES",
     "EmbeddingClient",
     "EmbeddingMetadataExpectation",
     "EmbeddingMetadataPayload",
@@ -269,8 +272,5 @@ __all__ = [
     "EmbeddingRequestPayload",
     "EmbeddingResponse",
     "EmbeddingResponsePayload",
-    "MAX_EMBEDDING_REQUEST_BYTES",
-    "MAX_EMBEDDING_TEXT_BYTES",
-    "MAX_EMBEDDING_TEXTS",
     "embedding_request_json_size",
 ]

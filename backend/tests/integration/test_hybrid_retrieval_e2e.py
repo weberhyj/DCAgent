@@ -35,7 +35,6 @@ class _FakeResponse:
         self.raise_calls += 1
         if self._error is not None:
             raise self._error
-        return None
 
     def json(self) -> object:
         return self._payload

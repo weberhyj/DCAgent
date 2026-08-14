@@ -383,9 +383,7 @@ class WordFactRouteRepositoryTests(unittest.TestCase):
         return repository, conversation_id
 
     def test_fact_route_precedes_agent_and_llm(self) -> None:
-        repository, conversation_id = self.build_repository(
-            word_fact_service=self.fact_service
-        )
+        repository, conversation_id = self.build_repository(word_fact_service=self.fact_service)
 
         _, _, messages = repository.send_message(conversation_id, "张三几岁", "deep")
 
@@ -396,9 +394,7 @@ class WordFactRouteRepositoryTests(unittest.TestCase):
         self.assertFalse(run.route_metadata.adjacency_allowed)
 
     def test_open_word_question_continues_to_hybrid_rag(self) -> None:
-        repository, conversation_id = self.build_repository(
-            word_fact_service=self.fact_service
-        )
+        repository, conversation_id = self.build_repository(word_fact_service=self.fact_service)
 
         repository.send_message(conversation_id, "介绍张三", "deep")
 

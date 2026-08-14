@@ -395,7 +395,9 @@ class EmbeddingServiceTest(unittest.TestCase):
         backend = CloseTrackingEmbeddingBackend()
         loader_calls: list[str] = []
 
-        def load_backend(values: object, pinned: EmbeddingModelMetadata) -> CloseTrackingEmbeddingBackend:
+        def load_backend(
+            values: object, pinned: EmbeddingModelMetadata
+        ) -> CloseTrackingEmbeddingBackend:
             loader_calls.append(str(values["EMBEDDING_RUNTIME"]))  # type: ignore[index]
             return backend
 

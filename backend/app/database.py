@@ -120,9 +120,7 @@ class AgentRunRecord(Base):
     answer_message_id: Mapped[str] = mapped_column(String(64), nullable=False)
     evidence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     source_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    route_type: Mapped[str] = mapped_column(
-        String(40), nullable=False, default="document_qa"
-    )
+    route_type: Mapped[str] = mapped_column(String(40), nullable=False, default="document_qa")
     route_metadata: Mapped[dict[str, object]] = mapped_column(
         JSON, nullable=False, default=dict, server_default="{}"
     )

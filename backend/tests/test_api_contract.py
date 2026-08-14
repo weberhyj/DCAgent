@@ -178,12 +178,8 @@ class ApiContractTest(unittest.TestCase):
 
         database = Database("sqlite+pysqlite:///:memory:")
         database.create_schema()
-        repository = TerminalOnlySqlRepository(
-            database, llm_provider=FailingLLMProvider()
-        )
-        repository.configure_answer_services(
-            word_fact_service=WordFactAnswerService(repository)
-        )
+        repository = TerminalOnlySqlRepository(database, llm_provider=FailingLLMProvider())
+        repository.configure_answer_services(word_fact_service=WordFactAnswerService(repository))
         client = TestClient(create_app(repository), raise_server_exceptions=False)
         conversation_id = client.post("/api/conversations").json()["activeConversationId"]
 

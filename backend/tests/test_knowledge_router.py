@@ -160,9 +160,7 @@ class KnowledgeAnswerRouterTests(unittest.TestCase):
 
     def test_route_order_is_greeting_then_excel_then_word_then_document(self) -> None:
         router = self.router(
-            structured_result=run_result(
-                route_type=KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
-            )
+            structured_result=run_result(route_type=KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
         )
 
         result = router.answer("conv-1", "华东地区的销售额汇总", "deep", [])

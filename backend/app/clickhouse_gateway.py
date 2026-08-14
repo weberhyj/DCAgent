@@ -10,14 +10,14 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from .clickhouse_compatibility import (
+    ClickHouseCompatibilityMode,
+    ClickHouseCompatibilityProfile,
+)
 from .structured_models import (
     StructuredColumnSchema,
     StructuredColumnType,
     StructuredDatasetSchema,
-)
-from .clickhouse_compatibility import (
-    ClickHouseCompatibilityMode,
-    ClickHouseCompatibilityProfile,
 )
 
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9_]+$")
@@ -82,9 +82,7 @@ class ClickHouseGateway:
             "result_overflow_mode": "break",
         }
         query_readonly = (
-            2
-            if self._compatibility.mode is ClickHouseCompatibilityMode.LEGACY_18_16
-            else 1
+            2 if self._compatibility.mode is ClickHouseCompatibilityMode.LEGACY_18_16 else 1
         )
         self._query_settings = {
             **self._compatibility.query_settings(),
@@ -495,9 +493,8 @@ def _clickhouse_type(
 
 
 def _first_scalar(result: Any) -> str:
-    if isinstance(result, Mapping):
-        if result:
-            return str(next(iter(result.values())))
+    if isinstance(result, Mapping) and result:
+        return str(next(iter(result.values())))
     result_rows = getattr(result, "result_rows", None)
     if result_rows:
         row = result_rows[0]
@@ -505,9 +502,8 @@ def _first_scalar(result: Any) -> str:
         row = result[0]
     else:
         raise StructuredStorageError("ClickHouse version result has an unsupported shape")
-    if isinstance(row, Mapping):
-        if row:
-            return str(next(iter(row.values())))
+    if isinstance(row, Mapping) and row:
+        return str(next(iter(row.values())))
     if isinstance(row, Sequence) and not isinstance(row, (str, bytes)) and row:
         return str(row[0])
     return str(row)

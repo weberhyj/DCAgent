@@ -151,13 +151,10 @@ class OfflineSettings:
         unified_knowledge_routing_enabled = parse_bool(
             environ.get("UNIFIED_KNOWLEDGE_ROUTING_ENABLED"), default=False
         )
-        word_factual_qa_enabled = parse_bool(
-            environ.get("WORD_FACTUAL_QA_ENABLED"), default=False
-        )
+        word_factual_qa_enabled = parse_bool(environ.get("WORD_FACTUAL_QA_ENABLED"), default=False)
         if word_factual_qa_enabled and not unified_knowledge_routing_enabled:
             raise OfflineSettingsError(
-                "WORD_FACTUAL_QA_ENABLED=true requires "
-                "UNIFIED_KNOWLEDGE_ROUTING_ENABLED=true"
+                "WORD_FACTUAL_QA_ENABLED=true requires UNIFIED_KNOWLEDGE_ROUTING_ENABLED=true"
             )
         compatibility_value = environ.get("CLICKHOUSE_COMPATIBILITY_MODE", "modern")
         try:

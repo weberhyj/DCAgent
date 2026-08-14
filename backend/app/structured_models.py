@@ -6,7 +6,6 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
-
 MAX_STRUCTURED_ROUTE_FIELDS = 32
 
 MAX_STRUCTURED_ALIASES_PER_COLUMN = 20

@@ -23,6 +23,7 @@ from app.database import (
     StructuredPublicationRecord,
 )
 from app.infra.health import DependencyHealthRegistry
+from app.knowledge_route_models import KnowledgeRouteType
 from app.llm import TemplateLLMProvider
 from app.main import (
     _LazyStructuredQueryGateway,
@@ -31,7 +32,6 @@ from app.main import (
     create_production_app,
 )
 from app.models import ChatMessageModel, ChatState, ResponseParagraphModel
-from app.knowledge_route_models import KnowledgeRouteType
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
@@ -213,7 +213,10 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         assert result is not None
         self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_ROW_LOOKUP)
         self.assertEqual(result.reply.artifacts[0].columns, ["订单金额", "订单日期"])
-        self.assertEqual(result.reply.artifacts[0].rows, [["10", "2026-01-01"], ["20", "2026-01-02"]])
+        self.assertEqual(
+            result.reply.artifacts[0].rows, [["10", "2026-01-01"], ["20", "2026-01-02"]]
+        )
+
     @staticmethod
     def _catalog_with_aggregate_field(field_name: str):
         catalog = sample_catalog()
@@ -383,9 +386,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_lazy_gateway_preflights_before_publishing_the_legacy_gateway(self) -> None:
-        profile = ClickHouseCompatibilityProfile.for_mode(
-            ClickHouseCompatibilityMode.LEGACY_18_16
-        )
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
         clients: list[LifecycleClickHouseClient] = []
 
         class LegacyClient(LifecycleClickHouseClient):
@@ -422,9 +423,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         )
 
     def test_lazy_gateway_closes_clients_when_legacy_preflight_rejects_server(self) -> None:
-        profile = ClickHouseCompatibilityProfile.for_mode(
-            ClickHouseCompatibilityMode.LEGACY_18_16
-        )
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
         clients: list[LifecycleClickHouseClient] = []
 
         def build_client(**_kwargs: object) -> LifecycleClickHouseClient:
@@ -880,7 +879,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 "metric_0_value": Decimal("350.50"),
                 "metric_0_valid_count": 3,
                 "metric_0_null_count": 1,
-                "metric_1_value": Decimal("200"),
+                "metric_1_value": Decimal(200),
                 "metric_1_valid_count": 4,
                 "metric_1_null_count": 0,
                 "metric_2_value": None,
@@ -938,13 +937,13 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             RecordingClickHouseGateway(
                 result={
                     "total_count": 4,
-                    "metric_0_value": Decimal("1"),
+                    "metric_0_value": Decimal(1),
                     "metric_0_valid_count": 4,
                     "metric_0_null_count": 0,
-                    "metric_1_value": Decimal("2"),
+                    "metric_1_value": Decimal(2),
                     "metric_1_valid_count": 4,
                     "metric_1_null_count": 0,
-                    "metric_2_value": Decimal("3"),
+                    "metric_2_value": Decimal(3),
                     "metric_2_valid_count": 4,
                     "metric_2_null_count": 0,
                 }
@@ -968,7 +967,9 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
-        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(
+            result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE
+        )
         self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
         self.assertEqual(len(result.route_metadata.target_fields), 13)
         self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
@@ -985,10 +986,19 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         result.route_metadata.to_dict()
 
     def test_unavailable_multi_metrics_preserves_known_display_fields(self) -> None:
-        service = StructuredAnswerService(lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway())
-        with patch("app.structured_answer.resolve_structured_intent", return_value=StructuredUnavailable(
-            "unavailable", "ds-sales", ("销售额", "成本", "利润"), ("kb-sales",), "excel_multi_aggregate"
-        )):
+        service = StructuredAnswerService(
+            lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway()
+        )
+        with patch(
+            "app.structured_answer.resolve_structured_intent",
+            return_value=StructuredUnavailable(
+                "unavailable",
+                "ds-sales",
+                ("销售额", "成本", "利润"),
+                ("kb-sales",),
+                "excel_multi_aggregate",
+            ),
+        ):
             result = service.try_answer("conv-1", "地区为华东的销售额、成本、利润汇总", "quick", [])
 
         self.assertIsNotNone(result)
@@ -1044,14 +1054,16 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 origin_route="excel_filtered_aggregate",
             ),
         ):
-            result = StructuredAnswerService(lambda: catalog, RecordingClickHouseGateway()).try_answer(
-                "conv-1", "sales订单金额平均值", "quick", []
-            )
+            result = StructuredAnswerService(
+                lambda: catalog, RecordingClickHouseGateway()
+            ).try_answer("conv-1", "sales订单金额平均值", "quick", [])
 
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.route_type, KnowledgeRouteType.CLARIFICATION)
-        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
+        self.assertEqual(
+            result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE
+        )
         self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
         self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
 
@@ -1059,15 +1071,18 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         service = StructuredAnswerService(
             lambda: sample_multi_metric_catalog(), RecordingClickHouseGateway()
         )
-        with patch("app.structured_answer.StructuredQueryPlanner.plan_multi", side_effect=UnsafeStructuredQueryError):
-            result = service.try_answer(
-                "conv-1", "地区为华东的销售额、成本、利润汇总", "quick", []
-            )
+        with patch(
+            "app.structured_answer.StructuredQueryPlanner.plan_multi",
+            side_effect=UnsafeStructuredQueryError,
+        ):
+            result = service.try_answer("conv-1", "地区为华东的销售额、成本、利润汇总", "quick", [])
 
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
-        self.assertEqual(result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE)
+        self.assertEqual(
+            result.route_metadata.origin_route, KnowledgeRouteType.EXCEL_MULTI_AGGREGATE
+        )
         self.assertEqual(result.route_metadata.dataset_id, "ds-sales")
         self.assertEqual(result.route_metadata.target_fields, ("销售额", "成本", "利润"))
         self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-sales",))
@@ -1255,9 +1270,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertIsNotNone(service.try_answer("warm", "地区为华东的汇总", "quick", []))
         provider.error = RuntimeError("catalog down")
 
-        result = service.try_answer(
-            "outage", "地区为华东的销售额、成本、利润汇总", "quick", []
-        )
+        result = service.try_answer("outage", "地区为华东的销售额、成本、利润汇总", "quick", [])
 
         self.assertIsNotNone(result)
         assert result is not None
@@ -1391,9 +1404,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 self._assert_catalog_failure_uses_legacy_path(question)
 
     def test_catalog_failure_field_name_before_copula_remains_structured(self) -> None:
-        self._assert_catalog_failure_is_strong_candidate(
-            "产品说明平均值为10的销售额总和"
-        )
+        self._assert_catalog_failure_is_strong_candidate("产品说明平均值为10的销售额总和")
 
     def test_catalog_failure_explicit_filter_grammars_are_strong_candidates(self) -> None:
         questions = (

@@ -48,6 +48,7 @@ class StructuredIntentParsingTest(unittest.TestCase):
                 limit=100,
             ),
         )
+
     def test_mixed_allowed_and_disallowed_metrics_never_degrade_to_single_metric(
         self,
     ) -> None:
@@ -184,9 +185,7 @@ class StructuredIntentParsingTest(unittest.TestCase):
         self.assertLessEqual(len(result.target_fields), 32)
 
     def test_single_metric_huizong_keeps_single_metric_contract(self) -> None:
-        result = resolve_structured_intent(
-            "华东地区销售额汇总", sample_multi_metric_catalog()
-        )
+        result = resolve_structured_intent("华东地区销售额汇总", sample_multi_metric_catalog())
         self.assertEqual(
             result,
             StructuredIntent(
@@ -1487,9 +1486,7 @@ class StructuredQueryPlannerTest(unittest.TestCase):
     ) -> None:
         from app.structured_query import StructuredQueryPlanner
 
-        profile = ClickHouseCompatibilityProfile.for_mode(
-            ClickHouseCompatibilityMode.LEGACY_18_16
-        )
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
         catalog = sample_catalog()
         dataset = catalog.datasets[0]
         datetime_column = replace(
@@ -1585,9 +1582,7 @@ class StructuredQueryPlannerTest(unittest.TestCase):
                 ),
             ),
         )
-        modern_profile = ClickHouseCompatibilityProfile.for_mode(
-            ClickHouseCompatibilityMode.MODERN
-        )
+        modern_profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.MODERN)
         plan = StructuredQueryPlanner(catalog, compatibility=modern_profile).plan(
             StructuredIntent(
                 "ds-sales",
@@ -1613,9 +1608,7 @@ class StructuredQueryPlannerTest(unittest.TestCase):
     ) -> None:
         from app.structured_query import StructuredQueryPlanner
 
-        profile = ClickHouseCompatibilityProfile.for_mode(
-            ClickHouseCompatibilityMode.LEGACY_18_16
-        )
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
         catalog = sample_catalog()
         dataset = catalog.datasets[0]
         datetime_column = replace(
@@ -1650,9 +1643,7 @@ class StructuredQueryPlannerTest(unittest.TestCase):
     def test_legacy_decimal_filter_preserves_decimal_parameter(self) -> None:
         from app.structured_query import StructuredQueryPlanner
 
-        profile = ClickHouseCompatibilityProfile.for_mode(
-            ClickHouseCompatibilityMode.LEGACY_18_16
-        )
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
         plan = StructuredQueryPlanner(sample_catalog(), compatibility=profile).plan(
             StructuredIntent(
                 "ds-sales",
@@ -1759,6 +1750,7 @@ class StructuredQueryExecutorTest(unittest.TestCase):
         assert isinstance(result, StructuredRowLookupResult)
         self.assertEqual(result.rows, (("10.5", "2026-01-01"), ("20", "2026-01-02")))
         self.assertTrue(result.truncated)
+
     def test_multi_executor_returns_clickhouse_values_without_python_recalculation(
         self,
     ) -> None:
@@ -1984,7 +1976,7 @@ class StructuredQueryExecutorTest(unittest.TestCase):
             aggregate_rows=[
                 {
                     "total_count": 1,
-                    "metric_0_value": Decimal("10"),
+                    "metric_0_value": Decimal(10),
                     "metric_0_valid_count": 1,
                     "metric_0_null_count": 0,
                     "unexpected_alias": "must not be accepted",
@@ -2259,9 +2251,7 @@ class StructuredQueryExecutorTest(unittest.TestCase):
     def test_executor_regenerates_plan_with_the_same_legacy_profile(self) -> None:
         from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
 
-        profile = ClickHouseCompatibilityProfile.for_mode(
-            ClickHouseCompatibilityMode.LEGACY_18_16
-        )
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
         catalog = sample_catalog()
         dataset = catalog.datasets[0]
         datetime_column = replace(
@@ -2288,18 +2278,18 @@ class StructuredQueryExecutorTest(unittest.TestCase):
             ),
             sample_publication(),
         )
-        gateway = FakeClickHouse(aggregate_rows=[(Decimal("20"), 1, 1, 0)])
+        gateway = FakeClickHouse(aggregate_rows=[(Decimal(20), 1, 1, 0)])
 
         result = StructuredQueryExecutor(catalog, gateway, compatibility=profile).execute(plan)
 
-        self.assertEqual(result.value, Decimal("20"))
+        self.assertEqual(result.value, Decimal(20))
         self.assertEqual(gateway.queries[0][0], plan.sql)
 
     def test_gateway_query_uses_only_read_only_client_and_bounded_settings(self) -> None:
         from app.clickhouse_gateway import ClickHouseGateway
 
         ingest = FakeClickHouse()
-        query = FakeClickHouse(aggregate_rows=[(Decimal("20"), 3, 2, 1)])
+        query = FakeClickHouse(aggregate_rows=[(Decimal(20), 3, 2, 1)])
         gateway = ClickHouseGateway(
             ingest,
             query_client=query,
@@ -2310,7 +2300,7 @@ class StructuredQueryExecutorTest(unittest.TestCase):
 
         result = gateway.query("SELECT count()", {"region": "华东"})
 
-        self.assertEqual(result, [(Decimal("20"), 3, 2, 1)])
+        self.assertEqual(result, [(Decimal(20), 3, 2, 1)])
         self.assertEqual(ingest.queries, [])
         statement, args, kwargs = query.queries[0]
         self.assertEqual(statement, "SELECT count()")
@@ -2400,10 +2390,10 @@ class StructuredQueryExecutorTest(unittest.TestCase):
         plan = StructuredQueryPlanner(catalog).plan(intent, sample_publication())
         result = StructuredQueryExecutor(
             catalog,
-            FakeClickHouse(aggregate_rows=[(Decimal("30"), 3, 3, 0)]),
+            FakeClickHouse(aggregate_rows=[(Decimal(30), 3, 3, 0)]),
         ).execute(plan)
 
-        self.assertEqual(result.value, Decimal("30"))
+        self.assertEqual(result.value, Decimal(30))
         self.assertEqual(llm.generation_calls, 0)
 
     def test_executor_rejects_forged_join_plan_before_gateway_call(self) -> None:

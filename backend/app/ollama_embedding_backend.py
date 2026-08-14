@@ -185,13 +185,13 @@ def _normalize(vector: object, dimensions: int) -> list[float]:
 
 
 __all__ = [
+    "BGE_LARGE_ZH_V15_QUERY_PREFIX",
+    "OLLAMA_BGE_LARGE_ZH_V15_QUERY_PROFILE",
     "OLLAMA_EMBEDDING_ENCODING_PROFILE",
     "OLLAMA_EMBEDDING_ENCODING_PROFILE_SHA256",
-    "OLLAMA_BGE_LARGE_ZH_V15_QUERY_PROFILE",
     "OLLAMA_LEGACY_EMBEDDING_ENCODING_PROFILE",
     "OLLAMA_MODERN_EMBEDDING_ENCODING_PROFILE",
     "OLLAMA_RAW_QUERY_PROFILE",
-    "BGE_LARGE_ZH_V15_QUERY_PREFIX",
     "OllamaEmbeddingBackend",
     "ollama_embedding_encoding_profile",
     "ollama_embedding_encoding_profile_sha256",

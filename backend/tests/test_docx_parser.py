@@ -10,7 +10,6 @@ from app.docx_parser import parse_docx_knowledge_file, read_docx_blocks
 from app.text_parser import parse_knowledge_file
 from app.word_facts import KnowledgeFactModel, normalize_fact_key
 
-
 ParagraphFixture = str | tuple[str, str]
 
 

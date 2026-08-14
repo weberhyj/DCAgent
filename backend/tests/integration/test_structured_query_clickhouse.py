@@ -66,9 +66,9 @@ class StructuredQueryClickHouseIntegrationTest(unittest.TestCase):
                 table_name,
                 [
                     [Decimal("100.25"), Decimal("50.10"), Decimal("50.15"), "华东"],
-                    [Decimal("200"), Decimal("70"), Decimal("130"), "华东"],
-                    [None, Decimal("10"), None, "华东"],
-                    [Decimal("400"), Decimal("150"), Decimal("250"), "华南"],
+                    [Decimal(200), Decimal(70), Decimal(130), "华东"],
+                    [None, Decimal(10), None, "华东"],
+                    [Decimal(400), Decimal(150), Decimal(250), "华南"],
                 ],
                 column_names=(
                     "sales_amount",
@@ -111,10 +111,7 @@ class StructuredQueryClickHouseIntegrationTest(unittest.TestCase):
                 [Decimal("300.25"), Decimal("130.10"), Decimal("180.15")],
             )
             self.assertEqual(
-                [
-                    (metric.valid_count, metric.null_count)
-                    for metric in result.metrics
-                ],
+                [(metric.valid_count, metric.null_count) for metric in result.metrics],
                 [(2, 1), (3, 0), (2, 1)],
             )
         finally:
@@ -155,9 +152,9 @@ class StructuredQueryClickHouseIntegrationTest(unittest.TestCase):
             admin.insert(
                 table_name,
                 [
-                    [Decimal("10"), "华东", date(2026, 1, 1)],
-                    [Decimal("30"), "华东", date(2026, 1, 2)],
-                    [Decimal("50"), "华南", date(2026, 1, 3)],
+                    [Decimal(10), "华东", date(2026, 1, 1)],
+                    [Decimal(30), "华东", date(2026, 1, 2)],
+                    [Decimal(50), "华南", date(2026, 1, 3)],
                 ],
                 column_names=("order_amount", "region", "order_date"),
             )
@@ -182,7 +179,7 @@ class StructuredQueryClickHouseIntegrationTest(unittest.TestCase):
                 ClickHouseGateway(admin, query_client=query_client, max_result_rows=1),
             ).execute(plan)
 
-            self.assertEqual(result.value, Decimal("20"))
+            self.assertEqual(result.value, Decimal(20))
             self.assertEqual((result.total_count, result.valid_count, result.null_count), (2, 2, 0))
         finally:
             admin.command(f"DROP TABLE IF EXISTS {table_name}")

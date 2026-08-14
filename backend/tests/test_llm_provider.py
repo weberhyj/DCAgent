@@ -163,7 +163,6 @@ class FakePhysocResponse:
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.exit_count += 1
-        return None
 
     def raise_for_status(self) -> None:
         self.status_checked = True
@@ -188,7 +187,6 @@ class RecordingPhysocClient:
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.exit_count += 1
-        return None
 
     def stream(self, method: str, url: str, json: dict, headers: dict) -> FakePhysocResponse:
         self.requests.append({"method": method, "url": url, "json": json, "headers": headers})
