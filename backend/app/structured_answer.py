@@ -488,7 +488,22 @@ def _has_row_lookup_language(question: str, catalog: StructuredCatalog) -> bool:
 
 
 def _has_row_lookup_markers(question: str) -> bool:
-    return any(marker in question for marker in ("返回", "查找", "显示", "列出", "给出", "其他列"))
+    return any(
+        marker in question
+        for marker in (
+            "返回",
+            "查找",
+            "显示",
+            "列出",
+            "给出",
+            "其他列",
+            "所有",
+            "全部",
+            "每条",
+            "每行",
+            "明细",
+        )
+    )
 
 
 def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:

@@ -33,6 +33,25 @@ from tests.support.structured_fakes import (
 
 
 class StructuredIntentParsingTest(unittest.TestCase):
+    def test_parses_natural_language_row_lookup_with_implicit_region_and_date(self) -> None:
+        result = resolve_structured_intent(
+            "华东在2026-01-01中所有的订单金额",
+            sample_catalog(),
+        )
+
+        self.assertEqual(
+            result,
+            StructuredRowLookupIntent(
+                dataset_id="ds-sales",
+                filters=(
+                    StructuredFilter("region", "eq", "华东"),
+                    StructuredFilter("order_date", "between", "2026-01-01", "2026-01-01"),
+                ),
+                selected_physical_names=("order_amount",),
+                limit=100,
+            ),
+        )
+
     def test_parses_row_lookup_filter_and_selected_columns(self) -> None:
         result = resolve_structured_intent(
             "地区=华东，返回订单金额和订单日期",

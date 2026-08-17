@@ -82,11 +82,24 @@ _SUMMARY_WORDS = ("汇总", "统计")
 _NUMERIC_TYPES = frozenset({StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL})
 _COMPARISON_OPERATORS = {"大于": "gt", "不少于": "gte", "小于": "lt", "不超过": "lte"}
 _DATE_RANGE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\s*至\s*(\d{4}-\d{2}-\d{2})")
+_DATE_LITERAL_RE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _NUMBER_RE = r"-?\d+(?:\.\d+)?"
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9_]+$")
 _ALLOWED_AGGREGATES = frozenset({"avg", "sum", "count", "min", "max"})
 _ALLOWED_SQL_FUNCTIONS = frozenset({"AVG", "SUM", "COUNT", "MIN", "MAX"})
-_ROW_LOOKUP_MARKERS = ("返回", "查找", "显示", "列出", "给出", "其他列")
+_ROW_LOOKUP_MARKERS = (
+    "返回",
+    "查找",
+    "显示",
+    "列出",
+    "给出",
+    "其他列",
+    "所有",
+    "全部",
+    "每条",
+    "每行",
+    "明细",
+)
 
 
 class UnsafeStructuredQueryError(ValueError):
@@ -337,15 +350,36 @@ class StructuredQueryPlanner:
             column = columns.get(item.physical_name)
             if column is None or not column.allow_filter:
                 raise UnsafeStructuredQueryError("unknown or disallowed filter column")
-            if item.operator != "eq" or item.upper_value is not None:
-                raise UnsafeStructuredQueryError("row lookup supports equality filters only")
             name = _require_identifier(column.physical_name)
             parameter_name = f"filter_{index}"
+            parameter_type = self._compatibility.parameter_type(column.data_type)
+            if item.operator == "eq" and item.upper_value is None:
+                parameters[parameter_name] = _convert_parameter(
+                    item.value, column.data_type, self._compatibility
+                )
+                predicates.append(f"{name} = {{{parameter_name}:{parameter_type}}}")
+                continue
+            if item.operator != "between" or item.upper_value is None:
+                raise UnsafeStructuredQueryError(
+                    "row lookup supports equality and bounded date filters only"
+                )
+            upper_name = f"filter_{index}_upper"
+            upper_value = _convert_parameter(
+                item.upper_value, column.data_type, self._compatibility
+            )
+            upper_operator = "<="
+            if column.data_type is StructuredColumnType.DATETIME and re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}", item.upper_value
+            ):
+                upper_value = upper_value + timedelta(days=1)
+                upper_operator = "<"
             parameters[parameter_name] = _convert_parameter(
                 item.value, column.data_type, self._compatibility
             )
+            parameters[upper_name] = upper_value
             predicates.append(
-                f"{name} = {{{parameter_name}:{self._compatibility.parameter_type(column.data_type)}}}"
+                f"({name} >= {{{parameter_name}:{parameter_type}}} AND "
+                f"{name} {upper_operator} {{{upper_name}:{parameter_type}}})"
             )
         table_name = _require_identifier(publication.physical_table_name)
         sql = f"SELECT {', '.join(_require_identifier(column.physical_name) for column in selected)} FROM {table_name}"
@@ -1338,6 +1372,17 @@ def _parse_filter_clause(
     all_matches.extend(implicit_matches)
     consumed.extend(implicit.consumed_spans)
 
+    natural = _parse_natural_date_and_value_filters(
+        _mask_spans(available, consumed),
+        filter_columns,
+        existing_columns={match.item.physical_name for match in all_matches},
+    )
+    if natural.issue is not None:
+        return _ClauseParseResult(issue=natural.issue)
+    natural_matches = natural.value or ()
+    all_matches.extend(natural_matches)
+    consumed.extend(span for match in natural_matches for span in match.consumed_spans)
+
     if "或" in available and all_matches:
         return _ClauseParseResult(issue=StructuredUnavailable("结构化筛选暂不支持 OR 条件"))
 
@@ -1352,6 +1397,76 @@ def _parse_filter_clause(
         consumed_spans=_merge_spans(consumed),
         shared_columns=tuple(dict.fromkeys(shared_columns)),
     )
+
+
+def _parse_natural_date_and_value_filters(
+    question: str,
+    columns: tuple[StructuredColumnSchema, ...],
+    *,
+    existing_columns: set[str],
+) -> _ClauseParseResult[tuple[_FilterMatch, ...]]:
+    """Parse common user phrasing without requiring ``field=value`` syntax.
+
+    For example, when a dataset has one filterable text column and one date
+    column, ``华东在 2025-01-01 的所有销售额`` becomes region=华东 and
+    date=2025-01-01. We only infer an omitted text field when it is
+    unambiguous; otherwise the caller receives a clarification instead of
+    silently querying the wrong column.
+    """
+    matches: list[_FilterMatch] = []
+    date_columns = tuple(
+        column
+        for column in columns
+        if column.physical_name not in existing_columns
+        and column.data_type in {StructuredColumnType.DATE, StructuredColumnType.DATETIME}
+    )
+    date_match = _DATE_LITERAL_RE.search(question)
+    if date_match is not None and date_columns:
+        if len(date_columns) > 1:
+            return _ClauseParseResult(
+                issue=StructuredClarification(
+                    "日期匹配多个字段，请明确日期字段",
+                    tuple(sorted(column.display_name for column in date_columns)),
+                )
+            )
+        date_column = date_columns[0]
+        date_value = date_match.group(1)
+        matches.append(
+            _FilterMatch(
+                StructuredFilter(date_column.physical_name, "between", date_value, date_value),
+                _TextSpan(date_match.start(), date_match.end()),
+                (_TextSpan(date_match.start(), date_match.end()),),
+            )
+        )
+
+    string_columns = tuple(
+        column
+        for column in columns
+        if column.physical_name not in existing_columns
+        and column.data_type is StructuredColumnType.STRING
+    )
+    value_match = re.search(
+        r"(?P<value>[A-Za-z0-9\u4e00-\u9fff]{1,20})\s*(?:在|于)\s*"
+        r"\d{4}-\d{2}-\d{2}\s*(?:中|内|当天|这一天)?",
+        question,
+    )
+    if value_match is not None and string_columns:
+        if len(string_columns) > 1:
+            return _ClauseParseResult(
+                issue=StructuredClarification(
+                    "自然语言中的筛选值匹配多个字段，请明确筛选字段",
+                    tuple(sorted(column.display_name for column in string_columns)),
+                )
+            )
+        value = value_match.group("value")
+        matches.append(
+            _FilterMatch(
+                StructuredFilter(string_columns[0].physical_name, "eq", value),
+                _TextSpan(value_match.start("value"), value_match.end("value")),
+                (_TextSpan(value_match.start(), value_match.end()),),
+            )
+        )
+    return _ClauseParseResult(value=tuple(matches))
 
 
 def _bound_date_field_span(

@@ -217,6 +217,22 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             result.reply.artifacts[0].rows, [["10", "2026-01-01"], ["20", "2026-01-02"]]
         )
 
+    def test_natural_language_row_lookup_keeps_excel_route(self) -> None:
+        gateway = RecordingClickHouseGateway(result=[{"order_amount": "10"}])
+        service = StructuredAnswerService(lambda: sample_catalog(), gateway)
+
+        result = service.try_answer(
+            "conv-1",
+            "华东在2026-01-01中所有的订单金额",
+            "quick",
+            [],
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_ROW_LOOKUP)
+        self.assertEqual(result.reply.artifacts[0].columns, ["订单金额"])
+
     @staticmethod
     def _catalog_with_aggregate_field(field_name: str):
         catalog = sample_catalog()
