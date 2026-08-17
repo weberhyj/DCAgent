@@ -28,7 +28,6 @@ from .structured_models import (
     StructuredClarification,
     StructuredColumnSchema,
     StructuredDatasetCatalog,
-    StructuredFilter,
     StructuredIntent,
     StructuredMultiAggregateIntent,
     StructuredMultiAggregateResult,
@@ -41,6 +40,7 @@ from .structured_query import (
     StructuredQueryPlanner,
     UnsafeStructuredQueryError,
     _candidate_equality_value_spans,
+    _resolution_names,
     resolve_structured_intent,
 )
 from .time_utils import display_datetime_label
@@ -345,7 +345,7 @@ class StructuredAnswerService:
                 conversation_id,
                 question,
                 mode,
-                f"已从 {result.source_name} / {result.worksheet_name} 返回 {len(result.rows)} 行{suffix}。",
+                f"已返回 {len(result.rows)} 行{suffix}。",
                 f"structured row lookup completed; audit_id={result.audit_id}",
                 source_ids=[result.source_id],
                 artifacts=[artifact],
@@ -358,10 +358,14 @@ class StructuredAnswerService:
                 ),
             )
         if isinstance(result, StructuredMultiAggregateResult):
-            paragraph = (
-                f"结构化汇总结果：{result.source_name} / {result.worksheet_name}，"
-                f"匹配 {result.total_count} 行，筛选条件：{_format_filters(result.filters)}。"
-            )
+            paragraph = "；".join(
+                _format_metric_result(
+                    item.metric_display_name,
+                    item.aggregate,
+                    item.value,
+                )
+                for item in result.metrics
+            ) + "。"
             artifact = TableArtifactModel(
                 type="table",
                 title="结构化汇总结果",
@@ -461,12 +465,7 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
         for dataset in catalog.datasets
         for column in dataset.schema.columns
         if column.allow_aggregate
-        for value in (
-            column.physical_name,
-            column.original_name,
-            column.display_name,
-            *column.aliases,
-        )
+        for _, value in _resolution_names(column)
         for normalized in (_normalize(value),)
         if normalized
     }
@@ -516,12 +515,7 @@ def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:
     for column in dataset.schema.columns:
         names.update(
             _normalize(value)
-            for value in (
-                column.physical_name,
-                column.original_name,
-                column.display_name,
-                *column.aliases,
-            )
+            for _, value in _resolution_names(column)
         )
     return tuple(name for name in names if name)
 
@@ -946,43 +940,32 @@ def _route_for_parser_outcome(outcome: StructuredUnavailable) -> KnowledgeRouteT
 
 def _format_result(result: StructuredAggregateResult) -> str:
     metric = result.metric_display_name or result.metric_physical_name or "all_rows"
-    value = _format_numeric_value(result.value)
-    return (
-        "结构化查询结果："
-        f"source_file={result.source_name}; "
-        f"worksheet={result.worksheet_name}; "
-        f"aggregate={result.aggregate}; "
-        f"metric={metric}; "
-        f"value={value}; "
-        f"total={result.total_count}; "
-        f"valid={result.valid_count}; "
-        f"null={result.null_count}; "
-        f"filters={_format_filters(result.filters)}; "
-        f"schema_version={result.schema_version}; "
-        f"publication_version={result.publication_id}; "
-        f"publication_id={result.publication_id}; "
-        f"elapsed_ms={result.elapsed_ms:.3f}; "
-        f"audit_id={result.audit_id}"
-    )
+    if metric == "all_rows":
+        return f"共有 {result.total_count} 条记录。"
+    return _format_metric_result(metric, result.aggregate, result.value) + "。"
+
+
+def _format_metric_result(
+    metric: str,
+    aggregate: str,
+    value: Decimal | int | None,
+) -> str:
+    aggregate_label = {
+        "avg": "平均值",
+        "sum": "总和",
+        "count": "记录数",
+        "min": "最小值",
+        "max": "最大值",
+    }.get(aggregate, aggregate)
+    if value is None:
+        return f"未计算出{metric}的{aggregate_label}（没有有效数值）"
+    return f"{metric}的{aggregate_label}为 {_format_numeric_value(value)}"
 
 
 def _format_numeric_value(value: Decimal | int | None) -> str:
     if value is None:
         return "null"
     return format(value, ",")
-
-
-def _format_filters(filters: tuple[StructuredFilter, ...]) -> str:
-    if not filters:
-        return "none"
-    return ",".join(
-        (
-            f"{item.physical_name}:{item.operator}:{item.value}"
-            if item.upper_value is None
-            else f"{item.physical_name}:{item.operator}:{item.value}..{item.upper_value}"
-        )
-        for item in filters
-    )
 
 
 def _structured_run(

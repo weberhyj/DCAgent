@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.clickhouse_compatibility import (
@@ -33,6 +33,58 @@ from tests.support.structured_fakes import (
 
 
 class StructuredIntentParsingTest(unittest.TestCase):
+    def test_parses_natural_chinese_datetime_range_and_unitless_metric_name(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        amount = replace(
+            dataset.schema.columns[0],
+            original_name="温度 (°C)",
+            display_name="温度 (°C)",
+            aliases=("温度 (°C)",),
+        )
+        datetime_column = replace(
+            dataset.schema.columns[2],
+            physical_name="toronto_edt",
+            original_name="时间（Toronto / EDT）",
+            display_name="时间（Toronto / EDT）",
+            data_type=StructuredColumnType.DATETIME,
+            aliases=("时间（Toronto / EDT）",),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(amount, dataset.schema.columns[1], datetime_column),
+                    ),
+                ),
+            ),
+        )
+
+        result = resolve_structured_intent(
+            "多伦多在2026年8月16日00:00到1:00这段时间的平均温度",
+            catalog,
+        )
+
+        self.assertEqual(
+            result,
+            StructuredIntent(
+                dataset_id="ds-sales",
+                aggregate="avg",
+                metric_physical_name="order_amount",
+                filters=(
+                    StructuredFilter(
+                        "toronto_edt",
+                        "between",
+                        "2026-08-16T00:00:00",
+                        "2026-08-16T01:00:00",
+                    ),
+                ),
+            ),
+        )
+
     def test_parses_natural_language_row_lookup_with_implicit_region_and_date(self) -> None:
         result = resolve_structured_intent(
             "华东在2026-01-01中所有的订单金额",
@@ -1534,9 +1586,12 @@ class StructuredQueryPlannerTest(unittest.TestCase):
             sample_publication(),
         )
 
-        self.assertNotIn("DateTime64(3)", plan.sql)
-        self.assertIn("{filter_0:DateTime}", plan.sql)
-        self.assertEqual(plan.parameters["filter_0"], datetime(2026, 1, 1, 12, 30, 45))
+        self.assertNotIn("DateTime64", plan.sql)
+        self.assertIn("{filter_0:DateTime('UTC')}", plan.sql)
+        self.assertEqual(
+            plan.parameters["filter_0"],
+            datetime(2026, 1, 1, 12, 30, 45, tzinfo=timezone.utc),
+        )
 
     def test_plan_is_select_only_and_aggregate_whitelisted(self) -> None:
         import sqlglot
@@ -1619,8 +1674,56 @@ class StructuredQueryPlannerTest(unittest.TestCase):
             sample_publication(),
         )
 
-        self.assertIn("order_date < {filter_0_upper:DateTime64(3)}", plan.sql)
-        self.assertEqual(plan.parameters["filter_0_upper"], datetime(2026, 2, 1))
+        self.assertIn("order_date < {filter_0_upper:DateTime64(3, 'UTC')}", plan.sql)
+        self.assertEqual(
+            plan.parameters["filter_0_upper"],
+            datetime(2026, 2, 1, tzinfo=timezone.utc),
+        )
+
+    def test_datetime_time_range_uses_half_open_upper_bound(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        catalog = sample_catalog()
+        base = catalog.datasets[0]
+        datetime_column = replace(
+            base.schema.columns[2],
+            data_type=StructuredColumnType.DATETIME,
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    base,
+                    schema=replace(
+                        base.schema,
+                        columns=(base.schema.columns[0], base.schema.columns[1], datetime_column),
+                    ),
+                ),
+            ),
+        )
+        profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.MODERN)
+        plan = StructuredQueryPlanner(catalog, compatibility=profile).plan(
+            StructuredIntent(
+                "ds-sales",
+                "avg",
+                "order_amount",
+                (
+                    StructuredFilter(
+                        "order_date",
+                        "between",
+                        "2026-08-16T00:00:00",
+                        "2026-08-16T01:00:00",
+                    ),
+                ),
+            ),
+            sample_publication(),
+        )
+
+        self.assertIn("order_date < {filter_0_upper:DateTime64(3, 'UTC')}", plan.sql)
+        self.assertEqual(
+            plan.parameters["filter_0_upper"],
+            datetime(2026, 8, 16, 1, tzinfo=timezone.utc),
+        )
 
     def test_legacy_datetime_date_range_expands_upper_bound_with_datetime_placeholder(
         self,
@@ -1656,8 +1759,11 @@ class StructuredQueryPlannerTest(unittest.TestCase):
             sample_publication(),
         )
 
-        self.assertIn("order_date < {filter_0_upper:DateTime}", plan.sql)
-        self.assertEqual(plan.parameters["filter_0_upper"], datetime(2026, 2, 1))
+        self.assertIn("order_date < {filter_0_upper:DateTime('UTC')}", plan.sql)
+        self.assertEqual(
+            plan.parameters["filter_0_upper"],
+            datetime(2026, 2, 1, tzinfo=timezone.utc),
+        )
 
     def test_legacy_decimal_filter_preserves_decimal_parameter(self) -> None:
         from app.structured_query import StructuredQueryPlanner

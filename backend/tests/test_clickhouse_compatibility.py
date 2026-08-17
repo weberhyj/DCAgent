@@ -11,8 +11,10 @@ from app.structured_models import StructuredColumnType
 class ClickHouseCompatibilityProfileTest(unittest.TestCase):
     def test_legacy_profile_uses_second_precision_and_legacy_decimal_expression(self) -> None:
         profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.LEGACY_18_16)
-        self.assertEqual(profile.storage_type(StructuredColumnType.DATETIME), "Nullable(DateTime)")
-        self.assertEqual(profile.parameter_type(StructuredColumnType.DATETIME), "DateTime")
+        self.assertEqual(
+            profile.storage_type(StructuredColumnType.DATETIME), "Nullable(DateTime('UTC'))"
+        )
+        self.assertEqual(profile.parameter_type(StructuredColumnType.DATETIME), "DateTime('UTC')")
         self.assertEqual(
             profile.canonical_value_expression("amount", StructuredColumnType.DECIMAL),
             "toString(amount)",
@@ -25,6 +27,14 @@ class ClickHouseCompatibilityProfileTest(unittest.TestCase):
     def test_modern_profile_preserves_datetime_precision(self) -> None:
         value = datetime(2026, 8, 10, 12, 30, 1, 999999)
         profile = ClickHouseCompatibilityProfile.for_mode(ClickHouseCompatibilityMode.MODERN)
+        self.assertEqual(
+            profile.storage_type(StructuredColumnType.DATETIME),
+            "Nullable(DateTime64(3, 'UTC'))",
+        )
+        self.assertEqual(
+            profile.parameter_type(StructuredColumnType.DATETIME),
+            "DateTime64(3, 'UTC')",
+        )
         self.assertEqual(profile.normalize_datetime(value), value)
 
     def test_legacy_profile_settings_are_scoped_and_fresh(self) -> None:

@@ -121,7 +121,7 @@ class ClickHouseGatewayTest(unittest.TestCase):
         )
         gateway.create_table("structured_sales", schema.columns)
         ddl = "\n".join(statement for statement, _settings in ingest.ddl)
-        self.assertIn("Nullable(DateTime)", ddl)
+        self.assertIn("Nullable(DateTime('UTC'))", ddl)
         self.assertNotIn("DateTime64", ddl)
         self.assertEqual(query.queries[0][1]["readonly"], 2)
         self.assertEqual(query.queries[1][1]["readonly"], 2)

@@ -35,7 +35,11 @@ from app.models import ChatMessageModel, ChatState, ResponseParagraphModel
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
 from app.structured_answer import StructuredAnswerService
-from app.structured_models import StructuredClarification, StructuredUnavailable
+from app.structured_models import (
+    StructuredClarification,
+    StructuredColumnType,
+    StructuredUnavailable,
+)
 from app.structured_query import UnsafeStructuredQueryError
 from app.structured_repository import StructuredRepository
 from tests.support.structured_fakes import sample_catalog, sample_multi_metric_catalog
@@ -867,22 +871,19 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(len(gateway.calls), 1)
         answer = messages[-1].paragraphs[0].text
         for expected in (
-            "sales.xlsx",
-            "明细",
-            "avg",
             "订单金额",
+            "平均值",
             "20.1250",
-            "total=4",
-            "valid=3",
-            "null=1",
-            "filters=none",
-            "schema_version=1",
-            "publication_version=pub-sales-1",
-            "publication_id=pub-sales-1",
+        ):
+            self.assertIn(expected, answer)
+        for internal_field in (
+            "source_file=",
+            "schema_version=",
+            "publication_id=",
             "elapsed_ms=",
             "audit_id=",
         ):
-            self.assertIn(expected, answer)
+            self.assertNotIn(internal_field, answer)
         runs = repository.list_agent_runs()
         self.assertEqual(len(runs), 1)
         self.assertEqual([step.tool_name for step in runs[0].steps], ["query_structured_data"])
@@ -927,7 +928,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         reply = messages[-1]
         self.assertEqual(
             reply.paragraphs[0].text,
-            "结构化汇总结果：sales.xlsx / 明细，匹配 4 行，筛选条件：region:eq:华东。",
+            "销售额的总和为 350.50；成本的总和为 200；未计算出利润的总和（没有有效数值）。",
         )
         self.assertEqual(len(reply.artifacts), 1)
         artifact = reply.artifacts[0]
@@ -1124,7 +1125,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(gateway.calls, [])
         self.assertEqual(provider.calls, 0)
 
-    def test_single_metric_existing_answer_format_remains_supported(self) -> None:
+    def test_single_metric_answer_is_user_readable(self) -> None:
         gateway = RecordingClickHouseGateway()
         result = StructuredAnswerService(lambda: sample_catalog(), gateway).try_answer(
             "conv-1",
@@ -1135,9 +1136,68 @@ class StructuredAnswerServiceTest(unittest.TestCase):
 
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertIn("aggregate=sum", result.reply.paragraphs[0].text)
+        answer = result.reply.paragraphs[0].text
+        self.assertIn("订单金额的总和为", answer)
+        self.assertNotIn("source_file=", answer)
+        self.assertNotIn("audit_id=", answer)
         self.assertEqual(result.reply.artifacts, [])
         self.assertEqual(result.steps[0].source_ids, ["kb-sales"])
+
+    def test_datetime_aggregate_answer_hides_internal_audit_fields(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        metric = replace(
+            dataset.schema.columns[0],
+            original_name="温度 (°C)",
+            display_name="温度 (°C)",
+            aliases=("温度 (°C)",),
+        )
+        datetime_column = replace(
+            dataset.schema.columns[2],
+            physical_name="toronto_edt",
+            original_name="时间（Toronto / EDT）",
+            display_name="时间（Toronto / EDT）",
+            data_type=StructuredColumnType.DATETIME,
+            aliases=("时间（Toronto / EDT）",),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(metric, dataset.schema.columns[1], datetime_column),
+                    ),
+                ),
+            ),
+        )
+        result = StructuredAnswerService(
+            lambda: catalog,
+            RecordingClickHouseGateway(
+                result={
+                    "aggregate_value": Decimal("19.705"),
+                    "total_count": 60,
+                    "valid_count": 60,
+                    "null_count": 0,
+                }
+            ),
+        ).try_answer(
+            "conv-1",
+            "多伦多在2026年8月16日00:00到1:00这段时间的平均温度",
+            "quick",
+            [],
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        answer = result.reply.paragraphs[0].text
+        self.assertEqual(
+            answer,
+            "温度 (°C)的平均值为 19.705。",
+        )
+        self.assertNotIn("publication_id", answer)
+        self.assertNotIn("audit_id", answer)
 
     def test_structured_decimal_value_uses_deterministic_thousands_separator(self) -> None:
         gateway = RecordingClickHouseGateway(
@@ -1156,7 +1216,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
 
         _, _, messages = repository.send_message(conversation_id, "订单金额总和", "source")
 
-        self.assertIn("value=12,345.67", messages[-1].paragraphs[0].text)
+        self.assertIn("12,345.67", messages[-1].paragraphs[0].text)
 
     def test_non_structured_query_keeps_legacy_agent_path(self) -> None:
         provider = RecordingLLMProvider()
@@ -1259,7 +1319,7 @@ class StructuredAnswerServiceTest(unittest.TestCase):
         self.assertEqual(provider.calls, 0)
         self.assertEqual(len(gateway.calls), 1)
         self.assertIn("count() AS aggregate_value", gateway.calls[0][0])
-        self.assertIn("aggregate=count", messages[-1].paragraphs[0].text)
+        self.assertIn("条记录", messages[-1].paragraphs[0].text)
 
     def test_catalog_failure_only_marks_strong_structured_shape_unavailable(self) -> None:
         provider = RecordingLLMProvider()

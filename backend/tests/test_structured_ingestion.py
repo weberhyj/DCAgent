@@ -130,6 +130,14 @@ class StructuredIngestionTest(unittest.TestCase):
         )
         self.assertEqual(canonical, b"V23:2026-01-01 10:11:12.987;")
 
+    def test_decimal_negative_zero_is_normalized_before_publication_hashing(self) -> None:
+        from app.structured_ingestion import _decimal_38_9
+
+        value = _decimal_38_9("-0.000000000")
+
+        self.assertEqual(value, Decimal("0.000000000"))
+        self.assertEqual(value.as_tuple().sign, 0)
+
     def test_ingestion_writes_bounded_batches_and_counts_rows(self) -> None:
         confirmed = sample_confirmed_schema(self.temp_dir, row_count=5)
         sink = RecordingParquetSink(self.temp_dir / "parquet")

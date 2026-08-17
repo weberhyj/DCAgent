@@ -571,6 +571,10 @@ def _decimal_38_9(value: Any) -> Decimal:
     with localcontext() as context:
         context.prec = 38
         quantized = number.quantize(Decimal("0.000000001"), rounding=ROUND_HALF_EVEN)
+    # Decimal128/ClickHouse normalize signed zero to plain zero.  Normalize it
+    # before hashing so the pre-insert digest is identical to the stored value.
+    if quantized.is_zero():
+        quantized = quantized.copy_abs()
     if len(quantized.as_tuple().digits) > 38:
         raise ValueError("decimal value exceeds Decimal(38, 9)")
     return quantized

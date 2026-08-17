@@ -30,9 +30,9 @@ class ClickHouseCompatibilityProfile:
             StructuredColumnType.DECIMAL: "Nullable(Decimal(38, 9))",
             StructuredColumnType.DATE: "Nullable(Date)",
             StructuredColumnType.DATETIME: (
-                "Nullable(DateTime)"
+                "Nullable(DateTime('UTC'))"
                 if self.mode is ClickHouseCompatibilityMode.LEGACY_18_16
-                else "Nullable(DateTime64(3))"
+                else "Nullable(DateTime64(3, 'UTC'))"
             ),
             StructuredColumnType.BOOLEAN: "Nullable(UInt8)",
         }
@@ -45,9 +45,9 @@ class ClickHouseCompatibilityProfile:
             StructuredColumnType.DECIMAL: "Decimal(38, 9)",
             StructuredColumnType.DATE: "Date",
             StructuredColumnType.DATETIME: (
-                "DateTime"
+                "DateTime('UTC')"
                 if self.mode is ClickHouseCompatibilityMode.LEGACY_18_16
-                else "DateTime64(3)"
+                else "DateTime64(3, 'UTC')"
             ),
             StructuredColumnType.BOOLEAN: "UInt8",
         }

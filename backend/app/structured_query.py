@@ -5,7 +5,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import PurePath
 from typing import Literal
@@ -82,6 +82,13 @@ _SUMMARY_WORDS = ("汇总", "统计")
 _NUMERIC_TYPES = frozenset({StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL})
 _COMPARISON_OPERATORS = {"大于": "gt", "不少于": "gte", "小于": "lt", "不超过": "lte"}
 _DATE_RANGE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\s*至\s*(\d{4}-\d{2}-\d{2})")
+_NATURAL_DATETIME_RANGE_RE = re.compile(
+    r"(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日?\s*"
+    r"(?P<start_hour>\d{1,2}):(?P<start_minute>\d{2})\s*"
+    r"(?:到|至)\s*"
+    r"(?:(?P<end_year>\d{4})年(?P<end_month>\d{1,2})月(?P<end_day>\d{1,2})日?\s*)?"
+    r"(?P<end_hour>\d{1,2}):(?P<end_minute>\d{2})"
+)
 _DATE_LITERAL_RE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _NUMBER_RE = r"-?\d+(?:\.\d+)?"
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9_]+$")
@@ -177,12 +184,11 @@ class StructuredQueryPlanner:
                 upper_value = _convert_parameter(
                     item.upper_value, column.data_type, self._compatibility
                 )
-                upper_operator = "<="
-                if column.data_type is StructuredColumnType.DATETIME and re.fullmatch(
-                    r"\d{4}-\d{2}-\d{2}", item.upper_value
-                ):
-                    upper_value = upper_value + timedelta(days=1)
-                    upper_operator = "<"
+                upper_value, upper_operator = _between_upper_bound(
+                    column.data_type,
+                    item.upper_value,
+                    upper_value,
+                )
                 parameters[upper_name] = upper_value
                 upper_placeholder = f"{{{upper_name}:{parameter_type}}}"
                 predicates.append(
@@ -282,12 +288,11 @@ class StructuredQueryPlanner:
                 upper_value = _convert_parameter(
                     item.upper_value, column.data_type, self._compatibility
                 )
-                upper_operator = "<="
-                if column.data_type is StructuredColumnType.DATETIME and re.fullmatch(
-                    r"\d{4}-\d{2}-\d{2}", item.upper_value
-                ):
-                    upper_value = upper_value + timedelta(days=1)
-                    upper_operator = "<"
+                upper_value, upper_operator = _between_upper_bound(
+                    column.data_type,
+                    item.upper_value,
+                    upper_value,
+                )
                 parameters[upper_name] = upper_value
                 upper_placeholder = f"{{{upper_name}:{parameter_type}}}"
                 predicates.append(
@@ -367,12 +372,11 @@ class StructuredQueryPlanner:
             upper_value = _convert_parameter(
                 item.upper_value, column.data_type, self._compatibility
             )
-            upper_operator = "<="
-            if column.data_type is StructuredColumnType.DATETIME and re.fullmatch(
-                r"\d{4}-\d{2}-\d{2}", item.upper_value
-            ):
-                upper_value = upper_value + timedelta(days=1)
-                upper_operator = "<"
+            upper_value, upper_operator = _between_upper_bound(
+                column.data_type,
+                item.upper_value,
+                upper_value,
+            )
             parameters[parameter_name] = _convert_parameter(
                 item.value, column.data_type, self._compatibility
             )
@@ -1309,6 +1313,67 @@ def _parse_filter_clause(
     consumed = list(explicit.consumed_spans)
     shared_columns: list[StructuredColumnSchema] = []
 
+    natural_datetime_ranges = tuple(_NATURAL_DATETIME_RANGE_RE.finditer(available))
+    if len(natural_datetime_ranges) > 1:
+        return _ClauseParseResult(issue=StructuredUnavailable("结构化筛选暂不支持多个日期范围"))
+    if natural_datetime_ranges:
+        datetime_columns = tuple(
+            column
+            for column in filter_columns
+            if column.data_type is StructuredColumnType.DATETIME
+        )
+        date_columns = tuple(
+            column for column in filter_columns if column.data_type is StructuredColumnType.DATE
+        )
+        candidate_columns = datetime_columns or date_columns
+        if len(candidate_columns) > 1:
+            return _ClauseParseResult(
+                issue=StructuredClarification(
+                    "日期范围匹配多个日期字段，请选择一个字段",
+                    tuple(sorted(column.display_name for column in candidate_columns)),
+                )
+            )
+        if not candidate_columns:
+            return _ClauseParseResult(
+                issue=StructuredUnavailable("问题包含日期范围，但数据集没有可筛选的日期字段")
+            )
+        range_match = natural_datetime_ranges[0]
+        try:
+            start_value = datetime(
+                int(range_match.group("year")),
+                int(range_match.group("month")),
+                int(range_match.group("day")),
+                int(range_match.group("start_hour")),
+                int(range_match.group("start_minute")),
+            )
+            end_value = datetime(
+                int(range_match.group("end_year") or range_match.group("year")),
+                int(range_match.group("end_month") or range_match.group("month")),
+                int(range_match.group("end_day") or range_match.group("day")),
+                int(range_match.group("end_hour")),
+                int(range_match.group("end_minute")),
+            )
+        except ValueError:
+            return _ClauseParseResult(issue=StructuredUnavailable("日期时间范围格式无效"))
+        if end_value < start_value:
+            return _ClauseParseResult(issue=StructuredUnavailable("日期时间范围的结束时间早于开始时间"))
+        date_column = candidate_columns[0]
+        if date_column.data_type is StructuredColumnType.DATETIME:
+            start_text = start_value.isoformat(timespec="seconds")
+            end_text = end_value.isoformat(timespec="seconds")
+        else:
+            start_text = start_value.date().isoformat()
+            end_text = end_value.date().isoformat()
+        range_span = _TextSpan(range_match.start(), range_match.end())
+        all_matches.append(
+            _FilterMatch(
+                StructuredFilter(date_column.physical_name, "between", start_text, end_text),
+                range_span,
+                (range_span,),
+            )
+        )
+        consumed.append(range_span)
+
     date_ranges = tuple(_DATE_RANGE_RE.finditer(available))
     if len(date_ranges) > 1:
         return _ClauseParseResult(issue=StructuredUnavailable("结构化筛选暂不支持多个日期范围"))
@@ -1819,16 +1884,25 @@ def _column_names(column: StructuredColumnSchema) -> tuple[str, ...]:
 
 
 def _resolution_names(column: StructuredColumnSchema) -> tuple[tuple[int, str], ...]:
-    return tuple(
-        dict.fromkeys(
-            (
-                (0, column.physical_name),
-                (1, column.display_name),
-                (1, column.original_name),
-                *((2, alias) for alias in column.aliases),
-            )
-        )
-    )
+    names = [
+        (0, column.physical_name),
+        (1, column.display_name),
+        (1, column.original_name),
+        *((2, alias) for alias in column.aliases),
+    ]
+    for priority, name in tuple(names):
+        simplified = _strip_parenthetical_suffix(name)
+        # Unit-stripped aliases are primarily for metric phrases such as
+        # “平均温度”; generic filter/date columns like “时间（时区）” must not
+        # match incidental words such as “这段时间”.
+        if simplified != name and column.allow_aggregate:
+            names.append((priority + 1, simplified))
+    return tuple(dict.fromkeys(names))
+
+
+def _strip_parenthetical_suffix(value: str) -> str:
+    simplified = re.sub(r"\s*[（(][^（）()]{1,40}[）)]\s*$", "", value).strip()
+    return simplified or value
 
 
 def _field_pattern(name: str, *, normalized: bool) -> str:
@@ -1920,7 +1994,11 @@ def _convert_parameter(
         if column_type is StructuredColumnType.DATE:
             return date.fromisoformat(value)
         if column_type is StructuredColumnType.DATETIME:
-            return compatibility.normalize_datetime(datetime.fromisoformat(value))
+            # Structured DateTime columns are stored with an explicit UTC
+            # timezone.  Pass an aware UTC value to clickhouse-connect so a
+            # host-local timezone cannot shift the filter by several hours.
+            normalized = compatibility.normalize_datetime(datetime.fromisoformat(value))
+            return normalized.replace(tzinfo=timezone.utc)
         if column_type is StructuredColumnType.BOOLEAN:
             normalized = value.strip().casefold()
             if normalized in {"1", "true", "yes", "是"}:
@@ -1933,6 +2011,28 @@ def _convert_parameter(
             "filter value does not match the confirmed column type"
         ) from error
     return value
+
+
+def _between_upper_bound(
+    column_type: StructuredColumnType,
+    upper_text: str,
+    upper_value: object,
+) -> tuple[object, str]:
+    """Return the normalized upper bound and its comparison operator.
+
+    Date-only ranges represent calendar days, so a DateTime column is expanded
+    to the beginning of the following day and compared exclusively.  A
+    DateTime range that contains an explicit time is also left-closed/right-
+    open.  This prevents a query such as ``00:00 到 01:00`` over minute data
+    from counting the 01:00 row as part of the first hour.
+    """
+    if column_type is StructuredColumnType.DATETIME:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", upper_text):
+            if not isinstance(upper_value, datetime):
+                raise UnsafeStructuredQueryError("datetime upper bound is invalid")
+            return upper_value + timedelta(days=1), "<"
+        return upper_value, "<"
+    return upper_value, "<="
 
 
 def _validate_generated_select(

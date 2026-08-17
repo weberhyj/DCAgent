@@ -540,13 +540,14 @@ class StructuredAggregationEndToEndTest(unittest.TestCase):
                             expected = _reference(aggregate, predicate)
                             self.assertEqual(gateway.last_result, expected)
                             answer = response.json()["messages"][-1]["paragraphs"][0]["text"]
-                            self.assertIn(f"aggregate={aggregate}", answer)
                             self.assertIn(
-                                f"value={format(expected['aggregate_value'], ',')}", answer
+                                format(expected["aggregate_value"], ","),
+                                answer,
                             )
-                            self.assertIn(f"total={expected['total_count']}", answer)
-                            self.assertIn(f"valid={expected['valid_count']}", answer)
-                            self.assertIn(f"null={expected['null_count']}", answer)
+                            self.assertNotIn("查询结果：", answer)
+                            self.assertNotIn("筛选范围：", answer)
+                            self.assertNotIn("source_file=", answer)
+                            self.assertNotIn("audit_id=", answer)
 
                     count_all_conversation = client.post("/api/conversations").json()[
                         "activeConversationId"

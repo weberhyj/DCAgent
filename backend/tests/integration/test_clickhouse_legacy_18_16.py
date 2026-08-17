@@ -712,7 +712,7 @@ class TestClickHouseLegacy1816Acceptance:
                 "units": "Nullable(Int64)",
                 "amount": "Nullable(Decimal(38, 9))",
                 "business_date": "Nullable(Date)",
-                "occurred_at": "Nullable(DateTime)",
+                "occurred_at": "Nullable(DateTime('UTC'))",
                 "enabled": "Nullable(UInt8)",
                 "_source_id": "String",
                 "_dataset_id": "String",
