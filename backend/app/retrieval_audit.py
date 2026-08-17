@@ -167,6 +167,14 @@ class RetrievalAuditRepository:
             )
             return None if record is None else _publication_from_record(record)
 
+    def list_publication_collection_names(self) -> tuple[str, ...]:
+        """Return collection names reserved by the publication audit table."""
+        with self._database.session() as session:
+            values = session.scalars(
+                select(RetrievalPublicationRecord.collection_name)
+            ).all()
+        return tuple(str(value) for value in values)
+
     @contextmanager
     def source_maintenance_lock(self, source_id: str) -> Iterator[None]:
         source = _identifier("source_id", source_id)

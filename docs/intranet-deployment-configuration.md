@@ -397,6 +397,22 @@ set -Eeuo pipefail
 
 ## 9. 构建并激活 Qdrant 检索索引
 
+Ubuntu 原生部署首次启动时，建议在 Embedding、Qdrant 和 PostgreSQL 可用后执行一次幂等引导：
+
+```bash
+cd /opt/DCAgent
+sudo bash tools/start_ubuntu_supervisor_chain.sh
+```
+
+该命令会检查 `retrieval_publications` 与 Qdrant alias：已有一致的 active publication 时直接跳过；
+已有知识片段但没有 active publication 时自动创建下一个 `knowledge_chunks_qwen3_vN` collection、
+完成 BGE-M3 全量构建并激活 alias；知识库为空时安全跳过。数据库审计记录与 Qdrant alias 不一致时会
+失败并要求人工处理，不会覆盖旧 collection。
+
+启动时知识库为空也不会留下永久的“无索引”状态：首次导入普通文档并生成片段后，导入流程会
+自动重复同一套幂等引导，再进行源级增量写入。这样新部署不需要手工预先创建一个空的 Qdrant
+collection。
+
 模板默认使用影子模式：
 
 ```env

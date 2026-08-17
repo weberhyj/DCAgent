@@ -6,7 +6,7 @@ import { normalizeAdminBasePath } from './src/config/adminBasePath'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const apiProxyTarget = env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:9313'
+  const apiProxyTarget = env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8000'
 
   return {
     base: normalizeAdminBasePath(env.VITE_ADMIN_BASE_PATH),

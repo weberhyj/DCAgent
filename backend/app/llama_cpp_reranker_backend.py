@@ -142,13 +142,20 @@ def _parse_results(response: object, passage_count: int) -> list[float]:
             isinstance(raw_score, bool)
             or not isinstance(raw_score, (int, float))
             or not math.isfinite(float(raw_score))
-            or not 0.0 <= float(raw_score) <= 1.0
         ):
             raise ValueError("llama.cpp reranker returned an invalid relevance score")
-        scores[index] = float(raw_score)
+        scores[index] = _logit_to_probability(float(raw_score))
     if len(scores) != passage_count:
         raise ValueError("llama.cpp reranker returned incomplete result indexes")
     return [scores[index] for index in range(passage_count)]
+
+
+def _logit_to_probability(value: float) -> float:
+    """Convert llama.cpp's raw reranker logit into the service score range."""
+    if value >= 0.0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exp_value = math.exp(value)
+    return exp_value / (1.0 + exp_value)
 
 
 def validate_llama_cpp_url(value: str) -> str:

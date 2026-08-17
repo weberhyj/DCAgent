@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 from app.llama_cpp_reranker_backend import LlamaCppRerankerBackend
@@ -19,6 +20,32 @@ class _Transport:
 
 
 class LlamaCppRerankerBackendTests(unittest.TestCase):
+    def test_normalizes_llama_cpp_logits_to_probability_range(self) -> None:
+        transport = _Transport(
+            {
+                "results": [
+                    {"index": 0, "relevance_score": -6.45},
+                    {"index": 1, "relevance_score": -7.93},
+                ]
+            }
+        )
+        backend = LlamaCppRerankerBackend(
+            transport,
+            base_path="/v1/rerank",
+            model="bge-reranker-v2-m3",
+        )
+
+        scores = backend.rerank("where", ["first", "second"])
+
+        self.assertEqual(
+            scores,
+            [
+                1.0 / (1.0 + math.exp(6.45)),
+                1.0 / (1.0 + math.exp(7.93)),
+            ],
+        )
+        self.assertGreater(scores[0], scores[1])
+
     def test_converts_documents_and_restores_scores_by_index(self) -> None:
         transport = _Transport(
             {
@@ -34,7 +61,13 @@ class LlamaCppRerankerBackendTests(unittest.TestCase):
             model="bge-reranker-v2-m3",
         )
 
-        self.assertEqual(backend.rerank("where", ["first", "second"]), [0.9, 0.2])
+        self.assertEqual(
+            backend.rerank("where", ["first", "second"]),
+            [
+                1.0 / (1.0 + math.exp(-0.9)),
+                1.0 / (1.0 + math.exp(-0.2)),
+            ],
+        )
         self.assertEqual(transport.calls[0][0], "/v1/rerank")
         self.assertEqual(
             transport.calls[0][1],

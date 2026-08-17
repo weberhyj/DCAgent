@@ -8,9 +8,35 @@ Before this rollout, install and probe the two independent llama.cpp model proce
 [`LLAMA_CPP_EMBEDDING.md`](./LLAMA_CPP_EMBEDDING.md). Do not rebuild or switch the Qdrant alias until
 the BGE-M3 embedding dimension and both GGUF checksums have been recorded.
 
+On a fresh Ubuntu deployment, run the idempotent bootstrap after PostgreSQL, Qdrant, and the
+Embedding service are available, but before accepting document questions:
+
+```bash
+./tools/bootstrap_retrieval_index.sh
+```
+
+The command skips when an active publication already matches the alias, safely skips an empty
+knowledge base, and creates the first versioned collection when imported knowledge chunks already
+exist. It refuses to continue if the database audit and Qdrant alias disagree.
+
+For Supervisor deployments, use the repository startup wrapper after PostgreSQL, Qdrant, and the
+llama.cpp programs have been installed. It starts the model services, performs the bootstrap, and
+only then starts the API and structured worker:
+
+```bash
+cd /opt/DCAgent
+sudo bash tools/start_ubuntu_supervisor_chain.sh
+```
+
+The wrapper is fail-closed: if the first Qdrant build cannot complete, the API and structured
+worker are not started. On later boots, an already healthy publication is detected and skipped.
+If the knowledge base was empty at boot, the first ordinary document import performs the same
+initialization automatically before source-level upsert.
+
 The production default is `RETRIEVAL_MODE=qwen3` with `RERANKER_ENABLED=true`. Exact Excel and
 Word factual routes remain deterministic and do not call Embedding, Reranker, or LLM; only ordinary
-document routes use the BGE-M3 -> Qdrant/BM25 -> BGE-Reranker-v2-M3 -> Physoc chain.
+document routes use the BGE-M3 -> Qdrant/BM25 -> BGE-Reranker-v2-M3 -> configured
+OpenAI-compatible LLM chain (DeepSeek in the current intranet environment).
 
 ## 1. Deploy code, dependencies, and migrations
 
@@ -44,6 +70,16 @@ First create a new Qdrant collection for the BGE-M3 embedding fingerprint. Reind
 document into that new collection, validate its vector dimension and sample retrieval results, and
 only then atomically switch `QDRANT_COLLECTION_ALIAS`. Never append BGE-M3 vectors to the previous
 Ollama/BGE-large collection; keep the old collection and alias target for rollback.
+
+For the first publication, use the bootstrap command above. The lower-level worker remains
+available when an operator intentionally chooses a collection name:
+
+```bash
+cd /opt/DCAgent/backend
+/srv/dcagent/venv/bin/python -m app.retrieval_index_worker \
+  --collection knowledge_chunks_qwen3_v1 \
+  --activate
+```
 
 Keep `WORD_FACTUAL_QA_ENABLED=false`. For every existing Word knowledge source, submit:
 

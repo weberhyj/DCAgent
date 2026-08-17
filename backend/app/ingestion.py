@@ -22,6 +22,8 @@ class KnowledgeIngestionJob:
 
 
 class KnowledgeIndexLifecycle(Protocol):
+    def ensure_active_publication(self) -> object | None: ...
+
     def upsert_source(
         self,
         source_id: str,
@@ -138,6 +140,12 @@ class KnowledgeIngestionQueue:
             return
         failure_finalized = False
         try:
+
+            ensure_active_publication = getattr(
+                self._index_lifecycle, "ensure_active_publication", None
+            )
+            if callable(ensure_active_publication):
+                ensure_active_publication()
 
             def finalize_index(indexed: object) -> object:
                 publication_id = getattr(indexed, "publication_id", None)

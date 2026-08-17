@@ -134,6 +134,31 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         self.assertEqual(events, [("qdrant", 1), "postgres-indexed", "fence-release"])
         self.assertEqual(self.repository.get_source_index_status(source_id), "indexed")
 
+    def test_first_document_ensures_publication_after_empty_startup(self) -> None:
+        events: list[str] = []
+
+        class FreshLifecycle:
+            def ensure_active_publication(inner_self):
+                events.append("bootstrap-publication")
+
+            def upsert_source(inner_self, source_id, *, finalize=None, on_failure=None):
+                events.append("qdrant-upsert")
+                indexed = SimpleNamespace(publication_id="publication-1", indexed_point_count=1)
+                return indexed if finalize is None else finalize(indexed)
+
+        source_id = "source-first-publication"
+        path = Path(self.temp_dir.name) / "first-publication.txt"
+        path.write_text("first searchable passage", encoding="utf-8")
+        self.repository.add_uploaded_knowledge_source(
+            source_id, path.name, "TXT", "internal", 0, str(path), path.stat().st_size, "text/plain"
+        )
+
+        queue = KnowledgeIngestionQueue(self.repository, index_lifecycle=FreshLifecycle())
+        queue.process(source_id, path, "TXT")
+
+        self.assertEqual(events, ["bootstrap-publication", "qdrant-upsert"])
+        self.assertEqual(self.repository.get_source_index_status(source_id), "indexed")
+
     def test_docx_queue_persists_facts_before_qdrant_publication(self) -> None:
         events: list[str] = []
         source_id = "kb-ingestion-facts"

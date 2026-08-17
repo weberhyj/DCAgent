@@ -427,6 +427,18 @@ class RetrievalIndexPublisher:
             validation_sample_size=validation_sample_size,
         )
 
+    def ensure_active_publication(self) -> RetrievalPublication | None:
+        """Create the first publication when chunks arrive after an empty boot.
+
+        Startup bootstrap intentionally skips an empty knowledge base. The
+        first subsequent document must therefore perform the same idempotent
+        reconciliation before ``upsert_source`` asks for an active index.
+        """
+        from .retrieval_bootstrap import bootstrap_publisher
+
+        bootstrap_publisher(self)
+        return self.audit.active_publication(self._alias_name)
+
     def build(
         self,
         collection_name: str,
