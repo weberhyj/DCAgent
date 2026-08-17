@@ -27,11 +27,11 @@ git pull
 
 echo Going to build and deploy admin page ...
 cd admin-frontend/
-./update_deploy.sh
+bash ./update_deploy.sh
 
 echo Deploying frontend ...
 cd ../frontend/
-./update_deploy.sh
+bash ./update_deploy.sh
 
 echo Install deps and restart backend ...
 cd ../backend/
