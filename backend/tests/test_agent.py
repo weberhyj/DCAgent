@@ -8,6 +8,7 @@ from app.agent import (
     AgentSearchResult,
     KnowledgeAgentTools,
     ReadOnlyKnowledgeAgent,
+    filter_relevant_hits,
     is_greeting_message,
 )
 from app.knowledge_route_models import KnowledgeRouteType
@@ -133,6 +134,75 @@ class RecordingRouteProvider:
 
 
 class AgentTest(unittest.TestCase):
+    def test_relevance_gate_drops_low_scoring_unrelated_sources(self) -> None:
+        town = source("kb-town", "test.docx")
+        spider = source("kb-spider", "蜘蛛侠角色介绍.docx")
+        candidates = [
+            hit(town, chunk("kb-town", 0, "欧洲小镇名称源于犀牛陂的谐音。"), 0.938),
+            hit(town, chunk("kb-town", 1, "欧洲小镇园区规划。"), 0.006),
+            hit(town, chunk("kb-town", 2, "欧洲小镇参观须知。"), 0.0001),
+            hit(spider, chunk("kb-spider", 0, "蜘蛛侠由彼得·帕克担任。"), 0.0014),
+            hit(spider, chunk("kb-spider", 1, "蜘蛛侠的主要能力。"), 0.0),
+        ]
+
+        filtered = filter_relevant_hits(candidates)
+
+        self.assertEqual([item.source.id for item in filtered], ["kb-town", "kb-town"])
+        self.assertEqual([item.chunk.chunk_index for item in filtered], [0, 1])
+        self.assertEqual([item.rank for item in filtered], [1, 2])
+
+    def test_relevance_gate_keeps_independently_relevant_sources(self) -> None:
+        policy = source("kb-policy", "差旅制度.txt")
+        finance = source("kb-finance", "财务规则.txt")
+
+        filtered = filter_relevant_hits(
+            [
+                hit(policy, chunk("kb-policy", 0, "差旅申请需要审批。"), 0.91),
+                hit(finance, chunk("kb-finance", 0, "票据需要提交发票。"), 0.82),
+            ]
+        )
+
+        self.assertEqual(
+            {item.source.id for item in filtered},
+            {"kb-policy", "kb-finance"},
+        )
+
+    def test_agent_never_sends_low_scoring_unrelated_document_to_llm(self) -> None:
+        town = source("kb-town", "test.docx")
+        spider = source("kb-spider", "蜘蛛侠角色介绍.docx")
+        candidates = (
+            hit(town, chunk("kb-town", 0, "欧洲小镇名称源于犀牛陂的谐音。"), 0.938),
+            hit(town, chunk("kb-town", 1, "欧洲小镇园区规划。"), 0.006),
+            hit(spider, chunk("kb-spider", 0, "蜘蛛侠角色起源。"), 0.0014),
+            hit(spider, chunk("kb-spider", 1, "蜘蛛侠人物关系。"), 0.0),
+        )
+        provider = RecordingProvider()
+        agent = ReadOnlyKnowledgeAgent(
+            tools=KnowledgeAgentTools(
+                search_knowledge=lambda query, limit, routing_key: AgentSearchResult(
+                    hits=candidates
+                )
+            ),
+            llm_provider=provider,
+        )
+
+        result = agent.run(
+            conversation_id="conv-town",
+            content="欧洲小镇名字的由来",
+            mode="quick",
+            previous_messages=[],
+        )
+
+        self.assertIsNotNone(provider.request)
+        assert provider.request is not None
+        self.assertEqual(
+            {item.source.id for item in provider.request.knowledge_hits},
+            {"kb-town"},
+        )
+        self.assertEqual(result.evidence_count, 2)
+        self.assertEqual(result.source_count, 1)
+        self.assertEqual(result.route_metadata.candidate_source_ids, ("kb-town",))
+
     def test_pure_greeting_builds_welcome_run_without_external_dependencies(self) -> None:
         def unexpected_call(*args: object, **kwargs: object) -> None:
             raise AssertionError("greeting must not call external dependencies")

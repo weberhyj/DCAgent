@@ -183,6 +183,68 @@ def merge_ranked_hits(
     ]
 
 
+def filter_relevant_hits(
+    hits: Sequence[KnowledgeSearchHitModel],
+    *,
+    relative_score_floor: float = 0.05,
+    minimum_score_floor: float = 0.01,
+    adjacency_distance: int = 1,
+) -> list[KnowledgeSearchHitModel]:
+    """Drop unrelated sources before evidence is passed to the LLM.
+
+    Hybrid retrieval intentionally returns a bounded candidate set, which can
+    include low-scoring documents (especially when bounded adjacency expands a
+    result).  Those candidates must not become LLM evidence just because they
+    fit inside ``top_k``.  A hit is retained when its source has an anchor hit
+    above a relative score floor, plus at most the immediately adjacent chunks
+    around each anchor so a split passage remains readable.
+    """
+    hit_list = list(hits)
+    if not hit_list:
+        return []
+    if any(value < 0 for value in (relative_score_floor, minimum_score_floor)):
+        raise ValueError("score floors must be non-negative")
+    if adjacency_distance < 0:
+        raise ValueError("adjacency_distance must be non-negative")
+
+    top_score = max(hit.score for hit in hit_list)
+    if top_score <= 0:
+        return []
+    cutoff = max(minimum_score_floor, top_score * relative_score_floor)
+    anchors = [hit for hit in hit_list if hit.score >= cutoff]
+    if not anchors:
+        return []
+
+    anchor_indices: dict[str, list[int]] = {}
+    for hit in anchors:
+        anchor_indices.setdefault(hit.source.id, []).append(hit.chunk.chunk_index)
+
+    filtered: list[KnowledgeSearchHitModel] = []
+    for hit in hit_list:
+        indices = anchor_indices.get(hit.source.id)
+        if not indices:
+            continue
+        if hit.score >= cutoff or any(
+            abs(hit.chunk.chunk_index - anchor_index) <= adjacency_distance
+            for anchor_index in indices
+        ):
+            filtered.append(hit)
+
+    filtered.sort(key=lambda hit: (-hit.score, hit.source.name, hit.chunk.chunk_index))
+    return [
+        KnowledgeSearchHitModel(
+            source=hit.source,
+            chunk=hit.chunk,
+            score=hit.score,
+            keyword_score=hit.keyword_score,
+            vector_score=hit.vector_score,
+            rank=index,
+            matched_terms=hit.matched_terms,
+        )
+        for index, hit in enumerate(filtered, start=1)
+    ]
+
+
 def build_comparison_context(hits: list[KnowledgeSearchHitModel], search_rounds: int) -> str:
     source_names = list(dict.fromkeys(hit.source.name for hit in hits))
     if not source_names:
@@ -438,8 +500,9 @@ class ReadOnlyKnowledgeAgent:
 
     def _compare(self, state: AgentState) -> dict:
         rounds = state["query_index"] + 1
-        context = build_comparison_context(state["knowledge_hits"], rounds)
-        source_ids = list(dict.fromkeys(hit.source.id for hit in state["knowledge_hits"]))
+        filtered_hits = filter_relevant_hits(state["knowledge_hits"])
+        context = build_comparison_context(filtered_hits, rounds)
+        source_ids = list(dict.fromkeys(hit.source.id for hit in filtered_hits))
         step = self._step(
             state,
             "compare_evidence",
@@ -447,7 +510,11 @@ class ReadOnlyKnowledgeAgent:
             context,
             source_ids,
         )
-        return {"agent_context": context, "steps": [*state["steps"], step]}
+        return {
+            "knowledge_hits": filtered_hits,
+            "agent_context": context,
+            "steps": [*state["steps"], step],
+        }
 
     def _answer(self, state: AgentState) -> dict:
         context = state["agent_context"] or build_comparison_context(
