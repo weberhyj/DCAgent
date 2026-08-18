@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 from typing import Annotated
 
+from asynctor.contrib.fastapi import ClientIpDep
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -506,6 +507,7 @@ def reindex_knowledge_source(
 
 @router.post("/knowledge/uploads", response_model=list[KnowledgeSource])
 async def upload_knowledge_file(
+    user_ip: ClientIpDep,
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
     classification: str = Form(default="公开"),
@@ -516,10 +518,13 @@ async def upload_knowledge_file(
     selected_files = files or ([file] if file is not None else [])
     if not selected_files:
         raise HTTPException(status_code=400, detail="Upload at least one knowledge file")
+    logger.info(f"Received {len(selected_files)=} from {user_ip} with {classification=}")
 
     for upload in selected_files:
         content = await upload.read()
-        stored = storage.save(upload.filename or "", content)
+        filename = upload.filename or ""
+        logger.info(f"Going to handle knowledge {filename=}, {len(content)=}")
+        stored = storage.save(filename, content)
         repository.add_uploaded_knowledge_source(
             source_id=stored.source_id,
             name=stored.original_name,

@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import Condition
 from typing import Any
 
-from asynctor.contrib.fastapi import config_access_log
+from asynctor.contrib.fastapi import add_timing_middleware, config_access_log
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.engine import make_url
@@ -305,6 +305,7 @@ def _build_app(*, lifespan: Any | None = None) -> FastAPI:
     )
     app.include_router(router)
     config_access_log(app)
+    add_timing_middleware(app)
     return app
 
 
