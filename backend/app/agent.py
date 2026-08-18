@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -29,6 +30,56 @@ GREETING_REPLY = (
 )
 GREETING_PHRASES = frozenset(
     {"你好", "您好", "嗨", "哈喽", "在吗", "你在吗", "你是谁", "介绍一下你自己"}
+)
+FOLLOW_UP_PREFIXES = (
+    "继续",
+    "再说",
+    "再补充",
+    "补充一下",
+    "还有",
+    "那",
+    "那么",
+    "这个",
+    "那个",
+    "这两个",
+    "那两个",
+    "两者",
+    "两份",
+    "各自",
+    "哪个",
+    "上述",
+    "前面",
+    "刚才",
+    "他",
+    "她",
+    "它",
+    "他们",
+    "她们",
+    "它们",
+    "该人",
+    "该项目",
+    "该制度",
+    "对此",
+    "what about",
+    "how about",
+    "continue",
+)
+FOLLOW_UP_REFERENCES = (
+    "上一个",
+    "上一条",
+    "前一个",
+    "前面提到",
+    "刚才提到",
+    "上面说的",
+    "上面的内容",
+    "上述内容",
+    "前述",
+    "前文",
+    "之前",
+    "刚刚的",
+    "这个答案",
+    "这个结果",
+    "它们之间",
 )
 
 
@@ -138,6 +189,19 @@ def is_greeting_message(content: str) -> bool:
         and character not in {"~", "～"}
     ).casefold()
     return normalized in GREETING_PHRASES
+
+
+def is_follow_up_message(content: str) -> bool:
+    """Return whether a question depends on preceding conversation context."""
+
+    normalized = re.sub(r"\s+", " ", content).strip().casefold()
+    if not normalized:
+        return False
+    if normalized.startswith(FOLLOW_UP_PREFIXES):
+        return True
+    if any(reference in normalized for reference in FOLLOW_UP_REFERENCES):
+        return True
+    return normalized.rstrip("？? ").endswith(("呢", "又如何", "还有吗"))
 
 
 def build_agent_search_queries(content: str, mode: ComposerMode) -> list[str]:
@@ -464,11 +528,17 @@ class ReadOnlyKnowledgeAgent:
         ):
             fallback_reasons.append(search_result.fallback_reason)
         source_ids = list(dict.fromkeys(hit.source.id for hit in hits))
+        evidence_audit = ", ".join(
+            f"{hit.chunk.id}:{hit.score:.6f}" for hit in hits[: self.max_hits]
+        )
+        output_summary = f"命中 {len(hits)} 个片段，累计保留 {len(merged)} 个片段"
+        if evidence_audit:
+            output_summary += f"；evidence={evidence_audit}"
         step = self._step(
             state,
             "search_knowledge",
             query,
-            f"命中 {len(hits)} 个片段，累计保留 {len(merged)} 个片段",
+            output_summary,
             source_ids,
         )
         return {
@@ -528,12 +598,12 @@ class ReadOnlyKnowledgeAgent:
                 knowledge_hits=state["knowledge_hits"],
                 previous_messages=state["previous_messages"],
                 agent_context=context,
-                include_history=state["route_type"]
-                not in {
-                    KnowledgeRouteType.WORD_FACTUAL,
-                    KnowledgeRouteType.EXCEL_ROW_LOOKUP,
-                    KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE,
-                    KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+                include_history=bool(state["previous_messages"])
+                and is_follow_up_message(state["content"])
+                and state["route_type"]
+                in {
+                    KnowledgeRouteType.DOCUMENT_QA,
+                    KnowledgeRouteType.SUMMARY_COMPARE,
                 },
             )
         )

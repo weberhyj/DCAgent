@@ -23,6 +23,9 @@ from .physoc_sse import PhysocStreamError, collect_physoc_response, iter_sse_lin
 from .time_utils import display_datetime_label
 
 NO_EVIDENCE_REPLY = "未检索到足够依据。请先在知识库中补充相关资料，或换一个更具体的问题重新检索。"
+DETERMINISTIC_TEMPERATURE = 0
+DETERMINISTIC_TOP_P = 1
+DETERMINISTIC_SEED = 42
 RAG_SYSTEM_PROMPT = (
     "你是 DCAgent，面向公司内部资料库的知识检索智能体。"
     "你必须只基于用户本次请求中提供的可用知识片段回答。"
@@ -104,7 +107,12 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 },
                 {"role": "user", "content": build_prompt(request)},
             ],
-            "temperature": 0.1,
+            # Knowledge-base answers should be reproducible when the question
+            # and evidence are unchanged. Ollama's OpenAI-compatible endpoint
+            # accepts these sampling controls directly.
+            "temperature": DETERMINISTIC_TEMPERATURE,
+            "top_p": DETERMINISTIC_TOP_P,
+            "seed": DETERMINISTIC_SEED,
         }
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:

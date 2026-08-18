@@ -9,6 +9,9 @@ import httpx
 
 from app import llm as llm_module
 from app.llm import (
+    DETERMINISTIC_SEED,
+    DETERMINISTIC_TEMPERATURE,
+    DETERMINISTIC_TOP_P,
     NO_EVIDENCE_REPLY,
     RAG_SYSTEM_PROMPT,
     LLMProviderError,
@@ -527,7 +530,9 @@ class LLMProviderTest(unittest.TestCase):
         self.assertEqual(request["headers"]["Authorization"], "Bearer test-key")
         payload = request["json"]
         self.assertEqual(payload["model"], "dc-agent-test-model")
-        self.assertEqual(payload["temperature"], 0.1)
+        self.assertEqual(payload["temperature"], DETERMINISTIC_TEMPERATURE)
+        self.assertEqual(payload["top_p"], DETERMINISTIC_TOP_P)
+        self.assertEqual(payload["seed"], DETERMINISTIC_SEED)
         self.assertEqual(payload["messages"][0]["role"], "system")
         self.assertEqual(payload["messages"][0]["content"], RAG_SYSTEM_PROMPT)
         self.assertIn("不要在回答中输出", payload["messages"][0]["content"])

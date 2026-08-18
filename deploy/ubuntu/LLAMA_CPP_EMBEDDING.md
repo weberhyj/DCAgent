@@ -199,6 +199,8 @@ OFFLINE_MODE=true
 
 `LLM_API_KEY` 在这个 loopback 部署中只是 OpenAI-compatible 客户端要求的非空占位值；Ollama
 本机接口不会使用它。不要复用公司真实密钥，也不要把 Ollama 监听到 `0.0.0.0`。
+生成请求在代码中固定使用 `temperature=0`、`top_p=1` 和 `seed=42`；普通独立问题
+不携带会话历史，只有包含“继续”、“那他呢”、“刚才提到的”等明确指代的追问才携带历史。
 
 ## 4. 重建向量与切换 alias
 

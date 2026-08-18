@@ -9,6 +9,7 @@ from app.agent import (
     KnowledgeAgentTools,
     ReadOnlyKnowledgeAgent,
     filter_relevant_hits,
+    is_follow_up_message,
     is_greeting_message,
 )
 from app.knowledge_route_models import KnowledgeRouteType
@@ -134,6 +135,73 @@ class RecordingRouteProvider:
 
 
 class AgentTest(unittest.TestCase):
+    def test_history_is_only_enabled_for_context_dependent_follow_ups(self) -> None:
+        previous_messages = [
+            ChatMessageModel(
+                id="msg-user-previous",
+                role="user",
+                time="2026-08-18 10:00:00",
+                paragraphs=[ResponseParagraphModel(text="张三的职务是什么")],
+            )
+        ]
+        policy = source("kb-policy", "people.docx")
+        provider = RecordingProvider()
+        agent = ReadOnlyKnowledgeAgent(
+            tools=KnowledgeAgentTools(
+                search_knowledge=lambda query, limit, routing_key: AgentSearchResult(
+                    hits=(hit(policy, chunk("kb-policy", 0, "张三负责财务审批。"), 0.95),)
+                )
+            ),
+            llm_provider=provider,
+        )
+
+        agent.run(
+            conversation_id="conv-history",
+            content="张三负责哪些工作",
+            mode="quick",
+            previous_messages=previous_messages,
+        )
+        assert provider.request is not None
+        self.assertFalse(provider.request.include_history)
+
+        agent.run(
+            conversation_id="conv-history",
+            content="那他的审批范围呢？",
+            mode="quick",
+            previous_messages=previous_messages,
+        )
+        assert provider.request is not None
+        self.assertTrue(provider.request.include_history)
+
+    def test_follow_up_detection_requires_an_explicit_context_reference(self) -> None:
+        independent = ("张三负责哪些工作", "报销流程是什么", "介绍一下蜘蛛侠")
+        follow_ups = ("那他的职务呢？", "继续介绍", "刚才提到的制度适用谁？")
+
+        self.assertTrue(all(not is_follow_up_message(item) for item in independent))
+        self.assertTrue(all(is_follow_up_message(item) for item in follow_ups))
+
+    def test_search_audit_records_stable_chunk_ids_and_scores(self) -> None:
+        policy = source("kb-policy", "policy.docx")
+        provider = RecordingProvider()
+        agent = ReadOnlyKnowledgeAgent(
+            tools=KnowledgeAgentTools(
+                search_knowledge=lambda query, limit, routing_key: AgentSearchResult(
+                    hits=(hit(policy, chunk("kb-policy", 3, "差旅申请需要审批。"), 0.937654),)
+                )
+            ),
+            llm_provider=provider,
+        )
+
+        result = agent.run(
+            conversation_id="conv-audit",
+            content="差旅申请如何审批",
+            mode="quick",
+            previous_messages=[],
+        )
+
+        search_step = next(step for step in result.steps if step.tool_name == "search_knowledge")
+        self.assertIn("evidence=chunk-kb-policy-3:0.937654", search_step.output_summary)
+
     def test_relevance_gate_drops_low_scoring_unrelated_sources(self) -> None:
         town = source("kb-town", "test.docx")
         spider = source("kb-spider", "蜘蛛侠角色介绍.docx")

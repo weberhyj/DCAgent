@@ -88,6 +88,9 @@ OFFLINE_MODE=true
 完整的模型命令、Supervisor 配置和探针见
 [`deploy/ubuntu/LLAMA_CPP_EMBEDDING.md`](deploy/ubuntu/LLAMA_CPP_EMBEDDING.md)。这里的
 `LLM_API_KEY` 是无鉴权 loopback Ollama 服务的非空客户端占位值，不应替换为公司真实密钥。
+知识库生成请求固定使用 `temperature=0`、`top_p=1`、`seed=42`。独立问题不会携带
+历史回答；只有“继续”、“那他呢”、“刚才提到的”等明确追问才会使用最近会话。
+检索步骤的问答审计会记录候选片段 ID 和分数，可用于对比重复问题是否获得了相同依据。
 
 ### Physoc DeepSeek 模式
 
