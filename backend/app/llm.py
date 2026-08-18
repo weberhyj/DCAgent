@@ -5,10 +5,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from ipaddress import ip_address, ip_network
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-import httpx
+import httpx2 as httpx
+from asynctor.jsons import json_dumps, json_loads
 
 from .answer_text import normalize_plain_text_answer
 from .models import (
@@ -94,6 +96,20 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         self.model = model
         self.timeout_seconds = timeout_seconds
 
+    def http_chat(self, client: httpx.Client, payload: dict) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        url = f"{self.api_base}/chat/completions"
+        try:
+            response = client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return json_loads(response.content)
+        except httpx.HTTPError as e:
+            msg = ""
+            if isinstance(e, httpx.TimeoutException):
+                msg += f"{self.timeout_seconds = }, "
+            msg += f"payload:\n{json_dumps(payload, pretty=True)}"
+            raise httpx.HTTPError(msg) from e
+
     def generate_reply(self, request: LLMRequest) -> ChatMessageModel:
         if not request.knowledge_hits:
             return build_no_evidence_reply()
@@ -114,14 +130,9 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             "top_p": DETERMINISTIC_TOP_P,
             "seed": DETERMINISTIC_SEED,
         }
-        headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
-                response = client.post(
-                    f"{self.api_base}/chat/completions", json=payload, headers=headers
-                )
-                response.raise_for_status()
-                data = response.json()
+                data = self.http_chat(client, payload)
             content = normalize_plain_text_answer(str(data["choices"][0]["message"]["content"]))
         except httpx.TimeoutException as exc:
             raise LLMProviderError("大模型响应超时，请稍后重试。") from exc
