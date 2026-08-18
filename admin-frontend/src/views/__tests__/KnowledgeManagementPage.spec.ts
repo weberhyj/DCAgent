@@ -199,7 +199,7 @@ describe('KnowledgeManagementPage', () => {
     expect(wrapper.find('[data-testid="knowledge-source-loading"]').exists()).toBe(true)
     expect(document.querySelector('[data-testid="knowledge-upload-progress"]')).not.toBeNull()
     expect(wrapper.text()).toContain('正在刷新资料清单')
-    expect(document.body.textContent).toContain('上传后正在解析并建立索引')
+    expect(document.body.textContent).toContain('文件上传中，完成后将由后台解析并建立索引')
   })
 
   it('confirms before deleting a knowledge source', async () => {

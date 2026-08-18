@@ -23,8 +23,8 @@ import type {
 import { isStructuredKnowledgeSource } from '@/utils/knowledgeSources'
 
 const KNOWLEDGE_INDEXING_STATUS: KnowledgeSource['status'] = '解析中'
-const KNOWLEDGE_POLL_INTERVAL_MS = 800
-const KNOWLEDGE_POLL_ATTEMPTS = 5
+const KNOWLEDGE_POLL_INTERVAL_MS = 1000
+const KNOWLEDGE_POLL_ATTEMPTS = 300
 const STRUCTURED_POLL_INTERVAL_MS = 800
 
 function hasIndexingSource(sources: readonly KnowledgeSource[]) {
@@ -89,6 +89,9 @@ export function useChatKnowledgeManagement() {
     error.value = null
     try {
       knowledgeSources.value = await fetchKnowledgeSources()
+      if (hasIndexingSource(knowledgeSources.value)) {
+        void pollKnowledgeSourcesWhileIndexing()
+      }
     } catch {
       error.value = '资料库列表读取失败，请确认 FastAPI 后端已启动。'
     } finally {

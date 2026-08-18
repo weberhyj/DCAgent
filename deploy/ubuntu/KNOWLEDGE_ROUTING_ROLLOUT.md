@@ -50,8 +50,9 @@ cd /opt/DCAgent/backend
 ./.venv/bin/python -m app.migration_entrypoint
 cd /opt/DCAgent
 sudo supervisorctl restart dcagent-api
+sudo supervisorctl restart dcagent-ingestion-worker
 sudo supervisorctl restart dcagent-structured-worker
-sudo supervisorctl status dcagent-api dcagent-structured-worker
+sudo supervisorctl status dcagent-api dcagent-ingestion-worker dcagent-structured-worker
 ```
 
 At this stage keep the API configuration at:
@@ -61,8 +62,9 @@ UNIFIED_KNOWLEDGE_ROUTING_ENABLED=false
 WORD_FACTUAL_QA_ENABLED=false
 ```
 
-Confirm both Supervisor programs are `RUNNING`. Do not stop `dcagent-structured-worker`; it remains
-responsible for structured Excel imports.
+Confirm all Supervisor programs are `RUNNING`. Do not stop `dcagent-ingestion-worker` or
+`dcagent-structured-worker`; they remain responsible for uploaded document parsing and structured
+Excel imports.
 
 ## 2. Reindex Word sources before enabling factual QA
 
@@ -105,12 +107,12 @@ UNIFIED_KNOWLEDGE_ROUTING_ENABLED=true
 WORD_FACTUAL_QA_ENABLED=true
 ```
 
-Restart only the API and leave the structured worker running:
+Restart the API and ingestion worker, and leave the structured worker running:
 
 ```bash
 cd /opt/DCAgent
-sudo supervisorctl restart dcagent-api
-sudo supervisorctl status dcagent-api dcagent-structured-worker
+sudo supervisorctl restart dcagent-api dcagent-ingestion-worker
+sudo supervisorctl status dcagent-api dcagent-ingestion-worker dcagent-structured-worker
 ```
 
 The API must refuse startup if `WORD_FACTUAL_QA_ENABLED=true` while
@@ -146,10 +148,11 @@ Then restart only the API:
 
 ```bash
 cd /opt/DCAgent
-sudo supervisorctl restart dcagent-api
-sudo supervisorctl status dcagent-api dcagent-structured-worker
+sudo supervisorctl restart dcagent-api dcagent-ingestion-worker
+sudo supervisorctl status dcagent-api dcagent-ingestion-worker dcagent-structured-worker
 ```
 
 This restores the legacy greeting -> structured -> Agent order without Word factual routing. Do not
 drop or truncate `knowledge_facts`, remove ClickHouse tables or Qdrant publications, delete indexed
-data, stop `dcagent-structured-worker`, or perform any destructive database action.
+data, stop `dcagent-ingestion-worker` / `dcagent-structured-worker`, or perform any destructive
+database action.

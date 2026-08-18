@@ -13,6 +13,7 @@ RERANKER_PROGRAM="${DCAGENT_RERANKER_PROGRAM:-dcagent-llama-reranker}"
 LLM_PROGRAM="${DCAGENT_LLM_PROGRAM:-dcagent-ollama-llm}"
 API_PROGRAM="${DCAGENT_API_PROGRAM:-dcagent-api}"
 WORKER_PROGRAM="${DCAGENT_WORKER_PROGRAM:-dcagent-structured-worker}"
+INGESTION_PROGRAM="${DCAGENT_INGESTION_PROGRAM:-dcagent-ingestion-worker}"
 
 if [[ -z "$BOOTSTRAP_SCRIPT" ]]; then
   SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -33,10 +34,10 @@ echo "Starting llama.cpp Embedding/Reranker and Ollama LLM services..."
 echo "Reconciling the Qdrant retrieval publication..."
 "$BOOTSTRAP_SCRIPT"
 
-echo "Starting API and structured worker..."
-"$SUPERVISORCTL" start "$API_PROGRAM" "$WORKER_PROGRAM"
+echo "Starting API, knowledge ingestion worker, and structured worker..."
+"$SUPERVISORCTL" start "$API_PROGRAM" "$INGESTION_PROGRAM" "$WORKER_PROGRAM"
 
 echo "Supervisor status:"
 "$SUPERVISORCTL" status \
   "$EMBEDDING_PROGRAM" "$RERANKER_PROGRAM" "$LLM_PROGRAM" \
-  "$API_PROGRAM" "$WORKER_PROGRAM"
+  "$API_PROGRAM" "$INGESTION_PROGRAM" "$WORKER_PROGRAM"

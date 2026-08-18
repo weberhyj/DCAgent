@@ -13,6 +13,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
 )
 from fastapi.responses import JSONResponse
@@ -439,10 +440,12 @@ def send_message(
 
 @router.get("/knowledge/sources", response_model=list[KnowledgeSource])
 def list_knowledge_sources(
+    request: Request,
     repository: ChatRepository = Depends(get_repository),
     ingestion_queue: KnowledgeIngestionQueue = Depends(get_ingestion_queue),
 ) -> list[KnowledgeSource]:
-    ingestion_queue.drain()
+    if not getattr(request.app.state, "asynchronous_knowledge_ingestion", False):
+        ingestion_queue.drain()
     return [KnowledgeSource.from_model(source) for source in repository.list_knowledge_sources()]
 
 
@@ -482,6 +485,7 @@ def delete_knowledge_source(
 @router.post("/knowledge/sources/{source_id}/reindex", response_model=list[KnowledgeSource])
 def reindex_knowledge_source(
     source_id: str,
+    request: Request,
     repository: ChatRepository = Depends(get_repository),
     ingestion_queue: KnowledgeIngestionQueue = Depends(get_ingestion_queue),
 ) -> list[KnowledgeSource]:
@@ -501,13 +505,16 @@ def reindex_knowledge_source(
     )
     if retried is None or not hasattr(retried, "id"):
         raise RuntimeError("knowledge source reindex did not finalize")
-    ingestion_queue.enqueue(retried.id, retried.file_path, retried.source_type)
+    if not getattr(request.app.state, "asynchronous_knowledge_ingestion", False):
+        ingestion_queue.enqueue(retried.id, retried.file_path, retried.source_type)
     return [KnowledgeSource.from_model(item) for item in repository.list_knowledge_sources()]
 
 
 @router.post("/knowledge/uploads", response_model=list[KnowledgeSource])
 async def upload_knowledge_file(
     user_ip: ClientIpDep,
+    request: Request,
+    response: Response,
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
     classification: str = Form(default="公开"),
@@ -535,12 +542,16 @@ async def upload_knowledge_file(
             file_size=stored.size,
             mime_type=upload.content_type,
         )
-        await run_in_threadpool(
-            ingestion_queue.process,
-            stored.source_id,
-            stored.path,
-            stored.source_type,
-        )
+        if not getattr(request.app.state, "asynchronous_knowledge_ingestion", False):
+            await run_in_threadpool(
+                ingestion_queue.process,
+                stored.source_id,
+                stored.path,
+                stored.source_type,
+            )
+
+    if getattr(request.app.state, "asynchronous_knowledge_ingestion", False):
+        response.status_code = 202
 
     return [KnowledgeSource.from_model(source) for source in repository.list_knowledge_sources()]
 

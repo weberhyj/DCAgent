@@ -241,6 +241,7 @@ def create_app(
     structured_query_enabled: bool = False,
     llm_provider: LLMProvider | None = None,
     health_registry: DependencyHealthRegistry | None = None,
+    asynchronous_knowledge_ingestion: bool = False,
 ) -> FastAPI:
     owns_repository = repository is None
     if repository is None:
@@ -267,6 +268,7 @@ def create_app(
         structured_repository=structured_repository,
         structured_query_enabled=structured_query_enabled,
     )
+    app.state.asynchronous_knowledge_ingestion = asynchronous_knowledge_ingestion
     app.state.knowledge_file_storage = KnowledgeFileStorage(
         upload_dir or Path(__file__).resolve().parents[1] / "uploads" / "knowledge"
     )
@@ -603,6 +605,10 @@ def create_production_app(
             application.state.retrieval_gateway = retrieval_gateway
             application.state.retrieval_scope_provider = retrieval_scope_provider
             application.state.knowledge_ingestion_queue = ingestion_queue
+            # Production HTTP workers only persist the uploaded source. Its
+            # ``解析中`` source row is the durable queue; app.ingestion_worker
+            # owns parsing/indexing so large files never occupy an API worker.
+            application.state.asynchronous_knowledge_ingestion = True
             application.state.knowledge_file_storage = storage
             application.state.evaluation_import_service = evaluation_service
             application.state.health_registry = health_registry

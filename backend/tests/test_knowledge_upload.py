@@ -9,7 +9,7 @@ from docx import Document
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.repository import InMemoryChatRepository
+from app.repository import STATUS_INDEXING, InMemoryChatRepository
 from app.seed import build_seed_state
 
 
@@ -58,6 +58,41 @@ class KnowledgeUploadTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()[0]["classification"], "公开")
+
+    def test_production_style_upload_enqueues_and_returns_before_parsing(self) -> None:
+        class RecordingQueue:
+            def __init__(self) -> None:
+                self.enqueued: list[tuple[str, Path, str]] = []
+                self.process_calls = 0
+
+            def enqueue(self, source_id: str, path: Path, source_type: str) -> None:
+                self.enqueued.append((source_id, Path(path), source_type))
+
+            def process(self, source_id: str, path: Path, source_type: str) -> None:
+                self.process_calls += 1
+
+        queue = RecordingQueue()
+        client = TestClient(
+            create_app(
+                repository=self.repository,
+                upload_dir=Path(self.temp_dir.name),
+                ingestion_queue=queue,  # type: ignore[arg-type]
+                asynchronous_knowledge_ingestion=True,
+            )
+        )
+
+        response = client.post(
+            "/api/knowledge/uploads",
+            files={"file": ("async-policy.txt", b"async policy" * 20, "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        uploaded = response.json()[0]
+        self.assertEqual(uploaded["status"], STATUS_INDEXING)
+        self.assertEqual(uploaded["records"], 0)
+        self.assertEqual(queue.process_calls, 0)
+        self.assertEqual(queue.enqueued, [])
+        self.assertEqual(self.repository.list_knowledge_chunks(uploaded["id"]), [])
 
     def test_uploads_file_and_indexes_before_returning(self) -> None:
         response = self.client.post(

@@ -334,7 +334,7 @@ function formatFileSize(bytes?: number | null) {
         </button>
 
         <div v-if="knowledgeUploading" class="inline-state" data-testid="knowledge-upload-progress">
-          <i aria-hidden="true" />上传后正在解析并建立索引
+          <i aria-hidden="true" />文件上传中，完成后将由后台解析并建立索引
         </div>
 
         <label class="field-label">
@@ -348,7 +348,7 @@ function formatFileSize(bytes?: number | null) {
           </BaseButton>
           <BaseButton type="submit" variant="primary" :disabled="!canUpload">
             <FileUp :size="16" />
-            {{ knowledgeUploading ? '上传解析中' : '上传并解析' }}
+            {{ knowledgeUploading ? '上传中' : '上传并解析' }}
           </BaseButton>
         </div>
         <p v-if="error" class="page-error">{{ error }}</p>

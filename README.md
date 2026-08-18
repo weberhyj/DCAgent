@@ -92,6 +92,12 @@ OFFLINE_MODE=true
 历史回答；只有“继续”、“那他呢”、“刚才提到的”等明确追问才会使用最近会话。
 检索步骤的问答审计会记录候选片段 ID 和分数，可用于对比重复问题是否获得了相同依据。
 
+生产环境的 `/api/knowledge/uploads` 只负责接收并落盘文件、创建状态为“解析中”的资料源，随后
+以 HTTP `202` 返回；Word、PDF、TXT 等解析、切片和检索索引由独立的
+`python -m app.ingestion_worker` 进程完成。Worker 会从 PostgreSQL 重新发现尚未完成的资料源，
+因此 API 或 Worker 重启不会丢失已经落盘的上传任务。Excel/CSV 完成表结构预览后，后续正式
+结构化发布仍由 `python -m app.structured_worker` 执行，这两个 Worker 都需要由 Supervisor 常驻。
+
 ### Physoc DeepSeek 模式
 
 Physoc DeepSeek 流式接口可以按以下方式配置，示例使用本机 loopback 地址：

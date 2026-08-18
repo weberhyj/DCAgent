@@ -109,6 +109,29 @@ stderr_logfile=/var/log/dcagent/ollama-llm-error.log
 environment=HOME="/home/dcagent",PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",OLLAMA_HOST="127.0.0.1:11434",OLLAMA_MODELS="/srv/dcagent/models/ollama"
 ```
 
+普通知识资料上传还需要独立的异步解析 Worker。创建
+`/etc/supervisor/conf.d/dcagent-ingestion-worker.conf`：
+
+```ini
+[program:dcagent-ingestion-worker]
+directory=/srv/dcagent/backend
+command=/srv/dcagent/backend/.venv/bin/python -m app.ingestion_worker
+user=dcagent
+environment=PYTHONUNBUFFERED="1"
+autostart=true
+autorestart=true
+startsecs=5
+stopsignal=TERM
+stopwaitsecs=120
+stdout_logfile=/var/log/dcagent/ingestion-worker.log
+stderr_logfile=/var/log/dcagent/ingestion-worker-error.log
+```
+
+该 Worker 必须与 `dcagent-api` 使用同一份环境变量、PostgreSQL 和上传目录，并且只启动一个实例。
+上传接口返回 `202` 后，资料会保持“解析中”，由该进程完成解析、切片和检索索引。Excel/CSV
+表结构预览也由它生成；确认表结构后的 ClickHouse 正式导入仍由
+`dcagent-structured-worker` 完成。
+
 加载配置并确认进程：
 
 ```bash
@@ -215,8 +238,10 @@ Excel 行级查询和 Word 年龄/性别/职务事实查询不依赖 Embedding�
 
 ```bash
 set -Eeuo pipefail
-sudo supervisorctl restart dcagent-api dcagent-structured-worker
-sudo supervisorctl status dcagent-api dcagent-structured-worker dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl restart dcagent-api dcagent-ingestion-worker dcagent-structured-worker
+sudo supervisorctl status dcagent-api dcagent-ingestion-worker dcagent-structured-worker dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm
 curl --fail-with-body --silent --show-error http://127.0.0.1:8000/readyz
 ```
 
@@ -225,9 +250,9 @@ Supervisor 回滚命令：
 
 ```bash
 set -Eeuo pipefail
-sudo supervisorctl stop dcagent-api dcagent-structured-worker
+sudo supervisorctl stop dcagent-api dcagent-ingestion-worker dcagent-structured-worker
 # 恢复旧环境文件和 Qdrant alias 后：
 sudo supervisorctl start dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm
-sudo supervisorctl start dcagent-api dcagent-structured-worker
-sudo supervisorctl status dcagent-api dcagent-structured-worker
+sudo supervisorctl start dcagent-api dcagent-ingestion-worker dcagent-structured-worker
+sudo supervisorctl status dcagent-api dcagent-ingestion-worker dcagent-structured-worker
 ```
