@@ -14,6 +14,6 @@ def validate_production_llm_provider(environ: Mapping[str, str]) -> str:
     if provider in NON_GENERATING_PROVIDERS:
         raise ValueError(
             "Production runtime requires a real LLM provider; "
-            "set LLM_PROVIDER=physoc_deepseek for the internal deployment"
+            "set LLM_PROVIDER=openai_compatible for the native Ollama deployment"
         )
     return provider

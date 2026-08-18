@@ -1,8 +1,8 @@
-# Ubuntu + Supervisor：llama.cpp BGE-M3 Embedding
+# Ubuntu + Supervisor：llama.cpp Embedding/Reranker + Ollama DeepSeek LLM
 
-生产内网使用两个独立的 llama.cpp 进程：Embedding 使用 `bge-m3-Q4_K_M.gguf`，Reranker 使用
-`bge-reranker-v2-m3-Q4_K_M.gguf`。Embedding 进程只提供 OpenAI-compatible
-`/v1/embeddings`，不与 DC-Agent API 共用端口或模型上下文。
+生产内网中，Embedding 与 Reranker 继续使用两个独立的 llama.cpp 进程；回答生成改为本机
+Ollama 的 `deepseek-llm:7b`。DC-Agent 直接调用 Ollama 的 OpenAI-compatible
+`/v1/chat/completions`，不再经过 Physoc。
 
 ## 1. 启动 llama.cpp 进程
 
@@ -13,6 +13,7 @@ set -Eeuo pipefail
 install -d -o dcagent -g dcagent -m 0750 /srv/dcagent/models /var/log/dcagent
 sha256sum /srv/dcagent/models/bge-m3-Q4_K_M.gguf
 sha256sum /srv/dcagent/models/bge-reranker-v2-m3-Q4_K_M.gguf
+install -d -o dcagent -g dcagent -m 0750 /srv/dcagent/models/ollama
 ```
 
 Embedding 服务：
@@ -35,7 +36,31 @@ Reranker 服务：
   -c 4096 -np 2
 ```
 
-不要把两个模型加载到同一个进程。启动前确认 `llama-server --help` 包含对应的
+Ollama 模型准备：
+
+```bash
+sudo systemctl disable --now ollama 2>/dev/null || true
+sudo -u dcagent env \
+  HOME=/home/dcagent \
+  OLLAMA_HOST=127.0.0.1:11434 \
+  OLLAMA_MODELS=/srv/dcagent/models/ollama \
+  /usr/local/bin/ollama serve
+```
+
+首次启动 Ollama 后，在另一个终端拉取或导入已批准的模型：
+
+```bash
+sudo -u dcagent env \
+  HOME=/home/dcagent \
+  OLLAMA_HOST=http://127.0.0.1:11434 \
+  OLLAMA_MODELS=/srv/dcagent/models/ollama \
+  /usr/local/bin/ollama pull deepseek-llm:7b
+```
+
+完全离线环境应提前把 Ollama manifest 和 blob 导入 `OLLAMA_MODELS`，不能在生产服务器临时访问
+公网拉取。导入后使用 `ollama list` 确认模型名精确为 `deepseek-llm:7b`。
+
+不要把 Embedding 和 Reranker 加载到同一个 llama.cpp 进程。启动前确认 `llama-server --help` 包含对应的
 `--embedding` 和 `--reranking` 选项；如果构建版本不支持，先替换为公司批准的 llama.cpp
 构建，不要在应用层绕过探针。
 
@@ -69,6 +94,19 @@ killasgroup=true
 stdout_logfile=/var/log/dcagent/llama-reranker.log
 stderr_logfile=/var/log/dcagent/llama-reranker-error.log
 environment=HOME="/nonexistent",PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+
+[program:dcagent-ollama-llm]
+command=/usr/local/bin/ollama serve
+directory=/srv/dcagent
+user=dcagent
+autostart=true
+autorestart=true
+startsecs=10
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/var/log/dcagent/ollama-llm.log
+stderr_logfile=/var/log/dcagent/ollama-llm-error.log
+environment=HOME="/home/dcagent",PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",OLLAMA_HOST="127.0.0.1:11434",OLLAMA_MODELS="/srv/dcagent/models/ollama"
 ```
 
 加载配置并确认进程：
@@ -77,8 +115,8 @@ environment=HOME="/nonexistent",PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/
 set -Eeuo pipefail
 sudo supervisorctl reread
 sudo supervisorctl update
-sudo supervisorctl restart dcagent-llama-embedding dcagent-llama-reranker
-sudo supervisorctl status dcagent-llama-embedding dcagent-llama-reranker
+sudo supervisorctl restart dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm
+sudo supervisorctl status dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm
 ```
 
 ## 3. 探针与维度校验
@@ -108,6 +146,17 @@ curl --fail-with-body --silent --show-error \
   -X POST http://127.0.0.1:8080/v1/rerank \
   -H 'Content-Type: application/json' \
   -d '{"model":"bge-reranker-v2-m3-Q4_K_M.gguf","query":"probe","documents":["relevant","unrelated"]}'
+
+curl --fail-with-body --silent --show-error \
+  http://127.0.0.1:11434/api/version
+
+curl --fail-with-body --silent --show-error \
+  http://127.0.0.1:11434/api/tags
+
+curl --fail-with-body --silent --show-error \
+  -X POST http://127.0.0.1:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-llm:7b","messages":[{"role":"user","content":"只回复：模型就绪"}],"temperature":0}'
 ```
 
 把真实 GGUF `sha256sum` 和探测到的维度写入 Supervisor/API 的环境文件：
@@ -137,7 +186,19 @@ LLAMA_CPP_RERANKER_PATH=/v1/rerank
 LLAMA_CPP_RERANKER_MODEL=bge-reranker-v2-m3-Q4_K_M.gguf
 LLAMA_CPP_RERANK_TIMEOUT_SECONDS=10
 LLAMA_CPP_RERANK_BATCH_MAX_ITEMS=32
+
+# 回答生成直接调用本机 Ollama，不经过 Physoc。
+LLM_PROVIDER=openai_compatible
+LLM_API_BASE=http://127.0.0.1:11434/v1
+LLM_API_KEY=ollama-local
+LLM_MODEL=deepseek-llm:7b
+LLAMA_SERVER_URL=http://127.0.0.1:11434
+LLM_HEALTH_PATH=/api/version
+OFFLINE_MODE=true
 ```
+
+`LLM_API_KEY` 在这个 loopback 部署中只是 OpenAI-compatible 客户端要求的非空占位值；Ollama
+本机接口不会使用它。不要复用公司真实密钥，也不要把 Ollama 监听到 `0.0.0.0`。
 
 ## 4. 重建向量与切换 alias
 
@@ -153,7 +214,7 @@ Excel 行级查询和 Word 年龄/性别/职务事实查询不依赖 Embedding�
 ```bash
 set -Eeuo pipefail
 sudo supervisorctl restart dcagent-api dcagent-structured-worker
-sudo supervisorctl status dcagent-api dcagent-structured-worker dcagent-llama-embedding dcagent-llama-reranker
+sudo supervisorctl status dcagent-api dcagent-structured-worker dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm
 curl --fail-with-body --silent --show-error http://127.0.0.1:8000/readyz
 ```
 
@@ -164,7 +225,7 @@ Supervisor 回滚命令：
 set -Eeuo pipefail
 sudo supervisorctl stop dcagent-api dcagent-structured-worker
 # 恢复旧环境文件和 Qdrant alias 后：
-sudo supervisorctl start dcagent-llama-embedding dcagent-llama-reranker
+sudo supervisorctl start dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm
 sudo supervisorctl start dcagent-api dcagent-structured-worker
 sudo supervisorctl status dcagent-api dcagent-structured-worker
 ```

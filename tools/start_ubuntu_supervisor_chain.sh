@@ -10,6 +10,7 @@ SUPERVISORCTL="${DCAGENT_SUPERVISORCTL:-supervisorctl}"
 BOOTSTRAP_SCRIPT="${DCAGENT_RETRIEVAL_BOOTSTRAP:-}"
 EMBEDDING_PROGRAM="${DCAGENT_EMBEDDING_PROGRAM:-dcagent-llama-embedding}"
 RERANKER_PROGRAM="${DCAGENT_RERANKER_PROGRAM:-dcagent-llama-reranker}"
+LLM_PROGRAM="${DCAGENT_LLM_PROGRAM:-dcagent-ollama-llm}"
 API_PROGRAM="${DCAGENT_API_PROGRAM:-dcagent-api}"
 WORKER_PROGRAM="${DCAGENT_WORKER_PROGRAM:-dcagent-structured-worker}"
 
@@ -26,8 +27,8 @@ die() {
 command -v "$SUPERVISORCTL" >/dev/null 2>&1 || die "supervisorctl is unavailable"
 [[ -x "$BOOTSTRAP_SCRIPT" ]] || die "retrieval bootstrap script is not executable: $BOOTSTRAP_SCRIPT"
 
-echo "Starting llama.cpp services..."
-"$SUPERVISORCTL" start "$EMBEDDING_PROGRAM" "$RERANKER_PROGRAM"
+echo "Starting llama.cpp Embedding/Reranker and Ollama LLM services..."
+"$SUPERVISORCTL" start "$EMBEDDING_PROGRAM" "$RERANKER_PROGRAM" "$LLM_PROGRAM"
 
 echo "Reconciling the Qdrant retrieval publication..."
 "$BOOTSTRAP_SCRIPT"
@@ -37,4 +38,5 @@ echo "Starting API and structured worker..."
 
 echo "Supervisor status:"
 "$SUPERVISORCTL" status \
-  "$EMBEDDING_PROGRAM" "$RERANKER_PROGRAM" "$API_PROGRAM" "$WORKER_PROGRAM"
+  "$EMBEDDING_PROGRAM" "$RERANKER_PROGRAM" "$LLM_PROGRAM" \
+  "$API_PROGRAM" "$WORKER_PROGRAM"

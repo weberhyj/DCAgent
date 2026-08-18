@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "tools" / "start_ubuntu_supervisor_chain.sh"
 
@@ -63,10 +62,10 @@ class UbuntuSupervisorChainContractTest(unittest.TestCase):
         self.assertEqual(
             self.calls.read_text(encoding="utf-8").splitlines(),
             [
-                "supervisor start dcagent-llama-embedding dcagent-llama-reranker",
+                "supervisor start dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm",
                 "bootstrap",
                 "supervisor start dcagent-api dcagent-structured-worker",
-                "supervisor status dcagent-llama-embedding dcagent-llama-reranker dcagent-api dcagent-structured-worker",
+                "supervisor status dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm dcagent-api dcagent-structured-worker",
             ],
         )
 
@@ -85,7 +84,7 @@ class UbuntuSupervisorChainContractTest(unittest.TestCase):
         self.assertEqual(
             self.calls.read_text(encoding="utf-8").splitlines(),
             [
-                "supervisor start dcagent-llama-embedding dcagent-llama-reranker",
+                "supervisor start dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm",
                 "bootstrap-failed",
             ],
         )

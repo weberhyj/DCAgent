@@ -748,6 +748,13 @@ def _generation_enabled(environ: Mapping[str, str]) -> bool:
     )
 
 
+def _generation_health_path(environ: Mapping[str, str]) -> str:
+    path = environ.get("LLM_HEALTH_PATH", "/health").strip()
+    if path not in {"/health", "/api/version"}:
+        raise ValueError("LLM_HEALTH_PATH must be /health or /api/version")
+    return path
+
+
 def _qdrant_retrieval_check(
     readiness_check: DependencyCheckCallable,
     gateway: Any | None,
@@ -1106,6 +1113,7 @@ def validate_health_service_urls(
         ),
     ]
     if _generation_enabled(environ):
+        _generation_health_path(environ)
         services.append(
             (
                 "LLAMA_SERVER_URL",
@@ -1271,7 +1279,7 @@ def build_dependency_checks(
                 "llama",
                 _http_status_check(
                     settings.llama_server_url,
-                    "/health",
+                    _generation_health_path(environ),
                     timeout_seconds,
                     client=http_client,
                     client_factory=http_client_factory,

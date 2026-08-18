@@ -13,8 +13,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
-from fastapi.testclient import TestClient
-
 from app.infra import health as health_module
 from app.infra.health import DependencyCheck, DependencyHealthRegistry, build_dependency_checks
 from app.main import create_app
@@ -24,6 +22,7 @@ from app.retrieval_scope import DynamicRetrievalScopeProvider
 from app.retrieval_settings import RetrievalSettings
 from app.routes import router as app_router
 from app.seed import build_seed_state
+from fastapi.testclient import TestClient
 
 
 def retrieval_health_environment(mode: str = "qwen3") -> dict[str, str]:
@@ -192,6 +191,48 @@ def retrieval_health_responses(*, reranker_version: str = "1.0.0") -> dict[str, 
 
 
 class InfraHealthTest(unittest.TestCase):
+    def test_ollama_generation_health_uses_version_endpoint(self) -> None:
+        environ = retrieval_health_environment("legacy")
+        environ.update(
+            {
+                "LLM_PROVIDER": "openai_compatible",
+                "LLAMA_SERVER_URL": "http://127.0.0.1:11434",
+                "LLM_HEALTH_PATH": "/api/version",
+            }
+        )
+        endpoint = "http://127.0.0.1:11434/api/version"
+        http_client = RetrievalHealthHttpClient(
+            {endpoint: MetadataResponse({"version": "0.11.0"})}
+        )
+
+        checks = build_dependency_checks(
+            OfflineSettings.from_environ(environ),
+            database=object(),
+            environ=environ,
+            http_client=http_client,
+        )
+        llama = next(check for check in checks if check.name == "llama")
+
+        self.assertEqual(llama.check(), (True, "ready"))
+        self.assertEqual(http_client.urls, [endpoint])
+
+    def test_generation_health_rejects_unknown_path(self) -> None:
+        environ = retrieval_health_environment("legacy")
+        environ.update(
+            {
+                "LLM_PROVIDER": "openai_compatible",
+                "LLM_HEALTH_PATH": "https://example.test/health",
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "LLM_HEALTH_PATH"):
+            build_dependency_checks(
+                OfflineSettings.from_environ(environ),
+                database=object(),
+                environ=environ,
+                http_client=RetrievalHealthHttpClient({}),
+            )
+
     def test_qwen3_rrf_only_health_omits_reranker_dependency(self) -> None:
         environ = retrieval_health_environment()
         environ["RERANKER_ENABLED"] = "false"

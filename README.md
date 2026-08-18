@@ -70,6 +70,25 @@ LLM_API_KEY=replace-with-your-api-key
 LLM_MODEL=your-model-name
 ```
 
+### 原生 Ubuntu 本地 Ollama DeepSeek LLM
+
+原生 Ubuntu + Supervisor 内网部署不需要 Physoc。由本机 Ollama 加载 `deepseek-llm:7b`，
+DC-Agent 直接调用 Ollama 提供的 OpenAI-compatible `/v1/chat/completions`：
+
+```text
+LLM_PROVIDER=openai_compatible
+LLM_API_BASE=http://127.0.0.1:11434/v1
+LLM_API_KEY=ollama-local
+LLM_MODEL=deepseek-llm:7b
+LLAMA_SERVER_URL=http://127.0.0.1:11434
+LLM_HEALTH_PATH=/api/version
+OFFLINE_MODE=true
+```
+
+完整的模型命令、Supervisor 配置和探针见
+[`deploy/ubuntu/LLAMA_CPP_EMBEDDING.md`](deploy/ubuntu/LLAMA_CPP_EMBEDDING.md)。这里的
+`LLM_API_KEY` 是无鉴权 loopback Ollama 服务的非空客户端占位值，不应替换为公司真实密钥。
+
 ### Physoc DeepSeek 模式
 
 Physoc DeepSeek 流式接口可以按以下方式配置，示例使用本机 loopback 地址：

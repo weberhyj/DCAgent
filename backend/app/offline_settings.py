@@ -178,7 +178,7 @@ class OfflineSettings:
             "redis_url": environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"),
             "embedding_service_url": environ.get("EMBEDDING_SERVICE_URL", "http://127.0.0.1:8081"),
             "reranker_service_url": environ.get("RERANKER_SERVICE_URL", "http://127.0.0.1:8082"),
-            "llama_server_url": environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:8080"),
+            "llama_server_url": environ.get("LLAMA_SERVER_URL", "http://127.0.0.1:11434"),
         }
         if offline_mode:
             values = {key: require_private_url(value, key) for key, value in values.items()}
