@@ -64,8 +64,8 @@ class UbuntuSupervisorChainContractTest(unittest.TestCase):
             [
                 "supervisor start dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm",
                 "bootstrap",
-                "supervisor start dcagent-api dcagent-ingestion-worker dcagent-structured-worker",
-                "supervisor status dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm dcagent-api dcagent-ingestion-worker dcagent-structured-worker",
+                "supervisor start dcagent-api dcagent-structured-worker",
+                "supervisor status dcagent-llama-embedding dcagent-llama-reranker dcagent-ollama-llm dcagent-api dcagent-structured-worker",
             ],
         )
 

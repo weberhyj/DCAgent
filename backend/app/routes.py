@@ -19,7 +19,6 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BeforeValidator
-from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .evaluation import (
@@ -485,7 +484,7 @@ def delete_knowledge_source(
 @router.post("/knowledge/sources/{source_id}/reindex", response_model=list[KnowledgeSource])
 def reindex_knowledge_source(
     source_id: str,
-    request: Request,
+    background_tasks: BackgroundTasks,
     repository: ChatRepository = Depends(get_repository),
     ingestion_queue: KnowledgeIngestionQueue = Depends(get_ingestion_queue),
 ) -> list[KnowledgeSource]:
@@ -505,8 +504,12 @@ def reindex_knowledge_source(
     )
     if retried is None or not hasattr(retried, "id"):
         raise RuntimeError("knowledge source reindex did not finalize")
-    if not getattr(request.app.state, "asynchronous_knowledge_ingestion", False):
-        ingestion_queue.enqueue(retried.id, retried.file_path, retried.source_type)
+    background_tasks.add_task(
+        ingestion_queue.process,
+        retried.id,
+        retried.file_path,
+        retried.source_type,
+    )
     return [KnowledgeSource.from_model(item) for item in repository.list_knowledge_sources()]
 
 
@@ -515,6 +518,7 @@ async def upload_knowledge_file(
     user_ip: ClientIpDep,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] | None = File(default=None),
     file: UploadFile | None = File(default=None),
     classification: str = Form(default="公开"),
@@ -542,16 +546,17 @@ async def upload_knowledge_file(
             file_size=stored.size,
             mime_type=upload.content_type,
         )
-        if not getattr(request.app.state, "asynchronous_knowledge_ingestion", False):
-            await run_in_threadpool(
-                ingestion_queue.process,
-                stored.source_id,
-                stored.path,
-                stored.source_type,
-            )
+        background_tasks.add_task(
+            ingestion_queue.process,
+            stored.source_id,
+            stored.path,
+            stored.source_type,
+        )
 
-    if getattr(request.app.state, "asynchronous_knowledge_ingestion", False):
-        response.status_code = 202
+    # Parsing/indexing is intentionally scheduled after the HTTP response. The
+    # client must observe the durable ``解析中`` state and poll for completion;
+    # it must never wait for a large document to be parsed in the request.
+    response.status_code = 202
 
     return [KnowledgeSource.from_model(source) for source in repository.list_knowledge_sources()]
 

@@ -24,7 +24,7 @@ class KnowledgeUploadTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_uploaded_word_document_is_searchable_before_upload_returns(self) -> None:
+    def test_uploaded_word_document_is_indexed_by_background_task(self) -> None:
         document = Document()
         document.add_paragraph("年度培训预算为八十万元，申请部门为人力资源部。")
         content = BytesIO()
@@ -41,10 +41,10 @@ class KnowledgeUploadTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
         uploaded = response.json()[0]
-        self.assertEqual(uploaded["status"], "已索引")
-        self.assertGreater(uploaded["records"], 0)
+        self.assertEqual(uploaded["status"], STATUS_INDEXING)
+        self.assertEqual(uploaded["records"], 0)
 
         hits = self.repository.search_knowledge_chunks("年度培训预算")
         self.assertGreater(len(hits), 0)
@@ -56,10 +56,10 @@ class KnowledgeUploadTest(unittest.TestCase):
             files={"file": ("public-policy.txt", b"public policy" * 20, "text/plain")},
         )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()[0]["classification"], "公开")
 
-    def test_production_style_upload_enqueues_and_returns_before_parsing(self) -> None:
+    def test_production_style_upload_schedules_background_parsing(self) -> None:
         class RecordingQueue:
             def __init__(self) -> None:
                 self.enqueued: list[tuple[str, Path, str]] = []
@@ -90,7 +90,7 @@ class KnowledgeUploadTest(unittest.TestCase):
         uploaded = response.json()[0]
         self.assertEqual(uploaded["status"], STATUS_INDEXING)
         self.assertEqual(uploaded["records"], 0)
-        self.assertEqual(queue.process_calls, 0)
+        self.assertEqual(queue.process_calls, 1)
         self.assertEqual(queue.enqueued, [])
         self.assertEqual(self.repository.list_knowledge_chunks(uploaded["id"]), [])
 
@@ -101,13 +101,13 @@ class KnowledgeUploadTest(unittest.TestCase):
             files={"file": ("董事会纪要.pdf", b"quarterly board memo" * 20, "application/pdf")},
         )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
         source = response.json()[0]
         self.assertEqual(source["name"], "董事会纪要.pdf")
         self.assertEqual(source["sourceType"], "PDF")
         self.assertEqual(source["classification"], "内部·机密")
-        self.assertEqual(source["status"], "已索引")
-        self.assertGreater(source["records"], 0)
+        self.assertEqual(source["status"], STATUS_INDEXING)
+        self.assertEqual(source["records"], 0)
         self.assertGreater(source["fileSize"], 0)
         self.assertEqual(source["mimeType"], "application/pdf")
 
@@ -118,7 +118,7 @@ class KnowledgeUploadTest(unittest.TestCase):
         indexed = self.client.get("/api/knowledge/sources").json()[0]
         self.assertEqual(indexed["id"], source["id"])
         self.assertEqual(indexed["status"], "已索引")
-        self.assertEqual(indexed["records"], source["records"])
+        self.assertGreater(indexed["records"], 0)
 
     def test_uploads_multiple_files_in_one_request(self) -> None:
         response = self.client.post(
@@ -130,12 +130,15 @@ class KnowledgeUploadTest(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
         sources_by_name = {source["name"]: source for source in response.json()}
-        self.assertEqual(sources_by_name["policy-a.txt"]["status"], "已索引")
-        self.assertEqual(sources_by_name["policy-b.md"]["status"], "已索引")
-        self.assertGreater(sources_by_name["policy-a.txt"]["records"], 0)
-        self.assertGreater(sources_by_name["policy-b.md"]["records"], 0)
+        self.assertEqual(sources_by_name["policy-a.txt"]["status"], STATUS_INDEXING)
+        self.assertEqual(sources_by_name["policy-b.md"]["status"], STATUS_INDEXING)
+        refreshed = {source["name"]: source for source in self.client.get("/api/knowledge/sources").json()}
+        self.assertEqual(refreshed["policy-a.txt"]["status"], "已索引")
+        self.assertEqual(refreshed["policy-b.md"]["status"], "已索引")
+        self.assertGreater(refreshed["policy-a.txt"]["records"], 0)
+        self.assertGreater(refreshed["policy-b.md"]["records"], 0)
         self.assertEqual(sources_by_name["policy-a.txt"]["classification"], "内部")
         self.assertEqual(sources_by_name["policy-b.md"]["classification"], "内部")
 

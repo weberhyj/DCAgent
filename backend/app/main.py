@@ -605,9 +605,8 @@ def create_production_app(
             application.state.retrieval_gateway = retrieval_gateway
             application.state.retrieval_scope_provider = retrieval_scope_provider
             application.state.knowledge_ingestion_queue = ingestion_queue
-            # Production HTTP workers only persist the uploaded source. Its
-            # ``解析中`` source row is the durable queue; app.ingestion_worker
-            # owns parsing/indexing so large files never occupy an API worker.
+            # Upload parsing/indexing is scheduled with FastAPI BackgroundTasks
+            # after the 202 response, so large files never occupy the request.
             application.state.asynchronous_knowledge_ingestion = True
             application.state.knowledge_file_storage = storage
             application.state.evaluation_import_service = evaluation_service

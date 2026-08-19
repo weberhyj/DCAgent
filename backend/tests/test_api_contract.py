@@ -434,12 +434,12 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(failed["status"], "解析失败")
         self.assertEqual(failed["errorMessage"], "文件内容无法解析")
 
-    def test_reindex_failed_source_resets_status_and_queues_ingestion(self) -> None:
+    def test_reindex_failed_source_schedules_ingestion(self) -> None:
         class RecordingIngestionQueue:
             def __init__(self) -> None:
                 self.jobs: list[tuple[str, str, str]] = []
 
-            def enqueue(self, source_id: str, file_path: str, source_type: str) -> None:
+            def process(self, source_id: str, file_path: str, source_type: str) -> None:
                 self.jobs.append((source_id, file_path, source_type))
 
             def discard_source(self, source_id: str, *, finalize=None):

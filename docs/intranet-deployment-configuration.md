@@ -404,6 +404,10 @@ cd /opt/DCAgent
 sudo bash tools/start_ubuntu_supervisor_chain.sh
 ```
 
+普通文档上传后的解析、切片和检索索引由 API 的 FastAPI `BackgroundTasks` 执行，Supervisor
+不再启动独立的 `dcagent-ingestion-worker`。Excel/CSV 的正式结构化发布仍由
+`dcagent-structured-worker` 常驻处理。
+
 该命令会检查 `retrieval_publications` 与 Qdrant alias：已有一致的 active publication 时直接跳过；
 已有知识片段但没有 active publication 时自动创建下一个 `knowledge_chunks_qwen3_vN` collection、
 完成 BGE-M3 全量构建并激活 alias；知识库为空时安全跳过。数据库审计记录与 Qdrant alias 不一致时会
