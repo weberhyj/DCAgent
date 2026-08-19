@@ -23,7 +23,7 @@ import type {
 import { isStructuredKnowledgeSource } from '@/utils/knowledgeSources'
 
 const KNOWLEDGE_INDEXING_STATUS: KnowledgeSource['status'] = '解析中'
-const KNOWLEDGE_POLL_INTERVAL_MS = 1000
+const KNOWLEDGE_POLL_INTERVAL_MS = 30_000
 const KNOWLEDGE_POLL_ATTEMPTS = 300
 const STRUCTURED_POLL_INTERVAL_MS = 800
 

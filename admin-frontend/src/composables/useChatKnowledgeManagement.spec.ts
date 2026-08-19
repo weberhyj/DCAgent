@@ -150,12 +150,12 @@ describe('useChatKnowledgeManagement', () => {
     expect(uploadKnowledgeFiles).toHaveBeenCalledWith([file], '内部·机密')
     expect(knowledge.knowledgeSources.value[0].status).toBe(INDEXING_STATUS)
 
-    await vi.advanceTimersByTimeAsync(1000)
+    await vi.advanceTimersByTimeAsync(30_000)
 
     expect(fetchKnowledgeSources).toHaveBeenCalledTimes(1)
     expect(knowledge.knowledgeSources.value[0].status).toBe(INDEXING_STATUS)
 
-    await vi.advanceTimersByTimeAsync(1000)
+    await vi.advanceTimersByTimeAsync(30_000)
 
     expect(fetchKnowledgeSources).toHaveBeenCalledTimes(2)
     expect(knowledge.knowledgeSources.value[0].status).toBe(INDEXED_STATUS)
