@@ -277,7 +277,7 @@ flowchart TD
     I --> K["ClickHouse 不可变发布表"]
 
     L["用户提问"] --> M{"是否为已发布数据集的统计问题"}
-    M -->|"avg / sum / count / min / max"| K
+    M -->|"受控统计、分组、分位数、Top N"| K
     K --> N["确定性统计答案，不调用大模型"]
     K -.->|"不可用或超时"| X["显式失败，不回退到切片计算"]
 
@@ -392,8 +392,13 @@ Legacy 结果或模板文本伪装成模型答案。
   这种模式适合查找某行或某项说明，不适合计算整列平均值、总和等全量统计。
 - `STRUCTURED_QUERY_ENABLED=true`（环境模板默认）：管理员必须确认字段类型、别名和统计权限，随后由
   `--profile indexing` worker 分批写入 Parquet 并发布到 ClickHouse。对于已成功发布且已通过
-  行数和内容校验的 ClickHouse publication，`avg`、`sum`、`count`、`min`、`max` 由
+  行数和内容校验的 ClickHouse publication，基础统计和高级统计由
   ClickHouse 对该 publication 的数据确定性计算，不调用 Physoc，也不会从文档切片估算结果。
+
+当前受控统计白名单包括：`sum`、`avg`、`count`、去重计数、`min`、`max`、中位数、
+任意 0–100 分位数、总体方差和总体标准差。支持按一个或多个已授权筛选字段分组、同一指标
+同时计算多个统计量、升降序以及 Top/Bottom N；分组结果以表格返回。所有字段、函数、排序和
+行数限制仍由服务端查询计划生成并经 SQL AST 校验，用户和大模型都不能提交任意 SQL。
 
 这条路线称为 `ClickHouse complete-data aggregation`。Spreadsheet averages must not be
 calculated from RAG chunks；Qdrant 中只保存表结构、字段和安全摘要，绝不把局部切片平均值当作
@@ -405,6 +410,8 @@ calculated from RAG chunks；Qdrant 中只保存表结构、字段和安全摘�
 - “汇总”/“统计” sums all `allowAggregate` integer/decimal columns and returns matched/valid/null counts.
 - `STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS` defaults to 12; over-limit questions ask the user to choose fields.
 - All metrics in one answer are calculated by one ClickHouse `SELECT`.
+- Grouped, ordered and Top/Bottom N summaries are also executed as one bounded ClickHouse `SELECT`.
+- Examples: “按地区统计销售额总和前 10 名”, “销售额最大值和最小值”, “销售额 P90 分位数”.
 - ClickHouse or parsing failures return a structured error and never search Word/PDF chunks.
 
 This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.

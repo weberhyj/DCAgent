@@ -55,12 +55,26 @@ _CHINESE_AGGREGATE_TERMS = (
     "多少条",
     "数量",
     "计数",
+    "去重数量",
+    "去重数",
+    "不同数量",
+    "唯一数量",
+    "不重复数量",
     "最大值",
     "最大",
     "最高",
     "最小值",
     "最小",
     "最低",
+    "中位数",
+    "中位值",
+    "标准差",
+    "标准偏差",
+    "方差",
+    "变异数",
+    "分位数",
+    "百分位",
+    "百分位数",
     "汇总",
     "统计",
 )
@@ -68,8 +82,13 @@ _AGGREGATE_WORDS = (
     ("avg", ("平均值", "平均", "均值")),
     ("sum", ("总和", "合计", "求和")),
     ("count", ("多少条", "数量", "计数")),
+    ("count_distinct", ("去重数量", "去重数", "不同数量", "唯一数量", "不重复数量")),
     ("max", ("最大", "最高")),
     ("min", ("最小", "最低")),
+    ("median", ("中位数", "中位值")),
+    ("stddev", ("标准差", "标准偏差")),
+    ("variance", ("方差", "变异数")),
+    ("percentile", ("分位数", "百分位", "百分位数")),
 )
 _IMPLICIT_ROW_COUNT_RE = re.compile(
     r"^(?:(?:总共|一共|共有)有?)?多少条(?:记录|数据|明细|行)?[？?。.]?$"
@@ -85,12 +104,25 @@ _STRONG_AGGREGATE_SUFFIXES = tuple(
             "合计",
             "求和",
             "计数",
+            "去重数量",
+            "去重数",
+            "不同数量",
+            "唯一数量",
+            "不重复数量",
             "最大值",
             "最大",
             "最高",
             "最小值",
             "最小",
             "最低",
+            "中位数",
+            "中位值",
+            "标准差",
+            "标准偏差",
+            "方差",
+            "分位数",
+            "百分位数",
+            "百分位",
             "汇总",
             "统计",
         ),
@@ -358,11 +390,60 @@ class StructuredAnswerService:
                 ),
             )
         if isinstance(result, StructuredMultiAggregateResult):
+            if result.group_by:
+                dataset = next(
+                    item for item in catalog.datasets if item.schema.dataset_id == result.dataset_id
+                )
+                display_by_physical = {
+                    column.physical_name: column.display_name for column in dataset.schema.columns
+                }
+                group_labels = [display_by_physical[name] for name in result.group_by]
+                metric_specs = result.groups[0].metrics if result.groups else ()
+                metric_labels = [
+                    _metric_result_label(item.metric_display_name, item.aggregate, item.percentile)
+                    for item in metric_specs
+                ]
+                artifact = TableArtifactModel(
+                    type="table",
+                    title="Excel 分组汇总结果",
+                    source=result.source_name,
+                    columns=[*group_labels, *metric_labels, "匹配行数"],
+                    rows=[
+                        [
+                            *group.group_values,
+                            *[_format_numeric_value(item.value) for item in group.metrics],
+                            str(group.total_count),
+                        ]
+                        for group in result.groups
+                    ],
+                )
+                answer = (
+                    f"已按{'、'.join(group_labels)}汇总，共得到 {len(result.groups)} 组。"
+                    if result.groups
+                    else "没有符合条件的分组数据。"
+                )
+                return _structured_run(
+                    conversation_id,
+                    question,
+                    mode,
+                    answer,
+                    f"structured grouped aggregate completed; audit_id={result.audit_id}",
+                    source_ids=[result.source_id],
+                    artifacts=[artifact],
+                    route_type=KnowledgeRouteType.EXCEL_MULTI_AGGREGATE,
+                    route_metadata=KnowledgeRouteMetadata(
+                        dataset_id=result.dataset_id,
+                        target_fields=tuple([*group_labels, *metric_labels]),
+                        candidate_source_ids=(result.source_id,),
+                        validation_passed=True,
+                    ),
+                )
             paragraph = "；".join(
                 _format_metric_result(
                     item.metric_display_name,
                     item.aggregate,
                     item.value,
+                    item.percentile,
                 )
                 for item in result.metrics
             ) + "。"
@@ -942,24 +1023,46 @@ def _format_result(result: StructuredAggregateResult) -> str:
     metric = result.metric_display_name or result.metric_physical_name or "all_rows"
     if metric == "all_rows":
         return f"共有 {result.total_count} 条记录。"
-    return _format_metric_result(metric, result.aggregate, result.value) + "。"
+    return _format_metric_result(metric, result.aggregate, result.value, result.percentile) + "。"
 
 
 def _format_metric_result(
     metric: str,
     aggregate: str,
     value: Decimal | int | None,
+    percentile: float | None = None,
 ) -> str:
     aggregate_label = {
         "avg": "平均值",
         "sum": "总和",
         "count": "记录数",
+        "count_distinct": "去重数量",
         "min": "最小值",
         "max": "最大值",
+        "median": "中位数",
+        "stddev": "标准差",
+        "variance": "方差",
+        "percentile": f"P{percentile:g} 分位数" if percentile is not None else "分位数",
     }.get(aggregate, aggregate)
     if value is None:
         return f"未计算出{metric}的{aggregate_label}（没有有效数值）"
     return f"{metric}的{aggregate_label}为 {_format_numeric_value(value)}"
+
+
+def _metric_result_label(metric: str, aggregate: str, percentile: float | None) -> str:
+    label = {
+        "avg": "平均值",
+        "sum": "总和",
+        "count": "记录数",
+        "count_distinct": "去重数量",
+        "min": "最小值",
+        "max": "最大值",
+        "median": "中位数",
+        "stddev": "标准差",
+        "variance": "方差",
+        "percentile": f"P{percentile:g}" if percentile is not None else "分位数",
+    }.get(aggregate, aggregate)
+    return f"{metric}（{label}）"
 
 
 def _format_numeric_value(value: Decimal | int | None) -> str:

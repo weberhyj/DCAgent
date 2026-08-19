@@ -3,7 +3,7 @@
 本文用于把 DC-Agent 部署到公司内网。当前生产路线为：
 
 - 普通 Word、文本型 PDF、TXT、Markdown 等文档：解析与切片 → BGE 中文 Embedding → Qdrant Dense/Sparse 混合检索 → Qwen2.5 生成式 Reranker → Physoc DeepSeek 汇总回答。
-- Excel/CSV 统计问题：管理员确认表结构 → indexing worker → Parquet/ClickHouse → 精确执行 `avg`、`sum`、`count`、`min`、`max`。
+- Excel/CSV 统计问题：管理员确认表结构 → structured worker → Parquet/ClickHouse → 精确执行求和、平均、计数、去重计数、最值、中位数、分位数、方差、标准差、分组和 Top/Bottom N。
 - 不调用公网大模型 API。Embedding 和 Reranker 通过公司内网 Ollama 提供，大模型回答通过公司内网 Physoc 接口提供。
 
 除非内网拓扑与当前部署方式不兼容，一般不需要修改源代码。需要修改的是服务器上的实际环境文件、密码文件、镜像地址、服务地址和反向代理配置。
@@ -539,7 +539,8 @@ install -d -m 0700 /srv/dcagent/data /srv/dcagent/models
 - [ ] indexing worker 正常运行。
 - [ ] 管理员已确认字段结构和统计权限。
 - [ ] publication 状态为 `published`。
-- [ ] `avg`、`sum`、`count`、`min`、`max` 与原表人工计算结果一致。
+- [ ] 求和、平均、计数、去重计数、最值、中位数、P90、方差、标准差与原表人工计算结果一致。
+- [ ] 按字段分组、升降序、Top/Bottom N 的分组数、顺序和结果与原表一致。
 - [ ] ClickHouse 故障时没有退回切片估算。
 
 ### 12.4 网络和性能

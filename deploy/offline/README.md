@@ -587,7 +587,8 @@ confirmed schema by itself is not queryable; the indexing worker profile must su
 an immutable ClickHouse publication.
 
 For the smoke aggregate gate, use a small reviewed worksheet with known values and nulls. Confirm
-its schema, publish it, ask for `avg`, `sum`, `count`, `min`, and `max`, and compare the answer value,
+its schema, publish it, ask for `avg`, `sum`, `count`, distinct count, `min`, `max`, median,
+P90, variance, standard deviation and a grouped Top N, and compare the answer value,
 source file, worksheet, total/valid/null counts, schema version, and publication ID with the known
 fixture. The gate fails if an aggregate invokes Physoc/template generation or is calculated from
 document slices.
@@ -605,6 +606,8 @@ introduced.
 - “汇总”/“统计” sums all `allowAggregate` integer/decimal columns and returns matched/valid/null counts.
 - `STRUCTURED_IMPLICIT_SUMMARY_MAX_METRICS` defaults to 12; over-limit questions ask the user to choose fields.
 - All metrics in one answer are calculated by one ClickHouse `SELECT`.
+- Grouped summaries, ordering and Top/Bottom N remain one bounded, application-generated `SELECT`.
+- Advanced functions are restricted to distinct count, median, percentile, population variance and population standard deviation.
 - ClickHouse or parsing failures return a structured error and never search Word/PDF chunks.
 
 This Excel-only behavior does not require rebuilding Qdrant indexes or reindexing Word documents.

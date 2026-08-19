@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import PurePath
-from typing import Literal
 
 import sqlglot
 from sqlglot import exp
@@ -26,6 +25,7 @@ from .structured_models import (
     StructuredColumnType,
     StructuredDatasetCatalog,
     StructuredFilter,
+    StructuredGroupedAggregateRow,
     StructuredIntent,
     StructuredMetricIntent,
     StructuredMetricResult,
@@ -75,8 +75,13 @@ _AGGREGATE_WORDS = (
     ("avg", ("平均值", "平均", "均值")),
     ("sum", ("总和", "合计", "求和")),
     ("count", ("多少条", "数量", "计数")),
+    ("count_distinct", ("去重数量", "去重数", "不同数量", "唯一数量", "不重复数量")),
     ("max", ("最大", "最高")),
     ("min", ("最小", "最低")),
+    ("median", ("中位数", "中位值")),
+    ("stddev", ("标准差", "标准偏差")),
+    ("variance", ("方差", "变异数")),
+    ("percentile", ("分位数", "百分位", "百分位数")),
 )
 _SUMMARY_WORDS = ("汇总", "统计")
 _NUMERIC_TYPES = frozenset({StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL})
@@ -91,9 +96,45 @@ _NATURAL_DATETIME_RANGE_RE = re.compile(
 )
 _DATE_LITERAL_RE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _NUMBER_RE = r"-?\d+(?:\.\d+)?"
+_PERCENTILE_RE = re.compile(
+    r"(?:P\s*(?P<p_short>\d{1,3}(?:\.\d+)?)|"
+    r"(?P<p_long>\d{1,3}(?:\.\d+)?)\s*(?:%|百分位|百分位数|分位数))",
+    re.IGNORECASE,
+)
+_TOP_N_RE = re.compile(
+    r"(?P<direction>前|后|最高|最低|TOP|BOTTOM)\s*(?P<limit>\d{1,4})\s*(?:名|个|条|组)?",
+    re.IGNORECASE,
+)
+_ORDER_DIRECTION_RE = re.compile(r"(?P<direction>升序|降序|从低到高|从高到低|由小到大|由大到小)")
 _IDENTIFIER_RE = re.compile(r"^[a-z0-9_]+$")
-_ALLOWED_AGGREGATES = frozenset({"avg", "sum", "count", "min", "max"})
-_ALLOWED_SQL_FUNCTIONS = frozenset({"AVG", "SUM", "COUNT", "MIN", "MAX"})
+_ALLOWED_AGGREGATES = frozenset(
+    {
+        "avg",
+        "sum",
+        "count",
+        "count_distinct",
+        "min",
+        "max",
+        "median",
+        "percentile",
+        "stddev",
+        "variance",
+    }
+)
+_ALLOWED_SQL_FUNCTIONS = frozenset(
+    {
+        "AVG",
+        "SUM",
+        "COUNT",
+        "MIN",
+        "MAX",
+        "UNIQEXACT",
+        "QUANTILE",
+        "QUANTILEEXACT",
+        "STDDEVPOP",
+        "VARPOP",
+    }
+)
 _ROW_LOOKUP_MARKERS = (
     "返回",
     "查找",
@@ -111,6 +152,36 @@ _ROW_LOOKUP_MARKERS = (
 
 class UnsafeStructuredQueryError(ValueError):
     pass
+
+
+class InconsistentStructuredResultError(ValueError):
+    pass
+
+
+def _aggregate_sql_expression(
+    aggregate: str,
+    column_name: str,
+    *,
+    percentile: float | None = None,
+) -> str:
+    """Build one of the finite, application-owned ClickHouse aggregate expressions."""
+
+    name = _require_identifier(column_name)
+    if aggregate == "count_distinct":
+        return f"uniqExact({name})"
+    if aggregate == "median":
+        return f"quantileExact(0.5)({name})"
+    if aggregate == "percentile":
+        if percentile is None or not 0 < percentile <= 100:
+            raise UnsafeStructuredQueryError("percentile must be between 0 and 100")
+        return f"quantileExact({percentile / 100:g})({name})"
+    if aggregate == "stddev":
+        return f"stddevPop({name})"
+    if aggregate == "variance":
+        return f"varPop({name})"
+    if aggregate in {"avg", "sum", "count", "min", "max"}:
+        return f"{aggregate}({name})"
+    raise UnsafeStructuredQueryError("unsupported aggregate")
 
 
 class StructuredQueryPlanner:
@@ -146,14 +217,23 @@ class StructuredQueryPlanner:
         metric = None
         if intent.metric_physical_name is not None:
             metric = columns.get(intent.metric_physical_name)
-            if metric is None or (intent.aggregate != "count" and not metric.allow_aggregate):
+            if metric is None or (
+                intent.aggregate not in {"count", "count_distinct"}
+                and not metric.allow_aggregate
+            ):
                 raise UnsafeStructuredQueryError("unknown or disallowed aggregate column")
             _require_identifier(metric.physical_name)
         elif intent.aggregate != "count":
             raise UnsafeStructuredQueryError("aggregate requires a confirmed metric")
 
         aggregate_expression = (
-            "count()" if metric is None else f"{intent.aggregate}({metric.physical_name})"
+            "count()"
+            if metric is None
+            else _aggregate_sql_expression(
+                intent.aggregate,
+                metric.physical_name,
+                percentile=intent.percentile,
+            )
         )
         valid_expression = "count()" if metric is None else f"count({metric.physical_name})"
         null_expression = "0" if metric is None else f"count() - count({metric.physical_name})"
@@ -224,6 +304,7 @@ class StructuredQueryPlanner:
             parameters=parameters,
             aggregate=intent.aggregate,
             filters=intent.filters,
+            percentile=intent.percentile,
         )
 
     def plan_multi(
@@ -244,22 +325,38 @@ class StructuredQueryPlanner:
 
         table_name = _require_identifier(publication.physical_table_name)
         columns = {column.physical_name: column for column in dataset.schema.columns}
-        projections = ["count() AS total_count"]
-        seen_columns: set[str] = set()
+        projections = []
+        seen_metrics: set[tuple[str, str, float | None]] = set()
+        columns_for_query = {column.physical_name: column for column in dataset.schema.columns}
+        group_names: list[str] = []
+        for group_name in intent.group_by:
+            group_column = columns_for_query.get(group_name)
+            if group_column is None or not group_column.allow_filter:
+                raise UnsafeStructuredQueryError("unknown or disallowed group-by column")
+            if group_name in group_names:
+                raise UnsafeStructuredQueryError("duplicate group-by column")
+            group_names.append(_require_identifier(group_name))
+            projections.append(f"{group_names[-1]} AS group_{len(group_names) - 1}")
+        projections.append("count() AS total_count")
         for index, metric_intent in enumerate(intent.metrics):
             aggregate = metric_intent.aggregate
             if aggregate not in _ALLOWED_AGGREGATES:
                 raise UnsafeStructuredQueryError("unsupported aggregate")
             name = _require_identifier(metric_intent.metric_physical_name)
-            if name in seen_columns:
-                raise UnsafeStructuredQueryError("duplicate metric column")
-            seen_columns.add(name)
+            metric_key = (aggregate, name, metric_intent.percentile or intent.percentile)
+            if metric_key in seen_metrics:
+                raise UnsafeStructuredQueryError("duplicate metric")
+            seen_metrics.add(metric_key)
             metric = columns.get(name)
             if metric is None:
                 raise UnsafeStructuredQueryError("unknown metric column")
-            if aggregate != "count" and not metric.allow_aggregate:
+            if aggregate not in {"count", "count_distinct"} and not metric.allow_aggregate:
                 raise UnsafeStructuredQueryError("disallowed aggregate column")
-            aggregate_expression = f"{aggregate}({name})"
+            aggregate_expression = _aggregate_sql_expression(
+                aggregate,
+                name,
+                percentile=metric_intent.percentile or intent.percentile,
+            )
             projections.extend(
                 (
                     f"{aggregate_expression} AS metric_{index}_value",
@@ -315,10 +412,31 @@ class StructuredQueryPlanner:
         sql = f"SELECT {', '.join(projections)} FROM {table_name}"
         if predicates:
             sql += " WHERE " + " AND ".join(predicates)
+        if group_names:
+            sql += " GROUP BY " + ", ".join(group_names)
+            if intent.order_by is not None:
+                order_column = _require_identifier(intent.order_by)
+                if order_column not in columns or order_column not in group_names:
+                    metric_alias = next(
+                        (
+                            f"metric_{index}_value"
+                            for index, metric in enumerate(intent.metrics)
+                            if metric.metric_physical_name == order_column
+                        ),
+                        None,
+                    )
+                    if metric_alias is None:
+                        raise UnsafeStructuredQueryError("order-by column is not in the analysis")
+                    order_column = metric_alias
+                sql += f" ORDER BY {order_column} {'DESC' if intent.order_desc else 'ASC'}"
+            if intent.limit is not None:
+                if not 1 <= intent.limit <= 1000:
+                    raise UnsafeStructuredQueryError("analysis limit must be between 1 and 1000")
+                sql += f" LIMIT {intent.limit}"
         _validate_generated_select(
             sql,
             table_name=table_name,
-            allowed_columns=frozenset(columns),
+            allowed_columns=frozenset((*columns, *(f"group_{i}" for i in range(len(group_names))), *(f"metric_{i}_value" for i in range(len(intent.metrics))))),
         )
         return StructuredMultiAggregatePlan(
             publication_id=publication.publication_id,
@@ -328,6 +446,11 @@ class StructuredQueryPlanner:
             parameters=parameters,
             filters=intent.filters,
             implicit=intent.implicit,
+            group_by=tuple(group_names),
+            percentile=intent.percentile,
+            order_by=intent.order_by,
+            order_desc=intent.order_desc,
+            limit=intent.limit,
         )
 
     def plan_row_lookup(
@@ -446,6 +569,7 @@ class StructuredQueryExecutor:
                     aggregate=plan.aggregate,
                     metric_physical_name=plan.metric_physical_name,
                     filters=plan.filters,
+                    percentile=plan.percentile,
                 ),
                 publication,
             )
@@ -488,6 +612,12 @@ class StructuredQueryExecutor:
             return StructuredUnavailable("结构化查询返回了无效结果")
         if min(total_count, valid_count, null_count) < 0 or valid_count + null_count != total_count:
             return StructuredUnavailable("结构化查询返回了不一致的计数")
+        if (
+            plan.aggregate == "count_distinct"
+            and value is not None
+            and (not isinstance(value, int) or value < 0 or value > valid_count)
+        ):
+            return StructuredUnavailable("结构化查询返回了不一致的去重计数")
 
         metric = next(
             (
@@ -514,6 +644,7 @@ class StructuredQueryExecutor:
             filters=plan.filters,
             elapsed_ms=elapsed_ms,
             audit_id=self._audit_id_factory(),
+            percentile=plan.percentile,
         )
 
     def execute_multi(
@@ -536,6 +667,11 @@ class StructuredQueryExecutor:
                     metrics=plan.metrics,
                     filters=plan.filters,
                     implicit=plan.implicit,
+                    group_by=plan.group_by,
+                    percentile=plan.percentile,
+                    order_by=plan.order_by,
+                    order_desc=plan.order_desc,
+                    limit=plan.limit,
                 ),
                 publication,
             )
@@ -561,51 +697,28 @@ class StructuredQueryExecutor:
         elapsed_ms = max(0.0, (self._clock() - started) * 1000.0)
 
         try:
-            row = _multi_aggregate_row(raw_result, len(plan.metrics))
-            _require_exact_result_aliases(
-                row,
-                _multi_aggregate_aliases(len(plan.metrics)),
-            )
-            total_count = _strict_integer(row["total_count"])
-            metric_results: list[StructuredMetricResult] = []
-            for index, metric_intent in enumerate(plan.metrics):
-                valid_count = _strict_integer(row[f"metric_{index}_valid_count"])
-                null_count = _strict_integer(row[f"metric_{index}_null_count"])
-                if (
-                    min(total_count, valid_count, null_count) < 0
-                    or valid_count + null_count != total_count
-                ):
-                    return StructuredUnavailable("结构化查询返回了不一致的计数")
-                metric = next(
-                    (
-                        column
-                        for column in dataset.schema.columns
-                        if column.physical_name == metric_intent.metric_physical_name
+            rows = _multi_aggregate_rows(raw_result, len(plan.metrics), len(plan.group_by))
+            if not plan.group_by and len(rows) != 1:
+                raise ValueError("ungrouped aggregate query must return one row")
+            grouped_results = tuple(
+                StructuredGroupedAggregateRow(
+                    group_values=tuple(
+                        _format_row_value(row[f"group_{index}"])
+                        for index in range(len(plan.group_by))
                     ),
-                    None,
+                    metrics=self._parse_metric_results(row, plan, dataset),
+                    total_count=_strict_integer(row["total_count"]),
                 )
-                if metric is None:
-                    return StructuredUnavailable("结构化查询返回了无效结果")
-                if metric_intent.aggregate == "count":
-                    value = _strict_integer(row[f"metric_{index}_value"])
-                    if value < 0 or value != valid_count:
-                        return StructuredUnavailable("结构化查询返回了不一致的计数")
-                else:
-                    value = _aggregate_value(
-                        row[f"metric_{index}_value"],
-                        metric_intent.aggregate,
-                        valid_count=valid_count,
-                    )
-                metric_results.append(
-                    StructuredMetricResult(
-                        aggregate=metric_intent.aggregate,
-                        metric_physical_name=metric_intent.metric_physical_name,
-                        metric_display_name=metric.display_name,
-                        value=value,
-                        valid_count=valid_count,
-                        null_count=null_count,
-                    )
-                )
+                for row in rows
+            )
+            if plan.group_by:
+                total_count = sum(group.total_count for group in grouped_results)
+                metric_results: tuple[StructuredMetricResult, ...] = ()
+            else:
+                total_count = grouped_results[0].total_count
+                metric_results = grouped_results[0].metrics
+        except InconsistentStructuredResultError:
+            return StructuredUnavailable("结构化查询返回了不一致的计数")
         except (KeyError, TypeError, ValueError, IndexError, ArithmeticError):
             return StructuredUnavailable("结构化查询返回了无效结果")
 
@@ -613,7 +726,7 @@ class StructuredQueryExecutor:
             dataset_id=dataset.schema.dataset_id,
             source_id=dataset.schema.source_id,
             schema_version=dataset.schema.schema_version,
-            metrics=tuple(metric_results),
+            metrics=metric_results,
             total_count=total_count,
             source_name=dataset.source_name,
             worksheet_name=dataset.schema.worksheet_name,
@@ -621,7 +734,64 @@ class StructuredQueryExecutor:
             filters=plan.filters,
             elapsed_ms=elapsed_ms,
             audit_id=self._audit_id_factory(),
+            group_by=plan.group_by,
+            groups=grouped_results if plan.group_by else (),
         )
+
+    def _parse_metric_results(
+        self,
+        row: Mapping[str, object],
+        plan: StructuredMultiAggregatePlan,
+        dataset: StructuredDatasetCatalog,
+    ) -> tuple[StructuredMetricResult, ...]:
+        _require_exact_result_aliases(
+            row,
+            _multi_aggregate_aliases(len(plan.metrics), len(plan.group_by)),
+        )
+        total_count = _strict_integer(row["total_count"])
+        results: list[StructuredMetricResult] = []
+        for index, metric_intent in enumerate(plan.metrics):
+            valid_count = _strict_integer(row[f"metric_{index}_valid_count"])
+            null_count = _strict_integer(row[f"metric_{index}_null_count"])
+            if min(total_count, valid_count, null_count) < 0 or valid_count + null_count != total_count:
+                raise InconsistentStructuredResultError("inconsistent aggregate counts")
+            metric = next(
+                (
+                    column
+                    for column in dataset.schema.columns
+                    if column.physical_name == metric_intent.metric_physical_name
+                ),
+                None,
+            )
+            if metric is None:
+                raise ValueError("unknown metric")
+            raw_value = row[f"metric_{index}_value"]
+            if metric_intent.aggregate == "count":
+                value = _strict_integer(raw_value)
+                if value < 0 or value != valid_count:
+                    raise InconsistentStructuredResultError("inconsistent count")
+            elif metric_intent.aggregate == "count_distinct":
+                value = _strict_integer(raw_value)
+                if value < 0 or value > valid_count:
+                    raise InconsistentStructuredResultError("inconsistent distinct count")
+            else:
+                value = _aggregate_value(
+                    raw_value,
+                    metric_intent.aggregate,
+                    valid_count=valid_count,
+                )
+            results.append(
+                StructuredMetricResult(
+                    aggregate=metric_intent.aggregate,
+                    metric_physical_name=metric_intent.metric_physical_name,
+                    metric_display_name=metric.display_name,
+                    value=value,
+                    valid_count=valid_count,
+                    null_count=null_count,
+                    percentile=metric_intent.percentile or plan.percentile,
+                )
+            )
+        return tuple(results)
 
     def execute_row_lookup(
         self, plan: StructuredRowLookupPlan
@@ -738,10 +908,22 @@ def resolve_structured_intent(
     assert dataset_result.value is not None
     dataset = dataset_result.value
 
-    filter_result = _parse_filter_clause(
+    group_result = _parse_group_by_clause(
         question,
         dataset.schema.columns,
         dataset_result.consumed_spans,
+    )
+    if group_result.issue is not None:
+        return _with_clarification_context(
+            group_result.issue,
+            dataset,
+            origin_route="excel_multi_aggregate",
+        )
+    group_columns = group_result.value or ()
+    filter_result = _parse_filter_clause(
+        question,
+        dataset.schema.columns,
+        (*dataset_result.consumed_spans, *group_result.consumed_spans),
     )
     if filter_result.issue is not None:
         return _with_route_context(
@@ -749,7 +931,28 @@ def resolve_structured_intent(
         )
     assert filter_result.value is not None
 
-    consumed = (*dataset_result.consumed_spans, *filter_result.consumed_spans)
+    base_consumed = (
+        *dataset_result.consumed_spans,
+        *group_result.consumed_spans,
+        *filter_result.consumed_spans,
+    )
+    top_limit, top_desc, top_spans = _parse_top_n_clause(question)
+    order_explicit, order_desc, order_spans = _parse_order_direction_clause(question)
+    if not order_explicit:
+        order_desc = top_desc
+    if top_limit == 0:
+        return _with_route_context(
+            StructuredUnavailable("Top N 数量必须在 1 到 1000 之间"),
+            dataset,
+            origin_route="excel_multi_aggregate",
+        )
+    if (top_limit is not None or order_explicit) and not group_columns:
+        return _with_route_context(
+            StructuredUnavailable("Top N 汇总必须明确分组字段，例如“按地区统计销售额前 10 名”"),
+            dataset,
+            origin_route="excel_multi_aggregate",
+        )
+    consumed = (*base_consumed, *top_spans, *order_spans)
     aggregate_result = _parse_aggregate_clause(
         question,
         dataset.schema.columns,
@@ -757,6 +960,18 @@ def resolve_structured_intent(
         allow_missing=True,
     )
     if aggregate_result.issue is not None:
+        combined = _parse_combined_aggregate_intent(
+            question,
+            dataset,
+            filter_result.value,
+            consumed,
+            group_columns,
+            top_limit,
+            order_desc,
+            order_explicit,
+        )
+        if combined is not None:
+            return combined
         return _with_route_context(
             aggregate_result.issue, dataset, origin_route="excel_filtered_aggregate"
         )
@@ -776,6 +991,13 @@ def resolve_structured_intent(
             origin_route="excel_filtered_aggregate",
         )
     aggregate = aggregate_result.value or "sum"
+    percentile = _extract_percentile(question) if aggregate == "percentile" else None
+    if aggregate == "percentile" and percentile is None:
+        return _with_route_context(
+            StructuredUnavailable("请明确分位点，例如 P90 或 90 分位数"),
+            dataset,
+            origin_route="excel_filtered_aggregate",
+        )
 
     metric_list_result = _parse_metric_list(
         question,
@@ -818,20 +1040,27 @@ def resolve_structured_intent(
                 ),
                 target_fields=tuple(column.display_name for column in metrics),
             )
-        if len(metrics) == 1:
+        if len(metrics) == 1 and not group_columns:
             return StructuredIntent(
                 dataset_id=dataset.schema.dataset_id,
                 aggregate=aggregate,
                 metric_physical_name=metrics[0].physical_name,
                 filters=filter_result.value,
+                percentile=percentile,
             )
         return StructuredMultiAggregateIntent(
             dataset_id=dataset.schema.dataset_id,
             metrics=tuple(
-                StructuredMetricIntent(aggregate, column.physical_name) for column in metrics
+                StructuredMetricIntent(aggregate, column.physical_name, percentile)
+                for column in metrics
             ),
             filters=filter_result.value,
             implicit=False,
+            group_by=tuple(column.physical_name for column in group_columns),
+            percentile=percentile,
+            order_by=metrics[0].physical_name if top_limit is not None or order_explicit else None,
+            order_desc=order_desc,
+            limit=top_limit,
         )
 
     if aggregate_result.value is not None:
@@ -864,11 +1093,30 @@ def resolve_structured_intent(
                 target_fields=(() if metric is None else (metric.display_name,)),
             )
 
+        if group_columns or top_limit is not None:
+            if metric is None:
+                return _with_route_context(
+                    StructuredUnavailable("分组聚合必须指定指标列"),
+                    dataset,
+                    origin_route="excel_multi_aggregate",
+                )
+            return StructuredMultiAggregateIntent(
+                dataset_id=dataset.schema.dataset_id,
+                metrics=(StructuredMetricIntent(aggregate, metric.physical_name, percentile),),
+                filters=filter_result.value,
+                implicit=False,
+                group_by=tuple(column.physical_name for column in group_columns),
+                percentile=percentile,
+                order_by=metric.physical_name if top_limit is not None or order_explicit else None,
+                order_desc=order_desc,
+                limit=top_limit,
+            )
         return StructuredIntent(
             dataset_id=dataset.schema.dataset_id,
             aggregate=aggregate,
             metric_physical_name=None if metric is None else metric.physical_name,
             filters=filter_result.value,
+            percentile=percentile,
         )
 
     if has_summary_word:
@@ -902,9 +1150,161 @@ def resolve_structured_intent(
             ),
             filters=filter_result.value,
             implicit=True,
+            group_by=tuple(column.physical_name for column in group_columns),
+            order_by=(
+                implicit_columns[0].physical_name
+                if top_limit is not None or order_explicit
+                else None
+            ),
+            order_desc=order_desc,
+            limit=top_limit,
         )
 
     return StructuredUnavailable("未识别到受支持的聚合意图")
+
+
+def _parse_combined_aggregate_intent(
+    question: str,
+    dataset: StructuredDatasetCatalog,
+    filters: tuple[StructuredFilter, ...],
+    excluded_spans: tuple[_TextSpan, ...],
+    group_columns: tuple[StructuredColumnSchema, ...],
+    top_limit: int | None,
+    order_desc: bool,
+    order_explicit: bool,
+) -> StructuredMultiAggregateIntent | None:
+    """Support one metric requested with several explicit statistics in one query."""
+
+    available = _mask_spans(question, excluded_spans)
+    field_spans = _column_name_spans(available, dataset.schema.columns)
+    occurrences: list[tuple[int, str, _TextSpan]] = []
+    for aggregate, words in _AGGREGATE_WORDS:
+        for word in words:
+            for span in _find_normalized_spans(available, word):
+                if any(_contains(field_span, span) for field_span in field_spans):
+                    continue
+                occurrences.append((span.start, aggregate, span))
+    if len({aggregate for _, aggregate, _ in occurrences}) < 2:
+        return None
+    longest = [
+        item
+        for item in occurrences
+        if not any(
+            other[1] != item[1]
+            and other[2].start <= item[2].start
+            and item[2].end <= other[2].end
+            and (other[2].end - other[2].start) > (item[2].end - item[2].start)
+            for other in occurrences
+        )
+    ]
+    aggregates = tuple(dict.fromkeys(aggregate for _, aggregate, _ in sorted(longest)))
+    metric_text = _mask_spans(available, tuple(span for _, _, span in longest))
+    metrics = _resolve_multiple_columns(metric_text, dataset.schema.columns)
+    if isinstance(metrics, StructuredClarification) or len(metrics) != 1:
+        return None
+    metric = metrics[0]
+    if any(
+        aggregate not in {"count", "count_distinct"} and not metric.allow_aggregate
+        for aggregate in aggregates
+    ):
+        return None
+    metric_intents = tuple(
+        StructuredMetricIntent(
+            aggregate,
+            metric.physical_name,
+            _extract_percentile(question) if aggregate == "percentile" else None,
+        )
+        for aggregate in aggregates
+    )
+    return StructuredMultiAggregateIntent(
+        dataset_id=dataset.schema.dataset_id,
+        metrics=metric_intents,
+        filters=filters,
+        implicit=False,
+        group_by=tuple(column.physical_name for column in group_columns),
+        order_by=metric.physical_name if top_limit is not None or order_explicit else None,
+        order_desc=order_desc,
+        limit=top_limit,
+    )
+
+
+def _parse_group_by_clause(
+    question: str,
+    columns: tuple[StructuredColumnSchema, ...],
+    excluded_spans: tuple[_TextSpan, ...],
+) -> _ClauseParseResult[tuple[StructuredColumnSchema, ...]]:
+    """Resolve governed group dimensions from phrases such as ``按地区`` or ``各地区``."""
+
+    available = _mask_spans(question, excluded_spans)
+    marker_matches = list(
+        re.finditer(
+            r"(?P<marker>按照|分别按|分组按|每个|每种|按|各)(?P<body>.+?)"
+            r"(?=分别|分组|统计|汇总|求和|合计|总和|平均|均值|计数|去重|最大|最小|"
+            r"最高|最低|中位|标准差|方差|P\s*\d|\d+\s*(?:%|分位)|[，,。；;]|$)",
+            available,
+            re.IGNORECASE,
+        )
+    )
+    if not marker_matches:
+        return _ClauseParseResult(value=())
+    selected: list[StructuredColumnSchema] = []
+    spans: list[_TextSpan] = []
+    for marker in marker_matches:
+        body_start = marker.start("body")
+        body = marker.group("body")
+        resolved = _resolve_multiple_columns(body, columns)
+        if isinstance(resolved, StructuredClarification):
+            return _ClauseParseResult(issue=resolved)
+        resolved_columns = (
+            resolved[:1]
+            if marker.group("marker") in {"各", "每个", "每种"}
+            or re.search(r"[、,，和与及]", body) is None
+            else resolved
+        )
+        for column in resolved_columns:
+            if column.physical_name not in {item.physical_name for item in selected}:
+                selected.append(column)
+                spans.extend(_column_name_spans(available, (column,)))
+        spans.append(_TextSpan(body_start, marker.end("body")))
+    if not selected:
+        return _ClauseParseResult(issue=StructuredClarification("未识别到分组字段", ()))
+    return _ClauseParseResult(value=tuple(selected), consumed_spans=_merge_spans(spans))
+
+
+def _parse_top_n_clause(question: str) -> tuple[int | None, bool, tuple[_TextSpan, ...]]:
+    match = _TOP_N_RE.search(question)
+    if match is None:
+        return None, True, ()
+    limit = int(match.group("limit"))
+    if not 1 <= limit <= 1000:
+        return 0, True, (_TextSpan(match.start(), match.end()),)
+    direction = match.group("direction")
+    return (
+        limit,
+        direction.casefold() not in {"后", "最低", "bottom"},
+        (_TextSpan(match.start(), match.end()),),
+    )
+
+
+def _parse_order_direction_clause(question: str) -> tuple[bool, bool, tuple[_TextSpan, ...]]:
+    match = _ORDER_DIRECTION_RE.search(question)
+    if match is None:
+        return False, True, ()
+    direction = match.group("direction")
+    descending = direction in {"降序", "从高到低", "由大到小"}
+    return True, descending, (_TextSpan(match.start(), match.end()),)
+
+
+def _extract_percentile(question: str) -> float | None:
+    match = _PERCENTILE_RE.search(question)
+    if match is None:
+        return None
+    raw = match.group("p_short") or match.group("p_long")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value <= 100 else None
 
 
 def _parse_row_lookup_intent(
@@ -1000,6 +1400,23 @@ def _parse_aggregate_clause(
                 matches.setdefault(aggregate, []).append(span)
                 if aggregate == "count" and word == "多少条":
                     count_all_hint = True
+    # Prefer a governed compound phrase such as ``去重数量`` over the
+    # shorter ``数量`` token contained inside it.
+    all_spans = [
+        (aggregate, span)
+        for aggregate, spans in matches.items()
+        for span in spans
+    ]
+    for aggregate, span in all_spans:
+        if any(
+            other_aggregate != aggregate
+            and other_span.start <= span.start
+            and span.end <= other_span.end
+            and (other_span.end - other_span.start) > (span.end - span.start)
+            for other_aggregate, other_span in all_spans
+        ):
+            matches[aggregate].remove(span)
+    matches = {aggregate: spans for aggregate, spans in matches.items() if spans}
     if len(matches) > 1:
         return _ClauseParseResult(
             issue=StructuredClarification(
@@ -1142,7 +1559,9 @@ def _parse_metric_list(
         selected_spans.append(span)
 
     disallowed = tuple(
-        column for column in selected if aggregate != "count" and not column.allow_aggregate
+        column
+        for column in selected
+        if aggregate not in {"count", "count_distinct"} and not column.allow_aggregate
     )
     if disallowed:
         return _ClauseParseResult(
@@ -1252,7 +1671,7 @@ def _parse_metric_clause(
     available = _mask_spans(question, excluded_spans)
     aggregate_columns = (
         columns
-        if aggregate == "count"
+        if aggregate in {"count", "count_distinct"}
         else tuple(column for column in columns if column.allow_aggregate)
     )
     matches = _resolve_columns(available, aggregate_columns)
@@ -1264,7 +1683,7 @@ def _parse_metric_clause(
             value=metric,
             consumed_spans=_column_name_spans(available, (metric,)),
         )
-    if aggregate == "count":
+    if aggregate in {"count", "count_distinct"}:
         if count_all_hint:
             return _ClauseParseResult(value=None)
         reusable = tuple(dict.fromkeys(shared_columns))
@@ -2056,10 +2475,14 @@ def _validate_generated_select(
     if len(tables) != 1 or tables[0].name != table_name:
         raise UnsafeStructuredQueryError("query table is outside the active publication")
     for function in parsed.find_all(exp.AggFunc):
-        if function.sql_name().upper() not in _ALLOWED_SQL_FUNCTIONS:
+        function_name = function.sql_name().upper()
+        if isinstance(function, exp.Anonymous) or function.sql_name() in {
+            "ANONYMOUS_AGG_FUNC",
+            "PARAMETERIZED_AGG",
+        }:
+            function_name = getattr(function, "name", "").upper()
+        if function_name not in _ALLOWED_SQL_FUNCTIONS:
             raise UnsafeStructuredQueryError("query contains a non-whitelisted function")
-    if any(parsed.find_all(exp.Anonymous)):
-        raise UnsafeStructuredQueryError("query contains a non-whitelisted function")
     for column in parsed.find_all(exp.Column):
         if column.name not in allowed_columns:
             raise UnsafeStructuredQueryError("query contains an unknown column")
@@ -2123,35 +2546,45 @@ def _multi_aggregate_row(
     result: object,
     metric_count: int,
 ) -> Mapping[str, object]:
+    rows = _multi_aggregate_rows(result, metric_count, 0)
+    if len(rows) != 1:
+        raise ValueError("multi-aggregate query must return exactly one row")
+    return rows[0]
+
+
+def _multi_aggregate_rows(
+    result: object,
+    metric_count: int,
+    group_count: int,
+) -> tuple[Mapping[str, object], ...]:
     if isinstance(result, Mapping):
-        return result
+        return (result,)
     named_results = getattr(result, "named_results", None)
     if named_results is not None:
         rows = list(named_results())
-        if len(rows) != 1 or not isinstance(rows[0], Mapping):
-            raise ValueError("multi-aggregate query must return exactly one named row")
-        return rows[0]
+        if not all(isinstance(row, Mapping) for row in rows):
+            raise ValueError("multi-aggregate query returned an invalid named row")
+        return tuple(rows)
     column_names = getattr(result, "column_names", None)
     result_rows = getattr(result, "result_rows", None)
     if column_names is not None and result_rows is not None:
         rows = list(result_rows)
-        if len(rows) != 1:
-            raise ValueError("multi-aggregate query must return exactly one result row")
-        return dict(zip(column_names, rows[0], strict=True))
+        return tuple(dict(zip(column_names, row, strict=True)) for row in rows)
     if isinstance(result, Sequence) and not isinstance(result, (str, bytes, bytearray)):
         rows = list(result)
-        if len(rows) != 1:
-            raise ValueError("multi-aggregate query must return exactly one result row")
-        first = rows[0]
-        if isinstance(first, Mapping):
-            return first
-        if isinstance(first, Sequence) and not isinstance(first, (str, bytes, bytearray)):
-            return dict(zip(_multi_aggregate_aliases(metric_count), first, strict=True))
+        if all(isinstance(row, Mapping) for row in rows):
+            return tuple(rows)
+        if all(
+            isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray))
+            for row in rows
+        ):
+            aliases = _multi_aggregate_aliases(metric_count, group_count)
+            return tuple(dict(zip(aliases, row, strict=True)) for row in rows)
     raise TypeError("unsupported ClickHouse multi-aggregate result shape")
 
 
-def _multi_aggregate_aliases(metric_count: int) -> tuple[str, ...]:
-    aliases = ["total_count"]
+def _multi_aggregate_aliases(metric_count: int, group_count: int = 0) -> tuple[str, ...]:
+    aliases = [*(f"group_{index}" for index in range(group_count)), "total_count"]
     for index in range(metric_count):
         aliases.extend(
             (
@@ -2174,11 +2607,11 @@ def _require_exact_result_aliases(
 
 def _aggregate_value(
     value: object,
-    aggregate: Literal["avg", "sum", "count", "min", "max"],
+    aggregate: str,
     *,
     valid_count: int,
 ):
-    if aggregate == "count":
+    if aggregate in {"count", "count_distinct"}:
         return int(value)
     if value is None:
         if valid_count == 0:

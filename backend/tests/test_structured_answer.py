@@ -948,6 +948,51 @@ class StructuredAnswerServiceTest(unittest.TestCase):
             ],
         )
 
+    def test_grouped_top_n_returns_only_requested_analysis_table(self) -> None:
+        provider = RecordingLLMProvider()
+        gateway = RecordingClickHouseGateway(
+            result=[
+                {
+                    "group_0": "华东",
+                    "total_count": 3,
+                    "metric_0_value": Decimal("300.5"),
+                    "metric_0_valid_count": 3,
+                    "metric_0_null_count": 0,
+                },
+                {
+                    "group_0": "华南",
+                    "total_count": 2,
+                    "metric_0_value": Decimal("200"),
+                    "metric_0_valid_count": 2,
+                    "metric_0_null_count": 0,
+                },
+            ]
+        )
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(
+                lambda: sample_multi_metric_catalog(), gateway
+            ),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        _, _, messages = repository.send_message(
+            conversation_id,
+            "按地区统计销售额总和前2名",
+            "quick",
+        )
+
+        reply = messages[-1]
+        self.assertEqual(reply.paragraphs[0].text, "已按地区汇总，共得到 2 组。")
+        self.assertEqual(reply.artifacts[0].columns, ["地区", "销售额（总和）", "匹配行数"])
+        self.assertEqual(
+            reply.artifacts[0].rows,
+            [["华东", "300.5", "3"], ["华南", "200", "2"]],
+        )
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(len(gateway.calls), 1)
+
     def test_excel_multi_result_records_dataset_fields_and_validation(self) -> None:
         result = StructuredAnswerService(
             lambda: sample_multi_metric_catalog(),

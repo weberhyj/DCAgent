@@ -29,7 +29,18 @@ class StructuredDatasetStatus(StrEnum):
     FAILED = "failed"
 
 
-StructuredAggregateName = Literal["avg", "sum", "count", "min", "max"]
+StructuredAggregateName = Literal[
+    "avg",
+    "sum",
+    "count",
+    "count_distinct",
+    "min",
+    "max",
+    "median",
+    "percentile",
+    "stddev",
+    "variance",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,12 +164,14 @@ class StructuredIntent:
     aggregate: StructuredAggregateName
     metric_physical_name: str | None
     filters: tuple[StructuredFilter, ...]
+    percentile: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class StructuredMetricIntent:
     aggregate: StructuredAggregateName
     metric_physical_name: str
+    percentile: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +180,13 @@ class StructuredMultiAggregateIntent:
     metrics: tuple[StructuredMetricIntent, ...]
     filters: tuple[StructuredFilter, ...]
     implicit: bool
+    # Optional governed analysis modifiers.  Empty/default values preserve the
+    # original single-row summary contract.
+    group_by: tuple[str, ...] = ()
+    percentile: float | None = None
+    order_by: str | None = None
+    order_desc: bool = True
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +225,7 @@ class StructuredQueryPlan:
     parameters: Mapping[str, object]
     aggregate: StructuredAggregateName
     filters: tuple[StructuredFilter, ...]
+    percentile: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +237,11 @@ class StructuredMultiAggregatePlan:
     parameters: Mapping[str, object]
     filters: tuple[StructuredFilter, ...]
     implicit: bool
+    group_by: tuple[str, ...] = ()
+    percentile: float | None = None
+    order_by: str | None = None
+    order_desc: bool = True
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +273,7 @@ class StructuredAggregateResult:
     elapsed_ms: float
     audit_id: str
     source_id: str = ""
+    percentile: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +284,14 @@ class StructuredMetricResult:
     value: Decimal | int | None
     valid_count: int
     null_count: int
+    percentile: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredGroupedAggregateRow:
+    group_values: tuple[str, ...]
+    metrics: tuple[StructuredMetricResult, ...]
+    total_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +307,8 @@ class StructuredMultiAggregateResult:
     filters: tuple[StructuredFilter, ...]
     elapsed_ms: float
     audit_id: str
+    group_by: tuple[str, ...] = ()
+    groups: tuple[StructuredGroupedAggregateRow, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

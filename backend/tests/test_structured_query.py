@@ -536,14 +536,18 @@ class StructuredIntentParsingTest(unittest.TestCase):
                 result = parse_structured_intent(question, sample_catalog())
                 self.assertEqual(result.aggregate, expected)
 
-    def test_multiple_distinct_aggregates_require_clarification(self) -> None:
+    def test_multiple_distinct_aggregates_share_one_metric(self) -> None:
         result = parse_structured_intent(
             "订单金额最大值和最小值",
             sample_catalog(),
         )
 
-        self.assertIsInstance(result, StructuredClarification)
-        self.assertEqual(result.candidates, ("max", "min"))
+        self.assertIsInstance(result, StructuredMultiAggregateIntent)
+        assert isinstance(result, StructuredMultiAggregateIntent)
+        self.assertEqual(
+            [(metric.aggregate, metric.metric_physical_name) for metric in result.metrics],
+            [("max", "order_amount"), ("min", "order_amount")],
+        )
 
     def test_repeated_synonyms_for_one_aggregate_do_not_create_ambiguity(self) -> None:
         result = parse_structured_intent(
@@ -1542,15 +1546,49 @@ class StructuredQueryPlannerTest(unittest.TestCase):
 
         self.assertEqual(len(plan.metrics), 3)
 
-    def test_multi_plan_rejects_non_whitelisted_aggregate(self) -> None:
-        from app.structured_query import StructuredQueryPlanner, UnsafeStructuredQueryError
+    def test_multi_plan_accepts_governed_advanced_aggregate(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
 
         metric = StructuredMetricIntent("median", "sales_amount")  # type: ignore[arg-type]
-        with self.assertRaisesRegex(UnsafeStructuredQueryError, "aggregate"):
-            StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
-                StructuredMultiAggregateIntent("ds-sales", (metric,), (), False),
-                sample_publication(),
-            )
+        plan = StructuredQueryPlanner(sample_multi_metric_catalog()).plan_multi(
+            StructuredMultiAggregateIntent("ds-sales", (metric,), (), False),
+            sample_publication(),
+        )
+        self.assertIn("quantileExact(0.5)(sales_amount)", plan.sql)
+
+    def test_advanced_excel_aggregation_intents_are_structured(self) -> None:
+        from app.structured_query import StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        grouped = parse_structured_intent("按地区统计销售额总和前3名", catalog)
+        self.assertIsInstance(grouped, StructuredMultiAggregateIntent)
+        assert isinstance(grouped, StructuredMultiAggregateIntent)
+        self.assertEqual(grouped.group_by, ("region",))
+        self.assertEqual(grouped.limit, 3)
+        self.assertTrue(grouped.order_desc)
+
+        distinct = parse_structured_intent("地区去重数量", catalog)
+        self.assertEqual(
+            (distinct.aggregate, distinct.metric_physical_name),
+            ("count_distinct", "region"),
+        )
+
+        percentile = parse_structured_intent("销售额P90分位数", catalog)
+        self.assertEqual(percentile.aggregate, "percentile")
+        self.assertEqual(percentile.percentile, 90.0)
+
+        expected_sql = {
+            "销售额中位数": "quantileExact(0.5)(sales_amount)",
+            "销售额P90分位数": "quantileExact(0.9)(sales_amount)",
+            "销售额标准差": "stddevPop(sales_amount)",
+            "销售额方差": "varPop(sales_amount)",
+            "地区去重数量": "uniqExact(region)",
+        }
+        for question, expression in expected_sql.items():
+            with self.subTest(question=question):
+                intent = parse_structured_intent(question, catalog)
+                plan = StructuredQueryPlanner(catalog).plan(intent, sample_publication())
+                self.assertIn(expression, plan.sql)
 
     def test_legacy_datetime_equality_uses_datetime_placeholder_and_truncates_microseconds(
         self,
@@ -2520,6 +2558,41 @@ class StructuredQueryExecutorTest(unittest.TestCase):
 
         self.assertEqual(result.value, Decimal(30))
         self.assertEqual(llm.generation_calls, 0)
+
+    def test_grouped_top_n_executes_one_governed_query(self) -> None:
+        from app.structured_query import StructuredQueryExecutor, StructuredQueryPlanner
+
+        catalog = sample_multi_metric_catalog()
+        intent = parse_structured_intent("按地区统计销售额总和前2名", catalog)
+        assert isinstance(intent, StructuredMultiAggregateIntent)
+        plan = StructuredQueryPlanner(catalog).plan_multi(intent, sample_publication())
+        gateway = FakeClickHouse(
+            aggregate_rows=[
+                {
+                    "group_0": "华东",
+                    "total_count": 3,
+                    "metric_0_value": "300.5",
+                    "metric_0_valid_count": 3,
+                    "metric_0_null_count": 0,
+                },
+                {
+                    "group_0": "华南",
+                    "total_count": 2,
+                    "metric_0_value": "200",
+                    "metric_0_valid_count": 2,
+                    "metric_0_null_count": 0,
+                },
+            ]
+        )
+
+        result = StructuredQueryExecutor(catalog, gateway).execute_multi(plan)
+
+        assert isinstance(result, StructuredMultiAggregateResult)
+        self.assertEqual(result.group_by, ("region",))
+        self.assertEqual([row.group_values for row in result.groups], [("华东",), ("华南",)])
+        self.assertEqual(result.groups[0].metrics[0].value, Decimal("300.5"))
+        self.assertIn("ORDER BY metric_0_value DESC LIMIT 2", plan.sql)
+        self.assertEqual(len(gateway.queries), 1)
 
     def test_executor_rejects_forged_join_plan_before_gateway_call(self) -> None:
         from app.structured_models import StructuredUnavailable
