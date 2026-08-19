@@ -132,6 +132,10 @@ export async function fetchKnowledgeChunks(sourceId: string) {
   return data
 }
 
+export function knowledgeSourceDownloadUrl(sourceId: string) {
+  return `/api/knowledge/sources/${encodeURIComponent(sourceId)}/download`
+}
+
 export async function fetchStructuredPreview(sourceId: string) {
   const encodedSourceId = encodeURIComponent(sourceId)
   const { data } = await http.get<StructuredPreview>(

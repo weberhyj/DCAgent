@@ -178,6 +178,30 @@ describe('KnowledgeManagementPage', () => {
     expect(wrapper.text()).toContain('操作')
   })
 
+  it('offers the original file for download from each uploaded source', () => {
+    const wrapper = mountPage()
+    const download = wrapper.get('[data-testid="download-knowledge-source-kb-policy"]')
+
+    expect(download.element.tagName).toBe('A')
+    expect(download.attributes('href')).toBe('/api/knowledge/sources/kb-policy/download')
+    expect(download.attributes('download')).toBe('policy.txt')
+    expect(download.attributes('aria-label')).toBe('下载 policy.txt')
+  })
+
+  it('disables downloading for a registered source without an original file', () => {
+    knowledgeState.sources = [{
+      ...indexedSource,
+      id: 'kb-registered-only',
+      fileSize: null,
+    }]
+
+    const wrapper = mountPage()
+    const download = wrapper.get('[data-testid="download-knowledge-source-kb-registered-only"]')
+
+    expect(download.element.tagName).toBe('BUTTON')
+    expect((download.element as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('keeps regular page text at a readable 12px minimum', () => {
     const scopedStyle = knowledgeManagementPageSource.split('<style scoped>')[1] ?? ''
     const fontSizes = Array.from(scopedStyle.matchAll(/font-size:\s*(\d+(?:\.\d+)?)px/g))

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertTriangle, Database, Eye, FileUp, RefreshCcw, Search, ShieldCheck, Trash2, UploadCloud } from 'lucide-vue-next'
+import { AlertTriangle, Database, Download, Eye, FileUp, RefreshCcw, Search, ShieldCheck, Trash2, UploadCloud } from 'lucide-vue-next'
 import { computed, onMounted, shallowRef, useTemplateRef, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import AdminPageHeader from '@/components/layout/AdminPageHeader.vue'
@@ -8,6 +8,7 @@ import BaseDialog from '@/components/ui/BaseDialog.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
 import { useChatKnowledgeManagement } from '@/composables/useChatKnowledgeManagement'
+import { knowledgeSourceDownloadUrl } from '@/services/api'
 import type { KnowledgeSource } from '@/types/chat'
 import { isStructuredKnowledgeSource } from '@/utils/knowledgeSources'
 
@@ -286,6 +287,24 @@ function formatFileSize(bytes?: number | null) {
                 title="重新索引"
                 @click="retrySourceIndexing(source)"
               ><RefreshCcw :size="15" /></BaseButton>
+              <a
+                v-if="source.fileSize !== null && source.fileSize !== undefined"
+                class="download-action"
+                :href="knowledgeSourceDownloadUrl(source.id)"
+                :download="source.name"
+                :data-testid="`download-knowledge-source-${source.id}`"
+                :aria-label="`下载 ${source.name}`"
+                title="下载原文件"
+              ><Download :size="15" /></a>
+              <BaseButton
+                v-else
+                variant="ghost"
+                size="icon"
+                disabled
+                :data-testid="`download-knowledge-source-${source.id}`"
+                :aria-label="`${source.name} 没有可下载的原文件`"
+                title="没有可下载的原文件"
+              ><Download :size="15" /></BaseButton>
               <BaseButton
                 variant="ghost"
                 size="icon"
@@ -418,7 +437,7 @@ function formatFileSize(bytes?: number | null) {
 .inline-state { display: inline-flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px; border: 1px solid #bfd0e2; border-radius: 6px; color: #184985; background: #eef4ff; font-size: 12px; line-height: 1.4; }
 .inline-state i { width: 7px; height: 7px; border-radius: 50%; background: #1463ff; box-shadow: 0 0 0 4px rgba(20,99,255,.12); animation: pulse 1s ease-in-out infinite; }
 .source-table { min-width: 0; overflow-x: auto; padding-bottom: 5px; }
-.source-grid { display: grid; grid-template-columns: 30px minmax(210px,1.5fr) 78px 104px 58px 84px minmax(138px,.8fr) 112px; gap: 8px; align-items: center; min-width: 920px; }
+.source-grid { display: grid; grid-template-columns: 30px minmax(210px,1.5fr) 78px 104px 58px 84px minmax(138px,.8fr) 144px; gap: 8px; align-items: center; min-width: 952px; }
 .source-grid--head { min-height: 38px; padding: 0 10px; color: #68798a; font-size: 12px; font-weight: 700; line-height: 1.25; }
 .source-grid--head span:last-child { text-align: center; }
 .source-row { min-height: 74px; margin-bottom: 7px; padding: 10px; border: 1px solid #e0e7ef; border-radius: 7px; background: #fbfcfd; }
@@ -442,6 +461,9 @@ function formatFileSize(bytes?: number | null) {
 .updated-cell small { color: #8b98a6; font-size: 12px; }
 .row-actions { display: flex; justify-content: center; gap: 2px; }
 .row-actions :deep(.base-button--icon) { width: 31px; height: 31px; }
+.download-action { display: inline-flex; align-items: center; justify-content: center; width: 31px; height: 31px; border: 1px solid transparent; border-radius: 6px; color: #536578; text-decoration: none; }
+.download-action:hover { color: var(--color-accent-strong); border-color: #cbd8e5; background: #eef4ff; }
+.download-action:focus-visible { outline: 2px solid rgba(20,99,255,.48); outline-offset: 2px; }
 .empty-state { padding: 48px 20px; border: 1px dashed #b8c6d4; border-radius: 7px; color: #7d8d9d; background: #f8fafc; font-size: 12px; line-height: 1.55; text-align: center; }
 .remove-dialog { display: grid; gap: 18px; }
 .remove-warning { display: flex; align-items: center; gap: 8px; padding: 11px; border: 1px solid #efd1a8; border-radius: 7px; color: #7a4a16; background: #fff7e8; font-size: 12px; line-height: 1.45; }

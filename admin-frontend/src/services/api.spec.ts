@@ -113,6 +113,14 @@ describe('knowledge api service', () => {
     expect(httpMock.post).toHaveBeenCalledWith('/knowledge/sources/kb-policy/reindex')
   })
 
+  it('builds an encoded original-file download URL', async () => {
+    const { knowledgeSourceDownloadUrl } = await loadApi()
+
+    expect(knowledgeSourceDownloadUrl('source/差旅 ?')).toBe(
+      '/api/knowledge/sources/source%2F%E5%B7%AE%E6%97%85%20%3F/download',
+    )
+  })
+
   it('loads read-only agent audit runs from the administrator endpoint', async () => {
     httpMock.get.mockResolvedValue({ data: [agentRun] })
     const { fetchAgentRuns } = await loadApi()

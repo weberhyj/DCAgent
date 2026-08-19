@@ -16,7 +16,7 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from loguru import logger
 from pydantic import BeforeValidator
 
@@ -461,6 +461,29 @@ def add_knowledge_source(
             request.classification,
         )
     ]
+
+
+@router.get("/knowledge/sources/{source_id}/download", response_class=FileResponse)
+def download_knowledge_source(
+    source_id: str,
+    repository: ChatRepository = Depends(get_repository),
+    storage: KnowledgeFileStorage = Depends(get_storage),
+) -> FileResponse:
+    source = next(
+        (item for item in repository.list_knowledge_sources() if item.id == source_id), None
+    )
+    if source is None:
+        raise HTTPException(status_code=404, detail="Knowledge source not found")
+
+    file_path = storage.resolve_file(source.file_path)
+    if file_path is None:
+        raise HTTPException(status_code=404, detail="Knowledge source file is unavailable")
+
+    return FileResponse(
+        path=file_path,
+        media_type=source.mime_type or "application/octet-stream",
+        filename=source.name,
+    )
 
 
 @router.delete("/knowledge/sources/{source_id}", response_model=list[KnowledgeSource])

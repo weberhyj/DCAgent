@@ -71,6 +71,27 @@ class KnowledgeFileStorage:
             records=estimate_records(content, source_type),
         )
 
+    def resolve_file(self, file_path: str | Path | None) -> Path | None:
+        """Resolve a stored upload without allowing access outside the upload root."""
+        if not file_path:
+            return None
+
+        target = Path(file_path)
+        if not target.is_absolute():
+            target = self._root / target
+        if target.is_symlink():
+            return None
+
+        try:
+            root = self._root.resolve(strict=True)
+            resolved = target.resolve(strict=True)
+        except OSError:
+            return None
+
+        if root not in resolved.parents or not resolved.is_file():
+            return None
+        return resolved
+
     def delete(self, file_path: str | Path | None) -> None:
         if not file_path:
             return

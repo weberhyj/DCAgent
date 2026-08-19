@@ -137,6 +137,7 @@ interface AgentStepAudit {
 - `GET /api/knowledge/sources`：返回资料来源列表并推进待处理解析任务。
 - `POST /api/knowledge/sources`：注册资料来源。
 - `POST /api/knowledge/uploads`：批量上传 `.pdf`、`.docx`、`.xlsx`、`.csv`、`.txt`、`.md` 等文件。
+- `GET /api/knowledge/sources/{sourceId}/download`：下载上传时保存的原始文件；无原文件或文件已丢失时返回 `404`。
 - `POST /api/knowledge/sources/{sourceId}/reindex`：重新解析失败资料。
 - `DELETE /api/knowledge/sources/{sourceId}`：删除资料及其索引片段。
 - `GET /api/knowledge/sources/{sourceId}/chunks`：管理端读取解析片段。

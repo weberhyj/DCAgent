@@ -145,6 +145,50 @@ class KnowledgeUploadTest(unittest.TestCase):
         stored_files = sorted(path.suffix for path in Path(self.temp_dir.name).iterdir())
         self.assertEqual(stored_files, [".md", ".txt"])
 
+    def test_downloads_uploaded_original_file_with_original_filename(self) -> None:
+        content = b"downloadable policy content"
+        upload_response = self.client.post(
+            "/api/knowledge/uploads",
+            files={"file": ("policy.txt", content, "text/plain")},
+        )
+        source = upload_response.json()[0]
+
+        response = self.client.get(f"/api/knowledge/sources/{source['id']}/download")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, content)
+        self.assertEqual(response.headers["content-type"], "text/plain; charset=utf-8")
+        self.assertIn("policy.txt", response.headers["content-disposition"])
+
+    def test_download_rejects_source_without_uploaded_file(self) -> None:
+        sources = self.repository.add_knowledge_source("registered-only.txt", "文档", "内部")
+
+        response = self.client.get(f"/api/knowledge/sources/{sources[0].id}/download")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Knowledge source file is unavailable")
+
+    def test_download_rejects_file_outside_upload_directory(self) -> None:
+        upload_root = Path(self.temp_dir.name)
+        outside_file = upload_root.with_name(f"{upload_root.name}-outside-policy.txt")
+        outside_file.write_text("must not be downloadable", encoding="utf-8")
+        self.addCleanup(outside_file.unlink, missing_ok=True)
+        self.repository.add_uploaded_knowledge_source(
+            source_id="kb-outside",
+            name="outside-policy.txt",
+            source_type="文档",
+            classification="内部",
+            records=0,
+            file_path=str(outside_file),
+            file_size=outside_file.stat().st_size,
+            mime_type="text/plain",
+        )
+
+        response = self.client.get("/api/knowledge/sources/kb-outside/download")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Knowledge source file is unavailable")
+
     def test_deletes_uploaded_source_chunks_and_file(self) -> None:
         response = self.client.post(
             "/api/knowledge/uploads",
