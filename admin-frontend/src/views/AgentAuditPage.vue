@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Bot, RefreshCcw, Search } from 'lucide-vue-next'
+import { Bot, ChevronDown, RefreshCcw, Search } from 'lucide-vue-next'
 import { computed, onMounted, shallowRef } from 'vue'
 import AdminPageHeader from '@/components/layout/AdminPageHeader.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
@@ -35,6 +35,10 @@ onMounted(() => {
 
 function toolLabel(toolName: string) {
   return toolLabels[toolName] ?? toolName
+}
+
+function stepStatusLabel(status: 'completed' | 'failed') {
+  return status === 'completed' ? '已完成' : '失败'
 }
 </script>
 
@@ -85,14 +89,55 @@ function toolLabel(toolName: string) {
         <ol class="audit-steps">
           <li v-for="step in run.steps" :key="step.id">
             <span class="audit-step__index">{{ step.stepIndex + 1 }}</span>
-            <div>
-              <header>
-                <strong>{{ toolLabel(step.toolName) }}</strong>
-                <span>只读</span>
+            <details class="audit-step" :data-testid="`agent-step-${step.id}`">
+              <summary :data-testid="`agent-step-summary-${step.id}`">
+                <span class="audit-step__title">
+                  <strong>{{ toolLabel(step.toolName) }}</strong>
+                  <small>{{ step.outputSummary }}</small>
+                </span>
+                <span class="audit-step__status" :class="`is-${step.status}`">
+                  {{ stepStatusLabel(step.status) }}
+                </span>
                 <time>{{ step.completedAt }}</time>
-              </header>
-              <p>{{ step.outputSummary }}</p>
-            </div>
+                <ChevronDown class="audit-step__chevron" :size="15" aria-hidden="true" />
+              </summary>
+
+              <div class="audit-step__details" :data-testid="`agent-step-details-${step.id}`">
+                <dl>
+                  <div class="audit-step__wide">
+                    <dt>输入</dt>
+                    <dd>{{ step.inputSummary }}</dd>
+                  </div>
+                  <div class="audit-step__wide">
+                    <dt>输出</dt>
+                    <dd>{{ step.outputSummary }}</dd>
+                  </div>
+                  <div>
+                    <dt>工具名称</dt>
+                    <dd>{{ step.toolName }}</dd>
+                  </div>
+                  <div>
+                    <dt>执行权限</dt>
+                    <dd>{{ step.readOnly ? '只读' : '可写' }}</dd>
+                  </div>
+                  <div>
+                    <dt>开始时间</dt>
+                    <dd>{{ step.startedAt }}</dd>
+                  </div>
+                  <div>
+                    <dt>完成时间</dt>
+                    <dd>{{ step.completedAt }}</dd>
+                  </div>
+                  <div class="audit-step__wide">
+                    <dt>关联资料</dt>
+                    <dd v-if="step.sourceIds.length" class="audit-step__sources">
+                      <span v-for="sourceId in step.sourceIds" :key="sourceId">{{ sourceId }}</span>
+                    </dd>
+                    <dd v-else>无</dd>
+                  </div>
+                </dl>
+              </div>
+            </details>
           </li>
         </ol>
       </details>
@@ -226,6 +271,124 @@ function toolLabel(toolName: string) {
   border-top: 1px solid #e5ebf1;
 }
 
+.audit-step {
+  min-width: 0;
+}
+
+.audit-step > summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto 18px;
+  gap: 10px;
+  align-items: center;
+  min-height: 32px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.audit-step > summary::-webkit-details-marker {
+  display: none;
+}
+
+.audit-step__title {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.audit-step__title strong,
+.audit-step__title small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audit-step__title strong {
+  color: #1d2a36;
+  font-size: 12px;
+}
+
+.audit-step__title small {
+  color: #6f7f8f;
+  font-size: 10px;
+}
+
+.audit-step__status {
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #087b55;
+  background: #e5f5ee;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.audit-step__status.is-failed {
+  color: #b42318;
+  background: #fff0ed;
+}
+
+.audit-step__chevron {
+  color: #718397;
+  transition: transform 160ms ease;
+}
+
+.audit-step[open] .audit-step__chevron {
+  transform: rotate(180deg);
+}
+
+.audit-step__details {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid #dfe7ef;
+  border-radius: 7px;
+  background: #f7f9fc;
+}
+
+.audit-step__details dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+  margin: 0;
+}
+
+.audit-step__details dl > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.audit-step__details .audit-step__wide {
+  grid-column: 1 / -1;
+}
+
+.audit-step__details dt {
+  color: #718294;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.audit-step__details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #34475a;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.audit-step__sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.audit-step__sources span {
+  padding: 3px 6px;
+  border-radius: 5px;
+  color: #235999;
+  background: #e7efff;
+  font-family: var(--font-mono);
+  font-size: 9px;
+}
+
 .audit-step__index {
   display: grid;
   place-items: center;
@@ -238,38 +401,11 @@ function toolLabel(toolName: string) {
   font-size: 10px;
 }
 
-.audit-steps header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-
-.audit-steps header strong {
-  color: #1d2a36;
-  font-size: 12px;
-}
-
-.audit-steps header span {
-  padding: 2px 6px;
-  border-radius: 999px;
-  color: #087b55;
-  background: #e5f5ee;
-  font-size: 9px;
-}
-
 .audit-steps time {
-  margin-left: auto;
   color: #8090a0;
   font-family: var(--font-mono);
   font-size: 9px;
-}
-
-.audit-steps p {
-  margin: 5px 0 0;
-  color: #586a7b;
-  font-size: 11px;
-  line-height: 1.6;
+  white-space: nowrap;
 }
 
 .module-state {
@@ -298,6 +434,22 @@ function toolLabel(toolName: string) {
   .audit-run__metrics {
     grid-column: 2;
     justify-content: flex-start;
+  }
+
+  .audit-step > summary {
+    grid-template-columns: minmax(0, 1fr) auto 18px;
+  }
+
+  .audit-step > summary time {
+    display: none;
+  }
+
+  .audit-step__details dl {
+    grid-template-columns: 1fr;
+  }
+
+  .audit-step__details .audit-step__wide {
+    grid-column: auto;
   }
 }
 </style>

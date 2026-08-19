@@ -55,4 +55,26 @@ describe('AgentAuditPage', () => {
     await wrapper.find('[data-testid="refresh-agent-runs"]').trigger('click')
     expect(loadAgentRuns).toHaveBeenCalledTimes(2)
   })
+
+  it('keeps every agent step collapsed by default and expands its full details', async () => {
+    const wrapper = mount(AgentAuditPage)
+    const step = wrapper.get('[data-testid="agent-step-step-1"]')
+
+    expect(step.element.tagName).toBe('DETAILS')
+    expect((step.element as HTMLDetailsElement).open).toBe(false)
+
+    await wrapper.get('[data-testid="agent-step-summary-step-1"]').trigger('click')
+
+    expect((step.element as HTMLDetailsElement).open).toBe(true)
+    const details = wrapper.get('[data-testid="agent-step-details-step-1"]')
+    expect(details.text()).toContain('输入')
+    expect(details.text()).toContain('差旅票据材料需要什么')
+    expect(details.text()).toContain('输出')
+    expect(details.text()).toContain('命中 3 个片段')
+    expect(details.text()).toContain('search_knowledge')
+    expect(details.text()).toContain('只读')
+    expect(details.text()).toContain('kb-policy')
+    expect(details.text()).toContain('2026-07-10 10:00:00')
+    expect(details.text()).toContain('2026-07-10 10:00:01')
+  })
 })
