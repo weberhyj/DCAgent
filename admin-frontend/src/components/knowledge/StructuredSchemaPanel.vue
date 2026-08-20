@@ -244,9 +244,20 @@ function publishStructuredData(datasetId: string) {
 
 <template>
   <section class="structured-schema-panel" data-testid="structured-schema-panel">
-    <p v-if="confirmationLocked" class="structured-schema-panel__success">
-      {{ '\u8868\u7ed3\u6784\u5df2\u786e\u8ba4' }}
-    </p>
+    <header class="structured-schema-panel__hero">
+      <div>
+        <span class="structured-schema-panel__eyebrow">STRUCTURED DATASET</span>
+        <h2>表结构确认</h2>
+        <p>确认字段名称、类型和查询能力后，系统才会将表格发布为可精确检索的数据集。</p>
+      </div>
+      <span v-if="confirmationLocked" class="structured-schema-panel__confirmed">✓ 表结构已确认</span>
+    </header>
+
+    <div class="structured-schema-panel__legend">
+      <span><i class="legend-dot is-blue" />可编辑字段</span>
+      <span><i class="legend-dot is-green" />可用于查询</span>
+      <span><i class="legend-dot is-gray" />样本信息</span>
+    </div>
 
     <ul v-if="preview.diagnostics.length" class="structured-schema-panel__diagnostics">
       <li
@@ -273,21 +284,27 @@ function publishStructuredData(datasetId: string) {
       class="structured-schema-panel__dataset"
       :data-testid="`structured-dataset-${dataset.datasetId}`"
     >
-      <header>
-        <h3>{{ dataset.worksheetName }}</h3>
-        <span>{{ dataset.sampledRows }} sampled rows</span>
+      <header class="structured-schema-panel__dataset-header">
+        <div class="dataset-title">
+          <span class="dataset-title__icon">▦</span>
+          <div>
+            <h3>{{ dataset.worksheetName }}</h3>
+            <small>工作表 · {{ dataset.columns.length }} 个字段</small>
+          </div>
+        </div>
+        <span class="dataset-sample"><strong>{{ dataset.sampledRows }}</strong> sampled rows</span>
       </header>
 
       <div class="structured-schema-panel__table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Source column</th>
+              <th class="column-source">Source column</th>
               <th>Display name</th>
               <th>Aliases</th>
-              <th>Type</th>
-              <th>Capabilities</th>
-              <th>Nulls</th>
+              <th class="column-type">Type</th>
+              <th class="column-capabilities">Capabilities</th>
+              <th class="column-nulls">Nulls</th>
             </tr>
           </thead>
           <tbody>
@@ -296,14 +313,15 @@ function publishStructuredData(datasetId: string) {
               :key="column.physicalName"
               :data-testid="`structured-column-${column.physicalName}`"
             >
-              <td>
+              <td class="source-cell">
                 <strong>{{ column.originalName || '(blank header)' }}</strong>
                 <code>{{ column.physicalName }}</code>
-                <small>{{ column.examples.join(', ') || 'No examples' }}</small>
-                <small>{{ column.sampledRows }} sampled / {{ column.nullCount }} null</small>
+                <small class="source-cell__examples">{{ column.examples.join(', ') || 'No examples' }}</small>
+                <small class="source-cell__stats">{{ column.sampledRows }} sampled / {{ column.nullCount }} null</small>
               </td>
               <td>
                 <input
+                  class="field-control"
                   v-model="column.displayName"
                   :data-testid="`display-name-${column.physicalName}`"
                   :aria-label="`${dataset.worksheetName} ${column.physicalName} display name`"
@@ -314,6 +332,7 @@ function publishStructuredData(datasetId: string) {
               </td>
               <td>
                 <input
+                  class="field-control"
                   v-model="column.aliasesText"
                   :data-testid="`aliases-${column.physicalName}`"
                   :aria-label="`${dataset.worksheetName} ${column.physicalName} aliases`"
@@ -324,6 +343,7 @@ function publishStructuredData(datasetId: string) {
               </td>
               <td>
                 <select
+                  class="field-control"
                   v-model="column.dataType"
                   :data-testid="`type-${column.physicalName}`"
                   :aria-label="`${dataset.worksheetName} ${column.physicalName} type`"
@@ -336,7 +356,8 @@ function publishStructuredData(datasetId: string) {
                 </select>
               </td>
               <td>
-                <label>
+                <div class="capability-list">
+                  <label class="capability-toggle">
                   <input
                     v-model="column.allowAggregate"
                     :data-testid="`aggregate-${column.physicalName}`"
@@ -345,8 +366,8 @@ function publishStructuredData(datasetId: string) {
                     :disabled="confirmationLocked || !isNumeric(column.dataType)"
                   >
                   Aggregate
-                </label>
-                <label>
+                  </label>
+                  <label class="capability-toggle">
                   <input
                     v-model="column.allowFilter"
                     :data-testid="`filter-${column.physicalName}`"
@@ -355,10 +376,12 @@ function publishStructuredData(datasetId: string) {
                     :disabled="confirmationLocked"
                   >
                   Filter
-                </label>
+                  </label>
+                </div>
               </td>
               <td>
                 <select
+                  class="field-control"
                   v-model="column.nullPolicy"
                   :data-testid="`null-policy-${column.physicalName}`"
                   :aria-label="`${dataset.worksheetName} ${column.physicalName} null policy`"
@@ -385,6 +408,7 @@ function publishStructuredData(datasetId: string) {
       </p>
 
       <button
+        class="structured-schema-panel__publish-button"
         :data-testid="`structured-publish-button-${dataset.datasetId}`"
         type="button"
         :disabled="publicationDisabled"
@@ -398,14 +422,21 @@ function publishStructuredData(datasetId: string) {
       </button>
     </article>
 
-    <button
-      data-testid="structured-confirm-button"
-      type="button"
-      :disabled="confirmationDisabled"
-      @click="confirmSchema"
-    >
-      {{ confirming ? 'Confirming...' : confirmationLocked ? 'Confirmed' : 'Confirm structure' }}
-    </button>
+    <footer class="structured-schema-panel__actions">
+      <div>
+        <strong>准备好发布了吗？</strong>
+        <span>{{ confirmationLocked ? '结构已锁定，可发布到精确查询引擎。' : '确认后字段配置将锁定，之后可发布数据。' }}</span>
+      </div>
+      <button
+        class="structured-schema-panel__confirm-button"
+        data-testid="structured-confirm-button"
+        type="button"
+        :disabled="confirmationDisabled"
+        @click="confirmSchema"
+      >
+        {{ confirming ? 'Confirming...' : confirmationLocked ? 'Confirmed' : 'Confirm structure' }}
+      </button>
+    </footer>
 
   </section>
 </template>
@@ -417,38 +448,239 @@ function publishStructuredData(datasetId: string) {
   gap: 16px;
 }
 
-.structured-schema-panel__dataset > header {
+.structured-schema-panel {
+  padding: 20px;
+  border: 1px solid #d9e3ed;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #f9fbfe 0%, #f3f7fb 100%);
+  box-shadow: 0 18px 45px rgba(41, 65, 91, 0.08);
+}
+
+.structured-schema-panel__hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 4px 2px 2px;
+}
+
+.structured-schema-panel__eyebrow {
+  color: #5a86bb;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .14em;
+}
+
+.structured-schema-panel__hero h2 {
+  margin: 5px 0 4px;
+  color: #142b43;
+  font-size: 20px;
+  letter-spacing: -.02em;
+}
+
+.structured-schema-panel__hero p {
+  max-width: 720px;
+  margin: 0;
+  color: #64788d;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.structured-schema-panel__confirmed {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  border: 1px solid #b8e3d0;
+  border-radius: 999px;
+  color: #087b55;
+  background: #eaf8f1;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.structured-schema-panel__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 10px 12px;
+  border: 1px solid #e0e8f0;
+  border-radius: 8px;
+  color: #718396;
+  background: rgba(255, 255, 255, .68);
+  font-size: 10px;
+}
+
+.structured-schema-panel__legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.legend-dot.is-blue { background: #2975d7; }
+.legend-dot.is-green { background: #18a36f; }
+.legend-dot.is-gray { background: #9aaabc; }
+
+.structured-schema-panel__dataset {
+  padding: 14px;
+  border: 1px solid #dce5ee;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .86);
+  box-shadow: 0 8px 22px rgba(46, 69, 94, .045);
+}
+
+.structured-schema-panel__dataset-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
+  padding: 1px 2px 3px;
+}
+
+.dataset-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dataset-title__icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  color: #1762b9;
+  background: #e7f0ff;
+  font-size: 18px;
 }
 
 .structured-schema-panel__dataset h3 {
   margin: 0;
+  color: #1b324b;
+  font-size: 14px;
+}
+
+.dataset-title small,
+.dataset-sample {
+  color: #75879a;
+  font-size: 10px;
+}
+
+.dataset-title small {
+  display: block;
+  margin-top: 3px;
+}
+
+.dataset-sample {
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: #f0f4f8;
+  white-space: nowrap;
+}
+
+.dataset-sample strong {
+  color: #315c9d;
+  font-family: var(--font-mono);
 }
 
 .structured-schema-panel__table-wrap {
   overflow-x: auto;
+  border: 1px solid #dfe7ef;
+  border-radius: 8px;
+  background: #fff;
 }
 
 table {
   width: 100%;
-  border-collapse: collapse;
+  min-width: 980px;
+  border-collapse: separate;
+  border-spacing: 0;
 }
 
 th,
 td {
-  padding: 10px;
-  border: 1px solid var(--color-border);
+  padding: 11px 12px;
+  border-bottom: 1px solid #e7edf3;
+  border-right: 1px solid #edf1f5;
   text-align: left;
   vertical-align: top;
 }
+
+th:last-child,
+td:last-child { border-right: 0; }
+
+tbody tr:last-child td { border-bottom: 0; }
+
+th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: #60758b;
+  background: #f3f7fb;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  white-space: nowrap;
+}
+
+tbody tr:hover td { background: #f8fbff; }
+
+.column-source { width: 23%; }
+.column-type { width: 12%; }
+.column-capabilities { width: 16%; }
+.column-nulls { width: 12%; }
+
+td { color: #34495e; font-size: 11px; }
 
 td:first-child,
 td:nth-child(5) {
   display: grid;
   gap: 6px;
 }
+
+.source-cell strong { color: #1c3855; font-size: 12px; }
+.source-cell code { width: fit-content; padding: 2px 5px; border-radius: 4px; color: #4e7096; background: #eef4fb; font-family: var(--font-mono); font-size: 9px; }
+.source-cell__examples { color: #697d92; line-height: 1.45; }
+.source-cell__stats { color: #97a5b3; font-size: 9px; }
+
+.field-control {
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid #d0dce8;
+  border-radius: 6px;
+  color: #2c435a;
+  background: #fbfdff;
+  font: inherit;
+  font-size: 11px;
+  outline: none;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+
+.field-control:focus {
+  border-color: #4c8fe2;
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(58, 126, 214, .12);
+}
+
+.field-control:disabled { color: #8291a0; background: #f0f3f6; cursor: not-allowed; }
+
+.capability-list { display: grid; gap: 7px; }
+
+.capability-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #4f6479;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.capability-toggle input { accent-color: #216bd0; }
 
 input[type='text'],
 select {
@@ -457,25 +689,100 @@ select {
 
 .structured-schema-panel__diagnostics {
   margin: 0;
-  color: #b42318;
+  padding: 11px 14px 11px 30px;
+  border: 1px solid #f1cfca;
+  border-radius: 8px;
+  color: #a33b33;
+  background: #fff5f3;
+  font-size: 11px;
 }
 
 .structured-schema-panel__validation {
   margin: 0;
+  padding: 11px 14px 11px 30px;
+  border: 1px solid #f1cfca;
+  border-radius: 8px;
   color: #b42318;
-}
-
-.structured-schema-panel__success {
-  margin: 0;
-  color: #067647;
-  font-weight: 600;
+  background: #fff5f3;
+  font-size: 11px;
 }
 
 .structured-schema-panel__publication-status {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin: 0;
+  padding: 9px 11px;
+  border: 1px solid #cbdcf0;
+  border-radius: 7px;
   color: #315c9d;
   font-size: 12px;
+  background: #f2f7fd;
+}
+
+.structured-schema-panel__publication-status span:first-child { font-weight: 700; }
+
+.structured-schema-panel__publish-button,
+.structured-schema-panel__confirm-button {
+  min-height: 38px;
+  padding: 0 15px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+
+.structured-schema-panel__publish-button {
+  justify-self: end;
+  color: #fff;
+  background: linear-gradient(135deg, #2778de, #1555ad);
+  box-shadow: 0 7px 16px rgba(31, 95, 174, .18);
+}
+
+.structured-schema-panel__confirm-button {
+  min-width: 156px;
+  color: #fff;
+  background: linear-gradient(135deg, #1766c5, #10458e);
+  box-shadow: 0 9px 20px rgba(22, 84, 157, .2);
+}
+
+.structured-schema-panel__publish-button:hover:not(:disabled),
+.structured-schema-panel__confirm-button:hover:not(:disabled) { transform: translateY(-1px); }
+
+.structured-schema-panel__publish-button:disabled,
+.structured-schema-panel__confirm-button:disabled {
+  color: #8b99a7;
+  border-color: #d9e1e9;
+  background: #e8edf2;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+.structured-schema-panel__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 15px 16px;
+  border: 1px solid #cbdceb;
+  border-radius: 10px;
+  background: linear-gradient(100deg, #edf5ff, #f7fbff);
+}
+
+.structured-schema-panel__actions > div { display: grid; gap: 4px; }
+.structured-schema-panel__actions strong { color: #1d416d; font-size: 12px; }
+.structured-schema-panel__actions span { color: #6c8196; font-size: 10px; line-height: 1.5; }
+
+@media (max-width: 680px) {
+  .structured-schema-panel { padding: 14px; }
+  .structured-schema-panel__hero,
+  .structured-schema-panel__dataset-header,
+  .structured-schema-panel__actions { align-items: stretch; flex-direction: column; }
+  .structured-schema-panel__confirmed { align-self: flex-start; }
+  .structured-schema-panel__publish-button,
+  .structured-schema-panel__confirm-button { justify-self: stretch; width: 100%; }
 }
 </style>
