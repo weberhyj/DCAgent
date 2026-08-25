@@ -168,6 +168,8 @@ class AgentRunAudit:
 class AgentSearchResult:
     hits: tuple[KnowledgeSearchHitModel, ...]
     fallback_reason: str | None = None
+    retrieval_mode: str | None = None
+    stage_ms: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -290,6 +292,7 @@ def filter_relevant_hits(
     minimum_score_floor: float = 0.01,
     adjacency_distance: int = 1,
     single_source: bool = False,
+    diagnostics: dict[str, object] | None = None,
 ) -> list[KnowledgeSearchHitModel]:
     """Drop unrelated sources before evidence is passed to the LLM.
 
@@ -301,7 +304,13 @@ def filter_relevant_hits(
     around each anchor so a split passage remains readable.
     """
     hit_list = list(hits)
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics["candidate_count"] = len(hit_list)
     if not hit_list:
+        if diagnostics is not None:
+            diagnostics["reason"] = "no_candidates"
+            diagnostics["filtered_count"] = 0
         return []
     if any(value < 0 for value in (relative_score_floor, minimum_score_floor)):
         raise ValueError("score floors must be non-negative")
@@ -309,7 +318,13 @@ def filter_relevant_hits(
         raise ValueError("adjacency_distance must be non-negative")
 
     top_score = max(hit.score for hit in hit_list)
+    if diagnostics is not None:
+        diagnostics["score_min"] = min(hit.score for hit in hit_list)
+        diagnostics["score_max"] = top_score
     if top_score <= 0:
+        if diagnostics is not None:
+            diagnostics["reason"] = "top_score_not_positive"
+            diagnostics["filtered_count"] = 0
         return []
 
     # llama.cpp BGE reranker scores are converted to probabilities in [0, 1].
@@ -322,7 +337,21 @@ def filter_relevant_hits(
     effective_minimum_floor = max(minimum_score_floor, 0.03) if normalized_scores else minimum_score_floor
     cutoff = max(effective_minimum_floor, top_score * effective_relative_floor)
     anchors = [hit for hit in hit_list if hit.score >= cutoff]
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "normalized_scores": normalized_scores,
+                "relative_floor": effective_relative_floor,
+                "minimum_floor": effective_minimum_floor,
+                "cutoff": cutoff,
+                "anchor_count": len(anchors),
+                "anchor_chunk_ids": [hit.chunk.id for hit in anchors[:8]],
+            }
+        )
     if not anchors:
+        if diagnostics is not None:
+            diagnostics["reason"] = "all_candidates_below_cutoff"
+            diagnostics["filtered_count"] = 0
         return []
 
     allowed_source_ids: set[str] | None = None
@@ -352,22 +381,43 @@ def filter_relevant_hits(
             ):
                 allowed_source_ids = {strongest_source}
 
+    if diagnostics is not None:
+        diagnostics["single_source"] = single_source
+        diagnostics["anchor_source_ids"] = list(dict.fromkeys(hit.source.id for hit in anchors))
+        diagnostics["allowed_source_ids"] = sorted(allowed_source_ids or set())
+
     anchor_indices: dict[str, list[int]] = {}
     for hit in anchors:
         anchor_indices.setdefault(hit.source.id, []).append(hit.chunk.chunk_index)
 
     filtered: list[KnowledgeSearchHitModel] = []
+    dropped_by_source = 0
+    dropped_by_score = 0
     for hit in hit_list:
         if allowed_source_ids is not None and hit.source.id not in allowed_source_ids:
+            dropped_by_source += 1
             continue
         indices = anchor_indices.get(hit.source.id)
         if not indices:
+            dropped_by_score += 1
             continue
         if hit.score >= cutoff or any(
             abs(hit.chunk.chunk_index - anchor_index) <= adjacency_distance
             for anchor_index in indices
         ):
             filtered.append(hit)
+        else:
+            dropped_by_score += 1
+
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "filtered_count": len(filtered),
+                "dropped_by_source": dropped_by_source,
+                "dropped_by_score_or_adjacency": dropped_by_score,
+                "filtered_source_ids": list(dict.fromkeys(hit.source.id for hit in filtered)),
+            }
+        )
 
     filtered.sort(key=lambda hit: (-hit.score, hit.source.name, hit.chunk.chunk_index))
     return [
@@ -611,6 +661,16 @@ class ReadOnlyKnowledgeAgent:
         output_summary = f"命中 {len(hits)} 个片段，累计保留 {len(merged)} 个片段"
         if evidence_audit:
             output_summary += f"；evidence={evidence_audit}"
+        if search_result.fallback_reason:
+            output_summary += f"；fallback={search_result.fallback_reason}"
+        if search_result.retrieval_mode:
+            output_summary += f"；retrieval_mode={search_result.retrieval_mode}"
+        if search_result.stage_ms:
+            timing_summary = ", ".join(
+                f"{name}={duration:.1f}ms"
+                for name, duration in search_result.stage_ms.items()
+            )
+            output_summary += f"；stage_ms={timing_summary}"
         step = self._step(
             state,
             "search_knowledge",
@@ -651,20 +711,45 @@ class ReadOnlyKnowledgeAgent:
 
     def _compare(self, state: AgentState) -> dict:
         rounds = state["query_index"] + 1
+        diagnostics: dict[str, object] = {}
         filtered_hits = filter_relevant_hits(
             state["knowledge_hits"],
             single_source=(
                 state["route_type"] == KnowledgeRouteType.DOCUMENT_QA
                 and state["mode"] != "source"
             ),
+            diagnostics=diagnostics,
         )
         context = build_comparison_context(filtered_hits, rounds)
         source_ids = list(dict.fromkeys(hit.source.id for hit in filtered_hits))
+        reason_labels = {
+            "no_candidates": "检索结果为空",
+            "top_score_not_positive": "最高相关性分数不大于 0",
+            "all_candidates_below_cutoff": "所有候选片段都低于证据阈值",
+        }
+        diagnostic_reason = reason_labels.get(
+            str(diagnostics.get("reason")),
+            "已保留满足阈值的证据" if filtered_hits else "过滤后没有可用证据",
+        )
+        diagnostic_summary = (
+            "证据诊断："
+            f"候选={diagnostics.get('candidate_count', 0)}，"
+            f"锚点={diagnostics.get('anchor_count', 0)}，"
+            f"保留={diagnostics.get('filtered_count', 0)}，"
+            f"分数范围={diagnostics.get('score_min', 'n/a')}..{diagnostics.get('score_max', 'n/a')}，"
+            f"阈值={diagnostics.get('cutoff', 'n/a')}，"
+            f"来源丢弃={diagnostics.get('dropped_by_source', 0)}，"
+            f"分数/邻接丢弃={diagnostics.get('dropped_by_score_or_adjacency', 0)}，"
+            f"结论={diagnostic_reason}"
+        )
         step = self._step(
             state,
             "compare_evidence",
-            f"{len(source_ids)} 个来源",
-            context,
+            (
+                f"过滤前 {len(state['knowledge_hits'])} 个片段，"
+                f"{len(set(hit.source.id for hit in state['knowledge_hits']))} 个来源"
+            ),
+            f"{context}；{diagnostic_summary}",
             source_ids,
         )
         return {
@@ -698,7 +783,7 @@ class ReadOnlyKnowledgeAgent:
             state,
             "compose_answer",
             f"使用 {len(state['knowledge_hits'])} 个证据片段",
-            "已生成最终回答",
+            "已生成最终回答；已调用大模型" if state["knowledge_hits"] else "未调用大模型，直接返回无证据提示",
             list(dict.fromkeys(hit.source.id for hit in state["knowledge_hits"])),
         )
         return {

@@ -235,6 +235,27 @@ class AgentTest(unittest.TestCase):
             {"kb-policy", "kb-finance"},
         )
 
+    def test_relevance_gate_reports_filter_diagnostics(self) -> None:
+        town = source("kb-town", "test.docx")
+        spider = source("kb-spider", "蜘蛛侠角色介绍.docx")
+        diagnostics: dict[str, object] = {}
+
+        filtered = filter_relevant_hits(
+            [
+                hit(town, chunk("kb-town", 0, "欧洲小镇名称源于犀牛陂的谐音。"), 0.938),
+                hit(town, chunk("kb-town", 1, "欧洲小镇园区规划。"), 0.006),
+                hit(spider, chunk("kb-spider", 0, "蜘蛛侠角色起源。"), 0.0014),
+            ],
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(diagnostics["candidate_count"], 3)
+        self.assertEqual(diagnostics["filtered_count"], 2)
+        self.assertEqual(diagnostics["dropped_by_score_or_adjacency"], 1)
+        self.assertGreater(float(diagnostics["cutoff"]), 0.0)
+        self.assertNotIn("reason", diagnostics)
+
     def test_agent_never_sends_low_scoring_unrelated_document_to_llm(self) -> None:
         town = source("kb-town", "test.docx")
         spider = source("kb-spider", "蜘蛛侠角色介绍.docx")

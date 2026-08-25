@@ -1618,6 +1618,8 @@ class SqlChatRepository:
             return AgentSearchResult(
                 hits=tuple(outcome.hits),
                 fallback_reason=outcome.fallback_reason,
+                retrieval_mode=outcome.mode.value,
+                stage_ms=dict(outcome.stage_ms),
             )
         outcome = self.retrieval_router.search(
             RetrievalRequest(
@@ -1633,6 +1635,8 @@ class SqlChatRepository:
         return AgentSearchResult(
             hits=tuple(outcome.hits),
             fallback_reason=outcome.fallback_reason,
+            retrieval_mode=outcome.mode.value,
+            stage_ms=dict(outcome.stage_ms),
         )
 
     def _search_evaluation_case(
