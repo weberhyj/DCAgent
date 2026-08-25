@@ -377,6 +377,7 @@ class AgentTest(unittest.TestCase):
             content="差旅票据材料需要什么",
             mode="deep",
             previous_messages=[],
+            route_type=KnowledgeRouteType.SUMMARY_COMPARE,
         )
 
         self.assertEqual(len(search_calls), 2)
@@ -412,6 +413,7 @@ class AgentTest(unittest.TestCase):
             content="对比差旅制度和财务票据要求",
             mode="source",
             previous_messages=[],
+            route_type=KnowledgeRouteType.SUMMARY_COMPARE,
         )
 
         self.assertNotIn("inspect_document", [step.tool_name for step in result.steps])
@@ -422,7 +424,7 @@ class AgentTest(unittest.TestCase):
         self.assertIn("财务规则.txt", provider.request.agent_context)
         self.assertGreaterEqual(len(provider.request.knowledge_hits), 2)
 
-    def test_document_route_records_first_degradation_and_sorted_sources(self) -> None:
+    def test_document_route_does_not_expand_after_a_single_precise_search(self) -> None:
         policy = source("kb-policy", "policy.txt")
         finance = source("kb-finance", "finance.txt")
         search_calls = 0
@@ -453,11 +455,11 @@ class AgentTest(unittest.TestCase):
             route_type=KnowledgeRouteType.DOCUMENT_QA,
         )
 
-        self.assertEqual(search_calls, 2)
+        self.assertEqual(search_calls, 1)
         self.assertEqual(result.route_metadata.degradation_reason, "reranker_service_error")
         self.assertEqual(
             result.route_metadata.candidate_source_ids,
-            ("kb-finance", "kb-policy"),
+            ("kb-policy",),
         )
         self.assertTrue(result.route_metadata.adjacency_allowed)
 

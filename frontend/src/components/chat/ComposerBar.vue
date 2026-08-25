@@ -21,7 +21,9 @@ const emit = defineEmits<{
 }>()
 
 const content = shallowRef('')
-const DEFAULT_COMPOSER_MODE: ComposerMode = 'deep'
+// Ordinary questions use the precise single-pass retrieval path.  The
+// backend upgrades explicit comparison/summary requests to deep retrieval.
+const DEFAULT_COMPOSER_MODE: ComposerMode = 'quick'
 const composerHintText = 'DCAgent 会基于资料库线索生成结论，请结合专业判断复核。'
 const attachmentLabel = '添加附件'
 const isAttachmentEntryVisible = false

@@ -81,6 +81,22 @@ FOLLOW_UP_REFERENCES = (
     "这个结果",
     "它们之间",
 )
+MULTI_SOURCE_SYNTHESIS_TERMS = (
+    "比较",
+    "对比",
+    "异同",
+    "分别",
+    "各自",
+    "综合",
+    "多份",
+    "多个",
+    "两份",
+    "两者",
+    "这些资料",
+    "这些文档",
+    "跨文档",
+    "全库",
+)
 
 
 @dataclass(slots=True)
@@ -204,18 +220,38 @@ def is_follow_up_message(content: str) -> bool:
     return normalized.rstrip("？? ").endswith(("呢", "又如何", "还有吗"))
 
 
-def build_agent_search_queries(content: str, mode: ComposerMode) -> list[str]:
+def build_agent_search_queries(
+    content: str,
+    mode: ComposerMode,
+    route_type: KnowledgeRouteType | None = None,
+) -> list[str]:
+    """Build bounded retrieval queries without broadening ordinary fact lookup.
+
+    ``deep`` is useful for an explicit multi-document summary/ comparison, but
+    broadening every question with generic policy terms causes unrelated files
+    to enter the evidence set.  Production callers pass the classified route;
+    the ``None`` default keeps the small public helper backwards compatible.
+    """
     query = content.strip()
-    if mode == "quick":
+    if mode == "quick" or route_type == KnowledgeRouteType.DOCUMENT_QA:
+        return [query]
+
+    # Deep retrieval is reserved for routes that can legitimately use more
+    # than one document.  Do not invent generic terms when no useful expansion
+    # exists; the original query is more precise in that case.
+    if route_type is not None and route_type != KnowledgeRouteType.SUMMARY_COMPARE:
+        return [query]
+    if route_type == KnowledgeRouteType.SUMMARY_COMPARE and not any(
+        term in query for term in MULTI_SOURCE_SYNTHESIS_TERMS
+    ):
         return [query]
 
     terms = extract_embedding_terms(query)
     expanded = [term for term in expand_terms(terms) if term not in terms]
     if expanded:
         broader_query = " ".join([query, *expanded[:12]])
-    else:
-        broader_query = f"{query} 相关制度 规定 流程 依据"
-    return list(dict.fromkeys([query, broader_query]))
+        return list(dict.fromkeys([query, broader_query]))
+    return [query]
 
 
 def merge_ranked_hits(
@@ -253,6 +289,7 @@ def filter_relevant_hits(
     relative_score_floor: float = 0.05,
     minimum_score_floor: float = 0.01,
     adjacency_distance: int = 1,
+    single_source: bool = False,
 ) -> list[KnowledgeSearchHitModel]:
     """Drop unrelated sources before evidence is passed to the LLM.
 
@@ -274,10 +311,35 @@ def filter_relevant_hits(
     top_score = max(hit.score for hit in hit_list)
     if top_score <= 0:
         return []
-    cutoff = max(minimum_score_floor, top_score * relative_score_floor)
+
+    # llama.cpp BGE reranker scores are converted to probabilities in [0, 1].
+    # The old 5% floor is too permissive at that scale: a score of .04 could
+    # still become evidence beside a .8 match.  Keep the historical behavior
+    # for legacy/high-scale test and fallback scores, while applying a stricter
+    # normalized-score gate to the production reranker output.
+    normalized_scores = top_score <= 1.0 and all(0.0 <= hit.score <= 1.0 for hit in hit_list)
+    effective_relative_floor = max(relative_score_floor, 0.20) if normalized_scores else relative_score_floor
+    effective_minimum_floor = max(minimum_score_floor, 0.08) if normalized_scores else minimum_score_floor
+    cutoff = max(effective_minimum_floor, top_score * effective_relative_floor)
     anchors = [hit for hit in hit_list if hit.score >= cutoff]
     if not anchors:
         return []
+
+    allowed_source_ids: set[str] | None = None
+    if single_source:
+        # Ordinary document QA should answer from the strongest source only.
+        # Multi-source evidence remains available to the explicit comparison
+        # route, which calls this function with single_source=False.
+        source_scores: dict[str, float] = {}
+        for anchor in anchors:
+            source_scores[anchor.source.id] = max(
+                source_scores.get(anchor.source.id, 0.0), anchor.score
+            )
+        if source_scores:
+            strongest_source = max(
+                source_scores.items(), key=lambda item: (item[1], item[0])
+            )[0]
+            allowed_source_ids = {strongest_source}
 
     anchor_indices: dict[str, list[int]] = {}
     for hit in anchors:
@@ -285,6 +347,8 @@ def filter_relevant_hits(
 
     filtered: list[KnowledgeSearchHitModel] = []
     for hit in hit_list:
+        if allowed_source_ids is not None and hit.source.id not in allowed_source_ids:
+            continue
         indices = anchor_indices.get(hit.source.id)
         if not indices:
             continue
@@ -481,7 +545,9 @@ class ReadOnlyKnowledgeAgent:
         )
 
     def _plan(self, state: AgentState) -> dict:
-        queries = build_agent_search_queries(state["content"], state["mode"])
+        queries = build_agent_search_queries(
+            state["content"], state["mode"], state["route_type"]
+        )
         step = self._step(
             state,
             "plan_retrieval",
@@ -563,14 +629,24 @@ class ReadOnlyKnowledgeAgent:
             return True
         source_count = len({hit.source.id for hit in hits})
         top_score = max(hit.score for hit in hits)
-        return source_count < 2 or top_score < 6.0
+        # Scores from the BGE reranker are probabilities; legacy fallback
+        # scores historically used a larger scale.  Use the matching floor so
+        # deep mode does not keep expanding a clearly good normalized hit.
+        score_floor = 0.6 if 0.0 <= top_score <= 1.0 else 6.0
+        return source_count < 2 or top_score < score_floor
 
     def _advance_query(self, state: AgentState) -> dict:
         return {"query_index": state["query_index"] + 1}
 
     def _compare(self, state: AgentState) -> dict:
         rounds = state["query_index"] + 1
-        filtered_hits = filter_relevant_hits(state["knowledge_hits"])
+        filtered_hits = filter_relevant_hits(
+            state["knowledge_hits"],
+            single_source=(
+                state["route_type"] == KnowledgeRouteType.DOCUMENT_QA
+                and state["mode"] != "source"
+            ),
+        )
         context = build_comparison_context(filtered_hits, rounds)
         source_ids = list(dict.fromkeys(hit.source.id for hit in filtered_hits))
         step = self._step(

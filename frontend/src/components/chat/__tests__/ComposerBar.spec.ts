@@ -45,7 +45,7 @@ describe('ComposerBar', () => {
     expect(composerBarSource).toContain('<Paperclip :size="21" />')
   })
 
-  it('submits trimmed content with the fixed deep mode and clears the input', async () => {
+  it('submits trimmed content with the precise default mode and clears the input', async () => {
     const wrapper = mount(ComposerBar, {
       props: {
         sending: false,
@@ -57,7 +57,7 @@ describe('ComposerBar', () => {
     await wrapper.get('form').trigger('submit')
 
     expect(wrapper.emitted('send')).toEqual([[
-      { content: '分析现金流风险', mode: 'deep' },
+      { content: '分析现金流风险', mode: 'quick' },
     ]])
     expect(input.element.value).toBe('')
   })
