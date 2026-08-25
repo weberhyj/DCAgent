@@ -28,9 +28,16 @@ NO_EVIDENCE_REPLY = "未检索到足够依据。请先在知识库中补充相�
 DETERMINISTIC_TEMPERATURE = 0
 DETERMINISTIC_TOP_P = 1
 DETERMINISTIC_SEED = 42
+# Keep the evidence sent to the answer model bounded, but do not cut ordinary
+# chunks at an arbitrary 500-character boundary.  A single Word paragraph or
+# a field/value block can be slightly longer than that and contain the answer
+# near its end.
+KNOWLEDGE_CONTEXT_CHUNK_LIMIT = 2000
+KNOWLEDGE_CONTEXT_WINDOW_PADDING = 240
 RAG_SYSTEM_PROMPT = (
     "你是 DCAgent，面向公司内部资料库的知识检索智能体。"
     "你必须只基于用户本次请求中提供的可用知识片段回答。"
+    "只回答用户明确询问的对象、字段或时间范围，不要主动补充同一片段中的其他属性。"
     "如果知识片段不足以支持结论，必须明确说明未检索到足够依据，不能编造制度、数据、合同或项目事实。"
     "回答要简洁、审慎、面向业务使用。"
     "回答必须使用纯文本，不要使用 Markdown 或 HTML，不要输出标题、列表符号、加粗、斜体、代码围栏或链接语法。"
@@ -389,21 +396,106 @@ def build_prompt(request: LLMRequest) -> str:
     return (
         "回答规则：\n"
         "- 仅基于可用知识片段回答，不要补充片段之外的事实。\n"
+        "- 只回答用户明确询问的对象、字段或时间范围，不要主动补充片段中的其他属性。\n"
         f"- 如果可用知识片段为空或不足以回答，直接回复：{NO_EVIDENCE_REPLY}\n"
         "- 只输出纯文本，不要使用 Markdown 或 HTML，不要输出标题、列表符号、加粗、斜体、代码围栏或链接语法。\n"
         "- 不要在回答中输出 [1]、[2] 等引用编号或资料来源名称。\n\n"
         f"检索请求：{request.content}\n"
         f"检索模式：{request.mode}\n\n"
-        f"可用知识片段：\n{build_knowledge_context(request.knowledge_hits) or '无'}\n\n"
+        f"可用知识片段：\n{build_knowledge_context(request.knowledge_hits, request.content) or '无'}\n\n"
         f"当前会话上下文：\n{history or '无'}"
     )
 
 
-def build_knowledge_context(hits: list[KnowledgeSearchHitModel]) -> str:
+def build_knowledge_context(
+    hits: list[KnowledgeSearchHitModel],
+    query: str = "",
+) -> str:
     return "\n\n".join(
-        f"[知识片段 {index}]\n{snippet_text(hit.chunk.text, 500)}"
+        f"[知识片段 {index}]\n{_knowledge_context_text(hit.chunk.text, query)}"
         for index, hit in enumerate(hits, start=1)
     )
+
+
+def _knowledge_context_text(text: str, query: str) -> str:
+    """Preserve answer-bearing evidence when a chunk exceeds the context cap.
+
+    The old implementation always kept the first 500 characters.  That is
+    unsafe for structured Word blocks such as ``字段 | 值``: the field label
+    and value can be just after the cut point.  Short chunks are passed in full;
+    long chunks use a bounded window around the strongest query-term match.
+    """
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if len(normalized) <= KNOWLEDGE_CONTEXT_CHUNK_LIMIT:
+        return normalized
+
+    match = _find_context_match(normalized, query)
+    if match is None:
+        return normalized[:KNOWLEDGE_CONTEXT_CHUNK_LIMIT].rstrip() + "..."
+
+    match_start, match_end = match
+    window_start = max(0, match_start - KNOWLEDGE_CONTEXT_WINDOW_PADDING)
+    window_end = min(
+        len(normalized),
+        max(
+            window_start + KNOWLEDGE_CONTEXT_CHUNK_LIMIT,
+            match_end + KNOWLEDGE_CONTEXT_WINDOW_PADDING,
+        ),
+    )
+    if window_end - window_start > KNOWLEDGE_CONTEXT_CHUNK_LIMIT:
+        window_end = min(len(normalized), window_start + KNOWLEDGE_CONTEXT_CHUNK_LIMIT)
+    if window_end - window_start < KNOWLEDGE_CONTEXT_CHUNK_LIMIT:
+        window_start = max(0, window_end - KNOWLEDGE_CONTEXT_CHUNK_LIMIT)
+
+    prefix = "..." if window_start > 0 else ""
+    suffix = "..." if window_end < len(normalized) else ""
+    return f"{prefix}{normalized[window_start:window_end].strip()}{suffix}"
+
+
+def _find_context_match(text: str, query: str) -> tuple[int, int] | None:
+    """Find the most informative query span in a normalized chunk."""
+    normalized_query = re.sub(r"\s+", " ", query).strip()
+    if not normalized_query:
+        return None
+
+    candidates: set[str] = set()
+    for token in re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]{2,}", normalized_query):
+        token = token.strip()
+        if len(token) >= 2:
+            candidates.add(token)
+        # Chinese questions are commonly written as one uninterrupted run.
+        # Add bounded n-grams so a field such as “主要活动区域” can still be
+        # located inside “蜘蛛侠的主要活动区域是什么”.
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            for size in range(2, min(12, len(token)) + 1):
+                candidates.update(
+                    token[index : index + size]
+                    for index in range(len(token) - size + 1)
+                )
+
+    stop_terms = {
+        "什么",
+        "是什么",
+        "哪些",
+        "哪个",
+        "怎么",
+        "如何",
+        "请问",
+        "介绍",
+        "一下",
+        "的",
+    }
+    matches: list[tuple[int, int, int]] = []
+    for candidate in candidates:
+        if candidate in stop_terms:
+            continue
+        start = text.find(candidate)
+        if start >= 0:
+            matches.append((len(candidate), start, start + len(candidate)))
+    if not matches:
+        return None
+    _, start, end = max(matches, key=lambda item: (item[0], -item[1]))
+    return start, end
 
 
 def snippet_text(text: str, limit: int = 96) -> str:

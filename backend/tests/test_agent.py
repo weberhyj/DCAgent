@@ -256,6 +256,51 @@ class AgentTest(unittest.TestCase):
         self.assertGreater(float(diagnostics["cutoff"]), 0.0)
         self.assertNotIn("reason", diagnostics)
 
+    def test_relevance_gate_keeps_query_matching_top_hit_when_all_scores_are_low(self) -> None:
+        spider = source("kb-spider", "蜘蛛侠角色介绍.docx")
+        diagnostics: dict[str, object] = {}
+
+        filtered = filter_relevant_hits(
+            [
+                hit(
+                    spider,
+                    chunk("kb-spider", 0, "蜘蛛侠的主要活动区域是纽约市。"),
+                    0.021,
+                ),
+                hit(
+                    spider,
+                    chunk("kb-spider", 1, "蜘蛛侠的战斗方式和装备。"),
+                    0.004,
+                ),
+            ],
+            query="蜘蛛侠的主要活动区域是什么？",
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual([item.chunk.chunk_index for item in filtered], [0, 1])
+        self.assertEqual(diagnostics["reason"], "low_score_top_candidate_retained")
+        self.assertEqual(diagnostics["configured_cutoff"], 0.03)
+        self.assertEqual(diagnostics["cutoff"], 0.021)
+
+    def test_relevance_gate_does_not_keep_low_score_without_query_overlap(self) -> None:
+        source_model = source("kb-unrelated", "unrelated.docx")
+        diagnostics: dict[str, object] = {}
+
+        filtered = filter_relevant_hits(
+            [
+                hit(
+                    source_model,
+                    chunk("kb-unrelated", 0, "财务报销需要提交发票。"),
+                    0.021,
+                ),
+            ],
+            query="蜘蛛侠的主要活动区域是什么？",
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(diagnostics["reason"], "all_candidates_below_cutoff")
+
     def test_agent_never_sends_low_scoring_unrelated_document_to_llm(self) -> None:
         town = source("kb-town", "test.docx")
         spider = source("kb-spider", "蜘蛛侠角色介绍.docx")

@@ -81,6 +81,8 @@ FOLLOW_UP_REFERENCES = (
     "这个结果",
     "它们之间",
 )
+LOW_CONFIDENCE_TOP_SCORE = 0.005
+LOW_CONFIDENCE_QUERY_OVERLAP_MIN_LENGTH = 4
 MULTI_SOURCE_SYNTHESIS_TERMS = (
     "比较",
     "对比",
@@ -288,6 +290,7 @@ def merge_ranked_hits(
 def filter_relevant_hits(
     hits: Sequence[KnowledgeSearchHitModel],
     *,
+    query: str = "",
     relative_score_floor: float = 0.05,
     minimum_score_floor: float = 0.01,
     adjacency_distance: int = 1,
@@ -333,10 +336,32 @@ def filter_relevant_hits(
     # for legacy/high-scale test and fallback scores, while applying a stricter
     # normalized-score gate to the production reranker output.
     normalized_scores = top_score <= 1.0 and all(0.0 <= hit.score <= 1.0 for hit in hit_list)
-    effective_relative_floor = max(relative_score_floor, 0.10) if normalized_scores else relative_score_floor
-    effective_minimum_floor = max(minimum_score_floor, 0.03) if normalized_scores else minimum_score_floor
+    effective_relative_floor = (
+        max(relative_score_floor, 0.10) if normalized_scores else relative_score_floor
+    )
+    effective_minimum_floor = (
+        max(minimum_score_floor, 0.03) if normalized_scores else minimum_score_floor
+    )
     cutoff = max(effective_minimum_floor, top_score * effective_relative_floor)
     anchors = [hit for hit in hit_list if hit.score >= cutoff]
+    if (
+        not anchors
+        and normalized_scores
+        and top_score >= LOW_CONFIDENCE_TOP_SCORE
+        and query.strip()
+    ):
+        top_hit = max(hit_list, key=lambda hit: (hit.score, -hit.rank))
+        if _has_query_overlap(query, top_hit.chunk.text):
+            # A low but positive BGE probability can still be the only useful
+            # result for a short or synonym-heavy query.  Keep only the top
+            # candidate as the anchor; the normal adjacency rule may add its
+            # immediately adjacent chunks from the same source.
+            anchors = [top_hit]
+            diagnostics_cutoff = cutoff
+            cutoff = top_hit.score
+            if diagnostics is not None:
+                diagnostics["configured_cutoff"] = diagnostics_cutoff
+                diagnostics["reason"] = "low_score_top_candidate_retained"
     if diagnostics is not None:
         diagnostics.update(
             {
@@ -432,6 +457,37 @@ def filter_relevant_hits(
         )
         for index, hit in enumerate(filtered, start=1)
     ]
+
+
+def _has_query_overlap(query: str, text: str) -> bool:
+    """Require a lexical signal before accepting a low-confidence top hit."""
+    normalized_query = re.sub(r"\s+", "", query).casefold()
+    normalized_text = re.sub(r"\s+", "", text).casefold()
+    if not normalized_query or not normalized_text:
+        return False
+
+    candidates: set[str] = set(re.findall(r"[a-z0-9_]{2,}", normalized_query))
+    for token in re.findall(r"[\u4e00-\u9fff]+", normalized_query):
+        for size in range(2, min(8, len(token)) + 1):
+            candidates.update(
+                token[index : index + size]
+                for index in range(len(token) - size + 1)
+            )
+    stop_terms = {"什么", "如何", "怎么", "请问", "一下", "是否", "多少"}
+    matched_lengths = sorted(
+        (
+            len(candidate)
+            for candidate in candidates
+            if candidate not in stop_terms and candidate in normalized_text
+        ),
+        reverse=True,
+    )
+    if not matched_lengths:
+        return False
+    return (
+        matched_lengths[0] >= LOW_CONFIDENCE_QUERY_OVERLAP_MIN_LENGTH
+        or len(matched_lengths) >= 2
+    )
 
 
 def build_comparison_context(hits: list[KnowledgeSearchHitModel], search_rounds: int) -> str:
@@ -714,6 +770,7 @@ class ReadOnlyKnowledgeAgent:
         diagnostics: dict[str, object] = {}
         filtered_hits = filter_relevant_hits(
             state["knowledge_hits"],
+            query=state["content"],
             single_source=(
                 state["route_type"] == KnowledgeRouteType.DOCUMENT_QA
                 and state["mode"] != "source"
@@ -726,6 +783,7 @@ class ReadOnlyKnowledgeAgent:
             "no_candidates": "检索结果为空",
             "top_score_not_positive": "最高相关性分数不大于 0",
             "all_candidates_below_cutoff": "所有候选片段都低于证据阈值",
+            "low_score_top_candidate_retained": "候选分数整体偏低，但保留了与问题有文本重合的最高候选",
         }
         diagnostic_reason = reason_labels.get(
             str(diagnostics.get("reason")),

@@ -391,6 +391,38 @@ class LLMProviderTest(unittest.TestCase):
         ):
             self.assertNotIn(leaked, context)
 
+    def test_build_knowledge_context_keeps_answer_after_old_500_char_cutoff(self) -> None:
+        chunk = replace(
+            indexed_chunk(),
+            text=(
+                "蜘蛛侠角色介绍。"
+                + ("背景信息。" * 450)
+                + "快速档案 主要活动区域 | 纽约市，尤其常与皇后区联系在一起"
+            ),
+        )
+        context = build_knowledge_context(
+            [indexed_hit(chunk=chunk)],
+            query="蜘蛛侠的主要活动区域是什么？",
+        )
+
+        self.assertIn("主要活动区域 | 纽约市", context)
+        self.assertLessEqual(len(context), 2_020)
+
+    def test_build_prompt_passes_question_to_context_selector(self) -> None:
+        chunk = replace(
+            indexed_chunk(),
+            text=("前置资料。" * 450) + "职业/身份 | 学生、摄影师、科研人员等",
+        )
+        prompt = build_prompt(
+            LLMRequest(
+                content="蜘蛛侠的职业是什么？",
+                mode="quick",
+                knowledge_hits=[indexed_hit(chunk=chunk)],
+            )
+        )
+
+        self.assertIn("职业/身份 | 学生、摄影师、科研人员等", prompt)
+
     def test_build_prompt_includes_guardrails_text_and_recent_history(self) -> None:
         prompt = build_prompt(
             LLMRequest(
