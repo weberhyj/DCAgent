@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from collections.abc import Callable, Sequence
@@ -20,6 +21,15 @@ from .models import (
 )
 from .retrieval_models import EvidenceExpansionPolicy
 from .time_utils import display_datetime_label
+from .word_facts import (
+    find_query_field_aliases,
+    normalize_fact_key,
+    query_field_matches,
+    query_file_reference_terms,
+    query_overlap_terms,
+    query_primary_field_terms,
+    query_subject_terms,
+)
 
 AgentRunStatus = Literal["completed", "failed"]
 AgentStepStatus = Literal["completed", "failed"]
@@ -263,8 +273,17 @@ def merge_ranked_hits(
     incoming: Sequence[KnowledgeSearchHitModel],
     limit: int,
 ) -> list[KnowledgeSearchHitModel]:
-    by_chunk_id = {hit.chunk.id: hit for hit in existing}
+    # Retrieval output is an external/legacy boundary.  Do not let NaN/Inf
+    # scores enter the merged set: Python's ordering with NaN is not a total
+    # order and can make the selected source depend on insertion order.
+    by_chunk_id = {
+        hit.chunk.id: hit
+        for hit in existing
+        if _is_finite_score(hit.score)
+    }
     for hit in incoming:
+        if not _is_finite_score(hit.score):
+            continue
         current = by_chunk_id.get(hit.chunk.id)
         if current is None or hit.score > current.score:
             by_chunk_id[hit.chunk.id] = hit
@@ -285,6 +304,23 @@ def merge_ranked_hits(
         )
         for index, hit in enumerate(ranked, start=1)
     ]
+
+
+def _is_finite_score(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def _format_audit_score(value: object) -> str:
+    """Format an untrusted retrieval score without breaking the audit run."""
+
+    if not _is_finite_score(value):
+        return "n/a"
+    return f"{float(value):.6f}"
 
 
 def filter_relevant_hits(
@@ -310,11 +346,104 @@ def filter_relevant_hits(
     if diagnostics is not None:
         diagnostics.clear()
         diagnostics["candidate_count"] = len(hit_list)
+
+    # Scores are an untrusted boundary: legacy retrieval rows, mocks, or a
+    # partially-corrupt reranker response can contain NaN/Inf.  Letting one
+    # of those values reach max()/sorting/threshold arithmetic makes the
+    # result order and cutoff platform-dependent.  Drop them before any
+    # source or score decisions and fail closed when nothing finite remains.
+    finite_hits: list[KnowledgeSearchHitModel] = []
+    invalid_score_count = 0
+    for hit in hit_list:
+        score = hit.score
+        if not _is_finite_score(score):
+            invalid_score_count += 1
+            continue
+        finite_hits.append(hit)
+    if diagnostics is not None:
+        diagnostics["invalid_score_count"] = invalid_score_count
+        if invalid_score_count:
+            diagnostics["candidate_count_after_score_validation"] = len(finite_hits)
+    hit_list = finite_hits
+    if not hit_list:
+        if diagnostics is not None:
+            diagnostics["reason"] = (
+                "invalid_scores_filtered" if invalid_score_count else "no_candidates"
+            )
+            diagnostics["filtered_count"] = 0
+        return []
+    # An explicit filename is a hard user constraint. Apply it before score
+    # thresholds so an unrelated document with a stronger semantic score
+    # cannot become the answer source. The retrieval layer still receives the
+    # original query (and therefore can rank the named file), while this final
+    # guard fails closed if the bounded candidate set contains no such file.
+    file_references = query_file_reference_terms(query) if query.strip() else ()
+    if file_references and hit_list:
+        normalized_references = tuple(
+            normalize_fact_key(reference) for reference in file_references if reference
+        )
+        matching_by_reference = {
+            reference: {
+                hit.source.id
+                for hit in hit_list
+                if _file_reference_matches_source(reference, hit.source.name)
+            }
+            for reference in normalized_references
+        }
+        # ``query_file_reference_terms`` may retain both a cleaned wording
+        # candidate and a longer raw basename candidate (for example
+        # ``项目docx`` + ``关于项目docx``).  If the longer candidate matches
+        # an uploaded source, prefer it; otherwise fall back to the cleaned
+        # candidate.  This prevents a legitimate basename prefix from
+        # broadening the hard file scope to a similarly named second source.
+        matching_source_ids: set[str] = set()
+        for reference, source_ids in matching_by_reference.items():
+            if not source_ids:
+                continue
+            shadowed_by_longer_match = any(
+                len(other) > len(reference)
+                and other.endswith(reference)
+                and matching_by_reference.get(other)
+                for other in matching_by_reference
+            )
+            if not shadowed_by_longer_match:
+                matching_source_ids.update(source_ids)
+        if diagnostics is not None:
+            diagnostics["file_reference_terms"] = list(file_references)
+            diagnostics["candidate_count_before_file_scope"] = len(hit_list)
+        if not matching_source_ids:
+            if diagnostics is not None:
+                diagnostics["reason"] = "explicit_file_reference_not_in_candidates"
+                diagnostics["filtered_count"] = 0
+            return []
+        hit_list = [hit for hit in hit_list if hit.source.id in matching_source_ids]
+        if diagnostics is not None:
+            diagnostics["file_reference_source_ids"] = sorted(matching_source_ids)
+            diagnostics["candidate_count"] = len(hit_list)
     if not hit_list:
         if diagnostics is not None:
             diagnostics["reason"] = "no_candidates"
             diagnostics["filtered_count"] = 0
         return []
+    incompatible_field_count = 0
+    if query.strip() and find_query_field_aliases(query):
+        compatible_hits: list[KnowledgeSearchHitModel] = []
+        for hit in hit_list:
+            if _has_incompatible_field_label(query, hit.chunk.text):
+                incompatible_field_count += 1
+                continue
+            compatible_hits.append(hit)
+        hit_list = compatible_hits
+        if diagnostics is not None:
+            diagnostics["incompatible_field_count"] = incompatible_field_count
+            diagnostics["candidate_count_after_field_validation"] = len(hit_list)
+        if not hit_list:
+            if diagnostics is not None:
+                diagnostics["reason"] = "incompatible_fields_filtered"
+                diagnostics["filtered_count"] = 0
+            return []
+    elif diagnostics is not None:
+        diagnostics["incompatible_field_count"] = 0
     if any(value < 0 for value in (relative_score_floor, minimum_score_floor)):
         raise ValueError("score floors must be non-negative")
     if adjacency_distance < 0:
@@ -344,24 +473,47 @@ def filter_relevant_hits(
     )
     cutoff = max(effective_minimum_floor, top_score * effective_relative_floor)
     anchors = [hit for hit in hit_list if hit.score >= cutoff]
+    lexical_fallback_anchor_only = False
     if (
         not anchors
         and normalized_scores
         and top_score >= LOW_CONFIDENCE_TOP_SCORE
         and query.strip()
     ):
-        top_hit = max(hit_list, key=lambda hit: (hit.score, -hit.rank))
-        if _has_query_overlap(query, top_hit.chunk.text):
+        # A reranker can score an adjacent/context row above the row that
+        # contains the requested field. Inspect the complete bounded candidate
+        # set instead of trusting only the numerical top hit. For an explicit
+        # subject (including multiple entities), retain every lexical anchor;
+        # for a field-only question, retain only the strongest lexical anchor
+        # so a generic header shared by many files does not fan out evidence.
+        lexical_anchors = [
+            hit
+            for hit in hit_list
+            if _has_query_overlap(
+                query,
+                hit.chunk.text,
+                source_text=hit.source.name,
+                source_type=hit.source.source_type,
+            )
+        ]
+        subject_terms = query_subject_terms(query)
+        if subject_terms:
+            anchors = lexical_anchors
+        elif lexical_anchors:
+            anchors = [max(lexical_anchors, key=lambda hit: (hit.score, -hit.rank))]
+        if anchors:
             # A low but positive BGE probability can still be the only useful
-            # result for a short or synonym-heavy query.  Keep only the top
-            # candidate as the anchor; the normal adjacency rule may add its
-            # immediately adjacent chunks from the same source.
-            anchors = [top_hit]
+            # result for a short or synonym-heavy query. The normal adjacency
+            # rule may add immediately adjacent chunks from the same source.
             diagnostics_cutoff = cutoff
-            cutoff = top_hit.score
+            cutoff = max(hit.score for hit in anchors)
+            lexical_fallback_anchor_only = True
             if diagnostics is not None:
                 diagnostics["configured_cutoff"] = diagnostics_cutoff
                 diagnostics["reason"] = "low_score_top_candidate_retained"
+                diagnostics["lexical_anchor_chunk_ids"] = [
+                    hit.chunk.id for hit in anchors[:8]
+                ]
     if diagnostics is not None:
         diagnostics.update(
             {
@@ -369,6 +521,7 @@ def filter_relevant_hits(
                 "relative_floor": effective_relative_floor,
                 "minimum_floor": effective_minimum_floor,
                 "cutoff": cutoff,
+                "anchor_only_fallback": lexical_fallback_anchor_only,
                 "anchor_count": len(anchors),
                 "anchor_chunk_ids": [hit.chunk.id for hit in anchors[:8]],
             }
@@ -418,6 +571,7 @@ def filter_relevant_hits(
     filtered: list[KnowledgeSearchHitModel] = []
     dropped_by_source = 0
     dropped_by_score = 0
+    anchor_chunk_ids = {hit.chunk.id for hit in anchors}
     for hit in hit_list:
         if allowed_source_ids is not None and hit.source.id not in allowed_source_ids:
             dropped_by_source += 1
@@ -426,9 +580,18 @@ def filter_relevant_hits(
         if not indices:
             dropped_by_score += 1
             continue
-        if hit.score >= cutoff or any(
+        is_adjacent = any(
             abs(hit.chunk.chunk_index - anchor_index) <= adjacency_distance
             for anchor_index in indices
+        )
+        adjacent_conflict = bool(query.strip()) and _has_incompatible_field_label(
+            query,
+            hit.chunk.text,
+        )
+        if hit.chunk.id in anchor_chunk_ids or (
+            is_adjacent and not adjacent_conflict
+        ) or (
+            not lexical_fallback_anchor_only and hit.score >= cutoff
         ):
             filtered.append(hit)
         else:
@@ -459,35 +622,215 @@ def filter_relevant_hits(
     ]
 
 
-def _has_query_overlap(query: str, text: str) -> bool:
-    """Require a lexical signal before accepting a low-confidence top hit."""
-    normalized_query = re.sub(r"\s+", "", query).casefold()
-    normalized_text = re.sub(r"\s+", "", text).casefold()
-    if not normalized_query or not normalized_text:
+def _has_query_overlap(
+    query: str,
+    text: str,
+    *,
+    source_text: str = "",
+    source_type: str = "",
+) -> bool:
+    """Require a lexical signal before accepting a low-confidence top hit.
+
+    In addition to literal question n-grams, include the configured query
+    field vocabulary.  A user may ask for ``位置`` while a document labels the
+    same value ``主要活动区域`` or ``地理位置``; treating those aliases as
+    overlap prevents a genuinely relevant low-score hit from being discarded.
+    """
+    normalized_query = re.sub(
+        r"\s+", "", unicodedata.normalize("NFKC", query)
+    ).casefold()
+    normalized_text = re.sub(
+        r"\s+", "", unicodedata.normalize("NFKC", text)
+    ).casefold()
+    normalized_source = re.sub(
+        r"\s+", "", unicodedata.normalize("NFKC", source_text)
+    ).casefold()
+    source_is_tabular = _is_tabular_source_hint(source_text, source_type)
+    if not normalized_query or not (normalized_text or normalized_source):
         return False
 
-    candidates: set[str] = set(re.findall(r"[a-z0-9_]{2,}", normalized_query))
-    for token in re.findall(r"[\u4e00-\u9fff]+", normalized_query):
-        for size in range(2, min(8, len(token)) + 1):
-            candidates.update(
-                token[index : index + size]
-                for index in range(len(token) - size + 1)
-            )
-    stop_terms = {"什么", "如何", "怎么", "请问", "一下", "是否", "多少"}
+    # Field labels are evidence when they occur in the chunk body. A filename
+    # such as ``地址簿.xlsx`` is metadata and cannot prove that the retrieved
+    # row answers a bare ``地址`` question. For an explicit subject, a
+    # narrative chunk may express the field semantically without repeating a
+    # configured label (``蜘蛛侠常在纽约活动``), so a subject hit in the body
+    # is also accepted as the field signal.
+    field_query = bool(find_query_field_aliases(query))
+    field_terms = {
+        re.sub(r"\s+", "", term).casefold()
+        for term in query_primary_field_terms(query)
+        if term
+    }
+    overlap_text = (
+        f"{normalized_text}{normalized_source}" if source_is_tabular else normalized_text
+    )
+
+    candidates = set(query_overlap_terms(query))
+    # query_overlap_terms intentionally operates on normalized vocabulary,
+    # but normalize punctuation once more for defensive compatibility with
+    # callers that pass unusual Unicode forms.
+    candidates = {
+        re.sub(r"\s+", "", candidate).casefold()
+        for candidate in candidates
+        if candidate
+    }
+    stop_terms = {"什么", "如何", "怎么", "请问", "一下", "是否", "多少", "是什么"}
+    # A field synonym alone is not enough to retain a low-confidence hit when
+    # the question names a concrete subject.  For example, a generic policy
+    # mentioning ``主要活动区域`` must not be accepted for ``蜘蛛侠的位置``
+    # unless the subject/topic also appears in that candidate.  Field-only
+    # questions such as ``位置是什么`` intentionally remain eligible.
+    if field_query:
+        subject_terms = query_subject_terms(query)
+        field_in_chunk = query_field_matches(query, normalized_text)
+        if not subject_terms and field_terms and not field_in_chunk:
+            return False
+        if subject_terms:
+            # A named subject is not, by itself, evidence for every field
+            # attached to that subject.  In particular, a chunk saying
+            # ``蜘蛛侠性别：男`` must never become evidence for
+            # ``蜘蛛侠年龄是多少`` merely because the entity matches.  The
+            # field matcher includes configured aliases and guarded narrative
+            # semantic terms (``岁``/``出生`` for age, ``男``/``女`` for
+            # gender, etc.), so valid prose remains eligible while unrelated
+            # attributes are rejected before lexical fallback can promote
+            # them to LLM context.
+            if not field_in_chunk and (
+                not source_is_tabular
+                or _has_incompatible_field_label(query, normalized_text)
+            ):
+                return False
+            # Named entities/regions are hard anchors. A year or long numeric
+            # identifier is only a soft anchor because a long document may
+            # carry the date in its title/header while the matching split
+            # chunk contains the entity and value row. Date-only questions
+            # still require at least one numeric hit.
+            lexical_terms = [
+                term for term in subject_terms if not re.fullmatch(r"\d{4,}", term)
+            ]
+            numeric_terms = [
+                term for term in subject_terms if re.fullmatch(r"\d{4,}", term)
+            ]
+            # A multi-entity question is commonly represented as one row per
+            # entity (for example, ``张三和李四的联系方式``). The low-score
+            # guard runs on one candidate at a time, so requiring every entity
+            # in the same chunk would discard both valid rows before the
+            # source/adjacency stage can combine them. A single-entity query
+            # remains strict; for multiple entities one explicit subject is
+            # enough to establish that this candidate belongs to the request.
+            if lexical_terms and not (
+                any(term in overlap_text for term in lexical_terms)
+                if len(lexical_terms) > 1
+                else lexical_terms[0] in overlap_text
+            ):
+                return False
+            if not lexical_terms and numeric_terms and not any(
+                term in overlap_text for term in numeric_terms
+            ):
+                return False
+            subject_in_chunk = any(term in normalized_text for term in lexical_terms)
+            if not field_in_chunk and not subject_in_chunk and not source_is_tabular:
+                return False
     matched_lengths = sorted(
         (
             len(candidate)
             for candidate in candidates
-            if candidate not in stop_terms and candidate in normalized_text
+            if candidate not in stop_terms and candidate in overlap_text
         ),
         reverse=True,
     )
     if not matched_lengths:
-        return False
+        # A recognized field label is sufficient for a field-only query after
+        # the subject/metric guards above. Two-character Chinese headers such
+        # as ``年龄`` and ``温度`` are otherwise below the generic n-gram
+        # overlap threshold.
+        return bool(
+            field_query
+            and (
+                field_in_chunk
+                or (
+                    source_is_tabular
+                    and subject_terms
+                    and any(term in overlap_text for term in lexical_terms)
+                    and not _has_incompatible_field_label(query, normalized_text)
+                )
+            )
+        )
     return (
         matched_lengths[0] >= LOW_CONFIDENCE_QUERY_OVERLAP_MIN_LENGTH
         or len(matched_lengths) >= 2
+        or (field_query and field_in_chunk)
+        or (
+            field_query
+            and source_is_tabular
+            and subject_terms
+            and any(term in overlap_text for term in lexical_terms)
+            and not _has_incompatible_field_label(query, normalized_text)
+        )
     )
+
+
+def _is_tabular_source_hint(source_name: str, source_type: str) -> bool:
+    normalized_name = (source_name or "").casefold().split("?", 1)[0]
+    normalized_type = (source_type or "").casefold()
+    return normalized_name.endswith((".xlsx", ".xls", ".xlsb", ".csv")) or any(
+        marker in normalized_type
+        for marker in ("xlsx", "excel", "xls", "csv", "表格", "电子表")
+    )
+
+
+def _has_incompatible_field_label(query: str, text: str) -> bool:
+    """Return whether a tabular row explicitly names a different field.
+
+    Wide sheets can force a data-row chunk to omit its repeated header.  Such
+    a row is still useful when its subject/date filters match, provided it
+    does not explicitly advertise a conflicting metric (for example ``成本``
+    for a ``销售额`` question).  ``query_field_matches`` handles compatible
+    aliases before this helper is called; the remaining observed labels are
+    therefore safe to treat as conflicts.
+    """
+
+    target_fields = {match.field for match in find_query_field_aliases(query)}
+    if not target_fields:
+        return False
+    non_metric_fields = {"日期", "地区", "姓名"}
+    target_metric_fields = target_fields - non_metric_fields
+    # A filter-only question may legitimately retrieve a row that also
+    # contains metric columns; those columns are context, not competing
+    # answer fields.  Do not reject such rows at this lexical guard.
+    if not target_metric_fields:
+        return False
+    # Reuse the canonical compatibility rules first.  In particular, a raw
+    # ``温度`` header is a valid metric for an ``平均温度`` request, while an
+    # explicitly qualified ``最低温度`` header is not.
+    if query_field_matches(query, text):
+        return False
+    # Date/region/name labels are commonly filters that remain in a wide
+    # table row even when the requested measure header was omitted by chunk
+    # budgeting. They are not competing answer fields and must not make a
+    # valid row look incompatible.
+    observed_fields = {
+        match.field
+        for match in find_query_field_aliases(text)
+        if match.field not in non_metric_fields
+    }
+    return bool(observed_fields and observed_fields.isdisjoint(target_fields))
+
+
+def _file_reference_matches_source(reference: str, source_name: str) -> bool:
+    """Match an explicit file reference against an uploaded source basename.
+
+    File scope is a hard constraint. Compare normalized basenames exactly so
+    ``report.xlsx`` cannot accidentally select ``my_report.xlsx``.
+    """
+
+    normalized_reference = normalize_fact_key(reference)
+    raw_source = (source_name or "").split("?", 1)[0]
+    source_basename = re.split(r"[/\\]", raw_source)[-1]
+    normalized_source = normalize_fact_key(source_basename)
+    if not normalized_reference or not normalized_source:
+        return False
+    return normalized_source == normalized_reference
 
 
 def build_comparison_context(hits: list[KnowledgeSearchHitModel], search_rounds: int) -> str:
@@ -712,7 +1055,8 @@ class ReadOnlyKnowledgeAgent:
             fallback_reasons.append(search_result.fallback_reason)
         source_ids = list(dict.fromkeys(hit.source.id for hit in hits))
         evidence_audit = ", ".join(
-            f"{hit.chunk.id}:{hit.score:.6f}" for hit in hits[: self.max_hits]
+            f"{hit.chunk.id}:{_format_audit_score(hit.score)}"
+            for hit in hits[: self.max_hits]
         )
         output_summary = f"命中 {len(hits)} 个片段，累计保留 {len(merged)} 个片段"
         if evidence_audit:
@@ -754,8 +1098,11 @@ class ReadOnlyKnowledgeAgent:
         hits = state["knowledge_hits"]
         if not hits:
             return True
-        source_count = len({hit.source.id for hit in hits})
-        top_score = max(hit.score for hit in hits)
+        finite_hits = [hit for hit in hits if _is_finite_score(hit.score)]
+        if not finite_hits:
+            return True
+        source_count = len({hit.source.id for hit in finite_hits})
+        top_score = max(hit.score for hit in finite_hits)
         # Scores from the BGE reranker are probabilities; legacy fallback
         # scores historically used a larger scale.  Use the matching floor so
         # deep mode does not keep expanding a clearly good normalized hit.
@@ -784,6 +1131,8 @@ class ReadOnlyKnowledgeAgent:
             "top_score_not_positive": "最高相关性分数不大于 0",
             "all_candidates_below_cutoff": "所有候选片段都低于证据阈值",
             "low_score_top_candidate_retained": "候选分数整体偏低，但保留了与问题有文本重合的最高候选",
+            "invalid_scores_filtered": "候选包含非有限分数，已安全过滤",
+            "incompatible_fields_filtered": "候选字段与问题目标不兼容，已安全过滤",
         }
         diagnostic_reason = reason_labels.get(
             str(diagnostics.get("reason")),
@@ -792,6 +1141,8 @@ class ReadOnlyKnowledgeAgent:
         diagnostic_summary = (
             "证据诊断："
             f"候选={diagnostics.get('candidate_count', 0)}，"
+            f"无效分数={diagnostics.get('invalid_score_count', 0)}，"
+            f"冲突字段={diagnostics.get('incompatible_field_count', 0)}，"
             f"锚点={diagnostics.get('anchor_count', 0)}，"
             f"保留={diagnostics.get('filtered_count', 0)}，"
             f"分数范围={diagnostics.get('score_min', 'n/a')}..{diagnostics.get('score_max', 'n/a')}，"

@@ -95,6 +95,74 @@ class KnowledgeIngestionPipelineTest(unittest.TestCase):
         self.assertEqual(result.facts, ())
         self.assertEqual([chunk.text for chunk in result.chunks], ["plain searchable passage"])
 
+    def test_csv_chunks_keep_header_with_each_data_section(self) -> None:
+        path = Path(self.temp_dir.name) / "sales.csv"
+        path.write_text(
+            "地区,日期,销售额\n华东,2025-01-01,100\n华东,2025-01-02,200\n",
+            encoding="utf-8",
+        )
+
+        chunks = parse_knowledge_file(path, source_id="kb-csv", source_type="CSV")
+
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("[CSV]", chunks[0].text)
+        self.assertIn("地区 | 日期 | 销售额", chunks[0].text)
+        self.assertIn("华东 | 2025-01-02 | 200", chunks[0].text)
+
+    def test_headerless_csv_keeps_first_data_row(self) -> None:
+        path = Path(self.temp_dir.name) / "headerless.csv"
+        path.write_text(
+            "华东,2025-01-01,100\n华东,2025-01-02,200\n",
+            encoding="utf-8",
+        )
+
+        chunks = parse_knowledge_file(path, source_id="kb-headerless", source_type="CSV")
+
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("数据行（无表头）", chunks[0].text)
+        self.assertIn("华东 | 2025-01-01 | 100", chunks[0].text)
+        self.assertIn("华东 | 2025-01-02 | 200", chunks[0].text)
+
+    def test_xlsx_chunks_repeat_sheet_and_header_without_splitting_rows(self) -> None:
+        path = Path(self.temp_dir.name) / "regional-sales.xlsx"
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "销售明细"
+        worksheet.append(["地区", "日期", "销售额"])
+        rows = []
+        for index in range(80):
+            row = ["华东", f"2025-01-{(index % 28) + 1:02d}", index]
+            rows.append(" | ".join(str(value) for value in row))
+            worksheet.append(row)
+        workbook.save(path)
+
+        chunks = parse_knowledge_file(path, source_id="kb-xlsx", source_type="XLSX")
+
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertTrue(chunk.text.startswith("[销售明细]\n地区 | 日期 | 销售额\n"))
+            self.assertLessEqual(len(chunk.text), 600)
+            data_lines = chunk.text.splitlines()[2:]
+            self.assertTrue(all(line in rows for line in data_lines))
+
+    def test_tabular_chunks_cap_oversized_header_and_row(self) -> None:
+        from openpyxl import Workbook
+
+        path = Path(self.temp_dir.name) / "wide.xlsx"
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "宽表"
+        worksheet.append(["列头" * 200])
+        worksheet.append(["数据" * 500])
+        workbook.save(path)
+
+        chunks = parse_knowledge_file(path, source_id="kb-wide", source_type="XLSX")
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk.text) <= 600 for chunk in chunks))
+
     def test_new_document_updates_postgres_then_active_qdrant_collection(self) -> None:
         events = []
 

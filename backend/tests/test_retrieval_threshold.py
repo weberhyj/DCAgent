@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from app.models import ChatState, KnowledgeChunkModel
+from app.models import ChatState, KnowledgeChunkModel, KnowledgeSourceModel
 from app.repository import (
     InMemoryChatRepository,
+    build_search_terms,
     is_reliable_knowledge_score,
     resolve_retrieval_min_score,
+    score_knowledge_text,
 )
 from app.retrieval import resolve_hybrid_evidence_limit
 
@@ -79,6 +81,75 @@ class RetrievalThresholdTest(unittest.TestCase):
         hits = repository.search_knowledge_chunks("公司是否提供火星基地住房补贴", limit=5)
 
         self.assertEqual(hits, [])
+
+    def test_query_field_synonyms_are_included_in_keyword_terms(self) -> None:
+        terms = build_search_terms("蜘蛛侠的位置是什么？")
+
+        self.assertIn("位置", terms)
+        self.assertIn("地理位置", terms)
+        self.assertIn("主要活动区域", terms)
+
+    def test_query_field_synonym_retrieves_differently_labeled_record(self) -> None:
+        repository = InMemoryChatRepository(
+            ChatState(conversations=[], messages_by_conversation={}, knowledge_sources=[])
+        )
+        repository.add_uploaded_knowledge_source(
+            source_id="kb-spider-location",
+            name="蜘蛛侠资料.docx",
+            source_type="文档",
+            classification="内部",
+            records=0,
+            file_path="spider.docx",
+            file_size=128,
+            mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        repository.complete_knowledge_source_indexing(
+            "kb-spider-location",
+            [
+                KnowledgeChunkModel(
+                    id="chunk-spider-location-0",
+                    source_id="kb-spider-location",
+                    chunk_index=0,
+                    text="蜘蛛侠的主要活动区域是纽约市。",
+                    token_count=16,
+                )
+            ],
+        )
+
+        hits = repository.search_knowledge_chunks("蜘蛛侠的位置是什么？", limit=5)
+
+        self.assertEqual([hit.chunk.id for hit in hits], ["chunk-spider-location-0"])
+        self.assertIn("主要活动区域", hits[0].matched_terms)
+
+    def test_field_alias_density_does_not_outscore_explicit_subject(self) -> None:
+        source = KnowledgeSourceModel(
+            id="kb-score",
+            name="资料.txt",
+            source_type="文档",
+            records=1,
+            status="已索引",
+            updated_at="",
+            classification="内部",
+        )
+        subject_chunk = KnowledgeChunkModel(
+            id="subject",
+            source_id="kb-score",
+            chunk_index=0,
+            text="蜘蛛侠的主要活动区域是纽约市。",
+            token_count=10,
+        )
+        generic_chunk = KnowledgeChunkModel(
+            id="generic",
+            source_id="kb-score",
+            chunk_index=1,
+            text="位置、地理位置、所在地、活动区域、地址是可选字段。",
+            token_count=10,
+        )
+
+        self.assertGreater(
+            score_knowledge_text("蜘蛛侠的位置是什么？", source, subject_chunk),
+            score_knowledge_text("蜘蛛侠的位置是什么？", source, generic_chunk),
+        )
 
 
 if __name__ == "__main__":

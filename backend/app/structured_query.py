@@ -5,7 +5,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import PurePath
 
@@ -72,7 +72,7 @@ class _FilterMatch:
 
 
 _AGGREGATE_WORDS = (
-    ("avg", ("平均值", "平均", "均值")),
+    ("avg", ("平均值", "平均", "均值", "均温")),
     ("sum", ("总和", "合计", "求和")),
     ("count", ("多少条", "数量", "计数")),
     ("count_distinct", ("去重数量", "去重数", "不同数量", "唯一数量", "不重复数量")),
@@ -82,6 +82,31 @@ _AGGREGATE_WORDS = (
     ("stddev", ("标准差", "标准偏差")),
     ("variance", ("方差", "变异数")),
     ("percentile", ("分位数", "百分位", "百分位数")),
+)
+# Query-time aliases are deliberately kept separate from the persisted
+# spreadsheet schema.  A user may call a column ``气温`` while the uploaded
+# workbook uses ``温度`` (or vice versa); the resolver should bridge that
+# vocabulary without changing the physical column contract.  Aggregate
+# qualifiers are not included in the raw-temperature group so a request for
+# an average cannot silently select a ``最高温度``/``最低温度`` column.
+_STRUCTURED_RAW_FIELD_ALIAS_GROUPS = (
+    ("温度", "气温"),
+    ("地区", "区域"),
+    ("销售额", "销售金额"),
+    ("收入", "营收"),
+    ("联系方式", "联系电话"),
+)
+_STRUCTURED_AGGREGATE_FIELD_ALIAS_GROUPS = {
+    "avg": ("平均温度", "平均气温", "均温"),
+    "max": ("最高温度", "最高气温"),
+    "min": ("最低温度", "最低气温"),
+}
+_STRUCTURED_AGGREGATE_PREFIXES = (
+    ("平均", "avg"),
+    ("最高", "max"),
+    ("最低", "min"),
+    ("最大", "max"),
+    ("最小", "min"),
 )
 _SUMMARY_WORDS = ("汇总", "统计")
 _NUMERIC_TYPES = frozenset({StructuredColumnType.INTEGER, StructuredColumnType.DECIMAL})
@@ -1176,7 +1201,11 @@ def _parse_combined_aggregate_intent(
     """Support one metric requested with several explicit statistics in one query."""
 
     available = _mask_spans(question, excluded_spans)
-    field_spans = _column_name_spans(available, dataset.schema.columns)
+    field_spans = _column_name_spans(
+        available,
+        dataset.schema.columns,
+        include_semantic=False,
+    )
     occurrences: list[tuple[int, str, _TextSpan]] = []
     for aggregate, words in _AGGREGATE_WORDS:
         for word in words:
@@ -1389,7 +1418,11 @@ def _parse_aggregate_clause(
     allow_missing: bool = False,
 ) -> _ClauseParseResult[str]:
     available = _mask_spans(question, excluded_spans)
-    field_spans = _column_name_spans(available, columns)
+    field_spans = _column_name_spans(
+        available,
+        columns,
+        include_semantic=False,
+    )
     matches: dict[str, list[_TextSpan]] = {}
     count_all_hint = False
     for aggregate, words in _AGGREGATE_WORDS:
@@ -1397,7 +1430,15 @@ def _parse_aggregate_clause(
             for span in _find_normalized_spans(available, word):
                 if any(_contains(field_span, span) for field_span in field_spans):
                     continue
-                matches.setdefault(aggregate, []).append(span)
+                # ``均温`` combines the aggregate qualifier and the metric
+                # name in one token. Keep its span unconsumed so the metric
+                # resolver can use the complete semantic alias.
+                consumed_span = (
+                    _TextSpan(span.start, span.start)
+                    if aggregate == "avg" and word == "均温"
+                    else span
+                )
+                matches.setdefault(aggregate, []).append(consumed_span)
                 if aggregate == "count" and word == "多少条":
                     count_all_hint = True
     # Prefer a governed compound phrase such as ``去重数量`` over the
@@ -1417,6 +1458,10 @@ def _parse_aggregate_clause(
         ):
             matches[aggregate].remove(span)
     matches = {aggregate: spans for aggregate, spans in matches.items() if spans}
+    if not matches:
+        inferred = _infer_qualified_column_aggregate(available, columns)
+        if inferred is not None:
+            return inferred
     if len(matches) > 1:
         return _ClauseParseResult(
             issue=StructuredClarification(
@@ -1434,6 +1479,58 @@ def _parse_aggregate_clause(
         consumed_spans=_merge_spans(matches[aggregate]),
         count_all_hint=count_all_hint,
     )
+
+
+def _infer_qualified_column_aggregate(
+    question: str,
+    columns: Iterable[StructuredColumnSchema],
+) -> _ClauseParseResult[str] | None:
+    """Infer an aggregate when the governed metric header includes it.
+
+    For example, a workbook may expose ``平均气温`` as its numeric header.
+    In that case the word ``平均`` is inside the column name and the normal
+    aggregate scanner intentionally ignores it as a field token.  Infer the
+    operation only for an aggregatable numeric column whose complete name is
+    present, and consume just the qualifier so metric resolution still sees
+    the column body.
+    """
+
+    candidates: dict[str, tuple[StructuredColumnSchema, str]] = {}
+    for column in columns:
+        if not column.allow_aggregate or column.data_type not in _NUMERIC_TYPES:
+            continue
+        # Only persisted names participate here. Generated aliases are meant
+        # to bridge a raw column after an explicit aggregate has been found;
+        # using them for inference would make a raw ``温度`` column compete
+        # with a real ``最高温度`` column.
+        names = _column_names(column)
+        for name in dict.fromkeys(names):
+            normalized_name = _normalize(name)
+            if not normalized_name:
+                continue
+            for prefix, aggregate in _STRUCTURED_AGGREGATE_PREFIXES:
+                normalized_prefix = _normalize(prefix)
+                is_shorthand_average = normalized_name == _normalize("均温")
+                if not normalized_name.startswith(normalized_prefix) and not (
+                    aggregate == "avg" and is_shorthand_average
+                ):
+                    continue
+                if not _find_normalized_spans(question, name):
+                    continue
+                candidates[column.physical_name] = (column, aggregate)
+                break
+    if len(candidates) > 1:
+        return _ClauseParseResult(
+            issue=StructuredClarification(
+                "字段名称存在歧义，请选择一个字段",
+                tuple(sorted(candidates)),
+            )
+        )
+    if candidates:
+        # The qualifier is part of the governed field token. Leave it visible
+        # so metric resolution can prefer the complete qualified name.
+        return _ClauseParseResult(value=next(iter(candidates.values()))[1])
+    return None
 
 
 def _with_route_context(
@@ -1504,26 +1601,34 @@ def _parse_metric_list(
     excluded_spans: tuple[_TextSpan, ...],
 ) -> _ClauseParseResult[tuple[StructuredColumnSchema, ...]]:
     available = _mask_spans(question, excluded_spans)
-    raw_matches: list[tuple[_TextSpan, int, StructuredColumnSchema]] = []
+    raw_matches: list[tuple[_TextSpan, int, int, StructuredColumnSchema]] = []
+    # Aggregate words are masked before metric scanning. Recover a complete
+    # qualified header from the original question first, but only for a
+    # column whose governed header itself is qualified. This prevents a raw
+    # ``温度`` column's inferred ``最高气温`` alias from outranking a real
+    # ``最高温度`` column.
+    for span, column in _qualified_metric_matches(question, columns, aggregate):
+        raw_matches.append((span, -1, span.end - span.start, column))
     for column in columns:
-        for _, name in _resolution_names(column):
+        for priority, name in _resolution_names(column, aggregate=aggregate):
             normalized_name = _normalize(name)
             if not normalized_name:
                 continue
             for span in _find_normalized_spans(available, name):
-                raw_matches.append((span, len(normalized_name), column))
+                raw_matches.append((span, priority, len(normalized_name), column))
 
-    by_span: dict[_TextSpan, list[tuple[int, StructuredColumnSchema]]] = {}
-    for span, match_length, column in raw_matches:
-        by_span.setdefault(span, []).append((match_length, column))
+    by_span: dict[_TextSpan, list[tuple[int, int, StructuredColumnSchema]]] = {}
+    for span, priority, match_length, column in raw_matches:
+        by_span.setdefault(span, []).append((priority, match_length, column))
 
     span_groups: list[tuple[_TextSpan, int, dict[str, StructuredColumnSchema]]] = []
     for span, span_matches in by_span.items():
-        finalists = {column.physical_name: column for _, column in span_matches}
+        span_matches = _prefer_metric_resolution_matches(span_matches)
+        finalists = {column.physical_name: column for _, _, column in span_matches}
         span_groups.append(
             (
                 span,
-                max(match_length for match_length, _ in span_matches),
+                max(match_length for _, match_length, _ in span_matches),
                 finalists,
             )
         )
@@ -1534,10 +1639,7 @@ def _parse_metric_list(
         key=lambda item: (-item[1], item[0].start, item[0].end),
     ):
         span = match[0]
-        if any(
-            span.start < selected_span.end and selected_span.start < span.end
-            for selected_span, _, _ in non_overlapping
-        ):
+        if any(span.start < selected_span.end and selected_span.start < span.end for selected_span, _, _ in non_overlapping):
             continue
         non_overlapping.append(match)
 
@@ -1574,6 +1676,37 @@ def _parse_metric_list(
         value=tuple(selected),
         consumed_spans=tuple(selected_spans),
     )
+
+
+def _qualified_metric_matches(
+    question: str,
+    columns: Iterable[StructuredColumnSchema],
+    aggregate: str,
+) -> tuple[tuple[_TextSpan, StructuredColumnSchema], ...]:
+    """Find complete aggregate-qualified aliases for governed headers."""
+    if aggregate not in _STRUCTURED_AGGREGATE_FIELD_ALIAS_GROUPS:
+        return ()
+    matches: list[tuple[_TextSpan, StructuredColumnSchema]] = []
+    for column in columns:
+        if not column.allow_aggregate or column.data_type not in _NUMERIC_TYPES:
+            continue
+        for name in _column_names(column):
+            normalized_name = _normalize(_strip_parenthetical_suffix(name))
+            for prefix, prefix_aggregate in _STRUCTURED_AGGREGATE_PREFIXES:
+                normalized_prefix = _normalize(prefix)
+                if prefix_aggregate != aggregate or not normalized_name.startswith(normalized_prefix):
+                    continue
+                base = normalized_name[len(normalized_prefix) :]
+                base_aliases = {base}
+                if base in {"温度", "气温"}:
+                    base_aliases.update({"温度", "气温"})
+                for alias in base_aliases:
+                    phrase = f"{prefix}{alias}"
+                    matches.extend(
+                        (span, column) for span in _find_normalized_spans(question, phrase)
+                    )
+                break
+    return tuple(matches)
 
 
 def _parse_dataset_clause(
@@ -1674,7 +1807,20 @@ def _parse_metric_clause(
         if aggregate in {"count", "count_distinct"}
         else tuple(column for column in columns if column.allow_aggregate)
     )
-    matches = _resolve_columns(available, aggregate_columns)
+    qualified = _resolve_qualified_metric(
+        question,
+        available,
+        aggregate_columns,
+        aggregate=aggregate,
+    )
+    if isinstance(qualified, StructuredClarification):
+        return _ClauseParseResult(issue=qualified)
+    if qualified is not None:
+        return _ClauseParseResult(
+            value=qualified[0],
+            consumed_spans=qualified[1],
+        )
+    matches = _resolve_columns(available, aggregate_columns, aggregate=aggregate)
     if isinstance(matches, StructuredClarification):
         return _ClauseParseResult(issue=matches)
     if matches:
@@ -1715,6 +1861,61 @@ def _parse_metric_clause(
             )
         )
     return _ClauseParseResult(issue=StructuredUnavailable("未识别到可聚合的指标字段"))
+
+
+def _resolve_qualified_metric(
+    question: str,
+    available: str,
+    columns: Iterable[StructuredColumnSchema],
+    *,
+    aggregate: str,
+) -> tuple[StructuredColumnSchema, tuple[_TextSpan, ...]] | StructuredClarification | None:
+    """Prefer an explicitly qualified metric over a raw alias collision.
+
+    If a schema contains both ``温度`` and ``最高温度``, the latter must win
+    for ``最高温度`` even though aggregate parsing masks ``最高`` before the
+    generic column resolver runs.  This preference is query-only and applies
+    only when the complete qualified phrase (including common temperature
+    vocabulary bridges) is present in the user's original wording.
+    """
+
+    if aggregate not in _STRUCTURED_AGGREGATE_FIELD_ALIAS_GROUPS:
+        return None
+    normalized_question = _normalize(question)
+    candidates: list[tuple[StructuredColumnSchema, tuple[_TextSpan, ...]]] = []
+    for column in columns:
+        if not column.allow_aggregate or column.data_type not in _NUMERIC_TYPES:
+            continue
+        for name in _column_names(column):
+            simplified = _strip_parenthetical_suffix(name)
+            normalized_name = _normalize(simplified)
+            for prefix, prefix_aggregate in _STRUCTURED_AGGREGATE_PREFIXES:
+                if prefix_aggregate != aggregate or not normalized_name.startswith(_normalize(prefix)):
+                    continue
+                base = normalized_name[len(_normalize(prefix)) :]
+                base_aliases = {base}
+                if base in {"温度", "气温"}:
+                    base_aliases.update({"温度", "气温"})
+                if not any(
+                    _normalize(prefix) + alias in normalized_question
+                    for alias in base_aliases
+                ):
+                    continue
+                spans = _column_name_spans(available, (column,))
+                candidates.append((column, spans))
+                break
+            else:
+                continue
+            break
+    unique: dict[str, tuple[StructuredColumnSchema, tuple[_TextSpan, ...]]] = {
+        column.physical_name: (column, spans) for column, spans in candidates
+    }
+    if len(unique) > 1:
+        return StructuredClarification(
+            "字段名称存在歧义，请选择一个字段",
+            tuple(sorted(unique)),
+        )
+    return next(iter(unique.values())) if unique else None
 
 
 def _parse_filter_clause(
@@ -2175,13 +2376,16 @@ def _select_implicit_filter_matches(
 
 
 def _resolve_columns(
-    question: str, columns: Iterable[StructuredColumnSchema]
+    question: str,
+    columns: Iterable[StructuredColumnSchema],
+    *,
+    aggregate: str | None = None,
 ) -> tuple[StructuredColumnSchema, ...] | StructuredClarification:
     candidates = tuple(columns)
     normalized_question = _normalize(question)
     matches: list[tuple[int, int, int, int, StructuredColumnSchema]] = []
     for column in candidates:
-        for priority, name in _resolution_names(column):
+        for priority, name in _resolution_names(column, aggregate=aggregate):
             normalized_name = _normalize(name)
             if not normalized_name:
                 continue
@@ -2213,6 +2417,7 @@ def _resolve_columns(
         by_span.setdefault((start, end), []).append((priority, column))
     selected: set[StructuredColumnSchema] = set()
     for span_matches in by_span.values():
+        span_matches = _prefer_column_resolution_matches(span_matches)
         best_priority = min(priority for priority, _ in span_matches)
         selected.update(column for priority, column in span_matches if priority == best_priority)
     return _unique_or_clarification(selected)
@@ -2221,12 +2426,14 @@ def _resolve_columns(
 def _resolve_multiple_columns(
     question: str,
     columns: Iterable[StructuredColumnSchema],
+    *,
+    aggregate: str | None = None,
 ) -> tuple[StructuredColumnSchema, ...] | StructuredClarification:
     candidates = tuple(columns)
     normalized_question = _normalize(question)
     matches: list[tuple[int, int, int, int, StructuredColumnSchema]] = []
     for column in candidates:
-        for priority, name in _resolution_names(column):
+        for priority, name in _resolution_names(column, aggregate=aggregate):
             normalized_name = _normalize(name)
             if not normalized_name:
                 continue
@@ -2251,6 +2458,7 @@ def _resolve_multiple_columns(
         by_span.setdefault((start, end), []).append((priority, column))
     selected: list[tuple[int, StructuredColumnSchema]] = []
     for span, span_matches in by_span.items():
+        span_matches = _prefer_column_resolution_matches(span_matches)
         best_priority = min(priority for priority, _ in span_matches)
         finalists = tuple(
             {
@@ -2274,10 +2482,12 @@ def _resolve_multiple_columns(
 def _column_name_spans(
     question: str,
     columns: Iterable[StructuredColumnSchema],
+    *,
+    include_semantic: bool = True,
 ) -> tuple[_TextSpan, ...]:
     spans: set[_TextSpan] = set()
     for column in columns:
-        for _, name in _resolution_names(column):
+        for _, name in _resolution_names(column, include_semantic=include_semantic):
             spans.update(_find_normalized_spans(question, name))
     return tuple(sorted(spans))
 
@@ -2294,6 +2504,29 @@ def _unique_or_clarification(
     return ordered
 
 
+def _prefer_metric_resolution_matches(
+    matches: list[tuple[int, int, StructuredColumnSchema]],
+) -> list[tuple[int, int, StructuredColumnSchema]]:
+    """Drop inferred semantic aliases when an explicit column name matches.
+
+    Priority ``3`` is reserved for query-time aliases inferred from a header
+    (for example, treating ``温度`` as ``气温``).  Explicit physical/display/
+    original names and user-declared aliases must remain together so genuine
+    same-span ambiguity still produces a clarification.  When at least one
+    explicit match exists, inferred aliases are only fallback candidates.
+    """
+
+    explicit = [item for item in matches if item[0] < 3]
+    return explicit or matches
+
+
+def _prefer_column_resolution_matches(
+    matches: list[tuple[int, StructuredColumnSchema]],
+) -> list[tuple[int, StructuredColumnSchema]]:
+    explicit = [item for item in matches if item[0] < 3]
+    return explicit or matches
+
+
 def _column_names(column: StructuredColumnSchema) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
@@ -2302,7 +2535,12 @@ def _column_names(column: StructuredColumnSchema) -> tuple[str, ...]:
     )
 
 
-def _resolution_names(column: StructuredColumnSchema) -> tuple[tuple[int, str], ...]:
+def _resolution_names(
+    column: StructuredColumnSchema,
+    *,
+    aggregate: str | None = None,
+    include_semantic: bool = True,
+) -> tuple[tuple[int, str], ...]:
     names = [
         (0, column.physical_name),
         (1, column.display_name),
@@ -2316,7 +2554,80 @@ def _resolution_names(column: StructuredColumnSchema) -> tuple[tuple[int, str], 
         # match incidental words such as “这段时间”.
         if simplified != name and column.allow_aggregate:
             names.append((priority + 1, simplified))
+    if include_semantic:
+        names.extend(
+            (3, alias)
+            for alias in _structured_semantic_aliases(column, aggregate=aggregate)
+            if alias
+        )
     return tuple(dict.fromkeys(names))
+
+
+def _structured_semantic_aliases(
+    column: StructuredColumnSchema,
+    *,
+    aggregate: str | None = None,
+) -> tuple[str, ...]:
+    """Return bounded, query-only aliases inferred from a column header.
+
+    Schema aliases are user-governed and remain authoritative.  These extra
+    names only make natural-language resolution tolerant of common wording
+    differences; they never alter the physical column or publication schema.
+    """
+
+    source_names = _column_names(column)
+    normalized_names = tuple(_normalize(name) for name in source_names if name)
+    if not normalized_names:
+        return ()
+
+    aliases: list[str] = []
+    for group in _STRUCTURED_RAW_FIELD_ALIAS_GROUPS:
+        if not any(any(_normalize(alias) in name for alias in group) for name in normalized_names):
+            continue
+        # Only infer cross-vocabulary aliases when the column is usable for
+        # the corresponding operation.  This prevents a non-aggregatable
+        # dimension called ``区域`` from becoming a metric by accident.
+        if group == ("地区", "区域") and not column.allow_filter:
+            continue
+        if group != ("地区", "区域") and not column.allow_aggregate:
+            continue
+
+        if group == ("温度", "气温") and column.allow_aggregate:
+            has_average = any(
+                any(marker in name for marker in ("平均", "均值", "均温"))
+                for name in normalized_names
+            )
+            extreme_aggregate = next(
+                (
+                    candidate
+                    for candidate, markers in (
+                        ("max", ("最高", "最大")),
+                        ("min", ("最低", "最小")),
+                    )
+                    if any(marker in name for name in normalized_names for marker in markers)
+                ),
+                None,
+            )
+            # Qualified temperature columns are only bridged to their own
+            # aggregate.  A raw column gets the generic temperature aliases;
+            # a qualified column gets only its corresponding qualified aliases
+            # so ``最高气温`` cannot fall back to a raw ``温度`` field.
+            if extreme_aggregate is not None:
+                if aggregate == extreme_aggregate:
+                    aliases.extend(_STRUCTURED_AGGREGATE_FIELD_ALIAS_GROUPS[extreme_aggregate])
+                continue
+            if has_average:
+                if aggregate == "avg":
+                    aliases.extend(_STRUCTURED_AGGREGATE_FIELD_ALIAS_GROUPS["avg"])
+                continue
+            aliases.extend(group)
+            if aggregate == "avg":
+                aliases.extend(_STRUCTURED_AGGREGATE_FIELD_ALIAS_GROUPS["avg"])
+            elif aggregate in {"max", "min"}:
+                aliases.extend(_STRUCTURED_AGGREGATE_FIELD_ALIAS_GROUPS[aggregate])
+            continue
+        aliases.extend(group)
+    return tuple(dict.fromkeys(aliases))
 
 
 def _strip_parenthetical_suffix(value: str) -> str:
@@ -2417,7 +2728,7 @@ def _convert_parameter(
             # timezone.  Pass an aware UTC value to clickhouse-connect so a
             # host-local timezone cannot shift the filter by several hours.
             normalized = compatibility.normalize_datetime(datetime.fromisoformat(value))
-            return normalized.replace(tzinfo=timezone.utc)
+            return normalized.replace(tzinfo=UTC)
         if column_type is StructuredColumnType.BOOLEAN:
             normalized = value.strip().casefold()
             if normalized in {"1", "true", "yes", "是"}:

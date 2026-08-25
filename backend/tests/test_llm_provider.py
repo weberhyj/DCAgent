@@ -423,6 +423,145 @@ class LLMProviderTest(unittest.TestCase):
 
         self.assertIn("职业/身份 | 学生、摄影师、科研人员等", prompt)
 
+    def test_build_knowledge_context_obeys_shared_total_budget(self) -> None:
+        hits = [
+            indexed_hit(
+                chunk=replace(indexed_chunk(), text=("高相关资料。" * 900)),
+                score=0.95,
+                rank=1,
+            ),
+            indexed_hit(
+                chunk=replace(indexed_chunk(), id="chunk-llm-2", text=("低相关资料。" * 900)),
+                score=0.12,
+                rank=2,
+            ),
+            indexed_hit(
+                chunk=replace(indexed_chunk(), id="chunk-llm-3", text=("补充资料。" * 900)),
+                score=0.08,
+                rank=3,
+            ),
+        ]
+
+        context = build_knowledge_context(hits, query="资料", total_limit=1800)
+
+        self.assertLessEqual(len(context), 1800)
+        self.assertIn("[知识片段 1]", context)
+        self.assertIn("[知识片段 2]", context)
+        self.assertIn("[知识片段 3]", context)
+
+    def test_build_knowledge_context_normalizes_invalid_budget_values(self) -> None:
+        hit = indexed_hit()
+
+        for value in (None, "", "not-a-number", float("nan"), float("inf"), True, -1, 0):
+            with self.subTest(value=value):
+                self.assertEqual(build_knowledge_context([hit], total_limit=value), "")
+
+        fractional = build_knowledge_context([hit], total_limit=12.9)
+        self.assertLessEqual(len(fractional), 12)
+        huge = build_knowledge_context([hit], total_limit=10**9)
+        self.assertEqual(huge, "[知识片段 1]\n现金流风险与回款周期直接相关。")
+
+    def test_build_knowledge_context_ignores_empty_hits_without_wasting_budget(self) -> None:
+        empty_hit = indexed_hit(chunk=replace(indexed_chunk(), id="empty", text=" \n\t "))
+        context = build_knowledge_context(
+            [empty_hit, indexed_hit()],
+            query="现金流风险",
+            total_limit=120,
+        )
+
+        self.assertIn("[知识片段 1]", context)
+        self.assertNotIn("[知识片段 2]", context)
+        self.assertIn("现金流风险与回款周期直接相关。", context)
+
+    def test_build_prompt_does_not_reintroduce_empty_placeholder_hits(self) -> None:
+        empty_hit = indexed_hit(chunk=replace(indexed_chunk(), id="empty", text=" \n\t "))
+        prompt = build_prompt(
+            LLMRequest(
+                content="现金流风险是什么？",
+                mode="quick",
+                knowledge_hits=[empty_hit, indexed_hit()],
+            )
+        )
+
+        self.assertIn("[知识片段 1]", prompt)
+        self.assertNotIn("[知识片段 2]", prompt)
+        self.assertIn("现金流风险与回款周期直接相关。", prompt)
+
+    def test_build_knowledge_context_allocates_more_to_relevant_hit(self) -> None:
+        hits = [
+            indexed_hit(score=0.95, rank=1),
+            indexed_hit(
+                chunk=replace(indexed_chunk(), id="chunk-llm-2"),
+                score=0.12,
+                rank=2,
+            ),
+        ]
+
+        budgets = llm_module._allocate_context_limits(hits, 3600)
+
+        self.assertEqual(len(budgets), 2)
+        self.assertGreater(budgets[0], budgets[1])
+        self.assertLessEqual(sum(budgets), 3600)
+        self.assertLessEqual(max(budgets), 2000)
+
+    def test_long_unmatched_chunk_keeps_head_and_trailing_field(self) -> None:
+        chunk = replace(
+            indexed_chunk(),
+            text=(
+                "文档标题：蜘蛛侠资料\n"
+                + ("背景说明。\n" * 500)
+                + "主要活动区域 | 纽约市\n"
+            ),
+        )
+
+        context = build_knowledge_context(
+            [indexed_hit(chunk=chunk)],
+            query="一个文档中不存在的字段是什么？",
+            total_limit=700,
+        )
+
+        self.assertIn("文档标题：蜘蛛侠资料", context)
+        self.assertIn("主要活动区域 | 纽约市", context)
+
+    def test_context_selector_prefers_complete_record_line_and_matched_alias(self) -> None:
+        chunk = replace(
+            indexed_chunk(),
+            text=(
+                ("无关背景。\n" * 250)
+                + "主要活动区域 | 纽约市\n"
+                + ("其他说明。\n" * 250)
+            ),
+        )
+
+        context = build_knowledge_context(
+            [replace(indexed_hit(chunk=chunk), matched_terms=[])],
+            query="位置是什么？",
+            total_limit=700,
+        )
+
+        self.assertIn("主要活动区域 | 纽约市", context)
+
+    def test_tiny_context_budget_keeps_query_match_instead_of_only_ellipsis(self) -> None:
+        from app.llm import _knowledge_context_text
+
+        excerpt = _knowledge_context_text("前置说明 主要活动区域 | 纽约市 后续说明", "主要活动区域", limit=3)
+
+        self.assertEqual(excerpt, "主要活")
+
+    def test_average_temperature_context_does_not_anchor_on_minimum_column(self) -> None:
+        from app.llm import _knowledge_context_text
+
+        chunk = (
+            "最低温度 | 1\n"
+            + ("背景说明。\n" * 260)
+            + "温度 | 19.7\n"
+        )
+        excerpt = _knowledge_context_text(chunk, "平均温度是多少？", limit=300)
+
+        self.assertIn("温度 | 19.7", excerpt)
+        self.assertNotIn("最低温度 | 1", excerpt)
+
+
     def test_build_prompt_includes_guardrails_text_and_recent_history(self) -> None:
         prompt = build_prompt(
             LLMRequest(
@@ -602,6 +741,29 @@ class LLMProviderTest(unittest.TestCase):
             "数联：数据要素联通\n智联：智能与算力连接\n光联：城市光网支撑。",
         )
         self.assertEqual(reply.paragraphs[0].citations[0].source_id, "kb-llm")
+
+    def test_openai_provider_rejects_think_only_response_as_malformed(self) -> None:
+        client = RecordingHttpClient(response_content="<think>内部推理</think>")
+        provider = OpenAICompatibleLLMProvider(
+            api_base="https://llm.example.test/v1",
+            api_key="test-key",
+            model="deepseek-r1",
+        )
+
+        with (
+            patch("app.llm.httpx.Client", return_value=client),
+            self.assertRaises(LLMProviderError) as error,
+        ):
+            provider.generate_reply(
+                LLMRequest(
+                    content="蜘蛛侠的位置是什么？",
+                    mode="source",
+                    knowledge_hits=[indexed_hit()],
+                    previous_messages=[],
+                )
+            )
+
+        self.assertIn("大模型返回格式异常", str(error.exception))
 
     def test_openai_provider_refuses_without_external_call_when_no_knowledge_hits(self) -> None:
         provider = OpenAICompatibleLLMProvider(

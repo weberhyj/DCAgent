@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from collections.abc import Sequence
 
@@ -8,9 +9,11 @@ from app.agent import (
     AgentSearchResult,
     KnowledgeAgentTools,
     ReadOnlyKnowledgeAgent,
+    _has_query_overlap,
     filter_relevant_hits,
     is_follow_up_message,
     is_greeting_message,
+    merge_ranked_hits,
 )
 from app.knowledge_route_models import KnowledgeRouteType
 from app.llm import LLMRequest
@@ -300,6 +303,297 @@ class AgentTest(unittest.TestCase):
 
         self.assertEqual(filtered, [])
         self.assertEqual(diagnostics["reason"], "all_candidates_below_cutoff")
+
+    def test_query_overlap_accepts_document_field_synonym(self) -> None:
+        self.assertTrue(
+            _has_query_overlap(
+                "蜘蛛侠的位置是什么？",
+                "蜘蛛侠的主要活动区域是纽约市。",
+            )
+        )
+
+    def test_query_overlap_accepts_natural_age_question_forms(self) -> None:
+        people = source("kb-people", "people.docx")
+        age_chunk = chunk("kb-people", 0, "张三年龄：30岁。")
+        for question in (
+            "张三有多少岁",
+            "张三多少岁",
+            "张三今年多少岁",
+            "张三现在多少岁",
+            "张三现年多少岁",
+        ):
+            with self.subTest(question=question):
+                diagnostics: dict[str, object] = {}
+                filtered = filter_relevant_hits(
+                    [hit(people, age_chunk, 0.02)],
+                    query=question,
+                    diagnostics=diagnostics,
+                )
+                self.assertEqual([item.chunk.id for item in filtered], [age_chunk.id])
+
+    def test_query_overlap_rejects_same_subject_with_wrong_field(self) -> None:
+        self.assertFalse(
+            _has_query_overlap(
+                "蜘蛛侠的年龄是多少？",
+                "蜘蛛侠的性别：男。",
+            )
+        )
+
+    def test_relevance_gate_filters_non_finite_scores(self) -> None:
+        people = source("kb-people", "people.docx")
+        diagnostics: dict[str, object] = {}
+        filtered = filter_relevant_hits(
+            [
+                hit(people, chunk("kb-people", 0, "张三的年龄是30岁。"), math.nan),
+                hit(people, chunk("kb-people", 1, "张三的年龄是30岁。"), 0.8),
+            ],
+            query="张三的年龄是多少？",
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual([item.chunk.chunk_index for item in filtered], [1])
+        self.assertEqual(diagnostics["invalid_score_count"], 1)
+        self.assertEqual(diagnostics["candidate_count_after_score_validation"], 1)
+
+    def test_relevance_gate_drops_adjacent_chunk_with_conflicting_field(self) -> None:
+        people = source("kb-people", "people.docx")
+        filtered = filter_relevant_hits(
+            [
+                hit(people, chunk("kb-people", 0, "蜘蛛侠年龄：30岁。"), 0.9),
+                hit(people, chunk("kb-people", 1, "蜘蛛侠性别：男。"), 0.8),
+            ],
+            query="蜘蛛侠年龄是多少？",
+            adjacency_distance=1,
+        )
+        self.assertEqual([item.chunk.chunk_index for item in filtered], [0])
+
+    def test_relevance_gate_fails_closed_when_all_scores_are_non_finite(self) -> None:
+        people = source("kb-people", "people.docx")
+        diagnostics: dict[str, object] = {}
+        filtered = filter_relevant_hits(
+            [
+                hit(people, chunk("kb-people", 0, "张三的年龄是30岁。"), math.nan),
+                hit(people, chunk("kb-people", 1, "张三的年龄是30岁。"), math.inf),
+            ],
+            query="张三的年龄是多少？",
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(diagnostics["invalid_score_count"], 2)
+        self.assertEqual(diagnostics["reason"], "invalid_scores_filtered")
+        self.assertEqual(diagnostics["filtered_count"], 0)
+
+    def test_merge_ranked_hits_drops_non_finite_scores(self) -> None:
+        people = source("kb-people", "people.docx")
+        merged = merge_ranked_hits(
+            [hit(people, chunk("kb-people", 0, "有效"), math.nan)],
+            [
+                hit(people, chunk("kb-people", 1, "有效年龄"), 0.8),
+                hit(people, chunk("kb-people", 2, "无效"), math.inf),
+            ],
+            limit=5,
+        )
+        self.assertEqual([item.chunk.chunk_index for item in merged], [1])
+
+    def test_query_overlap_rejects_field_only_match_for_wrong_subject(self) -> None:
+        self.assertFalse(
+            _has_query_overlap(
+                "蜘蛛侠的位置是什么？",
+                "蝙蝠侠的主要活动区域是哥谭市。",
+            )
+        )
+
+    def test_query_overlap_allows_field_only_question(self) -> None:
+        self.assertTrue(
+            _has_query_overlap(
+                "位置是什么？",
+                "主要活动区域是纽约市。",
+            )
+        )
+
+    def test_query_overlap_does_not_use_filename_as_field_evidence(self) -> None:
+        self.assertFalse(
+            _has_query_overlap(
+                "位置是什么？",
+                "销售额 | 100",
+                source_text="地址簿.xlsx",
+            )
+        )
+
+    def test_query_overlap_keeps_aggregate_metric_families_separate(self) -> None:
+        self.assertFalse(_has_query_overlap("平均温度", "最低温度 | 10"))
+        self.assertTrue(_has_query_overlap("平均温度", "温度 | 10"))
+
+    def test_query_overlap_can_use_filename_for_entity_only(self) -> None:
+        self.assertTrue(
+            _has_query_overlap(
+                "多伦多的平均温度",
+                "[每分钟温度]\ntoronto_edt | 19.7",
+                source_text="多伦多_天气.xlsx",
+                source_type="XLSX",
+            )
+        )
+
+    def test_query_overlap_allows_headerless_tabular_row_without_conflicting_label(self) -> None:
+        self.assertTrue(
+            _has_query_overlap(
+                "多伦多的平均温度",
+                "toronto_edt | 2026-08-16T00:00:00 | 19.7",
+                source_text="多伦多_天气.xlsx",
+                source_type="XLSX",
+            )
+        )
+
+    def test_query_overlap_rejects_tabular_row_with_conflicting_field_label(self) -> None:
+        self.assertFalse(
+            _has_query_overlap(
+                "多伦多的平均温度",
+                "多伦多 | 最低温度 | 10",
+                source_text="多伦多_天气.xlsx",
+                source_type="XLSX",
+            )
+        )
+
+    def test_query_overlap_accepts_narrative_subject_without_literal_field_label(self) -> None:
+        self.assertTrue(
+            _has_query_overlap(
+                "蜘蛛侠的位置是什么？",
+                "蜘蛛侠常在纽约活动。",
+            )
+        )
+
+    def test_query_overlap_accepts_location_semantic_phrases(self) -> None:
+        for text in (
+            "蜘蛛侠位于纽约市。",
+            "蜘蛛侠的主要活动区域是纽约市。",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_has_query_overlap("蜘蛛侠的位置是什么？", text))
+
+    def test_query_overlap_rejects_bare_activity_or_department_as_location(self) -> None:
+        for text in (
+            "蜘蛛侠参加了公益活动。",
+            "蜘蛛侠所在部门是英雄联盟。",
+            "蜘蛛侠负责活动策划。",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(_has_query_overlap("蜘蛛侠的位置是什么？", text))
+
+    def test_query_overlap_does_not_use_narrative_filename_as_entity(self) -> None:
+        self.assertFalse(
+            _has_query_overlap(
+                "蜘蛛侠的位置是什么？",
+                "蝙蝠侠常在哥谭活动。",
+                source_text="蜘蛛侠资料.docx",
+                source_type="DOCX",
+            )
+        )
+
+    def test_low_score_guard_can_use_source_filename_for_tabular_entity(self) -> None:
+        weather = source("kb-weather", "多伦多_2026-08-16_每分钟天气温度.xlsx")
+        hit = KnowledgeSearchHitModel(
+            source=weather,
+            chunk=KnowledgeChunkModel(
+                id="weather-row",
+                source_id=weather.id,
+                chunk_index=0,
+                text="[每分钟温度]\ntoronto_edt | 2026-08-16T00:00:00 | 19.7",
+                token_count=20,
+            ),
+            score=0.006,
+            rank=1,
+        )
+
+        filtered = filter_relevant_hits(
+            [hit],
+            query="多伦多在2026年8月16日00:00到1:00这段时间的平均温度",
+        )
+
+        self.assertEqual([item.chunk.id for item in filtered], ["weather-row"])
+
+    def test_explicit_file_reference_scopes_candidates_to_named_source(self) -> None:
+        named = source("kb-named", "蜘蛛侠资料.docx")
+        unrelated = source("kb-other", "蝙蝠侠资料.docx")
+        filtered = filter_relevant_hits(
+            [
+                hit(
+                    unrelated,
+                    chunk("kb-other", 0, "蝙蝠侠的主要活动区域是哥谭市。"),
+                    0.9,
+                ),
+                hit(
+                    named,
+                    chunk("kb-named", 0, "蜘蛛侠的主要活动区域是纽约市。"),
+                    0.2,
+                ),
+            ],
+            query="请查询蜘蛛侠资料.docx中的位置",
+        )
+
+        self.assertEqual([item.source.id for item in filtered], ["kb-named"])
+
+    def test_explicit_file_reference_fails_closed_when_not_in_candidates(self) -> None:
+        unrelated = source("kb-other", "蝙蝠侠资料.docx")
+        diagnostics: dict[str, object] = {}
+        filtered = filter_relevant_hits(
+            [
+                hit(
+                    unrelated,
+                    chunk("kb-other", 0, "蝙蝠侠的主要活动区域是哥谭市。"),
+                    0.9,
+                )
+            ],
+            query="请查询蜘蛛侠资料.docx中的位置",
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(diagnostics["reason"], "explicit_file_reference_not_in_candidates")
+
+    def test_explicit_file_reference_matches_basename_not_substring(self) -> None:
+        named = source("kb-named", "upload-report.xlsx")
+        similar = source("kb-similar", "my_report.xlsx")
+        filtered = filter_relevant_hits(
+            [
+                hit(named, chunk("kb-named", 0, "销售额 | 100"), 0.2),
+                hit(similar, chunk("kb-similar", 0, "销售额 | 999"), 0.9),
+            ],
+            query=r"请查询 E:/data/report.xlsx 中的销售额",
+        )
+
+        self.assertEqual(filtered, [])
+
+    def test_explicit_file_reference_matches_exact_basename(self) -> None:
+        named = source("kb-named", "abc.xlsx")
+        filtered = filter_relevant_hits(
+            [hit(named, chunk("kb-named", 0, "销售额 | 100"), 0.2)],
+            query="请查询abc.xlsx中的销售额",
+        )
+
+        self.assertEqual([item.source.id for item in filtered], ["kb-named"])
+
+    def test_file_scope_prefers_longer_prefixed_basename_over_cleaned_candidate(self) -> None:
+        exact = source("kb-exact", "关于项目.docx")
+        cleaned = source("kb-cleaned", "项目.docx")
+        filtered = filter_relevant_hits(
+            [
+                hit(exact, chunk("kb-exact", 0, "项目内容：A"), 0.2),
+                hit(cleaned, chunk("kb-cleaned", 0, "项目内容：B"), 0.9),
+            ],
+            query="关于项目.docx中的内容",
+        )
+
+        self.assertEqual([item.source.id for item in filtered], ["kb-exact"])
+
+    def test_file_scope_falls_back_to_cleaned_candidate_when_raw_basename_is_absent(self) -> None:
+        cleaned = source("kb-cleaned", "项目.docx")
+        filtered = filter_relevant_hits(
+            [hit(cleaned, chunk("kb-cleaned", 0, "项目内容：B"), 0.2)],
+            query="关于项目.docx中的内容",
+        )
+
+        self.assertEqual([item.source.id for item in filtered], ["kb-cleaned"])
 
     def test_agent_never_sends_low_scoring_unrelated_document_to_llm(self) -> None:
         town = source("kb-town", "test.docx")

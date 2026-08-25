@@ -34,7 +34,7 @@ from app.main import (
 from app.models import ChatMessageModel, ChatState, ResponseParagraphModel
 from app.repository import InMemoryChatRepository
 from app.sql_repository import SqlChatRepository
-from app.structured_answer import StructuredAnswerService
+from app.structured_answer import StructuredAnswerService, is_structured_candidate
 from app.structured_models import (
     StructuredClarification,
     StructuredColumnType,
@@ -197,6 +197,104 @@ def empty_state() -> ChatState:
 
 
 class StructuredAnswerServiceTest(unittest.TestCase):
+    @staticmethod
+    def _temperature_catalog():
+        """Build the smallest published workbook catalog for route-boundary tests."""
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        metric = replace(
+            dataset.schema.columns[0],
+            physical_name="temperature",
+            original_name="温度 (°C)",
+            display_name="温度 (°C)",
+            aliases=("温度", "气温"),
+            data_type=StructuredColumnType.DECIMAL,
+        )
+        datetime_column = replace(
+            dataset.schema.columns[2],
+            physical_name="toronto_edt",
+            original_name="时间（Toronto / EDT）",
+            display_name="时间（Toronto / EDT）",
+            data_type=StructuredColumnType.DATETIME,
+            aliases=("时间（Toronto / EDT）",),
+        )
+        return replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    source_name="多伦多_2026-08-16_每分钟天气温度.xlsx",
+                    schema=replace(
+                        dataset.schema,
+                        columns=(metric, dataset.schema.columns[1], datetime_column),
+                    ),
+                ),
+            ),
+        )
+
+    def test_temperature_concept_questions_stay_on_rag(self) -> None:
+        catalog = self._temperature_catalog()
+        gateway = RecordingClickHouseGateway()
+        provider = RecordingLLMProvider()
+        repository = InMemoryChatRepository(
+            empty_state(),
+            llm_provider=provider,
+            structured_service=StructuredAnswerService(lambda: catalog, gateway),
+        )
+        _, conversation_id, _ = repository.create_conversation()
+
+        for question in (
+            "平均温度是什么",
+            "什么是平均温度",
+            "请介绍一下平均温度",
+            "通俗地解释一下平均温度",
+            "温度的平均值是什么",
+            "平均温度的含义",
+            "我想知道平均温度是什么",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(is_structured_candidate(question, catalog))
+                repository.send_message(conversation_id, question, "source")
+
+        self.assertEqual(provider.calls, 7)
+        self.assertEqual(gateway.calls, [])
+
+    def test_temperature_entity_question_routes_to_structured_query(self) -> None:
+        catalog = self._temperature_catalog()
+        gateway = RecordingClickHouseGateway()
+        service = StructuredAnswerService(lambda: catalog, gateway)
+
+        result = service.try_answer("conv-temperature", "多伦多平均温度", "quick", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(is_structured_candidate("多伦多平均温度", catalog))
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
+        self.assertEqual(len(gateway.calls), 1)
+
+    def test_temperature_entity_datetime_question_routes_to_structured_query(self) -> None:
+        catalog = self._temperature_catalog()
+        gateway = RecordingClickHouseGateway()
+        service = StructuredAnswerService(lambda: catalog, gateway)
+
+        result = service.try_answer(
+            "conv-temperature",
+            "多伦多在2026年8月16日00:00到1:00这段时间的平均温度",
+            "quick",
+            [],
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(
+            is_structured_candidate(
+                "多伦多在2026年8月16日00:00到1:00这段时间的平均温度",
+                catalog,
+            )
+        )
+        self.assertEqual(result.route_type, KnowledgeRouteType.EXCEL_FILTERED_AGGREGATE)
+        self.assertEqual(len(gateway.calls), 1)
+
     def test_row_lookup_question_returns_table_without_aggregate_word(self) -> None:
         gateway = RecordingClickHouseGateway(
             result=[
@@ -1441,6 +1539,18 @@ class StructuredAnswerServiceTest(unittest.TestCase):
                 repository.send_message(conversation_id, question, "source")
 
                 self.assertEqual(provider.calls, 1)
+
+    def test_catalog_failure_keeps_temperature_concept_questions_on_legacy_path(self) -> None:
+        questions = (
+            "平均温度是什么",
+            "什么是平均温度",
+            "温度的平均值是什么",
+            "我想知道平均温度是什么",
+            "请告诉我平均气温是什么意思",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                self._assert_catalog_failure_uses_legacy_path(question)
 
     def _assert_catalog_failure_uses_legacy_path(self, question: str) -> None:
         def failing_catalog():

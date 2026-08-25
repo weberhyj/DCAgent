@@ -4,6 +4,13 @@ import re
 
 _INLINE_CITATION_MARKER = re.compile(r"[ \t]*\[(?:[1-9]\d*)\]")
 _SPACE_BEFORE_PUNCTUATION = re.compile(r"[ \t]+([，。；：！？、,.!?;:])")
+# DeepSeek-R1/Ollama may include its private chain-of-thought in the returned
+# assistant text.  It is not answer evidence and must never be shown to the
+# user.  Keep this cleanup at the common answer boundary so OpenAI-compatible
+# and streamed providers behave consistently.
+_THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+_OPEN_THINK_BLOCK = re.compile(r"<think\b[^>]*>.*\Z", re.IGNORECASE | re.DOTALL)
+_STRAY_THINK_CLOSE = re.compile(r"</think\s*>", re.IGNORECASE)
 
 
 _COLUMN_ZERO_LIST_PREFIX = re.compile(r"^[-+*][ \t]+")
@@ -26,6 +33,20 @@ _PROTECTED_REGION = re.compile(
 def remove_inline_citation_markers(text: str) -> str:
     cleaned = _INLINE_CITATION_MARKER.sub("", text)
     return _SPACE_BEFORE_PUNCTUATION.sub(r"\1", cleaned).strip()
+
+
+def remove_think_blocks(text: str) -> str:
+    """Remove DeepSeek-style private reasoning tags from model output.
+
+    A complete block is removed while preserving text after ``</think>``. If
+    a provider truncates the stream before the closing tag, the unterminated
+    block is removed through the end rather than leaking internal reasoning.
+    A stray closing tag is also harmlessly removed for compatibility with
+    adapters that strip the opening tag first.
+    """
+    without_complete = _THINK_BLOCK.sub("", text)
+    without_open = _OPEN_THINK_BLOCK.sub("", without_complete)
+    return _STRAY_THINK_CLOSE.sub("", without_open)
 
 
 def _bold_delimiter_positions(text: str) -> list[int] | None:
@@ -82,7 +103,7 @@ def _normalize_formatting(text: str) -> str:
 
 
 def normalize_plain_text_answer(text: str) -> str:
-    cleaned = _normalize_formatting(text)
+    cleaned = _normalize_formatting(remove_think_blocks(text))
     leading_indent = _INDENTED_LIST_PREFIX.match(cleaned)
     if leading_indent:
         indent = leading_indent.group(1)

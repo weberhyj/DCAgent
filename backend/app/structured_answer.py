@@ -49,6 +49,7 @@ _CHINESE_AGGREGATE_TERMS = (
     "平均值",
     "平均",
     "均值",
+    "均温",
     "总和",
     "合计",
     "求和",
@@ -79,7 +80,7 @@ _CHINESE_AGGREGATE_TERMS = (
     "统计",
 )
 _AGGREGATE_WORDS = (
-    ("avg", ("平均值", "平均", "均值")),
+    ("avg", ("平均值", "平均", "均值", "均温")),
     ("sum", ("总和", "合计", "求和")),
     ("count", ("多少条", "数量", "计数")),
     ("count_distinct", ("去重数量", "去重数", "不同数量", "唯一数量", "不重复数量")),
@@ -100,6 +101,7 @@ _STRONG_AGGREGATE_SUFFIXES = tuple(
             "平均值",
             "平均",
             "均值",
+            "均温",
             "总和",
             "合计",
             "求和",
@@ -519,10 +521,21 @@ class StructuredAnswerService:
 
 
 def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
+    normalized_question = _normalize(question)
+    if _is_temperature_concept_question(normalized_question):
+        return False
     if _has_row_lookup_language(question, catalog):
         return True
     if not _has_aggregate_language(question):
         return False
+    # Temperature headers are commonly queried with a qualified alias such as
+    # ``平均温度`` while the workbook stores only a raw ``温度`` column.  The
+    # generic span gate cannot see through that qualified phrase because the
+    # longer alias masks the aggregate token.  Allow this one bounded semantic
+    # bridge only when the governed parser resolves it to an actual numeric,
+    # aggregatable temperature column.  Concept questions must remain on RAG.
+    if _is_temperature_aggregate_candidate(question, catalog):
+        return True
     if _is_implicit_summary(question):
         return True
     if (
@@ -546,12 +559,211 @@ def is_structured_candidate(question: str, catalog: StructuredCatalog) -> bool:
         for dataset in catalog.datasets
         for column in dataset.schema.columns
         if column.allow_aggregate
-        for _, value in _resolution_names(column)
+        for _, value in _candidate_resolution_names(column)
         for normalized in (_normalize(value),)
         if normalized
     }
     normalized = _normalize(_mask_aggregate_equality_values(question, filter_columns, metric_names))
     return _has_catalog_span_with_independent_aggregate(normalized, catalog_names)
+
+
+def _is_temperature_aggregate_candidate(
+    question: str,
+    catalog: StructuredCatalog,
+) -> bool:
+    normalized = _normalize(question)
+    if not any(term in normalized for term in ("温度", "气温", "均温")):
+        return False
+    if _is_aggregate_concept_question(normalized):
+        return False
+
+    temperature_columns = {
+        column.physical_name: column
+        for dataset in catalog.datasets
+        for column in dataset.schema.columns
+        if column.allow_aggregate
+        and column.data_type.value in {"integer", "decimal"}
+        and any(
+            term in _normalize(value)
+            for value in (
+                column.physical_name,
+                column.original_name,
+                column.display_name,
+                *column.aliases,
+            )
+            for term in ("温度", "气温")
+        )
+    }
+    if not temperature_columns:
+        return False
+
+    resolved = resolve_structured_intent(question, catalog)
+    if not isinstance(resolved, StructuredIntent):
+        return False
+    return resolved.metric_physical_name in temperature_columns
+
+
+def _is_temperature_concept_question(normalized: str) -> bool:
+    """Recognize explanatory temperature questions without routing to SQL."""
+    temperature_terms = (
+        "温度",
+        "气温",
+        "均温",
+        "平均温度",
+        "平均气温",
+        "最高温度",
+        "最高气温",
+        "最低温度",
+        "最低气温",
+    )
+    temperature_concept_suffixes = (
+        *_CONCEPT_TERM_SUFFIXES,
+        "是什么含义",
+        "是什么概念",
+        "是什么定义",
+    )
+    temperature_introducers = (
+        *_CONCEPT_TERM_INTRODUCERS,
+        "我想知道",
+        "想知道",
+        "请告诉我",
+        "告诉我",
+    )
+    if any(
+        phrase in normalized
+        and _temperature_concept_tail(
+            normalized[normalized.find(phrase) + len(phrase) :],
+            temperature_terms,
+        )
+        for phrase in _CONCEPT_ANYWHERE_PHRASES
+    ):
+        return True
+    # Common explanatory requests whose wording does not contain ``什么是``.
+    # Keep this anchored to the end of the question and to a short verb phrase
+    # so a real filtered query such as ``多伦多在某时段的平均温度`` is not
+    # mistaken for a concept question.
+    explanation_re = re.compile(
+        r"(?:请问|请|能否|可以|我想|想|帮我|请帮我|通俗地|简单地|麻烦)?"
+        r"(?:介绍一下|解释一下|说明一下|介绍|解释|说明|了解|讲讲|知道)"
+        r"(?:一下)?(?:平均温度|平均气温|最高温度|最高气温|最低温度|最低气温|温度|气温|均温)$"
+    )
+    if explanation_re.fullmatch(normalized):
+        return True
+    explanation_with_suffix_re = re.compile(
+        r"(?:请问|请|能否|可以|我想|想|帮我|请帮我|通俗地|简单地|麻烦)?"
+        r"(?:介绍一下|解释一下|说明一下|介绍|解释|说明|了解|讲讲|知道)"
+        r"(?:一下)?(?:平均温度|平均气温|最高温度|最高气温|最低温度|最低气温|温度|气温|均温)"
+        r"(?:是什么意思|是什么含义|是什么概念|是什么定义|怎么理解|如何理解|"
+        r"的含义|含义|的概念|概念|的定义|定义)$"
+    )
+    if explanation_with_suffix_re.fullmatch(normalized):
+        return True
+    # Also accept the common noun-phrase order ``温度的平均值是什么`` as a
+    # concept question when it has no entity/date/filter prefix.  Keep the
+    # pattern anchored so ``多伦多的温度的平均值`` remains a data request.
+    bare_average_noun_re = re.compile(
+        r"(?:请问|请|能否|可以|我想|想|帮我|请帮我|通俗地|简单地|麻烦)?"
+        r"(?:温度|气温)的(?:平均值|平均|均值|均温)"
+        r"(?:是什么|是什么意思|是什么含义|是什么概念|是什么定义|怎么理解|如何理解|"
+        r"的含义|含义|的概念|概念|的定义|定义)$"
+    )
+    if bare_average_noun_re.fullmatch(normalized):
+        return True
+    # Explanatory wording can have polite or adverbial prefixes, e.g.
+    # ``请介绍一下平均温度`` and ``通俗地解释一下平均温度``.  Treat it as a
+    # concept only when the tail is the bare temperature term (optionally with
+    # a definition/meaning suffix); a tail containing a location, date, or
+    # filter remains eligible for a real data query.
+    for introducer in temperature_introducers:
+        start = normalized.find(introducer)
+        while start >= 0:
+            remainder = normalized[start + len(introducer) :]
+            remainder = _strip_concept_question_tail(remainder)
+            if remainder in temperature_terms:
+                return True
+            if any(
+                remainder == f"{term}{suffix}"
+                for term in temperature_terms
+                for suffix in temperature_concept_suffixes
+            ):
+                return True
+            start = normalized.find(introducer, start + 1)
+    for term in temperature_terms:
+        for suffix in temperature_concept_suffixes:
+            phrase = f"{term}{suffix}"
+            if not normalized.endswith(phrase):
+                continue
+            prefix = normalized[: -len(phrase)]
+            # Meaning/definition tails are unambiguously explanatory even if
+            # a subject or location appears before the temperature term.
+            # ``多伦多的平均温度是什么`` is intentionally different: its
+            # bare ``是什么`` tail can still be a request for the value.
+            if suffix in {
+                "是什么意思",
+                "是什么含义",
+                "是什么概念",
+                "是什么定义",
+                "怎么理解",
+                "如何理解",
+                "的含义",
+                "含义",
+                "的概念",
+                "概念",
+                "的定义",
+                "定义",
+            }:
+                return True
+            # A bare field followed by a definition suffix is a concept
+            # question.  If a subject/date/location precedes it (for example
+            # ``多伦多的平均温度是什么``), it is a real data query and must
+            # remain eligible for the structured route.
+            if not prefix or _is_temperature_explanation_prefix(prefix):
+                return True
+    return False
+
+
+def _temperature_concept_tail(
+    remainder: str,
+    temperature_terms: tuple[str, ...],
+) -> bool:
+    """Check that a ``什么是`` tail is a bare temperature concept."""
+    remainder = _strip_concept_question_tail(remainder)
+    if remainder in temperature_terms:
+        return True
+    concept_suffixes = (
+        *_CONCEPT_TERM_SUFFIXES,
+        "是什么含义",
+        "是什么概念",
+        "是什么定义",
+    )
+    return any(
+        remainder == f"{term}{suffix}"
+        for term in temperature_terms
+        for suffix in concept_suffixes
+    )
+
+
+def _is_temperature_explanation_prefix(prefix: str) -> bool:
+    """Return whether text before a temperature concept is only polite wording."""
+    allowed = (
+        "请问",
+        "请",
+        "能否",
+        "可以",
+        "我想",
+        "我想知道",
+        "想知道",
+        "想",
+        "帮我",
+        "请帮我",
+        "请告诉我",
+        "告诉我",
+        "通俗地",
+        "简单地",
+        "简单说",
+        "关于",
+    )
+    return prefix in allowed
 
 
 def _has_row_lookup_language(question: str, catalog: StructuredCatalog) -> bool:
@@ -563,7 +775,7 @@ def _has_row_lookup_language(question: str, catalog: StructuredCatalog) -> bool:
         _normalize(value) in _normalize(question)
         for dataset in catalog.datasets
         for column in dataset.schema.columns
-        for value in (column.display_name, column.original_name, *column.aliases)
+        for _, value in _resolution_names(column)
     )
 
 
@@ -596,9 +808,26 @@ def _dataset_names(dataset: StructuredDatasetCatalog) -> tuple[str, ...]:
     for column in dataset.schema.columns:
         names.update(
             _normalize(value)
-            for _, value in _resolution_names(column)
+            for _, value in _candidate_resolution_names(column)
         )
     return tuple(name for name in names if name)
+
+
+def _candidate_resolution_names(
+    column: StructuredColumnSchema,
+) -> tuple[tuple[int, str], ...]:
+    """Return schema names plus aggregate-specific query aliases for routing.
+
+    The parser passes the actual aggregate context to the resolver. Candidate
+    detection runs before that context is known, so it needs to see bounded
+    aliases such as ``均温`` for a governed raw ``温度`` column as well. These
+    names are used only for route gating; they never alter persisted schema or
+    SQL planning.
+    """
+    names: list[tuple[int, str]] = list(_resolution_names(column))
+    for aggregate in ("avg", "max", "min"):
+        names.extend(_resolution_names(column, aggregate=aggregate))
+    return tuple(dict.fromkeys(names))
 
 
 def _has_aggregate_language(question: str) -> bool:
@@ -706,6 +935,13 @@ def _is_implicit_summary(question: str) -> bool:
 def _classify_without_catalog(question: str) -> Literal["weak", "strong", "concept"]:
     stripped = question.strip()
     normalized = _normalize(stripped)
+    # Keep explanatory temperature questions on the ordinary RAG path even
+    # when the structured catalog is cold/unavailable.  Without this early
+    # guard a phrase such as ``我想知道平均温度是什么`` is classified as a
+    # weak/strong aggregate shape and can incorrectly return a structured
+    # outage response instead of allowing the document retriever to answer.
+    if _is_temperature_concept_question(normalized):
+        return "concept"
     if _has_row_lookup_markers(stripped):
         return "strong"
     if not _has_aggregate_language(normalized):

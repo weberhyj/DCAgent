@@ -27,6 +27,7 @@ from .retrieval_models import (
 )
 from .retrieval_publication import deterministic_point_id
 from .sparse_embedding import SparseVector
+from .word_facts import expand_query_field_text
 
 
 class HybridRetrievalError(RuntimeError):
@@ -264,12 +265,17 @@ class HybridRetriever:
         query, requested_limit = _validate_request(request)
         deadline = self._monotonic() + self._total_timeout_seconds
         stage_ms: dict[str, float] = {}
+        # Keep dense retrieval and reranking faithful to the user's wording,
+        # but give the sparse BM25 path the document-side field vocabulary.
+        # This lets a question using “位置” match a chunk headed
+        # “主要活动区域” without requiring the user to know that label.
+        sparse_query = expand_query_field_text(query)
 
         stage_started = self._monotonic()
         dense_vector, sparse_vector = self._run_parallel(
             (
                 lambda: self._embed_query(query, deadline=deadline),
-                lambda: self.sparse.embed_query(query),
+                lambda: self.sparse.embed_query(sparse_query),
             ),
             deadline=deadline,
             generation=generation,

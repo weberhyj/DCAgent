@@ -419,6 +419,16 @@ class HybridRetrieverTest(unittest.TestCase):
         self.assertTrue(propagated)
         self.assertTrue(all(timeout is not None and 0 < timeout <= 5.0 for timeout in propagated))
 
+    def test_sparse_query_includes_document_field_synonyms(self) -> None:
+        sparse = RecordingSparse()
+        retriever = self.addCleanupFor(build_retriever(sparse_encoder=sparse))
+
+        retriever.retrieve(request("蜘蛛侠的位置是什么？"))
+
+        self.assertEqual(len(sparse.calls), 1)
+        self.assertIn("蜘蛛侠的位置是什么？", sparse.calls[0])
+        self.assertIn("主要活动区域", sparse.calls[0])
+
     def test_skips_adjacency_when_expansion_policy_is_none(self) -> None:
         top = candidate("c2", next_chunk_id="c3")
         retriever = self.addCleanupFor(

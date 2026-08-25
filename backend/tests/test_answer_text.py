@@ -83,6 +83,26 @@ class NormalizePlainTextAnswerTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(normalize_plain_text_answer(value), value)
 
+    def test_removes_deepseek_think_block_but_keeps_final_answer(self):
+        self.assertEqual(
+            normalize_plain_text_answer(
+                "<think>先分析检索结果，再组织答案。</think>\n蜘蛛侠位于纽约市。"
+            ),
+            "蜘蛛侠位于纽约市。",
+        )
+
+    def test_removes_unclosed_deepseek_think_block(self):
+        self.assertEqual(
+            normalize_plain_text_answer("<think>内部推理未正常闭合"),
+            "",
+        )
+
+    def test_think_tag_cleanup_is_case_insensitive(self):
+        self.assertEqual(
+            normalize_plain_text_answer("<THINK>reasoning</THINK>答案"),
+            "答案",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

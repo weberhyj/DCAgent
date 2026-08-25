@@ -14,7 +14,13 @@ from app.word_facts import (
     WordFactualIntent,
     canonical_fact_field,
     fact_value_has_embedded_key_value,
+    find_query_field_aliases,
     normalize_fact_key,
+    query_field_matches,
+    query_field_terms,
+    query_file_reference_terms,
+    query_overlap_terms,
+    query_subject_terms,
     resolve_word_factual_intent,
     validate_word_fact_answer,
 )
@@ -55,6 +61,279 @@ class WordFactContractTests(unittest.TestCase):
         self.assertEqual(set(FACT_FIELD_ALIASES), {"年龄", "性别", "职务"})
         with self.assertRaisesRegex(ValueError, "unknown fact field"):
             canonical_fact_field("部门")
+
+    def test_query_field_aliases_are_broader_without_changing_fact_contract(self) -> None:
+        matches = find_query_field_aliases("蜘蛛侠的位置是什么？")
+
+        self.assertEqual([(item.field, item.alias) for item in matches], [("位置", "位置")])
+        self.assertIn("主要活动区域", query_field_terms("蜘蛛侠的位置是什么？"))
+        self.assertIn("地理位置", query_field_terms("蜘蛛侠的位置是什么？"))
+        self.assertNotIn("位置", FACT_FIELD_ALIASES)
+
+    def test_longest_query_field_alias_wins_and_expands_synonyms(self) -> None:
+        matches = find_query_field_aliases("蜘蛛侠的主要活动区域是什么")
+
+        self.assertEqual([(item.field, item.alias) for item in matches], [("位置", "主要活动区域")])
+        terms = query_overlap_terms("蜘蛛侠的位置")
+        self.assertIn("主要活动区域", terms)
+        self.assertIn("地理位置", terms)
+
+    def test_query_subject_terms_exclude_field_and_question_scaffolding(self) -> None:
+        self.assertEqual(query_subject_terms("蜘蛛侠的位置是什么？"), ("蜘蛛侠",))
+        self.assertEqual(query_subject_terms("位置是什么？"), ())
+
+    def test_query_subject_terms_preserve_cjk_names_and_organizations(self) -> None:
+        self.assertEqual(query_subject_terms("李和平的年龄"), ("李和平",))
+        self.assertEqual(query_subject_terms("中山大学的所在地"), ("中山大学",))
+
+    def test_query_subject_terms_keep_explicit_region_and_year(self) -> None:
+        self.assertEqual(
+            query_subject_terms("华东在2025年的销售额"),
+            ("2025", "华东"),
+        )
+        self.assertEqual(query_subject_terms("华东2025销售额"), ("2025", "华东"))
+
+    def test_query_subject_terms_split_qualified_topics_without_breaking_names(self) -> None:
+        self.assertEqual(
+            query_subject_terms("中山大学在北京的地址"),
+            ("中山大学", "北京"),
+        )
+        self.assertEqual(
+            query_subject_terms("A公司北京地址"),
+            ("a公司", "北京"),
+        )
+        self.assertEqual(
+            query_subject_terms("A公司的北京地址"),
+            ("a公司", "北京"),
+        )
+        self.assertEqual(query_subject_terms("张三和李四的联系方式"), ("张三", "李四"))
+        self.assertEqual(query_subject_terms("李和平的年龄"), ("李和平",))
+
+    def test_query_subject_terms_omit_time_window_scaffolding(self) -> None:
+        self.assertEqual(
+            query_subject_terms("多伦多在2026年8月16日的平均温度"),
+            ("2026", "多伦多"),
+        )
+
+    def test_query_subject_terms_omit_relative_age_time_qualifiers(self) -> None:
+        for question in (
+            "张三今年几岁",
+            "张三现在多少岁",
+            "张三目前多大",
+            "张三当前年龄是多少",
+            "张三如今多少岁",
+            "张三现年多少岁",
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(query_subject_terms(question), ("张三",))
+
+    def test_query_subject_terms_drop_standalone_schema_nouns_but_keep_compound_names(
+        self,
+    ) -> None:
+        self.assertEqual(query_subject_terms("公司的岗位职责是什么"), ())
+        self.assertEqual(query_subject_terms("华为公司的地址"), ("华为公司",))
+        self.assertEqual(query_subject_terms("财务部门的电话"), ("财务部门",))
+
+    def test_query_subject_terms_split_location_and_ignore_clock_fragments(self) -> None:
+        self.assertEqual(
+            query_subject_terms("中山大学在北京的地址"),
+            ("中山大学", "北京"),
+        )
+        self.assertEqual(
+            query_subject_terms(
+                "多伦多在2026年8月16日00:00到1:00这段时间的平均温度"
+            ),
+            ("2026", "多伦多"),
+        )
+
+    def test_query_field_aliases_cover_natural_location_and_contact_questions(self) -> None:
+        self.assertEqual(find_query_field_aliases("蜘蛛侠在哪里？")[0].field, "位置")
+        self.assertEqual(find_query_field_aliases("怎么联系张三？")[0].field, "联系方式")
+
+    def test_natural_gender_question_forms_are_specific(self) -> None:
+        for question in ("蜘蛛侠是男是女", "蜘蛛侠男还是女", "蜘蛛侠是男或女"):
+            with self.subTest(question=question):
+                self.assertEqual(
+                    [item.field for item in find_query_field_aliases(question)],
+                    ["性别"],
+                )
+        self.assertEqual(find_query_field_aliases("男女混合活动")[0:1], ())
+
+    def test_natural_age_question_forms_do_not_become_quantity_queries(self) -> None:
+        for question in (
+            "张三有多少岁",
+            "张三多少岁",
+            "张三今年多少岁",
+            "张三现在多少岁",
+            "张三现年多少岁",
+        ):
+            with self.subTest(question=question):
+                matches = find_query_field_aliases(question)
+                self.assertEqual([item.field for item in matches], ["年龄"])
+                self.assertNotIn("数量", [item.field for item in matches])
+
+    def test_exact_word_fact_route_accepts_natural_age_question_forms(self) -> None:
+        for question in (
+            "张三有多少岁",
+            "张三多少岁",
+            "张三今年多少岁",
+            "张三现在多少岁",
+            "张三现年多少岁",
+        ):
+            with self.subTest(question=question):
+                intent = resolve_word_factual_intent(question)
+                self.assertIsInstance(intent, WordFactualIntent)
+                assert isinstance(intent, WordFactualIntent)
+                self.assertEqual(intent.entity, "张三")
+                self.assertEqual(intent.field, "年龄")
+
+    def test_explicit_file_reference_terms_ignore_question_scaffolding(self) -> None:
+        self.assertEqual(
+            query_file_reference_terms("请查询蜘蛛侠资料.docx中的位置"),
+            ("蜘蛛侠资料docx",),
+        )
+        self.assertEqual(
+            query_file_reference_terms("上传的A公司.xlsx里的地址"),
+            ("a公司xlsx",),
+        )
+        self.assertEqual(
+            query_file_reference_terms("文件名是abc.xlsx中的金额"),
+            ("abcxlsx",),
+        )
+        self.assertEqual(
+            query_file_reference_terms(r"请查询 E:/data/abc.xlsx 中的金额"),
+            ("abcxlsx",),
+        )
+        self.assertEqual(query_file_reference_terms("请查询文件类型为.docx的资料"), ())
+
+    def test_file_reference_cleaning_preserves_basename_that_is_a_prefix_word(self) -> None:
+        self.assertEqual(query_file_reference_terms("介绍.docx中的位置"), ("介绍docx",))
+        self.assertEqual(query_file_reference_terms("查询.xlsx中的金额"), ("查询xlsx",))
+
+    def test_file_reference_terms_keep_prefix_named_basenames(self) -> None:
+        self.assertEqual(
+            query_file_reference_terms("关于项目.docx中的内容"),
+            ("项目docx", "关于项目docx"),
+        )
+        self.assertEqual(
+            query_file_reference_terms("在北京.xlsx中的销售额"),
+            ("北京xlsx", "在北京xlsx"),
+        )
+        self.assertEqual(
+            query_file_reference_terms("请查询关于项目.docx中的内容"),
+            ("项目docx", "关于项目docx"),
+        )
+
+    def test_file_reference_terms_preserve_action_word_basename_candidates(self) -> None:
+        self.assertEqual(
+            query_file_reference_terms("介绍报告.docx中的内容"),
+            ("报告docx", "介绍报告docx"),
+        )
+        # Marker-aware wording still keeps the exact basename as a fallback;
+        # source scoping can therefore match a real upload named
+        # ``查询报告.xlsx`` instead of only the cleaned ``报告.xlsx``.
+        self.assertEqual(
+            query_file_reference_terms("文件名是查询报告.xlsx中的内容"),
+            ("报告xlsx", "查询报告xlsx"),
+        )
+        # A conversational prefix followed by ``一下`` must not create a
+        # bogus raw candidate such as ``一下报告xlsx``.
+        self.assertEqual(
+            query_file_reference_terms("介绍一下报告.xlsx中的内容"),
+            ("报告xlsx",),
+        )
+
+    def test_file_reference_terms_reject_placeholder_and_unbounded_extensions(self) -> None:
+        self.assertEqual(query_file_reference_terms("文件是 .xlsx"), ())
+        self.assertEqual(query_file_reference_terms("文件名为.docx"), ())
+        self.assertEqual(query_file_reference_terms("报告.xlsxabc中的内容"), ())
+        self.assertEqual(query_file_reference_terms("报告.xlsx_foo中的内容"), ())
+
+    def test_file_reference_terms_strip_leading_natural_language_scaffolding(self) -> None:
+        # Conversational wording must not become part of the hard filename
+        # constraint.  In particular, ``文件`` is a marker in these forms,
+        # not part of the uploaded basename.
+        cases = {
+            "请读取文件abc.xlsx": ("abcxlsx",),
+            "请介绍报告.xlsx": ("报告xlsx",),
+            "查一下abc.xlsb": ("abcxlsb",),
+        }
+        for question, expected in cases.items():
+            with self.subTest(question=question):
+                self.assertEqual(query_file_reference_terms(question), expected)
+
+    def test_file_reference_terms_strip_generic_question_prefixes(self) -> None:
+        expected = {
+            "请问蜘蛛侠资料.docx的位置": ("蜘蛛侠资料docx",),
+            "能告诉我蜘蛛侠资料.docx的位置吗": ("蜘蛛侠资料docx",),
+            # ``关于`` may be a genuine basename prefix, so retain both the
+            # cleaned conversational candidate and the exact full basename.
+            "关于蜘蛛侠资料.docx的位置": ("蜘蛛侠资料docx", "关于蜘蛛侠资料docx"),
+            "帮我查询蜘蛛侠资料.docx中的位置": ("蜘蛛侠资料docx",),
+            "介绍一下蜘蛛侠资料.docx的位置": ("蜘蛛侠资料docx",),
+            "查询一下蜘蛛侠资料.docx的位置": ("蜘蛛侠资料docx",),
+            "打开一下蜘蛛侠资料.docx的位置": ("蜘蛛侠资料docx",),
+            "我想查看蜘蛛侠资料.docx的位置": ("蜘蛛侠资料docx",),
+        }
+        for question, expected_terms in expected.items():
+            with self.subTest(question=question):
+                self.assertEqual(query_file_reference_terms(question), expected_terms)
+
+    def test_filename_field_words_do_not_become_subject_terms(self) -> None:
+        self.assertEqual(query_subject_terms("文件地点.xlsx中的内容"), ())
+        self.assertEqual(query_subject_terms("文件年龄.docx中的内容"), ())
+
+    def test_query_field_aliases_ignore_field_words_inside_file_names(self) -> None:
+        self.assertEqual(find_query_field_aliases("文件年龄.docx中的内容"), ())
+        matches = find_query_field_aliases("报告.xlsx中的销售额")
+        self.assertEqual([(item.field, item.alias) for item in matches], [("销售额", "销售额")])
+
+    def test_generic_work_word_does_not_create_a_second_field_for_workplace(self) -> None:
+        matches = find_query_field_aliases("工作地点在哪里")
+        self.assertEqual([(item.field, item.alias) for item in matches], [("位置", "在哪里")])
+
+    def test_metric_aliases_do_not_cross_expand_unrelated_fields(self) -> None:
+        temperature_terms = query_field_terms("平均温度")
+        self.assertIn("气温", temperature_terms)
+        self.assertNotIn("湿度", temperature_terms)
+        self.assertNotIn("评分", temperature_terms)
+        self.assertNotIn("风速", temperature_terms)
+        self.assertNotIn("最高温度", temperature_terms)
+        self.assertNotIn("最低温度", temperature_terms)
+
+    def test_average_temperature_compatibility_rejects_extrema(self) -> None:
+        self.assertTrue(query_field_matches("平均温度", "温度 | 19.7"))
+        self.assertFalse(query_field_matches("平均温度", "最低温度 | 10"))
+
+    def test_semantic_field_fallback_rejects_broad_narrative_terms(self) -> None:
+        negative_cases = (
+            ("年龄", "张三的出生地是北京。"),
+            ("性别", "男女混合活动正在报名。"),
+            ("职务", "张三负责活动策划。"),
+            ("联系方式", "请联系客户确认订单。"),
+        )
+        for field, text in negative_cases:
+            with self.subTest(field=field, text=text):
+                self.assertFalse(query_field_matches(field, text))
+
+    def test_semantic_field_fallback_accepts_explicit_narrative_forms(self) -> None:
+        positive_cases = (
+            ("年龄", "张三出生于1990年。"),
+            ("性别", "张三是一名女性。"),
+            ("职务", "张三担任工程师。"),
+            ("联系方式", "联系电话是13800000000。"),
+        )
+        for field, text in positive_cases:
+            with self.subTest(field=field, text=text):
+                self.assertTrue(query_field_matches(field, text))
+
+    def test_birth_narrative_is_scoped_to_age_or_location(self) -> None:
+        self.assertTrue(query_field_matches("年龄", "张三出生于1990年。"))
+        self.assertTrue(query_field_matches("年龄", "张三生于2020-01-02。"))
+        self.assertFalse(query_field_matches("年龄", "张三出生于北京。"))
+        self.assertTrue(query_field_matches("位置", "张三出生于北京。"))
+        self.assertTrue(query_field_matches("位置", "张三生于New York。"))
+        self.assertFalse(query_field_matches("位置", "张三出生于1990年。"))
 
     def test_ascii_field_alias_requires_identifier_boundaries(self) -> None:
         for value in ("https://example.com/page:1", "message: queued"):

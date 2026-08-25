@@ -6,8 +6,8 @@ from pathlib import Path
 
 from docx import Document
 
-from app.docx_parser import parse_docx_knowledge_file, read_docx_blocks
-from app.text_parser import parse_knowledge_file
+from app.docx_parser import parse_docx_knowledge_file, read_docx_blocks, split_text_spans
+from app.text_parser import chunk_text, parse_knowledge_file
 from app.word_facts import KnowledgeFactModel, normalize_fact_key
 
 ParagraphFixture = str | tuple[str, str]
@@ -256,6 +256,52 @@ class DocxParserTest(unittest.TestCase):
             [[{"paragraph": 0}], [{"paragraph": 0}]],
         )
 
+    def test_long_paragraph_prefers_sentence_boundaries(self) -> None:
+        sentence = "这是一个完整句子，用于验证语义切片不会在句中截断。"
+        text = sentence * 30
+
+        spans = split_text_spans(text)
+
+        self.assertGreater(len(spans), 1)
+        self.assertTrue(all(text[end - 1] in "。！？!?；;" for _, end in spans[:-1]))
+        self.assertTrue(all(end - start <= 600 for start, end in spans))
+        self.assertTrue(all(start < end for start, end in spans))
+
+        chunks = chunk_text("kb-semantic-text", text)
+        self.assertTrue(all(chunk.text.endswith("。") for chunk in chunks))
+
+    def test_table_row_chunk_repeats_header_context(self) -> None:
+        path = write_docx_table(
+            self.temp_dir / "header-context.docx",
+            headers=["姓名", "年龄", "职务"],
+            rows=[[f"员工{index}", f"{20 + index}岁", "工程师"] for index in range(30)],
+        )
+
+        result = parse_docx_knowledge_file(path, source_id="kb-header-context")
+
+        row_chunk = next(chunk for chunk in result.chunks if "员工17 | 37岁" in chunk.text)
+        self.assertIn("表头：姓名 | 年龄 | 职务", row_chunk.text)
+        self.assertLessEqual(len(row_chunk.text), 600)
+
+    def test_oversized_table_header_and_row_stay_within_chunk_limit(self) -> None:
+        path = self.temp_dir / "wide-header.docx"
+        document = Document()
+        table = document.add_table(rows=1, cols=2)
+        table.rows[0].cells[0].text = "姓名" * 150
+        table.rows[0].cells[1].text = "年龄" * 150
+        row = table.add_row().cells
+        row[0].text = "张三"
+        row[1].text = "28岁" * 300
+        document.save(path)
+
+        result = parse_docx_knowledge_file(path, source_id="kb-wide-header")
+
+        self.assertTrue(result.chunks)
+        self.assertTrue(all(len(chunk.text) <= 600 for chunk in result.chunks))
+        row_chunks = [chunk for chunk in result.chunks if "张三" in chunk.text]
+        self.assertTrue(row_chunks)
+        self.assertTrue(all("表头：" in chunk.text for chunk in row_chunks))
+
     def test_oversized_inline_fact_references_chunk_containing_late_value(self) -> None:
         path = write_docx(
             self.temp_dir / "long-inline-fact.docx",
@@ -308,6 +354,7 @@ class DocxParserTest(unittest.TestCase):
         evidence_chunk = next(chunk for chunk in result.chunks if chunk.id == fact.chunk_id)
         self.assertTrue(evidence_chunk.text.startswith("李四 | "))
         self.assertIn(fact.value[:500], evidence_chunk.text)
+        self.assertTrue(all(len(chunk.text) <= 600 for chunk in result.chunks))
 
     def test_table_row_stays_whole_and_preserves_cell_locators(self) -> None:
         path = self.temp_dir / "row-locator.docx"
@@ -327,6 +374,22 @@ class DocxParserTest(unittest.TestCase):
         self.assertIn({"table": 0, "row": 1, "column": 0}, row_chunk.metadata["locators"])
         self.assertIn({"table": 0, "row": 1, "column": 1}, row_chunk.metadata["locators"])
         self.assertIn("王五 | 42岁", row_chunk.text)
+
+    def test_near_limit_table_row_stays_whole_before_header_is_shortened(self) -> None:
+        value = "工程说明" * 140
+        path = write_docx_table(
+            self.temp_dir / "near-limit-row.docx",
+            headers=["姓名", "备注"],
+            rows=[["赵六", value]],
+        )
+
+        result = parse_docx_knowledge_file(path, source_id="kb-near-limit-row")
+
+        row_text = f"赵六 | {value}"
+        row_chunks = [chunk for chunk in result.chunks if chunk.text.startswith("赵六 | ")]
+        self.assertEqual(len(row_chunks), 1)
+        self.assertTrue(row_chunks[0].text.startswith(row_text))
+        self.assertLessEqual(len(row_chunks[0].text), 600)
 
     def test_fact_ids_are_stable_across_repeated_parses(self) -> None:
         path = write_docx(

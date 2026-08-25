@@ -34,6 +34,7 @@ from .structured_models import (
     StructuredDatasetSchema,
     StructuredPublicationResult,
 )
+from .word_facts import expand_query_field_text
 
 _COLLECTION_PATTERN = re.compile(r"^knowledge_chunks_qwen3_(v[0-9]+)$")
 _SAFE_COLUMN_FIELDS = frozenset(
@@ -1043,7 +1044,9 @@ class RetrievalIndexPublisher:
             purpose="query",
             expected=self._embedding_metadata,
         )
-        sparse_queries = tuple(self.sparse.embed_query(query) for query in queries)
+        sparse_queries = tuple(
+            self.sparse.embed_query(expand_query_field_text(query)) for query in queries
+        )
         if len(dense_queries) != len(samples) or len(sparse_queries) != len(samples):
             raise ValueError("validation query encoders returned an unexpected count")
         for expected, dense_query, sparse_query in zip(

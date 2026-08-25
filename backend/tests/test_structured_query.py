@@ -85,6 +85,130 @@ class StructuredIntentParsingTest(unittest.TestCase):
             ),
         )
 
+    def test_bridges_temperature_column_vocabulary_at_query_time(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        temperature = replace(
+            dataset.schema.columns[0],
+            original_name="气温",
+            display_name="气温",
+            aliases=("气温",),
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(temperature, *dataset.schema.columns[1:]),
+                    ),
+                ),
+            ),
+        )
+
+        for question in ("平均温度", "平均气温", "气温平均值", "均温"):
+            with self.subTest(question=question):
+                result = resolve_structured_intent(question, catalog)
+                self.assertIsInstance(result, StructuredIntent)
+                assert isinstance(result, StructuredIntent)
+                self.assertEqual(result.aggregate, "avg")
+                self.assertEqual(result.metric_physical_name, "order_amount")
+
+    def test_temperature_extrema_are_not_cross_matched_by_average_alias(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        average = replace(
+            dataset.schema.columns[0],
+            original_name="平均气温",
+            display_name="平均气温",
+            aliases=("平均气温",),
+        )
+        highest = replace(
+            dataset.schema.columns[1],
+            physical_name="highest_temperature",
+            original_name="最高温度",
+            display_name="最高温度",
+            data_type=StructuredColumnType.DECIMAL,
+            aliases=("最高温度",),
+            allow_aggregate=True,
+            allow_filter=True,
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(average, highest, dataset.schema.columns[2]),
+                    ),
+                ),
+            ),
+        )
+
+        result = resolve_structured_intent("平均温度", catalog)
+        self.assertIsInstance(result, StructuredIntent)
+        assert isinstance(result, StructuredIntent)
+        self.assertEqual(result.aggregate, "avg")
+        self.assertEqual(result.metric_physical_name, "order_amount")
+
+    def test_qualified_temperature_columns_win_over_raw_temperature_aliases(self) -> None:
+        catalog = sample_catalog()
+        dataset = catalog.datasets[0]
+        raw = replace(
+            dataset.schema.columns[0],
+            physical_name="temperature",
+            original_name="温度",
+            display_name="温度",
+            aliases=(),
+        )
+        highest = replace(
+            dataset.schema.columns[1],
+            physical_name="highest_temperature",
+            original_name="最高温度",
+            display_name="最高温度",
+            data_type=StructuredColumnType.DECIMAL,
+            aliases=(),
+            allow_aggregate=True,
+            allow_filter=False,
+        )
+        lowest = replace(
+            dataset.schema.columns[1],
+            physical_name="lowest_temperature",
+            original_name="最低温度",
+            display_name="最低温度",
+            data_type=StructuredColumnType.DECIMAL,
+            aliases=(),
+            allow_aggregate=True,
+            allow_filter=False,
+        )
+        catalog = replace(
+            catalog,
+            datasets=(
+                replace(
+                    dataset,
+                    schema=replace(
+                        dataset.schema,
+                        columns=(raw, highest, lowest),
+                    ),
+                ),
+            ),
+        )
+
+        cases = (
+            ("平均温度", "avg", "temperature"),
+            ("最高气温", "max", "highest_temperature"),
+            ("最低气温", "min", "lowest_temperature"),
+        )
+        for question, aggregate, metric in cases:
+            with self.subTest(question=question):
+                result = resolve_structured_intent(question, catalog)
+                self.assertIsInstance(result, StructuredIntent)
+                assert isinstance(result, StructuredIntent)
+                self.assertEqual(result.aggregate, aggregate)
+                self.assertEqual(result.metric_physical_name, metric)
+
     def test_parses_natural_language_row_lookup_with_implicit_region_and_date(self) -> None:
         result = resolve_structured_intent(
             "华东在2026-01-01中所有的订单金额",

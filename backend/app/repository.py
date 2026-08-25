@@ -53,7 +53,13 @@ from .retrieval import (
 )
 from .retrieval_scope import StaticRetrievalScopeProvider
 from .time_utils import display_datetime_label
-from .word_facts import KnowledgeFactModel, WordFactMatch, WordFactualIntent
+from .word_facts import (
+    KnowledgeFactModel,
+    WordFactMatch,
+    WordFactualIntent,
+    query_field_terms,
+    query_subject_terms,
+)
 
 if TYPE_CHECKING:
     from .retrieval_models import RetrievalScope
@@ -163,11 +169,18 @@ def build_search_terms(query: str) -> list[str]:
         for index in range(max(0, len(compact) - 1))
         if any(ord(char) > 127 for char in compact[index : index + 2])
     ]
-    return [
-        term
-        for term in expand_terms(list(dict.fromkeys([*ascii_terms, *cjk_grams])))
-        if term not in KNOWLEDGE_QUERY_STOP_TERMS
+    base_terms = list(dict.fromkeys([*ascii_terms, *cjk_grams]))
+    # Expand recognized query fields at keyword-search time as well as in the
+    # later evidence/context stages.  This bridges natural questions such as
+    # ``蜘蛛侠的位置`` to document labels such as ``主要活动区域`` without
+    # changing the strict Word fact extraction registry.
+    field_terms = [
+        term.strip().lower()
+        for term in query_field_terms(query)
+        if isinstance(term, str) and term.strip()
     ]
+    expanded = expand_terms(list(dict.fromkeys([*base_terms, *field_terms])))
+    return [term for term in expanded if term not in KNOWLEDGE_QUERY_STOP_TERMS]
 
 
 def score_knowledge_text(
@@ -179,9 +192,25 @@ def score_knowledge_text(
 
     haystack = f"{source.name} {source.source_type} {chunk.text}".lower()
     score = 0
+    field_terms = {term.strip().lower() for term in query_field_terms(query)}
+    field_match_count = 0
     for term in terms:
         if term in haystack:
-            score += 2 if len(term) <= 2 else 3
+            if term in field_terms:
+                # A generic schema/dictionary chunk may contain many aliases
+                # for one field.  Do not let that alias list outrank a passage
+                # containing the user's actual subject; field evidence gets a
+                # bounded contribution below.
+                field_match_count += 1
+            else:
+                score += 2 if len(term) <= 2 else 3
+    if field_match_count:
+        score += min(4, field_match_count * 2)
+    subject_matches = sum(
+        1 for term in query_subject_terms(query) if term and term in haystack
+    )
+    if subject_matches:
+        score += min(6, subject_matches * 4)
     if query.strip() and query.strip().lower() in haystack:
         score += 8
     return score

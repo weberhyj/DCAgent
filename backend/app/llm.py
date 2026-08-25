@@ -5,10 +5,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from ipaddress import ip_address, ip_network
+from math import isfinite
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import httpx as std_httpx
 import httpx2 as httpx
 from asynctor.jsons import json_dumps, json_loads
 
@@ -23,6 +25,7 @@ from .models import (
 from .offline_settings import parse_bool, require_private_url
 from .physoc_sse import PhysocStreamError, collect_physoc_response, iter_sse_lines
 from .time_utils import display_datetime_label
+from .word_facts import query_field_terms, query_overlap_terms, query_primary_fields
 
 NO_EVIDENCE_REPLY = "未检索到足够依据。请先在知识库中补充相关资料，或换一个更具体的问题重新检索。"
 DETERMINISTIC_TEMPERATURE = 0
@@ -34,6 +37,14 @@ DETERMINISTIC_SEED = 42
 # near its end.
 KNOWLEDGE_CONTEXT_CHUNK_LIMIT = 2000
 KNOWLEDGE_CONTEXT_WINDOW_PADDING = 240
+# The chunk cap protects the model from a single oversized paragraph.  The
+# total cap protects it from a large number of individually-valid chunks.  A
+# total evidence budget is intentionally kept here (rather than in the
+# parser) because the same retrieved chunks can be sent to different model
+# providers and prompt sizes need to be bounded at the final boundary.
+KNOWLEDGE_CONTEXT_TOTAL_LIMIT = 8000
+KNOWLEDGE_CONTEXT_MIN_CHUNK_LIMIT = 480
+KNOWLEDGE_CONTEXT_ELLIPSIS = "..."
 RAG_SYSTEM_PROMPT = (
     "你是 DCAgent，面向公司内部资料库的知识检索智能体。"
     "你必须只基于用户本次请求中提供的可用知识片段回答。"
@@ -51,6 +62,11 @@ _PHYSOC_ALLOWED_NETWORKS = (
     ip_network("192.168.0.0/16"),
     ip_network("fc00::/7"),
 )
+# The runtime client is httpx2, but adapters and older integrations may raise
+# the corresponding httpx 0.28 exception classes. Treat both families as
+# transport errors so user-facing responses stay stable across deployments.
+_HTTPX_TIMEOUT_ERRORS = (httpx.TimeoutException, std_httpx.TimeoutException)
+_HTTPX_ERRORS = (httpx.HTTPError, std_httpx.HTTPError)
 
 
 @dataclass(slots=True)
@@ -74,10 +90,11 @@ class LLMProviderError(Exception):
 
 class TemplateLLMProvider(LLMProvider):
     def generate_reply(self, request: LLMRequest) -> ChatMessageModel:
-        if not request.knowledge_hits:
+        usable_hits = _usable_knowledge_hits(request.knowledge_hits)
+        if not usable_hits:
             return build_no_evidence_reply()
 
-        knowledge_paragraph = build_knowledge_paragraph(request.knowledge_hits)
+        knowledge_paragraph = build_knowledge_paragraph(usable_hits)
         if knowledge_paragraph is None:
             return build_no_evidence_reply()
 
@@ -109,16 +126,20 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         try:
             response = client.post(url, json=payload, headers=headers)
             response.raise_for_status()
+            decoder = getattr(response, "json", None)
+            if callable(decoder):
+                return decoder()
             return json_loads(response.content)
-        except httpx.HTTPError as e:
+        except _HTTPX_ERRORS as e:
             msg = ""
-            if isinstance(e, httpx.TimeoutException):
+            if isinstance(e, _HTTPX_TIMEOUT_ERRORS):
                 msg += f"{self.timeout_seconds = }, "
             msg += f"payload:\n{json_dumps(payload, pretty=True)}"
             raise httpx.HTTPError(msg) from e
 
     def generate_reply(self, request: LLMRequest) -> ChatMessageModel:
-        if not request.knowledge_hits:
+        usable_hits = _usable_knowledge_hits(request.knowledge_hits)
+        if not usable_hits:
             return build_no_evidence_reply()
 
         payload = {
@@ -140,10 +161,15 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
                 data = self.http_chat(client, payload)
-            content = normalize_plain_text_answer(str(data["choices"][0]["message"]["content"]))
-        except httpx.TimeoutException as exc:
+            raw_content = data["choices"][0]["message"]["content"]
+            if not isinstance(raw_content, str):
+                raise TypeError("LLM message content must be a string")
+            content = normalize_plain_text_answer(raw_content)
+            if not content.strip():
+                raise ValueError("LLM message content is empty after normalization")
+        except _HTTPX_TIMEOUT_ERRORS as exc:
             raise LLMProviderError("大模型响应超时，请稍后重试。") from exc
-        except httpx.HTTPError as exc:
+        except _HTTPX_ERRORS as exc:
             raise LLMProviderError("大模型服务暂时不可用，请稍后重试。") from exc
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMProviderError("大模型返回格式异常，请稍后重试。") from exc
@@ -155,7 +181,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             paragraphs=[
                 ResponseParagraphModel(
                     text=content,
-                    citations=build_citations(request.knowledge_hits),
+                    citations=build_citations(usable_hits),
                 )
             ],
         )
@@ -176,7 +202,8 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
         self.timeout_seconds = timeout_seconds
 
     def generate_reply(self, request: LLMRequest) -> ChatMessageModel:
-        if not request.knowledge_hits:
+        usable_hits = _usable_knowledge_hits(request.knowledge_hits)
+        if not usable_hits:
             return build_no_evidence_reply()
 
         query = RAG_SYSTEM_PROMPT + "\n\n" + build_prompt(request)
@@ -208,9 +235,9 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
                 content = normalize_plain_text_answer(collected)
                 if not content.strip():
                     raise PhysocStreamError("Physoc response is empty after normalization")
-        except httpx.TimeoutException as exc:
+        except _HTTPX_TIMEOUT_ERRORS as exc:
             raise LLMProviderError("大模型响应超时，请稍后重试。") from exc
-        except httpx.HTTPError as exc:
+        except _HTTPX_ERRORS as exc:
             raise LLMProviderError("大模型服务暂时不可用，请稍后重试。") from exc
         except PhysocStreamError as exc:
             raise LLMProviderError("大模型返回格式异常，请稍后重试。") from exc
@@ -222,7 +249,7 @@ class PhysocDeepSeekLLMProvider(LLMProvider):
             paragraphs=[
                 ResponseParagraphModel(
                     text=content,
-                    citations=build_citations(request.knowledge_hits),
+                    citations=build_citations(usable_hits),
                 )
             ],
         )
@@ -385,6 +412,10 @@ def build_knowledge_paragraph(hits: list[KnowledgeSearchHitModel]) -> ResponsePa
 
 
 def build_prompt(request: LLMRequest) -> str:
+    # Provider entry points reject empty evidence before making a model call.
+    # Apply the same boundary here so direct callers and provider payloads do
+    # not re-introduce blank placeholder chunks into the prompt budget.
+    usable_hits = _usable_knowledge_hits(request.knowledge_hits)
     history = (
         "\n".join(
             f"{message.role}: {message.content or ' '.join(paragraph.text for paragraph in message.paragraphs)}"
@@ -402,63 +433,361 @@ def build_prompt(request: LLMRequest) -> str:
         "- 不要在回答中输出 [1]、[2] 等引用编号或资料来源名称。\n\n"
         f"检索请求：{request.content}\n"
         f"检索模式：{request.mode}\n\n"
-        f"可用知识片段：\n{build_knowledge_context(request.knowledge_hits, request.content) or '无'}\n\n"
+        f"可用知识片段：\n{build_knowledge_context(usable_hits, request.content) or '无'}\n\n"
         f"当前会话上下文：\n{history or '无'}"
     )
+
+
+def _usable_knowledge_hits(
+    hits: list[KnowledgeSearchHitModel],
+) -> list[KnowledgeSearchHitModel]:
+    """Return evidence rows with non-empty text for provider decisions.
+
+    Retrieval metadata can contain an empty placeholder row (for example
+    after a failed parser or an adjacency expansion). Such a row must not
+    make a provider call the model or emit a citation with no supporting text.
+    """
+    return [hit for hit in hits if re.sub(r"\s+", "", str(hit.chunk.text or ""))]
 
 
 def build_knowledge_context(
     hits: list[KnowledgeSearchHitModel],
     query: str = "",
+    *,
+    total_limit: int = KNOWLEDGE_CONTEXT_TOTAL_LIMIT,
 ) -> str:
-    return "\n\n".join(
-        f"[知识片段 {index}]\n{_knowledge_context_text(hit.chunk.text, query)}"
-        for index, hit in enumerate(hits, start=1)
-    )
+    """Build bounded evidence text for the answer model.
+
+    ``KNOWLEDGE_CONTEXT_CHUNK_LIMIT`` remains the maximum for one chunk, but
+    a retrieval can contain several chunks.  Allocate one shared budget by
+    relevance so the highest-ranked evidence keeps more surrounding context
+    while lower-ranked evidence still contributes a small, useful window.
+
+    ``total_limit`` is keyword-only to preserve the old two-argument call
+    contract for provider integrations and tests.  It is primarily useful for
+    tests and for deployments with a smaller model context window.
+    """
+    total_limit = _coerce_context_limit(total_limit)
+    if not hits or total_limit <= 0:
+        return ""
+
+    # Empty retrieval rows should not consume label or evidence budget. The
+    # remaining evidence is renumbered contiguously because these labels are
+    # prompt-local (citations are built separately from the original hits).
+    evidence_hits = [hit for hit in hits if _normalize_context_text(hit.chunk.text)]
+    if not evidence_hits:
+        return ""
+
+    # Reserve space for section labels and separators before allocating text
+    # bytes.  This makes the final result obey the advertised total limit,
+    # rather than limiting only the raw chunk bodies.
+    labels = [f"[知识片段 {index}]\n" for index in range(1, len(evidence_hits) + 1)]
+    label_budget = sum(len(label) for label in labels) + max(0, len(evidence_hits) - 1) * 2
+    content_budget = max(0, total_limit - label_budget)
+    budgets = _allocate_context_limits(evidence_hits, content_budget)
+
+    sections = []
+    for label, hit, budget in zip(labels, evidence_hits, budgets, strict=True):
+        excerpt = _knowledge_context_text(
+            hit.chunk.text,
+            query,
+            limit=budget,
+            matched_terms=hit.matched_terms,
+        )
+        sections.append(f"{label}{excerpt}")
+    context = "\n\n".join(sections)
+    if len(context) <= total_limit:
+        return context
+
+    # The arithmetic above accounts for labels and separators.  Keep this
+    # final guard for unusual Unicode/line-ending inputs and future format
+    # changes; it should rarely be reached.
+    return _bounded_excerpt(context, total_limit)
 
 
-def _knowledge_context_text(text: str, query: str) -> str:
+def _coerce_context_limit(value: object) -> int:
+    """Normalize a caller-provided evidence budget to a safe character cap.
+
+    The public builder is called from provider code with an integer default,
+    but deployment configuration and tests can supply environment-derived
+    strings or floating-point values. Invalid, non-finite, boolean, and
+    negative values disable the evidence body instead of leaking an exception
+    into answer generation. The global cap prevents an accidental huge value
+    from creating an unbounded prompt or an expensive allocation loop.
+    """
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return 0
+        numeric = float(value)
+        if not isfinite(numeric) or numeric <= 0:
+            return 0
+        normalized = int(numeric)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(KNOWLEDGE_CONTEXT_TOTAL_LIMIT, max(0, normalized))
+
+
+def _allocate_context_limits(
+    hits: list[KnowledgeSearchHitModel],
+    total_limit: int,
+) -> list[int]:
+    """Allocate a shared evidence budget using score and rank.
+
+    Scores come from different retrieval backends (RRF, cosine similarity,
+    and BGE reranker probabilities), so their absolute scales are not
+    comparable.  We normalize scores within this hit set and blend that
+    signal with rank.  Rank remains a stable fallback when all scores are
+    equal or very close.
+    """
+    total_limit = _coerce_context_limit(total_limit)
+    count = len(hits)
+    if count == 0 or total_limit <= 0:
+        return [0] * count
+
+    cap = KNOWLEDGE_CONTEXT_CHUNK_LIMIT
+    minimum = min(KNOWLEDGE_CONTEXT_MIN_CHUNK_LIMIT, total_limit // count)
+    budgets = [minimum] * count
+    remaining = total_limit - minimum * count
+    if remaining <= 0:
+        # Distribute a possible remainder to the most relevant hits while
+        # preserving deterministic order.
+        return _distribute_budget(budgets, hits, total_limit)
+
+    weights = _context_relevance_weights(hits)
+    while remaining > 0:
+        eligible = [index for index, budget in enumerate(budgets) if budget < cap]
+        if not eligible:
+            break
+        weight_total = sum(weights[index] for index in eligible)
+        if weight_total <= 0:
+            weight_total = float(len(eligible))
+
+        # A proportional pass avoids a rank-only staircase for large result
+        # sets.  At least one character is handed to the first eligible item
+        # when integer rounding would otherwise make no progress.
+        shares = {
+            index: max(0, int(remaining * weights[index] / weight_total))
+            for index in eligible
+        }
+        shares = {
+            index: min(share, cap - budgets[index])
+            for index, share in shares.items()
+        }
+        distributed = sum(shares.values())
+        if distributed == 0:
+            index = max(eligible, key=lambda candidate: (weights[candidate], -candidate))
+            budgets[index] += 1
+            remaining -= 1
+            continue
+
+        for index, share in shares.items():
+            budgets[index] += share
+        remaining -= distributed
+
+    return budgets
+
+
+def _context_relevance_weights(hits: list[KnowledgeSearchHitModel]) -> list[float]:
+    scores: list[float | None] = []
+    for hit in hits:
+        try:
+            score = float(hit.score)
+        except (TypeError, ValueError):
+            score = None
+        scores.append(score if score is not None and isfinite(score) else None)
+
+    valid_scores = [score for score in scores if score is not None]
+    score_min = min(valid_scores) if valid_scores else 0.0
+    score_max = max(valid_scores) if valid_scores else 0.0
+    score_span = score_max - score_min
+    count = len(hits)
+    weights: list[float] = []
+    for index, (hit, score) in enumerate(zip(hits, scores, strict=True)):
+        if score is None:
+            score_signal = 0.0
+        elif score_span > 1e-9:
+            score_signal = (score - score_min) / score_span
+        else:
+            score_signal = 0.0
+
+        rank = hit.rank if isinstance(hit.rank, int) and hit.rank > 0 else index + 1
+        rank_signal = max(0.0, min(1.0, (count - rank + 1) / count))
+        # Keep a non-zero floor so every retained hit can carry a useful
+        # field/value line, while giving score and rank a meaningful effect.
+        weights.append(0.35 + 0.65 * score_signal + 0.35 * rank_signal)
+    return weights
+
+
+def _distribute_budget(
+    budgets: list[int],
+    hits: list[KnowledgeSearchHitModel],
+    total_limit: int,
+) -> list[int]:
+    """Distribute an underfilled remainder deterministically."""
+    total_limit = _coerce_context_limit(total_limit)
+    remaining = total_limit - sum(budgets)
+    if remaining <= 0:
+        return budgets
+    weights = _context_relevance_weights(hits)
+    cap = KNOWLEDGE_CONTEXT_CHUNK_LIMIT
+    while remaining > 0:
+        eligible = [index for index, budget in enumerate(budgets) if budget < cap]
+        if not eligible:
+            break
+        index = max(eligible, key=lambda candidate: (weights[candidate], -candidate))
+        budgets[index] += 1
+        remaining -= 1
+    return budgets
+
+
+def _knowledge_context_text(
+    text: str,
+    query: str,
+    *,
+    limit: int = KNOWLEDGE_CONTEXT_CHUNK_LIMIT,
+    matched_terms: list[str] | tuple[str, ...] = (),
+) -> str:
     """Preserve answer-bearing evidence when a chunk exceeds the context cap.
 
     The old implementation always kept the first 500 characters.  That is
     unsafe for structured Word blocks such as ``字段 | 值``: the field label
     and value can be just after the cut point.  Short chunks are passed in full;
     long chunks use a bounded window around the strongest query-term match.
+    Newline-delimited records are expanded to complete lines when they fit;
+    when no term is found, a head-and-tail excerpt keeps both document context
+    and trailing field/value records.
     """
-    normalized = re.sub(r"\s+", " ", text).strip()
-    if len(normalized) <= KNOWLEDGE_CONTEXT_CHUNK_LIMIT:
+    normalized = _normalize_context_text(text)
+    limit = min(KNOWLEDGE_CONTEXT_CHUNK_LIMIT, _coerce_context_limit(limit))
+    if not normalized or limit == 0:
+        return ""
+    if len(normalized) <= limit:
         return normalized
 
-    match = _find_context_match(normalized, query)
+    match = _find_context_match(normalized, query, matched_terms)
     if match is None:
-        return normalized[:KNOWLEDGE_CONTEXT_CHUNK_LIMIT].rstrip() + "..."
+        return _head_tail_excerpt(normalized, limit)
 
     match_start, match_end = match
+    return _context_window_excerpt(normalized, match_start, match_end, limit)
+
+
+def _normalize_context_text(text: str) -> str:
+    """Normalize horizontal whitespace while retaining record boundaries."""
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in normalized.split("\n")]
+    return "\n".join(line for line in lines if line)
+
+
+def _context_window_excerpt(
+    text: str,
+    match_start: int,
+    match_end: int,
+    limit: int,
+) -> str:
+    marker = KNOWLEDGE_CONTEXT_ELLIPSIS
+    if limit <= len(marker):
+        # At very small budgets, an ellipsis would consume the entire output
+        # and hide the matched field. Return a centered raw slice instead.
+        start = max(0, min(match_start, len(text) - limit))
+        return text[start : start + limit]
+    left_marker = len(marker)
+    right_marker = len(marker)
+    # Reserve markers before selecting the body so the returned string never
+    # exceeds the per-chunk allocation.
+    body_limit = max(1, limit - left_marker - right_marker)
     window_start = max(0, match_start - KNOWLEDGE_CONTEXT_WINDOW_PADDING)
-    window_end = min(
-        len(normalized),
-        max(
-            window_start + KNOWLEDGE_CONTEXT_CHUNK_LIMIT,
-            match_end + KNOWLEDGE_CONTEXT_WINDOW_PADDING,
-        ),
-    )
-    if window_end - window_start > KNOWLEDGE_CONTEXT_CHUNK_LIMIT:
-        window_end = min(len(normalized), window_start + KNOWLEDGE_CONTEXT_CHUNK_LIMIT)
-    if window_end - window_start < KNOWLEDGE_CONTEXT_CHUNK_LIMIT:
-        window_start = max(0, window_end - KNOWLEDGE_CONTEXT_CHUNK_LIMIT)
+    window_end = min(len(text), match_end + KNOWLEDGE_CONTEXT_WINDOW_PADDING)
+    if window_end - window_start > body_limit:
+        window_start = max(0, match_end - body_limit // 2)
+        window_end = min(len(text), window_start + body_limit)
+        window_start = max(0, window_end - body_limit)
 
-    prefix = "..." if window_start > 0 else ""
-    suffix = "..." if window_end < len(normalized) else ""
-    return f"{prefix}{normalized[window_start:window_end].strip()}{suffix}"
+    # Prefer complete newline-delimited records (especially Word table rows)
+    # whenever the full record fits inside the current allocation.
+    line_start = text.rfind("\n", 0, match_start) + 1
+    line_end = text.find("\n", match_end)
+    if line_end < 0:
+        line_end = len(text)
+    if line_end - line_start <= body_limit:
+        if line_start < window_start and line_end <= window_start + body_limit:
+            window_start = line_start
+            window_end = max(window_end, line_end)
+        elif line_start >= window_start and line_end <= window_start + body_limit:
+            window_end = max(window_end, line_end)
+
+    prefix = marker if window_start > 0 else ""
+    suffix = marker if window_end < len(text) else ""
+    available = max(1, limit - len(prefix) - len(suffix))
+    if window_end - window_start > available:
+        # Center the final window on the match and trim at a nearby newline
+        # where possible.  The answer-bearing term is always retained.
+        window_start = max(0, match_end - available // 2)
+        window_end = min(len(text), window_start + available)
+        window_start = max(0, window_end - available)
+    body = text[window_start:window_end].strip()
+    result = f"{prefix}{body}{suffix}"
+    return result[:limit] if len(result) > limit else result
 
 
-def _find_context_match(text: str, query: str) -> tuple[int, int] | None:
+def _head_tail_excerpt(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    marker = KNOWLEDGE_CONTEXT_ELLIPSIS
+    if limit <= len(marker):
+        return text[:limit]
+    body_limit = limit - len(marker)
+    head_limit = max(1, int(body_limit * 0.55))
+    tail_limit = max(1, body_limit - head_limit)
+    head = text[:head_limit]
+    tail = text[-tail_limit:]
+    # Avoid cutting a table row/paragraph when a nearby boundary is available.
+    if "\n" in head:
+        head = head.rsplit("\n", 1)[0].strip() or head
+    if "\n" in tail:
+        tail = tail.split("\n", 1)[-1].strip() or tail
+    result = f"{head.rstrip()}{marker}{tail.lstrip()}"
+    if len(result) <= limit:
+        return result
+    # Boundary adjustment can leave a few extra spaces; enforce the hard cap.
+    return result[:limit]
+
+
+def _bounded_excerpt(text: str, limit: int) -> str:
+    """Hard cap a complete context string as a final defensive fallback."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return _head_tail_excerpt(text, limit)
+
+
+def _find_context_match(
+    text: str,
+    query: str,
+    matched_terms: list[str] | tuple[str, ...] = (),
+) -> tuple[int, int] | None:
     """Find the most informative query span in a normalized chunk."""
     normalized_query = re.sub(r"\s+", " ", query).strip()
-    if not normalized_query:
+    if not normalized_query and not matched_terms:
         return None
 
+    # Field aliases are more useful anchors than a long entity phrase: for a
+    # question such as “蜘蛛侠的位置是什么”, prefer a document row labelled
+    # “主要活动区域” over an earlier occurrence of “蜘蛛侠”.
+    field_candidates = {
+        term for term in query_field_terms(normalized_query) if len(term) >= 2
+    }
     candidates: set[str] = set()
+    candidates.update(term for term in query_overlap_terms(normalized_query) if len(term) >= 2)
+    for term in matched_terms or ():
+        normalized_term = re.sub(r"\s+", " ", str(term)).strip()
+        if len(normalized_term) >= 2:
+            candidates.add(normalized_term)
     for token in re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]{2,}", normalized_query):
         token = token.strip()
         if len(token) >= 2:
@@ -474,6 +803,24 @@ def _find_context_match(text: str, query: str) -> tuple[int, int] | None:
                 )
 
     stop_terms = {
+        "一个",
+        "文档",
+        "字段",
+        "资料",
+        "内容",
+        "信息",
+        "数据",
+        "问题",
+        "答案",
+        "存在",
+        "不存在",
+        "是否",
+        "请",
+        "告诉",
+        "其中",
+        "里面",
+        "中",
+        "不",
         "什么",
         "是什么",
         "哪些",
@@ -485,17 +832,47 @@ def _find_context_match(text: str, query: str) -> tuple[int, int] | None:
         "一下",
         "的",
     }
-    matches: list[tuple[int, int, int]] = []
+    matches: list[tuple[int, int, int, int]] = []
     for candidate in candidates:
         if candidate in stop_terms:
             continue
         start = text.find(candidate)
-        if start >= 0:
-            matches.append((len(candidate), start, start + len(candidate)))
+        while start >= 0:
+            if _context_candidate_is_compatible(query, candidate, text, start):
+                priority = 2 if candidate in field_candidates else 1
+                matches.append((priority, len(candidate), start, start + len(candidate)))
+                break
+            # A long chunk may contain an incompatible first occurrence (for
+            # example ``最低温度``) and a later compatible raw column
+            # (``温度``). Continue searching instead of abandoning the term.
+            start = text.find(candidate, start + max(1, len(candidate)))
     if not matches:
         return None
-    _, start, end = max(matches, key=lambda item: (item[0], -item[1]))
+    _, _, start, end = max(matches, key=lambda item: (item[0], item[1], -item[2]))
     return start, end
+
+
+def _context_candidate_is_compatible(
+    query: str,
+    candidate: str,
+    text: str,
+    start: int,
+) -> bool:
+    """Reject a lexical field hit from an incompatible aggregate column.
+
+    For example, an average-temperature question may contain both
+    ``最低温度`` and a raw ``温度`` row in the same long chunk. Without this
+    guard, the first two-character ``温度`` match wins and the answer window
+    is centered on the minimum-temperature value.
+    """
+    try:
+        fields = query_primary_fields(query)
+    except (TypeError, ValueError):
+        fields = ()
+    if "平均温度" not in fields or candidate not in {"温度", "气温"}:
+        return True
+    prefix = text[max(0, start - 2) : start]
+    return prefix not in {"最高", "最低", "最大", "最小"}
 
 
 def snippet_text(text: str, limit: int = 96) -> str:
