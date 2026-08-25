@@ -318,8 +318,8 @@ def filter_relevant_hits(
     # for legacy/high-scale test and fallback scores, while applying a stricter
     # normalized-score gate to the production reranker output.
     normalized_scores = top_score <= 1.0 and all(0.0 <= hit.score <= 1.0 for hit in hit_list)
-    effective_relative_floor = max(relative_score_floor, 0.20) if normalized_scores else relative_score_floor
-    effective_minimum_floor = max(minimum_score_floor, 0.08) if normalized_scores else minimum_score_floor
+    effective_relative_floor = max(relative_score_floor, 0.10) if normalized_scores else relative_score_floor
+    effective_minimum_floor = max(minimum_score_floor, 0.03) if normalized_scores else minimum_score_floor
     cutoff = max(effective_minimum_floor, top_score * effective_relative_floor)
     anchors = [hit for hit in hit_list if hit.score >= cutoff]
     if not anchors:
@@ -336,10 +336,21 @@ def filter_relevant_hits(
                 source_scores.get(anchor.source.id, 0.0), anchor.score
             )
         if source_scores:
-            strongest_source = max(
-                source_scores.items(), key=lambda item: (item[1], item[0])
-            )[0]
-            allowed_source_ids = {strongest_source}
+            ordered_sources = sorted(
+                source_scores.items(), key=lambda item: (-item[1], item[0])
+            )
+            strongest_source, strongest_score = ordered_sources[0]
+            second_score = ordered_sources[1][1] if len(ordered_sources) > 1 else 0.0
+            # Only collapse to one source when the leading result is both
+            # confident and clearly separated.  If the scores are close, the
+            # expected document may be rank 2+ in the retrieval Top-K; keep
+            # the independently relevant sources instead of returning no
+            # evidence to the answer composer.
+            if (
+                not normalized_scores
+                or (strongest_score >= 0.70 and strongest_score - second_score >= 0.15)
+            ):
+                allowed_source_ids = {strongest_source}
 
     anchor_indices: dict[str, list[int]] = {}
     for hit in anchors:

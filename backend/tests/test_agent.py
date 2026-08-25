@@ -374,7 +374,7 @@ class AgentTest(unittest.TestCase):
 
         result = agent.run(
             conversation_id="conv-agent",
-            content="差旅票据材料需要什么",
+            content="对比差旅制度和财务票据材料需要什么",
             mode="deep",
             previous_messages=[],
             route_type=KnowledgeRouteType.SUMMARY_COMPARE,
